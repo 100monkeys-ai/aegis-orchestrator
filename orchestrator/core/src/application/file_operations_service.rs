@@ -507,6 +507,81 @@ impl FileOperationsService {
         self.read_file(volume_id, tenant_id, &owner, path).await
     }
 
+    /// Read `path` from the volume `volume_id` of the caller's tenant: the
+    /// route `GET /v1/executions/:id/files/*path?volume_id=<id>` and
+    /// `aegis.execution.file` with `volume_id`. It is how a caller fetches a
+    /// file an `aegis.image.generate` answer names by its volume and path,
+    /// out of a run in the person's `chat-attachments` volume, where no
+    /// execution has that volume.
+    ///
+    /// `path` is relative to the volume's root (the route and the tool
+    /// strip a `/workspace/` prefix first). A volume that does not exist,
+    /// one of another tenant, one that holds no files and a path that is
+    /// not a file are all answered alike, `no file <path> in volume <id>`,
+    /// so the answer never tells that another tenant's volume exists (AEGIS
+    /// ADR-035 R5, NOT_FOUND: "existence is not told").
+    pub async fn read_file_in_volume_for_tenant(
+        &self,
+        volume_id: &VolumeId,
+        tenant_id: &TenantId,
+        path: &str,
+    ) -> Result<FileContent, FileOperationsError> {
+        use crate::domain::volume::VolumeStatus;
+
+        let no_file =
+            || FileOperationsError::NotFound(format!("no file {path} in volume {}", volume_id.0));
+        let volume = self
+            .fsal
+            .volume_repository()
+            .find_by_id(*volume_id)
+            .await
+            .map_err(|e| FileOperationsError::Repository(e.to_string()))?
+            .ok_or_else(no_file)?;
+        // A run's volume is detached once the run ends and keeps its files
+        // until its expiry; one being made, deleted or failed has none.
+        if &volume.tenant_id != tenant_id
+            || !matches!(
+                volume.status,
+                VolumeStatus::Available | VolumeStatus::Attached | VolumeStatus::Detached
+            )
+        {
+            return Err(no_file());
+        }
+        let full_path = self.sanitize_and_resolve(path, &volume)?;
+
+        let storage = self.fsal.storage_provider();
+        let attrs = storage.stat(&full_path).await.map_err(|e| match e {
+            StorageError::FileNotFound(_) | StorageError::NotFound(_) => no_file(),
+            other => FileOperationsError::Fsal(other.to_string()),
+        })?;
+        if attrs.file_type != FileType::File {
+            return Err(no_file());
+        }
+        let length = usize::try_from(attrs.size).map_err(|_| FileOperationsError::FileTooLarge)?;
+        let handle = storage
+            .open_file(&full_path, OpenMode::ReadOnly)
+            .await
+            .map_err(|e| match e {
+                StorageError::FileNotFound(_) | StorageError::NotFound(_) => no_file(),
+                other => FileOperationsError::Fsal(other.to_string()),
+            })?;
+        let read = storage.read_at(&handle, 0, length).await;
+        let _ = storage.close_file(&handle).await;
+        let data = read.map_err(|e| FileOperationsError::Fsal(e.to_string()))?;
+        if data.len() as u64 != attrs.size {
+            return Err(FileOperationsError::Fsal(format!(
+                "{path} changed while it was read: {} bytes of {}",
+                data.len(),
+                attrs.size
+            )));
+        }
+        Ok(FileContent {
+            data,
+            content_type: guess_content_type(path),
+            size_bytes: attrs.size,
+        })
+    }
+
     /// Read a file of an execution post-mortem: the route
     /// `GET /v1/executions/:id/files/*path` and `aegis.execution.file`
     /// (AEGIS ADR-005 I8, choices P2 and P3).

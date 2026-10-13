@@ -224,7 +224,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("aegis.system.info", "Returns system version, status, and capabilities.").skip_judge(),
     BuiltinToolDefinition::new("aegis.system.config", "Returns the current node configuration.").skip_judge(),
     BuiltinToolDefinition::new("aegis.runtime.list", "List all supported standard runtime environments (language/version pairs). Call this before creating an agent manifest to ensure the declared runtime is valid.").skip_judge(),
-    BuiltinToolDefinition::new("aegis.execution.file", "Read a file from a completed execution's workspace volume. Use this to retrieve output files after an agent or task execution finishes.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.execution.file", "Read a file from a completed execution's workspace volume. Use this to retrieve output files after an agent or task execution finishes. Given volume_id, it reads the file from that volume of yours, such as an image aegis.image.generate saved.").skip_judge(),
     BuiltinToolDefinition::new("aegis.attachment.read", "Read the contents of a file attached to a chat message. Returns the file content (UTF-8 text or base64-encoded bytes for binary), MIME type, size, and SHA-256 digest. Tenant-scoped and read-only.").skip_judge(),
     BuiltinToolDefinition::new("aegis.edge.fleet.list", "Resolve an edge fleet target (selector / group / @node / all) and return the matched node ids without dispatching. Operator-tier.").skip_judge().edge_executor(),
     BuiltinToolDefinition::new("aegis.edge.fleet.invoke", "Dispatch a tool to a fleet of edge daemons (selector / group / @node / all). Returns the fleet_command_id; per-node progress streams via /v1/edge/fleet/invoke. Operator-tier, fleet-capable.").skip_judge().edge_executor().fleet_capable(),
@@ -2546,14 +2546,18 @@ impl ToolRouter {
             "properties": {
                 "execution_id": {
                     "type": "string",
-                    "description": "The execution ID."
+                    "description": "The execution ID. Required unless volume_id is given."
+                },
+                "volume_id": {
+                    "type": "string",
+                    "description": "Read the file from this volume of yours instead of the execution's workspace: the volume_id an aegis.image.generate answer names for each file."
                 },
                 "path": {
                     "type": "string",
-                    "description": "File path (e.g. 'output.md' or '/workspace/output.md')."
+                    "description": "File path (e.g. 'output.md' or '/workspace/output.md'); with volume_id, the path inside that volume (e.g. 'generated/<batch>/1.jpg')."
                 }
             },
-            "required": ["execution_id", "path"]
+            "required": ["path"]
         })
     }
 

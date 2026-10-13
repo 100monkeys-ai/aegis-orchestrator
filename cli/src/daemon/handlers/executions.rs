@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use aegis_orchestrator_core::application::execution::ExecutionService;
 use aegis_orchestrator_core::application::file_operations_service::{
-    FileContent, FileOperationsError,
+    FileContent, FileOperationsError, FileOperationsService,
 };
 use aegis_orchestrator_core::application::goal_service::{
     cancel_ending_its_goal, CancelPathError, GoalService,
@@ -25,6 +25,7 @@ use aegis_orchestrator_core::domain::repository::{
     ExecutionRepository, WorkflowExecutionRepository, WorkflowRepository,
 };
 use aegis_orchestrator_core::domain::tenant::TenantId;
+use aegis_orchestrator_core::domain::volume::VolumeId;
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
 use crate::daemon::handlers::{
@@ -435,41 +436,78 @@ pub(crate) async fn list_executions_handler(
     }
 }
 
+/// The files route's query: `volume_id` reads the file from that volume of
+/// the caller's tenant in place of the execution's workspace (the volume an
+/// `aegis.image.generate` answer names).
+#[derive(serde::Deserialize)]
+pub(crate) struct ExecutionFileQuery {
+    pub(crate) volume_id: Option<Uuid>,
+}
+
 /// GET /v1/executions/:execution_id/files/*path
 ///
-/// Read a single file from a completed execution's workspace volume post-mortem.
-/// The path segment is normalized: a `/workspace/` prefix is stripped if present.
+/// Read a single file from a completed execution's workspace volume post-mortem,
+/// or, with `?volume_id=<id>`, from that volume of the caller's tenant, the
+/// execution id then not read. The path segment is normalized: a `/workspace/`
+/// prefix is stripped if present.
 pub(crate) async fn get_execution_file_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
     Path((execution_id, file_path)): Path<(Uuid, String)>,
+    Query(query): Query<ExecutionFileQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("execution:read")?;
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    execution_file(
+        state.file_operations_service.as_ref(),
+        &tenant_id,
+        ExecutionId(execution_id),
+        &file_path,
+        query.volume_id.map(VolumeId),
+    )
+    .await
+}
 
+/// The files route past its scope check: the file's bytes from `volume_id`
+/// when the query names one (tenant-checked: another tenant's volume is
+/// answered as one that does not exist), otherwise from the execution.
+async fn execution_file(
+    file_operations: &FileOperationsService,
+    tenant_id: &TenantId,
+    execution_id: ExecutionId,
+    file_path: &str,
+    volume_id: Option<VolumeId>,
+) -> Result<axum::response::Response, (StatusCode, axum::Json<serde_json::Value>)> {
     // Normalize: strip /workspace/ prefix if present
     let normalized = file_path
         .strip_prefix("workspace/")
         .or_else(|| file_path.strip_prefix("/workspace/"))
-        .unwrap_or(&file_path);
+        .unwrap_or(file_path);
 
-    state
-        .file_operations_service
-        .read_file_for_execution(ExecutionId(execution_id), &tenant_id, normalized)
-        .await
-        .map(execution_file_response)
-        .map_err(|e| {
-            let (status, message) = match &e {
-                FileOperationsError::NotFound(_) => (StatusCode::NOT_FOUND, e.to_string()),
-                FileOperationsError::Unauthorized => (StatusCode::FORBIDDEN, e.to_string()),
-                FileOperationsError::InvalidPath(_) => {
-                    (StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
-                }
-                _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-            };
-            (status, axum::Json(serde_json::json!({"error": message})))
-        })
+    let read = match volume_id {
+        Some(volume_id) => {
+            file_operations
+                .read_file_in_volume_for_tenant(&volume_id, tenant_id, normalized)
+                .await
+        }
+        None => {
+            file_operations
+                .read_file_for_execution(execution_id, tenant_id, normalized)
+                .await
+        }
+    };
+    read.map(execution_file_response).map_err(|e| {
+        let (status, message) = match &e {
+            FileOperationsError::NotFound(_) => (StatusCode::NOT_FOUND, e.to_string()),
+            FileOperationsError::Unauthorized => (StatusCode::FORBIDDEN, e.to_string()),
+            FileOperationsError::InvalidPath(_) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
+            }
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        (status, axum::Json(serde_json::json!({"error": message})))
+    })
 }
 
 /// The files route's answer: the bytes, their content type, and their
@@ -520,6 +558,141 @@ mod file_response_tests {
                 .map(|v| v.as_bytes()),
             Some(&b"19"[..]),
             "I8: the files route answers no Content-Length from the stat"
+        );
+    }
+}
+
+#[cfg(test)]
+mod file_volume_tests {
+    //! The files route with `?volume_id=`: the bytes of a file an
+    //! `aegis.image.generate` answer names, read from the volume it names
+    //! (row `image-generate-file-unfetchable`), tenant-checked.
+
+    use super::execution_file;
+    use aegis_orchestrator_core::application::file_operations_service::FileOperationsService;
+    use aegis_orchestrator_core::domain::events::StorageEvent;
+    use aegis_orchestrator_core::domain::execution::ExecutionId;
+    use aegis_orchestrator_core::domain::fsal::{AegisFSAL, EventPublisher};
+    use aegis_orchestrator_core::domain::repository::{ExecutionRepository, VolumeRepository};
+    use aegis_orchestrator_core::domain::tenant::TenantId;
+    use aegis_orchestrator_core::domain::volume::{
+        StorageClass, Volume, VolumeBackend, VolumeId, VolumeOwnership,
+    };
+    use aegis_orchestrator_core::infrastructure::repositories::{
+        InMemoryAgentRepository, InMemoryExecutionRepository, InMemoryVolumeRepository,
+    };
+    use aegis_orchestrator_core::infrastructure::storage::LocalHostStorageProvider;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// The first bytes of a JPEG file, then a few more.
+    const JPEG: &[u8] = b"\xff\xd8\xff\xe0\x00\x10JFIFgenerated-image";
+    const PATH: &str = "generated/54a33efd/1.jpg";
+
+    struct NoStorageEvents;
+
+    #[async_trait::async_trait]
+    impl EventPublisher for NoStorageEvents {
+        async fn publish_storage_event(&self, _event: StorageEvent) {}
+    }
+
+    /// A file service over a scratch root holding one person's
+    /// `chat-attachments` volume in `tenant` with [`JPEG`] at [`PATH`].
+    async fn person_volume(
+        tenant: &TenantId,
+    ) -> (tempfile::TempDir, FileOperationsService, VolumeId) {
+        let root = tempfile::tempdir().expect("scratch root");
+        let volumes = Arc::new(InMemoryVolumeRepository::new());
+        let fsal = Arc::new(AegisFSAL::new(
+            Arc::new(LocalHostStorageProvider::new(root.path()).expect("storage root")),
+            volumes.clone() as Arc<dyn VolumeRepository>,
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            Arc::new(NoStorageEvents),
+        ));
+        let mut volume = Volume::new(
+            "chat-attachments".to_string(),
+            tenant.clone(),
+            StorageClass::persistent(),
+            VolumeBackend::HostPath {
+                path: std::path::PathBuf::from("/placeholder"),
+            },
+            64 * 1024 * 1024,
+            VolumeOwnership::persistent("image-person"),
+        )
+        .expect("volume");
+        volume.backend = VolumeBackend::HostPath {
+            path: std::path::PathBuf::from(format!("/hosts/{}", volume.id)),
+        };
+        volume.mark_available().expect("available");
+        volumes.save(&volume).await.expect("saved");
+        let on_disk = root.path().join(format!("hosts/{}", volume.id)).join(PATH);
+        std::fs::create_dir_all(on_disk.parent().expect("a parent")).expect("dirs");
+        std::fs::write(on_disk, JPEG).expect("written");
+        let service = FileOperationsService::new(
+            fsal,
+            Arc::new(InMemoryExecutionRepository::new()) as Arc<dyn ExecutionRepository>,
+            Arc::new(InMemoryAgentRepository::new()),
+        );
+        (root, service, volume.id)
+    }
+
+    /// The route answers the file's bytes from the volume its query names,
+    /// with its content type and length; the execution id is not read.
+    #[tokio::test]
+    async fn the_route_answers_the_bytes_of_the_volume_it_names() {
+        let tenant = TenantId::for_consumer_user("image-person").expect("tenant");
+        let (_root, files, volume) = person_volume(&tenant).await;
+        let response = execution_file(&files, &tenant, ExecutionId(volume.0), PATH, Some(volume))
+            .await
+            .expect("the file is answered");
+        let headers = response.headers().clone();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body");
+        println!(
+            "files route with volume_id: content-type {:?}, content-length {:?}, {} bytes",
+            headers.get(axum::http::header::CONTENT_TYPE),
+            headers.get(axum::http::header::CONTENT_LENGTH),
+            body.len()
+        );
+        assert_eq!(body.as_ref(), JPEG);
+        assert_eq!(headers[axum::http::header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(
+            headers[axum::http::header::CONTENT_LENGTH],
+            JPEG.len().to_string()
+        );
+    }
+
+    /// Another tenant's volume is answered as one that does not exist: 404
+    /// with the same body form, no byte of the file.
+    #[tokio::test]
+    async fn the_route_answers_another_tenants_volume_as_missing() {
+        let owner = TenantId::for_consumer_user("image-person").expect("tenant");
+        let caller = TenantId::for_consumer_user("intruder").expect("tenant");
+        let (_root, files, volume) = person_volume(&owner).await;
+        let missing = VolumeId::new();
+        let answer = |volume: VolumeId| {
+            let files = &files;
+            let caller = &caller;
+            async move {
+                match execution_file(files, caller, ExecutionId::new(), PATH, Some(volume)).await {
+                    Ok(_) => panic!("another tenant's file was answered"),
+                    Err((status, axum::Json(body))) => (status, body),
+                }
+            }
+        };
+        let (refused_status, refused) = answer(volume).await;
+        let (absent_status, absent) = answer(missing).await;
+        println!("another tenant's volume: {refused_status} {refused}; a missing one: {absent_status} {absent}");
+        assert_eq!(refused_status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(absent_status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            refused,
+            serde_json::json!({"error": format!("not found: no file {PATH} in volume {volume}")})
+        );
+        assert_eq!(
+            absent,
+            serde_json::json!({"error": format!("not found: no file {PATH} in volume {missing}")})
         );
     }
 }

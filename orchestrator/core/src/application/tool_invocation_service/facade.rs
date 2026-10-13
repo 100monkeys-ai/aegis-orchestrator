@@ -2169,8 +2169,9 @@ impl ToolInvocationService {
                 }
             }
         }
+        let fetch = generated_fetch_sentence(&answered);
         Ok(ToolInvocationResult::Direct(
-            serde_json::json!({ "files": answered }),
+            serde_json::json!({ "files": answered, "fetch": fetch }),
         ))
     }
 
@@ -3511,6 +3512,26 @@ fn generated_image_extension(content_type: &str) -> &'static str {
     }
 }
 
+/// The sentence an `aegis.image.generate` answer carries on how its caller
+/// fetches each file: `aegis.execution.file` with the file's `volume_id` and
+/// `path`, the route an MCP caller outside the chat has to the bytes.
+fn generated_fetch_sentence(files: &[Value]) -> String {
+    let named: Vec<String> = files
+        .iter()
+        .map(|file| {
+            format!(
+                "volume_id {}, path {}",
+                file["volume_id"].as_str().unwrap_or_default(),
+                file["path"].as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    match named.as_slice() {
+        [one] => format!("Fetch it with aegis.execution.file, {one}."),
+        many => format!("Fetch each with aegis.execution.file: {}.", many.join("; ")),
+    }
+}
+
 /// Where `aegis.image.generate` writes its files.
 enum GeneratedTarget {
     /// Inside an execution: its workspace volume, and the store its produced
@@ -3578,7 +3599,29 @@ pub enum ImageGenerateError {
 
 #[cfg(test)]
 mod tests {
-    use super::generated_image_extension;
+    use super::{generated_fetch_sentence, generated_image_extension};
+
+    /// The image answer names how its caller fetches each file, by the
+    /// file's volume and path (row `image-generate-file-unfetchable`).
+    #[test]
+    fn an_image_answer_names_how_to_fetch_each_file() {
+        let file = |n: u8| {
+            serde_json::json!({
+                "volume_id": "9f0b2e1f-02cb-4e5b-9e45-51b16e5beaf6",
+                "path": format!("generated/54a33efd/{n}.jpg"),
+                "content_type": "image/jpeg",
+                "size_bytes": 242323,
+            })
+        };
+        assert_eq!(
+            generated_fetch_sentence(&[file(1)]),
+            "Fetch it with aegis.execution.file, volume_id 9f0b2e1f-02cb-4e5b-9e45-51b16e5beaf6, path generated/54a33efd/1.jpg."
+        );
+        assert_eq!(
+            generated_fetch_sentence(&[file(1), file(2)]),
+            "Fetch each with aegis.execution.file: volume_id 9f0b2e1f-02cb-4e5b-9e45-51b16e5beaf6, path generated/54a33efd/1.jpg; volume_id 9f0b2e1f-02cb-4e5b-9e45-51b16e5beaf6, path generated/54a33efd/2.jpg."
+        );
+    }
 
     #[test]
     fn a_generated_images_extension_follows_its_content_type() {
