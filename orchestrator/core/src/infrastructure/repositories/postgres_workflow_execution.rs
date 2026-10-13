@@ -62,6 +62,55 @@ use sqlx::postgres::PgPool;
 use sqlx::Row;
 use std::collections::HashMap;
 
+/// A `workflow_executions` row selected with the columns `id`,
+/// `workflow_id`, `input_params`, `status`, `current_state`, `blackboard`,
+/// `state_outputs`, `final_output`, `started_at`, `last_transition_at` and
+/// `initiating_user_sub`, as a [`WorkflowExecution`] of `tenant_id`.
+fn workflow_execution_from_row(
+    row: &sqlx::postgres::PgRow,
+    tenant_id: &TenantId,
+) -> WorkflowExecution {
+    let status_str: String = row.get("status");
+    let status = match status_str.as_str() {
+        "pending" => ExecutionStatus::Pending,
+        "running" => ExecutionStatus::Running,
+        "completed" => ExecutionStatus::Completed,
+        "failed" => ExecutionStatus::Failed,
+        "cancelled" => ExecutionStatus::Cancelled,
+        _ => ExecutionStatus::Pending,
+    };
+    let blackboard_val: serde_json::Value = row.get("blackboard");
+    let state_outputs_val: serde_json::Value = row.get("state_outputs");
+    let current_state_str: String = row.get("current_state");
+    let state_outputs: HashMap<StateName, serde_json::Value> = state_outputs_val
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| {
+                    StateName::new(k)
+                        .ok()
+                        .map(|state_name| (state_name, v.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    WorkflowExecution {
+        id: ExecutionId(row.get("id")),
+        workflow_id: WorkflowId(row.get("workflow_id")),
+        tenant_id: tenant_id.clone(),
+        status,
+        current_state: StateName::new(&current_state_str)
+            .unwrap_or_else(|_| StateName::new("start").unwrap()),
+        blackboard: Blackboard::from_json(&blackboard_val).unwrap_or_else(|_| Blackboard::new()),
+        input: row.get("input_params"),
+        state_outputs,
+        final_output: row.get("final_output"),
+        started_at: row.get("started_at"),
+        last_transition_at: row.get("last_transition_at"),
+        initiating_user_sub: row.get("initiating_user_sub"),
+    }
+}
+
 pub struct PostgresWorkflowExecutionRepository {
     pool: PgPool,
 }
@@ -634,6 +683,113 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
             .map(|execution| {
                 let event = latest.remove(&execution.id.0);
                 (execution, event)
+            })
+            .collect())
+    }
+
+    async fn find_gate_trails_for_initiator(
+        &self,
+        tenant_id: &TenantId,
+        initiating_user_sub: &str,
+    ) -> Result<
+        Vec<(
+            WorkflowExecution,
+            Vec<crate::domain::workflow::WorkflowExecutionEventRecord>,
+        )>,
+        RepositoryError,
+    > {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                w.id, w.workflow_id, w.input_params, w.status,
+                w.current_state, w.blackboard, w.state_outputs,
+                w.final_output,
+                w.started_at, w.last_transition_at, w.initiating_user_sub
+            FROM workflow_executions w
+            WHERE w.tenant_id = $1
+              AND w.initiating_user_sub = $2
+              AND EXISTS (
+                  SELECT 1 FROM execution_events g
+                  WHERE g.execution_id = w.id AND g.event_type = 'HumanInputRequested'
+              )
+            ORDER BY w.started_at DESC
+            "#,
+        )
+        .bind(tenant_id.as_str())
+        .bind(initiating_user_sub)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| {
+            RepositoryError::Database(format!("Failed to query gated workflow executions: {e}"))
+        })?;
+        let executions: Vec<WorkflowExecution> = rows
+            .iter()
+            .map(|row| workflow_execution_from_row(row, tenant_id))
+            .collect();
+        if executions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ids: Vec<uuid::Uuid> = executions.iter().map(|execution| execution.id.0).collect();
+        let event_types: Vec<String> = crate::domain::repository::GATE_TRAIL_EVENT_TYPES
+            .iter()
+            .map(|event_type| event_type.to_string())
+            .collect();
+        // A state exit's output is narrowed to a gate answer's fields: an
+        // Agent state's output can be large, and only a Human state's answer
+        // is read from it.
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                execution_id, sequence_number, event_type,
+                CASE WHEN event_type = 'WorkflowStateExited' THEN
+                    jsonb_set(
+                        event_payload,
+                        '{output}',
+                        jsonb_strip_nulls(jsonb_build_object(
+                            'response', event_payload->'output'->'response',
+                            'feedback', event_payload->'output'->'feedback',
+                            'timeout', event_payload->'output'->'timeout'
+                        ))
+                    )
+                ELSE event_payload END AS event_payload,
+                iteration_number, created_at
+            FROM execution_events
+            WHERE execution_id = ANY($1) AND event_type = ANY($2)
+            ORDER BY execution_id, sequence_number ASC
+            "#,
+        )
+        .bind(&ids)
+        .bind(&event_types)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| {
+            RepositoryError::Database(format!("Failed to query gate trail events: {e}"))
+        })?;
+
+        let mut trails: HashMap<
+            uuid::Uuid,
+            Vec<crate::domain::workflow::WorkflowExecutionEventRecord>,
+        > = HashMap::new();
+        for row in rows {
+            let execution_id: uuid::Uuid = row.get("execution_id");
+            let iteration_number: Option<i16> = row.get("iteration_number");
+            trails.entry(execution_id).or_default().push(
+                crate::domain::workflow::WorkflowExecutionEventRecord {
+                    sequence: row.get("sequence_number"),
+                    event_type: row.get("event_type"),
+                    state_name: None,
+                    iteration_number: iteration_number.map(|n| n as u8),
+                    payload: row.get("event_payload"),
+                    recorded_at: row.get("created_at"),
+                },
+            );
+        }
+        Ok(executions
+            .into_iter()
+            .map(|execution| {
+                let trail = trails.remove(&execution.id.0).unwrap_or_default();
+                (execution, trail)
             })
             .collect())
     }

@@ -536,7 +536,83 @@ pub trait WorkflowExecutionRepository: Send + Sync {
         }
         Ok(listed)
     }
+
+    /// The tenant's workflow executions that `initiating_user_sub` started
+    /// and that posted at least one Human gate, running or ended, each with
+    /// its gate trail: the events of [`GATE_TRAIL_EVENT_TYPES`], which open
+    /// and close its gates, in sequence order. Read-only.
+    ///
+    /// The default implementation pages the tenant's executions and reads
+    /// each one's trail; the Postgres repository answers in two queries and
+    /// narrows a state exit's `output` to a gate answer's fields
+    /// (`response`, `feedback`, `timeout`).
+    async fn find_gate_trails_for_initiator(
+        &self,
+        tenant_id: &TenantId,
+        initiating_user_sub: &str,
+    ) -> Result<
+        Vec<(
+            crate::domain::workflow::WorkflowExecution,
+            Vec<crate::domain::workflow::WorkflowExecutionEventRecord>,
+        )>,
+        RepositoryError,
+    > {
+        const PAGE: usize = 500;
+        let mut trails = Vec::new();
+        let mut offset = 0;
+        loop {
+            let executions = self
+                .list_paginated_for_tenant(tenant_id, PAGE, offset)
+                .await?;
+            let read = executions.len();
+            for execution in executions {
+                if execution.initiating_user_sub.as_deref() != Some(initiating_user_sub) {
+                    continue;
+                }
+                let mut trail = Vec::new();
+                let mut events_offset = 0;
+                loop {
+                    let page = self
+                        .find_events_by_execution(execution.id, PAGE, events_offset)
+                        .await?;
+                    let events_read = page.len();
+                    trail.extend(page.into_iter().filter(|event| {
+                        GATE_TRAIL_EVENT_TYPES.contains(&event.event_type.as_str())
+                    }));
+                    if events_read < PAGE {
+                        break;
+                    }
+                    events_offset += events_read;
+                }
+                if trail
+                    .iter()
+                    .any(|event| event.event_type == "HumanInputRequested")
+                {
+                    trail.sort_by_key(|event| event.sequence);
+                    trails.push((execution, trail));
+                }
+            }
+            if read < PAGE {
+                break;
+            }
+            offset += read;
+        }
+        Ok(trails)
+    }
 }
+
+/// The workflow event types that open and close a Human gate: the worker's
+/// post of the gate, the state exit carrying its answer, the next state
+/// entered, and the events that end a run.
+pub const GATE_TRAIL_EVENT_TYPES: [&str; 7] = [
+    "HumanInputRequested",
+    "WorkflowStateExited",
+    "WorkflowStateEntered",
+    "WorkflowStateVisitLimitExceeded",
+    "WorkflowExecutionCompleted",
+    "WorkflowExecutionFailed",
+    "WorkflowExecutionCancelled",
+];
 
 /// Repository interface for Volume aggregates
 /// One repository per aggregate root (Infrastructure & Hosting Context)

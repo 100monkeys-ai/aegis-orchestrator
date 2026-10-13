@@ -1,7 +1,7 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! `GET /v1/workflow-gates?status=pending` driven over HTTP through the
-//! daemon's authentication stack. One world of runs is seeded through the
+//! `GET /v1/workflow-gates` (`status=pending`, `answered` and `any`) driven
+//! over HTTP through the daemon's authentication stack. One world of runs is seeded through the
 //! repository traits, as the Temporal listener persists them: once on an
 //! in-memory trail (the repository trait's default query) and once on the
 //! real PostgreSQL repositories with every migration applied (the Postgres
@@ -262,6 +262,10 @@ struct World {
     ended: ExecutionId,
     others: ExecutionId,
     member_b: ExecutionId,
+    answered_yes: ExecutionId,
+    answered_no: ExecutionId,
+    timed_out: ExecutionId,
+    others_answered: ExecutionId,
 }
 
 /// Seed the runs through the repositories and serve the route over them.
@@ -433,6 +437,150 @@ async fn world(
                 gate("Nobody's?"),
             )],
         ),
+        // answered yes after a refused word: the gate posted twice, then left
+        // with the word, and the run went on to its next state
+        (
+            owner_tenant.clone(),
+            Some(OWNER),
+            ExecutionStatus::Running,
+            vec![
+                (
+                    1,
+                    "WorkflowExecutionStarted",
+                    "2026-10-13T06:19:00.000Z",
+                    json!({}),
+                ),
+                (
+                    2,
+                    "WorkflowStateEntered",
+                    "2026-10-13T06:19:30.000Z",
+                    entered.clone(),
+                ),
+                (
+                    3,
+                    "HumanInputRequested",
+                    "2026-10-13T06:20:00.000Z",
+                    gate("Approve the design?"),
+                ),
+                (
+                    4,
+                    "HumanInputRequested",
+                    "2026-10-13T06:22:00.000Z",
+                    gate(
+                        "\"ok\" is not an answer this gate takes; answer yes or no.\n\nApprove the design?",
+                    ),
+                ),
+                (
+                    5,
+                    "WorkflowStateExited",
+                    "2026-10-13T06:25:00.000Z",
+                    json!({
+                        "state_name": "AWAIT_REQUIREMENTS_APPROVAL",
+                        "output": { "response": "yes", "timeout": false },
+                    }),
+                ),
+                (
+                    6,
+                    "WorkflowStateEntered",
+                    "2026-10-13T06:25:01.000Z",
+                    json!({ "state_name": "ARCHITECT" }),
+                ),
+            ],
+        ),
+        // answered no with feedback, and the run ended on the answer
+        (
+            owner_tenant.clone(),
+            Some(OWNER),
+            ExecutionStatus::Completed,
+            vec![
+                (
+                    1,
+                    "WorkflowExecutionStarted",
+                    "2026-10-13T05:29:00.000Z",
+                    json!({}),
+                ),
+                (
+                    2,
+                    "HumanInputRequested",
+                    "2026-10-13T05:30:00.000Z",
+                    gate("Ship it?"),
+                ),
+                (
+                    3,
+                    "WorkflowStateExited",
+                    "2026-10-13T05:40:00.000Z",
+                    json!({
+                        "state_name": "AWAIT_REQUIREMENTS_APPROVAL",
+                        "output": {
+                            "response": "no",
+                            "feedback": "Narrow the scope.",
+                            "timeout": false,
+                        },
+                    }),
+                ),
+                (
+                    4,
+                    "WorkflowExecutionCompleted",
+                    "2026-10-13T05:40:01.000Z",
+                    json!({}),
+                ),
+            ],
+        ),
+        // nobody answered: the gate closed on its timeout and failed the run
+        (
+            owner_tenant.clone(),
+            Some(OWNER),
+            ExecutionStatus::Failed,
+            vec![
+                (
+                    1,
+                    "WorkflowExecutionStarted",
+                    "2026-10-13T04:29:00.000Z",
+                    json!({}),
+                ),
+                (
+                    2,
+                    "HumanInputRequested",
+                    "2026-10-13T04:30:00.000Z",
+                    gate("Anyone?"),
+                ),
+                (
+                    3,
+                    "WorkflowExecutionFailed",
+                    "2026-10-13T05:30:00.000Z",
+                    json!({ "error": "Human input timeout" }),
+                ),
+            ],
+        ),
+        // another tenant's answered gate
+        (
+            other_tenant.clone(),
+            Some(OTHER),
+            ExecutionStatus::Completed,
+            vec![
+                (
+                    1,
+                    "HumanInputRequested",
+                    "2026-10-13T06:30:00.000Z",
+                    gate("Theirs, answered?"),
+                ),
+                (
+                    2,
+                    "WorkflowStateExited",
+                    "2026-10-13T06:31:00.000Z",
+                    json!({
+                        "state_name": "AWAIT_REQUIREMENTS_APPROVAL",
+                        "output": { "response": "yes", "timeout": false },
+                    }),
+                ),
+                (
+                    3,
+                    "WorkflowExecutionCompleted",
+                    "2026-10-13T06:31:01.000Z",
+                    json!({}),
+                ),
+            ],
+        ),
     ];
 
     let mut ids = Vec::new();
@@ -487,6 +635,10 @@ async fn world(
         ended: ids[3],
         others: ids[4],
         member_b: ids[5],
+        answered_yes: ids[7],
+        answered_no: ids[8],
+        timed_out: ids[9],
+        others_answered: ids[10],
     }
 }
 
@@ -503,15 +655,23 @@ async fn in_memory_world() -> World {
 
 /// The caller's pending gates, by execution id.
 async fn gates(world: &World, token: &str) -> Vec<Value> {
+    listing(world, token, "status=pending").await
+}
+
+/// The caller's gates for a query string such as `status=answered`.
+async fn listing(world: &World, token: &str, query: &str) -> Vec<Value> {
     let (status, answer) = send(
         &world.base,
         &Method::GET,
-        "/v1/workflow-gates?status=pending",
+        &format!("/v1/workflow-gates?{query}"),
         &None,
         Some(token),
     )
     .await;
-    assert_eq!(status, 200, "the pending gates were not answered: {answer}");
+    assert_eq!(
+        status, 200,
+        "the gates ({query}) were not answered: {answer}"
+    );
     let listed = answer["gates"].as_array().cloned().unwrap_or_default();
     assert_eq!(
         answer["count"],
@@ -654,17 +814,16 @@ async fn a_run_another_person_started_in_the_tenant_is_not_listed() {
     );
 }
 
-/// The route needs `workflow:read` and a person; it lists pending gates
-/// only.
+/// The route needs `workflow:read` and a person, and a status it knows.
 #[tokio::test]
-async fn the_route_needs_workflow_read_a_person_and_the_pending_status() {
+async fn the_route_needs_workflow_read_a_person_and_a_known_status() {
     let world = in_memory_world().await;
     let mut answers = Vec::new();
     for (token, path) in [
         (Some("owner-no-scope"), "/v1/workflow-gates?status=pending"),
         (Some("service"), "/v1/workflow-gates?status=pending"),
         (None, "/v1/workflow-gates?status=pending"),
-        (Some("owner"), "/v1/workflow-gates?status=answered"),
+        (Some("owner"), "/v1/workflow-gates?status=closed"),
         (Some("owner"), "/v1/workflow-gates"),
     ] {
         let (status, _) = send(&world.base, &Method::GET, path, &None, token).await;
@@ -680,8 +839,202 @@ async fn the_route_needs_workflow_read_a_person_and_the_pending_status() {
             ),
             (Some("service"), "/v1/workflow-gates?status=pending", 403),
             (None, "/v1/workflow-gates?status=pending", 401),
-            (Some("owner"), "/v1/workflow-gates?status=answered", 400),
+            (Some("owner"), "/v1/workflow-gates?status=closed", 400),
             (Some("owner"), "/v1/workflow-gates", 200),
+        ]
+    );
+}
+
+/// The answered gate of `world.answered_yes`, as the route lists it.
+fn answered_yes_view(world: &World) -> Value {
+    json!({
+        "execution_id": world.answered_yes.to_string(),
+        "workflow_name": "the-forge",
+        "state_name": "AWAIT_REQUIREMENTS_APPROVAL",
+        "prompt": "\"ok\" is not an answer this gate takes; answer yes or no.\n\nApprove the design?",
+        "responses": ["yes", "no"],
+        "response": "yes",
+        "feedback": null,
+        "answered_at": "2026-10-13T06:25:00+00:00",
+        "answered_by": null,
+        "sequence": 4,
+        "requested_at": "2026-10-13T06:22:00+00:00",
+        "outcome": "went_on",
+    })
+}
+
+/// An answered gate is listed under `answered` with the word chosen, when,
+/// the feedback, and whether the run went on or ended; newest first.
+#[tokio::test]
+async fn an_answered_gate_is_listed_with_its_word_and_time() {
+    let world = in_memory_world().await;
+    let listed = listing(&world, "owner", "status=answered").await;
+    assert_eq!(
+        gate_of(&listed, world.answered_yes),
+        Some(&answered_yes_view(&world)),
+        "the gate answered yes is not listed with its word and time: {listed:?}"
+    );
+    assert_eq!(
+        gate_of(&listed, world.answered_no),
+        Some(&json!({
+            "execution_id": world.answered_no.to_string(),
+            "workflow_name": "the-forge",
+            "state_name": "AWAIT_REQUIREMENTS_APPROVAL",
+            "prompt": "Ship it?",
+            "responses": ["yes", "no"],
+            "response": "no",
+            "feedback": "Narrow the scope.",
+            "answered_at": "2026-10-13T05:40:00+00:00",
+            "answered_by": null,
+            "sequence": 2,
+            "requested_at": "2026-10-13T05:30:00+00:00",
+            "outcome": "ended",
+        })),
+        "the gate answered no is not listed with its word, feedback and end: {listed:?}"
+    );
+    assert_eq!(
+        ids(&listed),
+        vec![
+            world.answered_yes.to_string(),
+            world.answered_no.to_string(),
+            world.timed_out.to_string(),
+        ],
+        "the owner's answered gates are not exactly theirs, newest first"
+    );
+}
+
+/// A gate nobody answered before its timeout is listed under `answered`
+/// with no word and the outcome `timed_out`.
+#[tokio::test]
+async fn a_gate_closed_by_its_timeout_is_listed_as_timed_out() {
+    let world = in_memory_world().await;
+    let listed = listing(&world, "owner", "status=answered").await;
+    assert_eq!(
+        gate_of(&listed, world.timed_out),
+        Some(&json!({
+            "execution_id": world.timed_out.to_string(),
+            "workflow_name": "the-forge",
+            "state_name": "AWAIT_REQUIREMENTS_APPROVAL",
+            "prompt": "Anyone?",
+            "responses": ["yes", "no"],
+            "response": null,
+            "feedback": null,
+            "answered_at": "2026-10-13T05:30:00+00:00",
+            "answered_by": null,
+            "sequence": 2,
+            "requested_at": "2026-10-13T04:30:00+00:00",
+            "outcome": "timed_out",
+        })),
+        "the gate closed by its timeout is not listed as timed out: {listed:?}"
+    );
+}
+
+/// A gate still waiting, or one whose run ended or went on without an
+/// answer, is not listed under `answered`.
+#[tokio::test]
+async fn a_pending_gate_is_not_listed_as_answered() {
+    let world = in_memory_world().await;
+    let listed = listing(&world, "owner", "status=answered").await;
+    for (run, what) in [
+        (world.waiting, "a waiting gate"),
+        (world.reposted, "a reposted waiting gate"),
+        (world.past, "a run past its gate with no answer recorded"),
+        (world.ended, "a run that ended at its gate unanswered"),
+    ] {
+        assert!(
+            gate_of(&listed, run).is_none(),
+            "{what} was listed as answered: {listed:?}"
+        );
+    }
+}
+
+/// Another tenant's answered gate is not listed; its own person sees it.
+#[tokio::test]
+async fn another_tenants_answered_gate_is_not_listed() {
+    let world = in_memory_world().await;
+    let owners = listing(&world, "owner", "status=answered").await;
+    assert!(
+        gate_of(&owners, world.others_answered).is_none(),
+        "another tenant's answered gate was listed: {owners:?}"
+    );
+    assert_eq!(
+        ids(&listing(&world, "other", "status=answered").await),
+        vec![world.others_answered.to_string()],
+        "the other person's own answered gate was not listed to them alone"
+    );
+    assert_eq!(
+        ids(&listing(&world, "member-a", "status=answered").await),
+        Vec::<String>::new(),
+        "a member was shown answered gates of runs they did not start"
+    );
+}
+
+/// `status=any` lists the pending and the answered gates together, newest
+/// first by the gate's latest time (its answer, else its post); an answered
+/// gate is the one that carries an `outcome`.
+#[tokio::test]
+async fn any_lists_pending_and_answered_gates() {
+    let world = in_memory_world().await;
+    let listed = listing(&world, "owner", "status=any").await;
+    assert_eq!(
+        ids(&listed),
+        vec![
+            world.answered_yes.to_string(),
+            world.reposted.to_string(),
+            world.waiting.to_string(),
+            world.answered_no.to_string(),
+            world.timed_out.to_string(),
+        ],
+        "status=any does not list the owner's pending and answered gates, newest first"
+    );
+    assert_eq!(
+        gate_of(&listed, world.answered_yes),
+        Some(&answered_yes_view(&world)),
+        "status=any lists an answered gate unlike status=answered"
+    );
+    assert_eq!(
+        gate_of(&listed, world.waiting),
+        gate_of(&gates(&world, "owner").await, world.waiting),
+        "status=any lists a pending gate unlike status=pending"
+    );
+}
+
+/// `limit` (default 50, at most 200) and `offset` page the answered gates.
+#[tokio::test]
+async fn limit_and_offset_page_the_answered_gates() {
+    let world = in_memory_world().await;
+    assert_eq!(
+        ids(&listing(&world, "owner", "status=answered&limit=1&offset=1").await),
+        vec![world.answered_no.to_string()],
+        "limit=1&offset=1 is not the second answered gate"
+    );
+    assert_eq!(
+        ids(&listing(&world, "owner", "status=answered&offset=3").await),
+        Vec::<String>::new(),
+        "an offset past the last answered gate lists one"
+    );
+    let mut statuses = Vec::new();
+    for query in [
+        "status=answered&limit=0",
+        "status=answered&limit=201",
+        "status=answered&limit=200",
+    ] {
+        let (status, _) = send(
+            &world.base,
+            &Method::GET,
+            &format!("/v1/workflow-gates?{query}"),
+            &None,
+            Some("owner"),
+        )
+        .await;
+        statuses.push((query, status));
+    }
+    assert_eq!(
+        statuses,
+        vec![
+            ("status=answered&limit=0", 400),
+            ("status=answered&limit=201", 400),
+            ("status=answered&limit=200", 200),
         ]
     );
 }
@@ -745,12 +1098,19 @@ async fn the_postgres_repository_lists_the_same_gates() {
     )
     .await;
     let owners = gates(&world, "owner").await;
+    let answered = listing(&world, "owner", "status=answered").await;
     let listed = (
         ids(&owners),
         gate_of(&owners, world.waiting).cloned(),
         ids(&gates(&world, "other").await),
         ids(&gates(&world, "member-a").await),
         ids(&gates(&world, "member-b").await),
+    );
+    let answered_listed = (
+        ids(&answered),
+        gate_of(&answered, world.answered_yes).cloned(),
+        ids(&listing(&world, "other", "status=answered").await),
+        ids(&listing(&world, "owner", "status=any").await),
     );
 
     pool.close().await;
@@ -779,5 +1139,25 @@ async fn the_postgres_repository_lists_the_same_gates() {
             vec![world.member_b.to_string()],
         ),
         "the Postgres repository's gates differ from the trail's"
+    );
+    assert_eq!(
+        answered_listed,
+        (
+            vec![
+                world.answered_yes.to_string(),
+                world.answered_no.to_string(),
+                world.timed_out.to_string(),
+            ],
+            Some(answered_yes_view(&world)),
+            vec![world.others_answered.to_string()],
+            vec![
+                world.answered_yes.to_string(),
+                world.reposted.to_string(),
+                world.waiting.to_string(),
+                world.answered_no.to_string(),
+                world.timed_out.to_string(),
+            ],
+        ),
+        "the Postgres repository's answered gates differ from the trail's"
     );
 }
