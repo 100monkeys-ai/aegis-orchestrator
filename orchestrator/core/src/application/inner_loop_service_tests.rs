@@ -766,6 +766,8 @@ struct World {
     model: Arc<ScriptedModel>,
     agent: Agent,
     execution_id: ExecutionId,
+    /// The volumes the file tools find for an execution.
+    volumes: crate::application::nfs_gateway::NfsVolumeRegistry,
 }
 
 async fn world(agent: Agent, turns: Vec<Turn>) -> World {
@@ -823,6 +825,7 @@ async fn world_full(
         Arc::new(parking_lot::RwLock::new(HashMap::new())),
         Arc::new(NoOpPublisher),
     ));
+    let volumes = crate::application::nfs_gateway::NfsVolumeRegistry::new();
     let tools = ToolInvocationService::new(
         Arc::new(
             crate::infrastructure::seal::session_repository::InMemorySealSessionRepository::new(),
@@ -833,7 +836,7 @@ async fn world_full(
             crate::infrastructure::tool_router::ToolRouter::builtin_dispatchers(),
         )),
         fsal,
-        crate::application::nfs_gateway::NfsVolumeRegistry::new(),
+        volumes.clone(),
         Arc::new(OneAgent(agent.clone())),
         records.clone(),
         Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
@@ -856,6 +859,7 @@ async fn world_full(
         model,
         agent,
         execution_id,
+        volumes,
     }
 }
 
@@ -1753,4 +1757,200 @@ fn the_refinement_without_seconds_says_the_provider_ended_it() {
          before it finished, so none of it was kept. Answer this time with a tool call that \
          runs a program to compute the result; do not write the computed result in your text."
     );
+}
+
+// ---------------------------------------------------------------------------
+// The repeated-call guard and the deadline at the dispatch site
+// ---------------------------------------------------------------------------
+
+/// The sentence a call answered twice alike gets in place of a third run.
+const RAN_TWICE_ALIKE: &str = "This call was already run 2 times in this try with the same \
+                               answer; it is not run again. Change the call, or answer with \
+                               what you have.";
+
+/// The search the requirements analyst of run `ea6d7814` (child `e5f2d38f`)
+/// ran about fourteen times in one try, 0 matches each time.
+fn the_analysts_grep() -> Turn {
+    call_tool(
+        "fs.grep",
+        json!({
+            "path": "/workspace/aegis-examples/repo",
+            "pattern": "The Forge is AEGIS's built-in development workflow"
+        }),
+    )
+}
+
+impl World {
+    /// Gives this world's execution a `/workspace` volume the file tools
+    /// find; nothing is stored in it, so `fs.grep` answers 0 matches.
+    fn with_an_empty_workspace(self) -> Self {
+        self.volumes
+            .register(crate::application::nfs_gateway::VolumeRegistration {
+                volume_id: crate::domain::volume::VolumeId::new(),
+                execution_id: self.execution_id,
+                workflow_execution_id: None,
+                container_uid: 1000,
+                container_gid: 1000,
+                policy: crate::domain::fsal::FsalAccessPolicy {
+                    read: vec!["/*".to_string()],
+                    write: vec!["/*".to_string()],
+                },
+                mount_point: std::path::PathBuf::from("/workspace"),
+                remote_path: String::new(),
+            });
+        self
+    }
+
+    /// Each `ToolDispatched` event as its status and the layer that refused
+    /// it, if any.
+    fn dispatch_statuses(&self) -> Vec<String> {
+        self.records
+            .events_named("ToolDispatched")
+            .iter()
+            .map(|e| match e["refused_by"].as_str() {
+                Some(layer) => format!("{} {layer}", e["status"].as_str().unwrap_or_default()),
+                None => e["status"].as_str().unwrap_or_default().to_string(),
+            })
+            .collect()
+    }
+}
+
+/// The loop of run `ea6d7814`: the same `fs.grep` four times in one try,
+/// each answered 0 matches. The first two run; the third and the fourth are
+/// not run, the model is given the guard's sentence in their answer's place,
+/// and the try goes on to the model's answer. Each refused call is a
+/// `refused` event naming the guard, with the sentence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_answered_twice_alike_is_not_run_a_third_time() {
+    let w = world(
+        agent("60s", 30),
+        vec![
+            the_analysts_grep(),
+            the_analysts_grep(),
+            the_analysts_grep(),
+            the_analysts_grep(),
+            answer("the sentence is not in the repository"),
+        ],
+    )
+    .await
+    .with_an_empty_workspace();
+    w.records.update(w.execution_id, |e| {
+        e.start_iteration("count the ticks".to_string()).unwrap();
+    });
+    let answered = w.generate().await;
+    let mut complaints = Vec::new();
+    if !matches!(answered, Ok(OrchestratorMessage::Final { .. })) {
+        complaints.push(format!("the try answered {answered:?}"));
+    }
+    let statuses = w.dispatch_statuses();
+    let expected = vec![
+        "succeeded".to_string(),
+        "succeeded".to_string(),
+        "refused repeated_call".to_string(),
+        "refused repeated_call".to_string(),
+    ];
+    if statuses != expected {
+        complaints.push(format!(
+            "the four calls were {statuses:?}, not {expected:?}"
+        ));
+    }
+    for (call, seen) in [(1, "0 matches"), (2, "0 matches")] {
+        let told = last_tool_message(&w.model.conversation(call));
+        if !told.contains("\"count\":0") {
+            complaints.push(format!("call {call} was not answered {seen}: {told}"));
+        }
+    }
+    for call in [3, 4] {
+        let told = last_tool_message(&w.model.conversation(call));
+        if told != RAN_TWICE_ALIKE {
+            complaints.push(format!(
+                "repeat {} was answered {told:?}, not the guard's sentence",
+                call
+            ));
+        }
+    }
+    for event in w.records.events_named("ToolDispatched").iter().skip(2) {
+        if event["sentence"] != RAN_TWICE_ALIKE {
+            complaints.push(format!(
+                "the refused event's sentence is {}",
+                event["sentence"]
+            ));
+        }
+    }
+    let record = w.records.get(w.execution_id);
+    let steps: Vec<String> = record.iterations[0]
+        .trajectory
+        .clone()
+        .unwrap_or_default()
+        .iter()
+        .map(|s| s.status.clone())
+        .collect();
+    if steps != ["succeeded", "succeeded", "refused", "refused"] {
+        complaints.push(format!("the try's trajectory is {steps:?}"));
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// The same call whose answers differ is no repeat: a command printing the
+/// clock, asked for four times in one try, runs four times.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_same_call_answered_differently_runs_every_time() {
+    let clock = || run_command(json!({"command": "date +%s%N", "cwd": "/tmp"}));
+    let w = world(
+        agent("60s", 30),
+        vec![clock(), clock(), clock(), clock(), answer("four readings")],
+    )
+    .await;
+    assert_eq!(w.run(None).await.expect("answered"), "four readings");
+    let statuses = w.dispatch_statuses();
+    assert_eq!(
+        statuses,
+        vec!["dispatched"; 4],
+        "four calls with four different answers were {statuses:?}"
+    );
+    assert_eq!(w.records.events_named("ToolDispatchEnded").len(), 4);
+}
+
+/// A call asked for once the execution's time is up is not run (run
+/// `ea6d7814` dispatched tool calls for two minutes after its 900 s ran
+/// out): the try ends there with the sentence, the call is a `refused` event
+/// naming the deadline, and the model is not called again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_asked_for_after_the_executions_time_is_up_is_not_run() {
+    let w = world(
+        agent("60s", 30),
+        vec![the_analysts_grep(), answer("as far as I got")],
+    )
+    .await
+    .with_an_empty_workspace();
+    w.records.update(w.execution_id, |e| {
+        e.timeout_seconds = Some(5);
+        e.started_at = chrono::Utc::now() - chrono::Duration::seconds(10);
+        e.start_iteration("count the ticks".to_string()).unwrap();
+        e.iterations[0].started_at = chrono::Utc::now() - chrono::Duration::seconds(10);
+    });
+    let outcome = w.generate().await;
+    let mut complaints = Vec::new();
+    match &outcome {
+        Err(e) if e.to_string().contains("fs.grep was not run") => {}
+        other => complaints.push(format!(
+            "the try did not end with the deadline's sentence: {other:?}"
+        )),
+    }
+    let statuses = w.dispatch_statuses();
+    if statuses != ["refused deadline"] {
+        complaints.push(format!(
+            "the call asked for after the deadline was {statuses:?}"
+        ));
+    }
+    let calls = w.model.calls.lock().unwrap().len();
+    if calls != 1 {
+        complaints.push(format!("the model was called {calls} times"));
+    }
+    let record = w.records.get(w.execution_id);
+    let steps = record.iterations[0].trajectory.clone().unwrap_or_default();
+    if steps.len() != 1 || steps[0].status != "refused" {
+        complaints.push(format!("the try's trajectory is {steps:?}"));
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
 }

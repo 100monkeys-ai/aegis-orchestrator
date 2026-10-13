@@ -669,13 +669,17 @@ impl From<&crate::domain::llm::LLMError> for LlmErrorClass {
 }
 
 /// The layer that refused a tool call (AEGIS ADR-131 U34a): the execution's
-/// security context, or the try's time limit (a command asked for with too
-/// little of the try left to run it and read its result).
+/// security context; the try's time limit (a command asked for with too
+/// little of the try left to run it and read its result); the try's or the
+/// execution's deadline, already past when the call was asked for; or the
+/// repeated-call guard (the same call, answered alike twice in the try).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RefusalLayer {
     SecurityContext,
     TryTimeLimit,
+    Deadline,
+    RepeatedCall,
 }
 
 /// Workflow FSM lifecycle events (BC-3 Workflow Orchestration Context).

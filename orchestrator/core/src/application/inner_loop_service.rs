@@ -246,6 +246,62 @@ fn refused_by_security_context(e: &crate::domain::seal_session::SealSessionError
 }
 
 /// Whether the try's tool calls so far meet `requirement`.
+/// The answer a call gets in place of running when the same call was run
+/// `runs` times in this try with the same answer (the repeated-call guard).
+fn repeated_call_sentence(runs: usize) -> String {
+    format!(
+        "This call was already run {runs} times in this try with the same answer; it is not \
+         run again. Change the call, or answer with what you have."
+    )
+}
+
+/// How many times this try ran `tool` with exactly `arguments` to the same
+/// answer as its latest run, counted back from that run, when that is at
+/// least twice: the call is then not run again. A step that did not run (a
+/// refusal, a command still in flight) is not counted; an identical call whose
+/// latest two answers differ is not a repeat.
+fn repeated_call_runs(
+    trajectory: &[TrajectoryStep],
+    tool: &str,
+    arguments: &Value,
+) -> Option<usize> {
+    let answers: Vec<(&str, Option<&str>, Option<&str>)> = trajectory
+        .iter()
+        .filter(|step| step.tool_name == tool)
+        .filter(|step| matches!(step.status.as_str(), "succeeded" | "failed"))
+        .filter(|step| {
+            serde_json::from_str::<Value>(&step.arguments_json)
+                .ok()
+                .as_ref()
+                == Some(arguments)
+        })
+        .map(|step| {
+            (
+                step.status.as_str(),
+                step.result_json.as_deref(),
+                step.error.as_deref(),
+            )
+        })
+        .collect();
+    let latest = answers.last()?;
+    let alike = answers.iter().rev().take_while(|a| *a == latest).count();
+    (alike >= 2).then_some(alike)
+}
+
+/// The sentence a try ends with when a tool call is asked for once the try's
+/// or the execution's time is up: the call is not run.
+fn past_deadline_sentence(tool: &str) -> String {
+    format!("[AEGIS] {tool} was not run: this try's time is up. The try ends here.")
+}
+
+/// Why a tool call of the model's is not run, decided before it would run.
+enum CallNotRun {
+    /// The try's or the execution's deadline had passed.
+    PastDeadline,
+    /// The same call was already run this many times to the same answer.
+    Repeated(usize),
+}
+
 fn tool_call_requirement_met(
     requirement: &ToolCallRequirement,
     tool_calls: usize,
@@ -927,6 +983,109 @@ impl InnerLoopService {
                             result_json: None,
                             error: None,
                         };
+
+                        // Before anything runs: no call once the try's or the
+                        // execution's time is up (the clock the try's timeout
+                        // uses), and no third run of a call this try already
+                        // ran twice to the same answer.
+                        let not_run = {
+                            let lock = self.active_executions.read().await;
+                            let current = lock.get(execution_id_str).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "execution context for '{execution_id_str}' not found in active_executions"
+                                )
+                            })?;
+                            if current
+                                .deadline
+                                .is_some_and(|deadline| chrono::Utc::now() >= deadline)
+                            {
+                                Some(CallNotRun::PastDeadline)
+                            } else {
+                                repeated_call_runs(
+                                    &current.trajectory,
+                                    &tool_call.name,
+                                    &tool_call.arguments,
+                                )
+                                .map(CallNotRun::Repeated)
+                            }
+                        };
+                        match not_run {
+                            Some(CallNotRun::PastDeadline) => {
+                                let sentence = past_deadline_sentence(&tool_call.name);
+                                if let Some(mut ended_ctx) = self
+                                    .active_executions
+                                    .write()
+                                    .await
+                                    .remove(execution_id_str)
+                                {
+                                    let call_index = ended_ctx.trajectory.len();
+                                    let mut step = step;
+                                    step.status = "refused".to_string();
+                                    step.error = Some(sentence.clone());
+                                    ended_ctx.trajectory.push(step);
+                                    self.publish_dispatch(
+                                        execution_id_str,
+                                        &ended_ctx,
+                                        call_index,
+                                        &tool_call,
+                                        "refused",
+                                        Some(sentence.clone()),
+                                        Some(RefusalLayer::Deadline),
+                                        None,
+                                    )
+                                    .await;
+                                    self.persist_trajectory(execution_id_str, &ended_ctx).await;
+                                }
+                                anyhow::bail!(sentence);
+                            }
+                            Some(CallNotRun::Repeated(runs)) => {
+                                let sentence = repeated_call_sentence(runs);
+                                tracing::debug!(
+                                    execution_id = %execution_id_str,
+                                    tool = %tool_call.name,
+                                    tool_call_id = %tool_call.id,
+                                    runs,
+                                    "Repeated tool call not run"
+                                );
+                                let mut next_ctx = {
+                                    let lock = self.active_executions.read().await;
+                                    lock.get(execution_id_str)
+                                        .cloned()
+                                        .ok_or_else(|| anyhow::anyhow!(
+                                            "execution context for '{execution_id_str}' not found in active_executions"
+                                        ))?
+                                };
+                                let call_index = next_ctx.trajectory.len();
+                                let mut step = step;
+                                step.status = "refused".to_string();
+                                step.error = Some(sentence.clone());
+                                next_ctx.trajectory.push(step);
+                                self.publish_dispatch(
+                                    execution_id_str,
+                                    &next_ctx,
+                                    call_index,
+                                    &tool_call,
+                                    "refused",
+                                    Some(sentence.clone()),
+                                    Some(RefusalLayer::RepeatedCall),
+                                    None,
+                                )
+                                .await;
+                                next_ctx.conversation.push(ConversationMessage {
+                                    role: "tool".to_string(),
+                                    content: sentence,
+                                    tool_call_id: Some(tool_call.id.clone()),
+                                    tool_calls: None,
+                                });
+                                self.persist_trajectory(execution_id_str, &next_ctx).await;
+                                self.active_executions
+                                    .write()
+                                    .await
+                                    .insert(execution_id_str.to_string(), next_ctx);
+                                continue;
+                            }
+                            None => {}
+                        }
                         tracing::debug!(
                             execution_id = %execution_id_str,
                             tool = %tool_call.name,
