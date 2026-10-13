@@ -21,7 +21,9 @@ use aegis_orchestrator_core::application::goal_service::{
 use aegis_orchestrator_core::domain::agent::AgentId;
 use aegis_orchestrator_core::domain::execution::ExecutionId;
 use aegis_orchestrator_core::domain::iam::UserIdentity;
-use aegis_orchestrator_core::domain::repository::ExecutionRepository;
+use aegis_orchestrator_core::domain::repository::{
+    ExecutionRepository, WorkflowExecutionRepository, WorkflowRepository,
+};
 use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
@@ -53,8 +55,10 @@ pub(crate) async fn get_execution_handler(
     let delegation = headers
         .get(TENANT_DELEGATION_HEADER)
         .and_then(|v| v.to_str().ok());
-    Ok(execution_status(
+    Ok(execution_or_workflow_status(
         state.execution_repo.as_ref(),
+        state.workflow_execution_repo.as_ref(),
+        state.workflow_repo.as_ref(),
         identity.as_ref().map(|identity| &identity.0),
         delegation,
         execution_id,
@@ -71,12 +75,13 @@ pub(crate) async fn get_execution_handler(
 /// worker's status poll of a user's agent execution — and every other
 /// identity keeps its own tenant whatever the header says.
 ///
-/// The answer is `{id, agent_id, status, tenant_id}`. Once the execution has
-/// ended (Completed, Failed or Cancelled) it also carries `final_output`, the
-/// output of the last iteration that has one, and `error`, the execution's
-/// error, each `null` when there is none, so a caller that finds the run
-/// already over (the worker re-attaching to it) reads what it produced. A
-/// Pending or Running execution carries neither key.
+/// The answer is `{kind: "agent", id, agent_id, status, tenant_id}`. Once
+/// the execution has ended (Completed, Failed or Cancelled) it also carries
+/// `final_output`, the output of the last iteration that has one, and
+/// `error`, the execution's error, each `null` when there is none, so a
+/// caller that finds the run already over (the worker re-attaching to it)
+/// reads what it produced. A Pending or Running execution carries neither
+/// key.
 pub(crate) async fn execution_status(
     execution_repo: &dyn ExecutionRepository,
     identity: Option<&UserIdentity>,
@@ -99,6 +104,7 @@ pub(crate) async fn execution_status(
         Ok(Some(exec)) => {
             use aegis_orchestrator_core::domain::execution::ExecutionStatus;
             let mut body = serde_json::json!({
+                "kind": "agent",
                 "id": exec.id.0,
                 "agent_id": exec.agent_id.0,
                 "status": format!("{:?}", exec.status),
@@ -132,6 +138,71 @@ pub(crate) async fn execution_status(
             )
         }
     }
+}
+
+/// `GET /v1/executions/{id}`'s answer for an id of either kind.
+///
+/// An agent execution answers as [`execution_status`] gives it, with
+/// `"kind": "agent"`. When no agent execution has the id, a workflow run of
+/// the tenant the request resolves to (the same resolution as the agent
+/// read, [`tenant_id_from_request`]) answers with `"kind": "workflow"` and
+/// the fields `GET /v1/workflows/executions/{id}` gives: `execution_id`,
+/// `workflow_id`, `workflow_name`, `status` (lower case, as that route
+/// gives it), `current_state`, `started_at`, `last_transition_at` and
+/// `tenant_id`; once the run has ended (completed, failed or cancelled) it
+/// also carries `final_output`, `null` when the run produced none. Neither
+/// found answers 404 "Execution not found".
+pub(crate) async fn execution_or_workflow_status(
+    execution_repo: &dyn ExecutionRepository,
+    workflow_execution_repo: &dyn WorkflowExecutionRepository,
+    workflow_repo: &dyn WorkflowRepository,
+    identity: Option<&UserIdentity>,
+    delegation: Option<&str>,
+    execution_id: Uuid,
+) -> (StatusCode, axum::Json<serde_json::Value>) {
+    let agent_answer = execution_status(execution_repo, identity, delegation, execution_id).await;
+    if agent_answer.0 != StatusCode::NOT_FOUND {
+        return agent_answer;
+    }
+    let tenant_id = tenant_id_from_request(identity, delegation);
+    let run = match workflow_execution_repo
+        .find_by_id_for_tenant(&tenant_id, ExecutionId(execution_id))
+        .await
+    {
+        Ok(Some(run)) => run,
+        Ok(None) => return agent_answer,
+        Err(e) => {
+            tracing::debug!(error = %e, %execution_id, "workflow execution lookup failed");
+            return agent_answer;
+        }
+    };
+    let workflow_name = match workflow_repo
+        .find_by_id_visible(&tenant_id, run.workflow_id)
+        .await
+    {
+        Ok(Some(workflow)) => Some(workflow.metadata.name),
+        _ => None,
+    };
+    use aegis_orchestrator_core::domain::execution::ExecutionStatus;
+    let mut body = serde_json::json!({
+        "kind": "workflow",
+        "id": run.id.0,
+        "execution_id": run.id.0,
+        "workflow_id": run.workflow_id.0,
+        "workflow_name": workflow_name,
+        "status": format!("{:?}", run.status).to_lowercase(),
+        "current_state": run.current_state.as_str(),
+        "started_at": run.started_at,
+        "last_transition_at": run.last_transition_at,
+        "tenant_id": run.tenant_id.as_str(),
+    });
+    if matches!(
+        run.status,
+        ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Cancelled
+    ) {
+        body["final_output"] = run.final_output.unwrap_or(serde_json::Value::Null);
+    }
+    (StatusCode::OK, axum::Json(body))
 }
 
 /// `POST /v1/executions/{id}/cancel`'s cancel (AEGIS ADR-131 U33a): the
@@ -694,6 +765,228 @@ mod tests {
             assert!(body.0.get("final_output").is_none(), "body: {:?}", body.0);
             assert!(body.0.get("error").is_none(), "body: {:?}", body.0);
         }
+    }
+
+    // ── A workflow run's id on the executions route ──
+    //
+    // `GET /v1/executions/{id}` answers a workflow run of the caller's tenant
+    // when no agent execution has the id, with `"kind": "workflow"` and the
+    // fields the workflow route gives; an agent execution answers
+    // `"kind": "agent"`; another tenant's workflow run stays 404.
+
+    use super::execution_or_workflow_status;
+    use aegis_orchestrator_core::domain::execution::ExecutionStatus;
+    use aegis_orchestrator_core::domain::repository::{
+        WorkflowExecutionRepository, WorkflowRepository,
+    };
+    use aegis_orchestrator_core::domain::workflow::{
+        StateKind, StateName, Workflow, WorkflowExecution, WorkflowMetadata, WorkflowSpec,
+        WorkflowState,
+    };
+    use aegis_orchestrator_core::infrastructure::repositories::{
+        InMemoryWorkflowExecutionRepository, InMemoryWorkflowRepository,
+    };
+    use std::collections::HashMap;
+
+    #[derive(Clone)]
+    struct BothKinds {
+        executions: Arc<InMemoryExecutionRepository>,
+        workflow_executions: Arc<InMemoryWorkflowExecutionRepository>,
+        workflows: Arc<InMemoryWorkflowRepository>,
+    }
+
+    impl BothKinds {
+        fn new() -> Self {
+            Self {
+                executions: Arc::new(InMemoryExecutionRepository::new()),
+                workflow_executions: Arc::new(InMemoryWorkflowExecutionRepository::new()),
+                workflows: Arc::new(InMemoryWorkflowRepository::new()),
+            }
+        }
+    }
+
+    async fn both_kinds_route(
+        State(repos): State<BothKinds>,
+        identity: Option<Extension<UserIdentity>>,
+        headers: HeaderMap,
+        Path(execution_id): Path<Uuid>,
+    ) -> impl axum::response::IntoResponse {
+        let delegation = headers
+            .get(super::TENANT_DELEGATION_HEADER)
+            .and_then(|v| v.to_str().ok());
+        execution_or_workflow_status(
+            repos.executions.as_ref(),
+            repos.workflow_executions.as_ref(),
+            repos.workflows.as_ref(),
+            identity.as_ref().map(|identity| &identity.0),
+            delegation,
+            execution_id,
+        )
+        .await
+    }
+
+    async fn get_any_status(
+        repos: BothKinds,
+        caller: UserIdentity,
+        id: Uuid,
+        tenant_header: Option<&str>,
+    ) -> (u16, serde_json::Value) {
+        let router = Router::new()
+            .route("/v1/executions/{execution_id}", get(both_kinds_route))
+            .with_state(repos);
+        let base = serve(
+            router,
+            Some(identity_provider(&[("caller", caller, SCOPES)])),
+            None,
+        )
+        .await;
+        let mut request = reqwest::Client::new()
+            .get(format!("{base}/v1/executions/{id}"))
+            .bearer_auth("caller");
+        if let Some(tenant) = tenant_header {
+            request = request.header("x-tenant-id", tenant);
+        }
+        let response = request.send().await.expect("loopback request");
+        let status = response.status().as_u16();
+        let body = response.json().await.unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    fn two_state_workflow() -> Workflow {
+        let mut states = HashMap::new();
+        for name in ["ANALYZE", "BUILD"] {
+            states.insert(
+                StateName::new(name).unwrap(),
+                WorkflowState {
+                    kind: StateKind::System {
+                        command: "echo".to_string(),
+                        env: HashMap::new(),
+                        workdir: None,
+                    },
+                    transitions: vec![],
+                    timeout: None,
+                    max_state_visits: None,
+                },
+            );
+        }
+        Workflow::new(
+            WorkflowMetadata {
+                name: "the-forge".to_string(),
+                version: Some("1.0.0".to_string()),
+                description: None,
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                input_schema: None,
+                output_schema: None,
+                output_template: None,
+            },
+            WorkflowSpec {
+                initial_state: StateName::new("ANALYZE").unwrap(),
+                context: HashMap::new(),
+                states,
+                storage: Default::default(),
+                max_total_transitions: None,
+                default_schedule: None,
+                repositories: None,
+            },
+        )
+        .unwrap()
+    }
+
+    /// A workflow run of the consumer `owner-sub`, moved to `BUILD` and
+    /// shaped by `shape`, with its workflow saved in the same tenant.
+    async fn owner_workflow_run(
+        repos: &BothKinds,
+        shape: impl FnOnce(&mut WorkflowExecution),
+    ) -> (TenantId, ExecutionId) {
+        let tenant = TenantId::for_consumer_user("owner-sub").expect("owner tenant");
+        let workflow = two_state_workflow();
+        repos
+            .workflows
+            .save_for_tenant(&tenant, &workflow)
+            .await
+            .unwrap();
+        let mut run = WorkflowExecution::new(&workflow, ExecutionId::new(), serde_json::json!({}));
+        run.tenant_id = tenant.clone();
+        run.transition_to(StateName::new("BUILD").unwrap());
+        shape(&mut run);
+        repos
+            .workflow_executions
+            .save_for_tenant(&tenant, &run)
+            .await
+            .unwrap();
+        (tenant, run.id)
+    }
+
+    /// A workflow run's id answers 200 with `kind: workflow` and the run's
+    /// state (today: 404 "Execution not found", the route reading agent
+    /// executions only), for its owner and for the worker's delegated poll.
+    #[tokio::test]
+    async fn a_workflow_runs_id_answers_kind_workflow_and_its_current_state() {
+        let repos = BothKinds::new();
+        let (tenant, id) = owner_workflow_run(&repos, |_| {}).await;
+        for (caller, header) in [
+            (consumer("owner-sub"), None),
+            (service_account(), Some(tenant.as_str())),
+        ] {
+            let (status, body) = get_any_status(repos.clone(), caller, id.0, header).await;
+            assert_eq!(status, 200, "a workflow run's id answered: {body}");
+            assert_eq!(body["kind"], "workflow", "body: {body}");
+            assert_eq!(body["current_state"], "BUILD", "body: {body}");
+            assert_eq!(body["status"], "running", "body: {body}");
+            assert_eq!(body["workflow_name"], "the-forge", "body: {body}");
+            assert_eq!(body["execution_id"], id.0.to_string(), "body: {body}");
+            assert!(body["started_at"].is_string(), "body: {body}");
+            assert!(body["last_transition_at"].is_string(), "body: {body}");
+            assert!(
+                body.get("final_output").is_none(),
+                "a running workflow run carries no final output: {body}"
+            );
+        }
+    }
+
+    /// An ended workflow run answers its final output.
+    #[tokio::test]
+    async fn an_ended_workflow_run_answers_its_final_output() {
+        let repos = BothKinds::new();
+        let (_tenant, id) = owner_workflow_run(&repos, |run| {
+            run.status = ExecutionStatus::Completed;
+            run.final_output = Some(serde_json::json!({"summary": "built and tested"}));
+        })
+        .await;
+        let (status, body) = get_any_status(repos, consumer("owner-sub"), id.0, None).await;
+        assert_eq!(status, 200, "body: {body}");
+        assert_eq!(body["kind"], "workflow", "body: {body}");
+        assert_eq!(body["status"], "completed", "body: {body}");
+        assert_eq!(
+            body["final_output"],
+            serde_json::json!({"summary": "built and tested"}),
+            "body: {body}"
+        );
+    }
+
+    /// An agent execution's id still answers as an agent execution, now
+    /// with `kind: agent`.
+    #[tokio::test]
+    async fn an_agent_executions_id_answers_kind_agent() {
+        let repos = BothKinds::new();
+        let (tenant, id) = owner_execution(&repos.executions).await;
+        let (status, body) = get_any_status(repos, consumer("owner-sub"), id.0, None).await;
+        assert_eq!(status, 200, "body: {body}");
+        assert_eq!(body["kind"], "agent", "body: {body}");
+        assert_eq!(body["status"], "Running", "body: {body}");
+        assert_eq!(body["tenant_id"], tenant.as_str(), "body: {body}");
+    }
+
+    /// Another tenant's workflow run is not found, as another tenant's
+    /// agent execution is not.
+    #[tokio::test]
+    async fn another_tenants_workflow_run_answers_404() {
+        let repos = BothKinds::new();
+        let (_tenant, id) = owner_workflow_run(&repos, |_| {}).await;
+        let (status, body) = get_any_status(repos, consumer("intruder-sub"), id.0, None).await;
+        assert_eq!(status, 404, "body: {body}");
+        assert_eq!(body["error"], "Execution not found", "body: {body}");
     }
 }
 
