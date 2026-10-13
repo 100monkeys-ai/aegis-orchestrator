@@ -1056,12 +1056,18 @@ fn head_and_status_step(paths: &EphemeralCliPaths) -> GitStep {
 }
 
 /// Build the diff step: index to working tree, or HEAD to index when
-/// `staged`, with no colour, external diff or text conversion. It is
-/// handed no credential.
+/// `staged`, with no colour, external diff or text conversion. Before the
+/// working-tree diff, every untracked file that is not ignored is marked
+/// intent to add, so a new file shows as an addition; `--ignore-removal`
+/// keeps deleted files out of the index, so their deletion still shows.
+/// It is handed no credential.
 fn diff_step(paths: &EphemeralCliPaths, staged: bool) -> GitStep {
     let (mut s, _, _) =
         step_prelude(paths, "", None, None).expect("a step with no credential always builds");
     s.push_str(&format!("cd {}\n", tree_path(paths)));
+    if !staged {
+        s.push_str("g add --intent-to-add --ignore-removal .\n");
+    }
     let cached = if staged { " --cached" } else { "" };
     s.push_str(&format!(
         "g diff --no-color --no-ext-diff --no-textconv{cached}\n"
@@ -1933,6 +1939,36 @@ mod tests {
             }
             _ => panic!("expected HttpsPat variant"),
         }
+    }
+
+    /// DIFF shows new files: before the working-tree diff, the step marks
+    /// every untracked file that is not ignored as intent to add, keeping
+    /// deletions out of the index, so a new file reads as an addition. Run
+    /// `e946aeab`'s DIFF left out the eight test files TEST wrote. The staged
+    /// variant is unchanged.
+    #[test]
+    fn diff_step_marks_untracked_files_intent_to_add_before_the_diff() {
+        let paths = EphemeralCliPaths::default();
+        let script = diff_step(&paths, false).script;
+        let intent = script
+            .find("g add --intent-to-add --ignore-removal .\n")
+            .unwrap_or_else(|| {
+                panic!("the diff step must mark untracked files intent to add:\n{script}")
+            });
+        let diff = script
+            .find("g diff --no-color --no-ext-diff --no-textconv\n")
+            .expect("the working-tree diff");
+        assert!(
+            intent < diff,
+            "the intent to add must come before the diff:\n{script}"
+        );
+
+        let staged = diff_step(&paths, true).script;
+        assert!(
+            !staged.contains("intent-to-add"),
+            "the staged diff is unchanged:\n{staged}"
+        );
+        assert!(staged.contains("g diff --no-color --no-ext-diff --no-textconv --cached\n"));
     }
 
     #[test]

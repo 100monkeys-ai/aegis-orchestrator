@@ -313,6 +313,28 @@ pub async fn invoke_fs_tool(
     }
 }
 
+/// The replacement an `fs.edit` writes: when every line ending of the file
+/// before the edit is CRLF, the replacement's bare LF become CRLF, so the
+/// edited lines keep the file's ending. A file with no line ending, or with
+/// mixed endings, takes the replacement as sent.
+fn keep_crlf_line_ending<'a>(content: &str, replacement: &'a str) -> std::borrow::Cow<'a, str> {
+    let line_feeds = content.matches('\n').count();
+    let crlf = content.matches("\r\n").count();
+    if line_feeds == 0 || crlf != line_feeds || !replacement.contains('\n') {
+        return std::borrow::Cow::Borrowed(replacement);
+    }
+    let mut converted = String::with_capacity(replacement.len() + replacement.len() / 16);
+    let mut previous = None;
+    for c in replacement.chars() {
+        if c == '\n' && previous != Some('\r') {
+            converted.push('\r');
+        }
+        converted.push(c);
+        previous = Some(c);
+    }
+    std::borrow::Cow::Owned(converted)
+}
+
 async fn invoke_edit(
     args: &Value,
     _execution_id: ExecutionId,
@@ -354,13 +376,18 @@ async fn invoke_edit(
         ));
     }
 
-    let new_content = content.replace(target, replacement);
+    let replacement = keep_crlf_line_ending(&content, replacement);
+    let new_content = content.replace(target, &replacement);
 
-    // Write back
+    // Write back, then cut the file to the new length: a write at offset 0
+    // leaves the old bytes past the new end in place.
     let _ = fsal
         .write(&handle, &path, &vol_ctx.policy, 0, new_content.as_bytes())
         .await
         .map_err(|e| fsal_refusal("Edit error (write)", path_arg, e))?;
+    fsal.truncate(&handle, &path, &vol_ctx.policy, new_content.len() as u64)
+        .await
+        .map_err(|e| fsal_refusal("Edit error (truncate)", path_arg, e))?;
 
     Ok(ToolInvocationResult::Direct(serde_json::json!({
         "status": "success",
@@ -784,5 +811,159 @@ mod tests {
                 "fs.read must refuse {args} as invalid arguments"
             );
         }
+    }
+
+    /// An `fs.edit` over a host-path volume of its own: the FSAL on a scratch
+    /// root, the execution owning the volume, and the context the tool is
+    /// handed.
+    struct EditFixture {
+        root: tempfile::TempDir,
+        volume: crate::domain::volume::VolumeId,
+        fsal: Arc<AegisFSAL>,
+        context: crate::infrastructure::nfs::server::NfsVolumeContext,
+    }
+
+    struct NoStorageEvents;
+
+    #[async_trait::async_trait]
+    impl crate::domain::fsal::EventPublisher for NoStorageEvents {
+        async fn publish_storage_event(&self, _event: crate::domain::events::StorageEvent) {}
+    }
+
+    async fn edit_fixture(file: &str, bytes: &[u8]) -> EditFixture {
+        use crate::domain::repository::VolumeRepository;
+        use crate::domain::volume::{StorageClass, Volume, VolumeBackend, VolumeOwnership};
+
+        let root = tempfile::tempdir().expect("scratch root");
+        let execution = ExecutionId::new();
+        let volumes =
+            Arc::new(crate::infrastructure::repositories::InMemoryVolumeRepository::new());
+        let mut volume = Volume::new(
+            "workspace".to_string(),
+            crate::domain::tenant::TenantId::consumer(),
+            StorageClass::persistent(),
+            VolumeBackend::HostPath {
+                path: std::path::PathBuf::from("/placeholder"),
+            },
+            64 * 1024 * 1024,
+            VolumeOwnership::execution(execution),
+        )
+        .expect("volume");
+        volume.backend = VolumeBackend::HostPath {
+            path: std::path::PathBuf::from(format!("/hosts/{}", volume.id)),
+        };
+        volume.mark_available().expect("available");
+        volumes.save(&volume).await.expect("saved");
+        let fsal = Arc::new(AegisFSAL::new(
+            Arc::new(
+                crate::infrastructure::storage::LocalHostStorageProvider::new(root.path())
+                    .expect("storage root"),
+            ),
+            volumes as Arc<dyn VolumeRepository>,
+            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            Arc::new(NoStorageEvents),
+        ));
+        let fixture = EditFixture {
+            root,
+            volume: volume.id,
+            fsal,
+            context: crate::infrastructure::nfs::server::NfsVolumeContext {
+                execution_id: execution,
+                volume_id: volume.id,
+                workflow_execution_id: None,
+                container_uid: 1000,
+                container_gid: 1000,
+                policy: crate::domain::fsal::FsalAccessPolicy {
+                    read: vec!["/**".to_string()],
+                    write: vec!["/**".to_string()],
+                },
+                mount_point: std::path::PathBuf::from("/workspace"),
+                remote_path: String::new(),
+            },
+        };
+        let on_disk = fixture.on_disk(file);
+        std::fs::create_dir_all(on_disk.parent().expect("a parent")).expect("dirs");
+        std::fs::write(on_disk, bytes).expect("written");
+        fixture
+    }
+
+    impl EditFixture {
+        fn on_disk(&self, file: &str) -> std::path::PathBuf {
+            self.root
+                .path()
+                .join(format!("hosts/{}", self.volume))
+                .join(file)
+        }
+
+        async fn edit(&self, file: &str, target: &str, replacement: &str) -> Vec<u8> {
+            invoke_edit(
+                &json!({
+                    "path": format!("/workspace/{file}"),
+                    "target_content": target,
+                    "replacement_content": replacement,
+                }),
+                self.context.execution_id,
+                &self.fsal,
+                self.context.clone(),
+            )
+            .await
+            .expect("the edit is applied");
+            std::fs::read(self.on_disk(file)).expect("the edited file")
+        }
+    }
+
+    /// Run `e946aeab`'s README edit: the file ends every line in CRLF, the
+    /// model's replacement of one line carries bare LF. Before the fix the
+    /// text was replaced as sent, so the new lines ended in LF and the old
+    /// line's `\r` was left after the new last line.
+    #[tokio::test]
+    async fn fs_edit_keeps_a_crlf_files_line_ending_for_an_lf_replacement() {
+        let readme =
+            "# Examples\r\n\r\n**Learn by example. Build with confidence.**\r\n\r\nMore.\r\n";
+        let fixture = edit_fixture("README.md", readme.as_bytes()).await;
+
+        let edited = fixture
+            .edit(
+                "README.md",
+                "**Learn by example. Build with confidence.**",
+                "**Learn by example. Build with confidence.**\n\nThis line shows the loop end-to-end.",
+            )
+            .await;
+
+        let edited = String::from_utf8(edited).expect("utf-8");
+        assert_eq!(
+            edited,
+            "# Examples\r\n\r\n**Learn by example. Build with confidence.**\r\n\r\nThis line shows the loop end-to-end.\r\n\r\nMore.\r\n",
+            "an LF replacement in a file whose every line ends in CRLF must be written with CRLF, leaving no stray \\r"
+        );
+        assert!(
+            !edited.replace("\r\n", "").contains('\r')
+                && !edited.replace("\r\n", "").contains('\n'),
+            "every line ending must be CRLF: {edited:?}"
+        );
+    }
+
+    /// A file with mixed line endings is edited as sent.
+    #[tokio::test]
+    async fn fs_edit_leaves_a_mixed_ending_files_replacement_as_sent() {
+        let fixture = edit_fixture("mixed.txt", b"one\r\ntwo\nthree\r\n").await;
+        let edited = fixture.edit("mixed.txt", "two", "2a\n2b").await;
+        assert_eq!(edited, b"one\r\n2a\n2b\nthree\r\n");
+    }
+
+    /// An edit that shortens a file leaves no stale tail: before the fix the
+    /// shorter text was written at offset 0 over the old bytes and the file
+    /// kept its old length.
+    #[tokio::test]
+    async fn fs_edit_that_shortens_a_file_leaves_no_stale_tail() {
+        let fixture = edit_fixture("notes.txt", b"alpha beta gamma delta\n").await;
+        let edited = fixture
+            .edit("notes.txt", "alpha beta gamma delta", "alpha")
+            .await;
+        assert_eq!(
+            String::from_utf8_lossy(&edited),
+            "alpha\n",
+            "the edited file must end where the new text ends"
+        );
     }
 }

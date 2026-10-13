@@ -977,6 +977,58 @@ mod tests {
         );
     }
 
+    /// The Forge's second CODE visit carries the diff the judges reviewed,
+    /// beside their reports, and every judge is told that a diff's `-` and
+    /// `+` are its markers: on run `e946aeab` a judge read a `-` marker as a
+    /// removed dash in the text and the coder put one in.
+    #[test]
+    fn the_forge_code_revisit_and_judges_read_the_diff_markers_as_markers() {
+        const NOTE: &str = "lines beginning with - and + are the diff's markers, not the text";
+        let yaml = BUILTIN_WORKFLOWS
+            .iter()
+            .find(|(name, _)| *name == "the-forge")
+            .map(|(_, yaml)| *yaml)
+            .expect("the Forge is a built-in");
+        aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(yaml)
+            .expect("the Forge parses");
+        let raw: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let states = &raw["spec"]["states"];
+
+        let code = states["CODE"]["input"].as_str().expect("CODE's input");
+        let review = code
+            .find("# The last review")
+            .expect("CODE's revisit section");
+        let revisit = &code[review..];
+        let heading = format!("# The change they reviewed (a unified diff: {NOTE})");
+        let at = revisit
+            .find(&heading)
+            .unwrap_or_else(|| panic!("CODE's revisit must carry {heading:?}:\n{revisit}"));
+        assert!(
+            revisit[at..].contains("{{{DIFF.output.diff}}}"),
+            "the reviewed diff follows its heading:\n{revisit}"
+        );
+        let end = revisit.find("{{/if}}").expect("the revisit section ends");
+        assert!(
+            at < end,
+            "the diff is inside the revisit section, shown only after a review"
+        );
+
+        let judges = states["AUDIT"]["agents"]
+            .as_sequence()
+            .expect("AUDIT's judges");
+        assert_eq!(judges.len(), 3);
+        for judge in judges {
+            let name = judge["agent"].as_str().unwrap_or_default();
+            let input = judge["input"].as_str().unwrap_or_default();
+            let lower = input.to_lowercase();
+            assert!(
+                lower.contains(NOTE),
+                "{name}'s input must say that {NOTE}:\n{input}"
+            );
+            assert!(input.contains("{{{DIFF.output.diff}}}"));
+        }
+    }
+
     #[test]
     fn all_builtin_workflow_templates_parse_successfully() {
         for (name, yaml) in BUILTIN_WORKFLOWS {

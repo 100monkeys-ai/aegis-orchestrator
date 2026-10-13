@@ -227,6 +227,9 @@ spec:
         # The last review
         The three judges scored the change {{AUDIT.consensus.score}} (0.95 passes). Their reports:
         {{{json AUDIT.consensus.metadata.individual_outputs}}}
+
+        # The change they reviewed (a unified diff: lines beginning with - and + are the diff's markers, not the text)
+        {{{DIFF.output.diff}}}
         {{/if}}
 
         Change the implementation under {{repository.path}} as the design says, so that the suite passes. Never change the tests the tester wrote. When the suite has failed or the review has scored the change below 0.95, fix what the output and the reports name.
@@ -295,6 +298,7 @@ spec:
             {{{json ARCHITECT.output}}}
 
             # The change, as a unified diff against the commit the run started from
+            Lines beginning with - and + are the diff's markers, not the text.
             {{{DIFF.output.diff}}}
 
             # The test output (the suite passed)
@@ -314,6 +318,7 @@ spec:
             {{{json ARCHITECT.output}}}
 
             # The change, as a unified diff against the commit the run started from
+            Lines beginning with - and + are the diff's markers, not the text.
             {{{DIFF.output.diff}}}
 
             # The test output (the suite passed)
@@ -333,6 +338,7 @@ spec:
             {{{json ARCHITECT.output}}}
 
             # The change, as a unified diff against the commit the run started from
+            Lines beginning with - and + are the diff's markers, not the text.
             {{{DIFF.output.diff}}}
 
             # The test output (the suite passed)
