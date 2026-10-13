@@ -561,6 +561,20 @@ impl ToolRouter {
                 "stdin": {
                     "type": "string",
                     "description": "Text written to the command's standard input, which is then closed. Use it to feed a script that reads standard input, such as {\"value\": 43}. Without it the command reads an immediate end of input. At most max_output_bytes bytes."
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "The directory the command runs in, such as /workspace/app. /workspace when absent."
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Seconds the command may run before it is stopped. 600 when absent."
+                },
+                "max_output_bytes": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The most bytes of output kept from the command, and the most bytes stdin may hold. 1048576 when absent."
                 }
             },
             "required": ["command"]
@@ -3426,6 +3440,46 @@ mod tests {
                 .any(|v| v.as_str() == Some("stdin")),
             "stdin must be optional: {cmd_run}"
         );
+    }
+
+    /// The Forge run `7a237b3a`'s coder (2026-10-13) sent `path` for the
+    /// directory to run in, which the schema never named; `cmd.run` takes
+    /// `cwd`, `timeout_secs` and `max_output_bytes`, and the schema declares
+    /// each, optional, with its type.
+    #[test]
+    fn cmd_run_schema_declares_cwd_timeout_secs_and_max_output_bytes() {
+        let cmd_run = ToolRouter::schema_for_builtin("cmd.run");
+        let props = &cmd_run["properties"];
+        assert_eq!(
+            props["cwd"]["type"],
+            json!("string"),
+            "cmd.run schema does not declare cwd as a string: {cmd_run}"
+        );
+        let cwd_desc = props["cwd"]["description"]
+            .as_str()
+            .expect("cwd must carry a description");
+        assert!(
+            cwd_desc.contains("/workspace"),
+            "cwd description: {cwd_desc}"
+        );
+        for field in ["timeout_secs", "max_output_bytes"] {
+            assert_eq!(
+                props[field]["type"],
+                json!("integer"),
+                "cmd.run schema does not declare {field} as an integer: {cmd_run}"
+            );
+            assert!(
+                props[field]["description"].is_string(),
+                "{field} must carry a description: {cmd_run}"
+            );
+        }
+        let required = cmd_run["required"].as_array().expect("required");
+        for field in ["cwd", "timeout_secs", "max_output_bytes"] {
+            assert!(
+                !required.iter().any(|v| v.as_str() == Some(field)),
+                "{field} must be optional: {cmd_run}"
+            );
+        }
     }
 
     #[test]
