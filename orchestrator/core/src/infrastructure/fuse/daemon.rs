@@ -2111,8 +2111,8 @@ mod handle_tests {
                 .map(|(_, workflow)| workflow)
         }
 
-        fn lookup_execution_id(&self, _volume_id: VolumeId) -> Option<ExecutionId> {
-            None
+        fn holds_registration(&self, _volume_id: VolumeId, _execution_id: ExecutionId) -> bool {
+            false
         }
     }
 

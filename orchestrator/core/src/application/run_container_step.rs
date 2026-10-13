@@ -426,12 +426,6 @@ impl StepAttachments for WorkflowRunAttachments {
     }
 }
 
-/// A volume registration the step replaced, put back when the step ends.
-type Replaced = (
-    VolumeId,
-    Option<crate::infrastructure::nfs::server::NfsVolumeContext>,
-);
-
 impl RunContainerStepUseCase {
     pub fn new(runner: Arc<dyn ContainerStepRunner>) -> Self {
         Self {
@@ -488,40 +482,29 @@ impl RunContainerStepUseCase {
             };
             input.network_mode = Some(network.clone());
         }
-        let replaced = self.mount_run_repositories(&mut input).await?;
+        let step = input.execution_id;
+        self.mount_run_repositories(&mut input).await?;
         let staged = match self.mount_run_attachments(&mut input).await {
             Ok(staged) => staged,
             Err(refused) => {
-                self.put_back(replaced);
+                self.put_back(step);
                 return Err(refused);
             }
         };
         let result = self.execute(input).await;
-        self.put_back(replaced);
+        self.put_back(step);
         self.remove_attachments(staged).await;
         Ok(result?)
     }
 
-    /// Put back the registrations a step's repository mounts replaced.
-    fn put_back(&self, replaced: Vec<Replaced>) {
+    /// The step's end: its own registrations of the run's repositories are
+    /// removed, and only its own; an agent state of the run holding the
+    /// same volume keeps its registration.
+    fn put_back(&self, step: ExecutionId) {
         let Some((_, registry)) = self.repositories.get() else {
             return;
         };
-        for (volume_id, found) in replaced {
-            match found {
-                Some(context) => registry.register(VolumeRegistration {
-                    volume_id: context.volume_id,
-                    execution_id: context.execution_id,
-                    workflow_execution_id: context.workflow_execution_id,
-                    container_uid: context.container_uid,
-                    container_gid: context.container_gid,
-                    policy: context.policy,
-                    mount_point: context.mount_point,
-                    remote_path: context.remote_path,
-                }),
-                None => registry.deregister(volume_id),
-            }
-        }
+        registry.deregister_execution(step);
     }
 
     /// Each volume entry naming the run's attachments (AEGIS ADR-143 S4)
@@ -619,17 +602,17 @@ impl RunContainerStepUseCase {
     /// Each volume entry naming the run's repository (AEGIS ADR-141 F6)
     /// becomes its working tree's volume, registered with the gateway agent
     /// states mount through at the entry's `mount_path`, for the step's
-    /// length. Answers the registrations replaced, to be put back.
+    /// length.
     async fn mount_run_repositories(
         &self,
         input: &mut RunContainerStepInput,
-    ) -> Result<Vec<Replaced>, RunContainerStepError> {
+    ) -> Result<(), RunContainerStepError> {
         if !input
             .volumes
             .iter()
             .any(|v| run_repository_volume(&v.name).is_some())
         {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let Some((repositories, registry)) = self.repositories.get() else {
             return Err(RunContainerStepError::Refused(
@@ -674,10 +657,8 @@ impl RunContainerStepUseCase {
             };
             chosen.push((index, mount.mount.clone()));
         }
-        let mut replaced = Vec::with_capacity(chosen.len());
         for (index, mount) in chosen {
             let volume = &mut input.volumes[index];
-            replaced.push((mount.volume_id, registry.lookup(mount.volume_id)));
             registry.register(VolumeRegistration {
                 volume_id: mount.volume_id,
                 execution_id: input.execution_id,
@@ -704,7 +685,7 @@ impl RunContainerStepUseCase {
             );
             volume.name = mount.volume_id.0.to_string();
         }
-        Ok(replaced)
+        Ok(())
     }
 
     pub async fn execute(
@@ -1098,6 +1079,77 @@ mod tests {
             stderr: String::new(),
             duration_ms: 25,
         }
+    }
+
+    /// The run's repositories, one fixed mount of `volume` at `/workspace/app`.
+    struct OneRepository(VolumeId);
+
+    #[async_trait]
+    impl StepRepositories for OneRepository {
+        async fn mounts_of_run(
+            &self,
+            _tenant_id: &crate::domain::tenant::TenantId,
+            _run: uuid::Uuid,
+        ) -> Result<Vec<RunMount>, RunRepositoryError> {
+            Ok(vec![RunMount {
+                label: "app".to_string(),
+                mount: crate::domain::volume::VolumeMount::new(
+                    self.0,
+                    std::path::PathBuf::from("/workspace/app"),
+                    crate::domain::volume::AccessMode::ReadWrite,
+                    crate::domain::volume::FilerEndpoint::new("http://filer:8888").unwrap(),
+                    "/aegis/seaweedfs/volumes/forge/repo".to_string(),
+                ),
+            }])
+        }
+    }
+
+    /// A step mounting the run's repository while an agent state of the run
+    /// holds it: after the step, the step's own registration is gone and the
+    /// agent state's remains.
+    #[tokio::test]
+    async fn a_step_removes_its_own_registration_and_leaves_the_one_it_found() {
+        let registry = NfsVolumeRegistry::new();
+        let volume_id = VolumeId(uuid::Uuid::new_v4());
+        let agent_state = ExecutionId::new();
+        registry.register(VolumeRegistration {
+            volume_id,
+            execution_id: agent_state,
+            workflow_execution_id: None,
+            container_uid: 1000,
+            container_gid: 1000,
+            policy: FsalAccessPolicy::default(),
+            mount_point: std::path::PathBuf::from("/workspace/app"),
+            remote_path: "/aegis/seaweedfs/volumes/forge/repo".to_string(),
+        });
+        let runner = Arc::new(StubContainerStepRunner::with_step_outcomes([(
+            "test".to_string(),
+            vec![StubOutcome::Success(ok_result(0))],
+        )]));
+        let use_case = RunContainerStepUseCase::new(runner);
+        use_case.set_run_repositories(Arc::new(OneRepository(volume_id)), registry.clone());
+        let mut input = make_input("test");
+        input.workflow_execution_id = Some(uuid::Uuid::new_v4());
+        input.volumes = vec![crate::domain::workflow::ContainerVolumeMount {
+            name: "repository".to_string(),
+            mount_path: "/workspace/app".to_string(),
+            read_only: false,
+        }];
+        let step = input.execution_id;
+
+        use_case
+            .run(input)
+            .await
+            .unwrap_or_else(|e| panic!("the step was not run: {e}"));
+
+        assert!(
+            !registry.holds(volume_id, step),
+            "the step's own registration of the repository outlived the step"
+        );
+        assert!(
+            registry.holds(volume_id, agent_state),
+            "the step's end took the agent state's registration of the repository"
+        );
     }
 
     async fn recv_parallel_aggregated_event(receiver: &mut EventReceiver) -> ContainerRunEvent {

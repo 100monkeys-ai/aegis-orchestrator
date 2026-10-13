@@ -327,8 +327,9 @@ pub trait VolumeContextLookup: Send + Sync {
     /// Returns the `workflow_execution_id` registered for the given volume, if any.
     fn lookup_workflow_execution_id(&self, volume_id: VolumeId) -> Option<uuid::Uuid>;
 
-    /// Returns the execution registered for the given volume, if any.
-    fn lookup_execution_id(&self, volume_id: VolumeId) -> Option<ExecutionId>;
+    /// Whether the execution holds a registration of the given volume; several
+    /// executions may hold one at once.
+    fn holds_registration(&self, volume_id: VolumeId, execution_id: ExecutionId) -> bool;
 
     /// Returns the storage path registered for the given volume, if any: the
     /// root a mount of the volume shows, which for a repository volume is its
@@ -554,17 +555,13 @@ impl AegisFSAL {
                     .map(|ctx_wf_id| ctx_wf_id == *wf_id)
                     .unwrap_or(false)
             }
-            // A person's persistent volume is open to the one execution the
+            // A person's persistent volume is open to every execution the
             // orchestrator registered for it (a git clone step, a run that
-            // mounts the binding), and only while that registration holds.
+            // mounts the binding, a judge child beside the agent it judges),
+            // each only while its own registration holds.
             crate::domain::volume::VolumeOwnership::Persistent { .. } => execution_id
-                .zip(
-                    self.volume_context_lookup
-                        .as_ref()
-                        .and_then(|lookup| lookup.lookup_execution_id(volume_id)),
-                )
-                .map(|(eid, registered)| eid == registered)
-                .unwrap_or(false),
+                .zip(self.volume_context_lookup.as_ref())
+                .is_some_and(|(eid, lookup)| lookup.holds_registration(volume_id, eid)),
         };
 
         if !is_owner {
@@ -1956,6 +1953,49 @@ mod tests {
         );
     }
 
+    // ── VolumeOwnership::Persistent: every execution holding a registration ──
+
+    /// A person's repository volume registered for the Forge's CODE child and
+    /// then for its judge child is open to both while both registrations
+    /// hold, and stays closed to an execution that holds none.
+    #[tokio::test]
+    async fn every_execution_holding_a_registration_of_a_persistent_volume_is_admitted() {
+        use crate::application::nfs_gateway::{NfsVolumeRegistry, VolumeRegistration};
+
+        let vol = make_available_persistent_volume("alice");
+        let registry = NfsVolumeRegistry::new();
+        let coder = ExecutionId::new();
+        let judge = ExecutionId::new();
+        for execution_id in [coder, judge] {
+            registry.register(VolumeRegistration {
+                volume_id: vol.id,
+                execution_id,
+                workflow_execution_id: None,
+                container_uid: 1000,
+                container_gid: 1000,
+                policy: FsalAccessPolicy::default(),
+                mount_point: std::path::PathBuf::from("/workspace/aegis-examples"),
+                remote_path: String::new(),
+            });
+        }
+        let fsal = make_fsal_with_volume(&vol)
+            .await
+            .with_volume_context_lookup(Arc::new(registry));
+
+        for (name, execution_id) in [("coder", coder), ("judge", judge)] {
+            let result = fsal.authorize(execution_id, vol.id).await;
+            assert!(
+                result.is_ok(),
+                "the {name}, holding a registration of the persistent volume, was refused: {result:?}"
+            );
+        }
+        let result = fsal.authorize(ExecutionId::new(), vol.id).await;
+        assert!(
+            matches!(result, Err(FsalError::UnauthorizedAccess { .. })),
+            "an execution holding no registration of the persistent volume was admitted: {result:?}"
+        );
+    }
+
     // ── VolumeOwnership::WorkflowExecution authorize tests ────────────────
 
     /// Stub implementation of VolumeContextLookup that returns a fixed
@@ -1969,8 +2009,8 @@ mod tests {
             self.wf_id
         }
 
-        fn lookup_execution_id(&self, _volume_id: VolumeId) -> Option<ExecutionId> {
-            None
+        fn holds_registration(&self, _volume_id: VolumeId, _execution_id: ExecutionId) -> bool {
+            false
         }
     }
 
@@ -2235,8 +2275,8 @@ mod tests {
             None
         }
 
-        fn lookup_execution_id(&self, _volume_id: VolumeId) -> Option<ExecutionId> {
-            Some(self.execution_id)
+        fn holds_registration(&self, _volume_id: VolumeId, execution_id: ExecutionId) -> bool {
+            execution_id == self.execution_id
         }
 
         fn lookup_remote_path(&self, _volume_id: VolumeId) -> Option<String> {

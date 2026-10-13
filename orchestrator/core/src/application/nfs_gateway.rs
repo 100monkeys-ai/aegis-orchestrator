@@ -33,6 +33,7 @@ use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::debug;
@@ -76,21 +77,72 @@ pub struct VolumeRegistration {
 
 /// Volume context registry for NFS export path routing
 ///
-/// Maps VolumeId to execution context (execution_id, UID/GID, policy).
+/// Holds one registration per volume and execution: several executions may
+/// hold a registration of one volume at once (a CODE child and its judge
+/// child both mount the run's repository), each added by `register` and taken
+/// away only by its own execution's end (`deregister_execution`) or by the
+/// volume's own removal (`deregister`). The FSAL admits a person's persistent
+/// volume to every execution holding a registration of it.
+///
+/// The NFS server routes by volume alone, so it reads a per-volume view: the
+/// most recent registration of the volume still held.
+///
+/// Every mount point an execution registered is also kept until the
+/// execution's end, so that a path under a mount whose registration was taken
+/// away is refused by the mount's name rather than resolved into another of
+/// the execution's volumes.
+///
 /// Thread-safe with RwLock for concurrent access from NFS operations.
 #[derive(Clone)]
 pub struct NfsVolumeRegistry {
+    /// Every registration, keyed by volume and execution, with its order.
+    registrations: Arc<RwLock<HashMap<(VolumeId, ExecutionId), HeldRegistration>>>,
+    /// Per volume, the most recent registration still held (the NFS server's view).
     contexts: Arc<RwLock<HashMap<VolumeId, NfsVolumeContext>>>,
+    /// Per execution, every mount point it registered and the volume at it.
+    mounts: Arc<RwLock<HashMap<ExecutionId, HashMap<PathBuf, VolumeId>>>>,
+    /// The order of registrations, newest highest.
+    sequence: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+struct HeldRegistration {
+    context: NfsVolumeContext,
+    sequence: u64,
+}
+
+/// Where a container path of an execution resolves.
+enum PathResolution {
+    /// Under a mount whose volume the execution holds a registration of.
+    Registered(NfsVolumeContext),
+    /// Under a mount the execution registered whose registration no longer holds.
+    Unregistered(PathBuf),
+    /// Under no mount the execution registered.
+    NoMount,
+}
+
+/// Whether `requested` is `mount` or lies under it.
+fn is_under(requested: &str, mount: &str) -> bool {
+    let mount = mount.trim_end_matches('/');
+    requested == mount
+        || requested
+            .strip_prefix(mount)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 impl NfsVolumeRegistry {
     pub fn new() -> Self {
         Self {
+            registrations: Arc::new(RwLock::new(HashMap::new())),
             contexts: Arc::new(RwLock::new(HashMap::new())),
+            mounts: Arc::new(RwLock::new(HashMap::new())),
+            sequence: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Register a volume with its execution context
+    /// Add an execution's registration of a volume, beside any other
+    /// execution's; a second registration by the same execution replaces its
+    /// first.
     pub fn register(&self, registration: VolumeRegistration) {
         let volume_id = registration.volume_id;
         let execution_id = registration.execution_id;
@@ -104,22 +156,85 @@ impl NfsVolumeRegistry {
             mount_point: registration.mount_point,
             remote_path: registration.remote_path,
         };
-        self.contexts.write().insert(volume_id, context);
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let mut registrations = self.registrations.write();
+        self.mounts
+            .write()
+            .entry(execution_id)
+            .or_default()
+            .insert(context.mount_point.clone(), volume_id);
+        self.contexts.write().insert(volume_id, context.clone());
+        registrations.insert(
+            (volume_id, execution_id),
+            HeldRegistration { context, sequence },
+        );
         debug!(
             "Registered NFS volume context: volume_id={}, execution_id={}",
             volume_id, execution_id
         );
     }
 
-    /// Deregister a volume
+    /// Remove every registration of a volume. The mount points stay known to
+    /// the executions that registered them, so a path under one is refused.
     pub fn deregister(&self, volume_id: VolumeId) {
+        let mut registrations = self.registrations.write();
+        registrations.retain(|(volume, _), _| *volume != volume_id);
         self.contexts.write().remove(&volume_id);
         debug!("Deregistered NFS volume context: volume_id={}", volume_id);
     }
 
-    /// Lookup execution context for a volume
+    /// An execution's end: remove its own registrations, and only its own,
+    /// and forget its mount points. A volume another execution still holds
+    /// is shown by that execution's most recent registration. Answers how
+    /// many registrations were removed.
+    pub fn deregister_execution(&self, execution_id: ExecutionId) -> usize {
+        let mut registrations = self.registrations.write();
+        let released: Vec<VolumeId> = registrations
+            .keys()
+            .filter(|(_, execution)| *execution == execution_id)
+            .map(|(volume, _)| *volume)
+            .collect();
+        for volume_id in &released {
+            registrations.remove(&(*volume_id, execution_id));
+        }
+        {
+            let mut contexts = self.contexts.write();
+            for volume_id in &released {
+                let newest = registrations
+                    .iter()
+                    .filter(|((volume, _), _)| volume == volume_id)
+                    .max_by_key(|(_, held)| held.sequence)
+                    .map(|(_, held)| held.context.clone());
+                match newest {
+                    Some(context) => {
+                        contexts.insert(*volume_id, context);
+                    }
+                    None => {
+                        contexts.remove(volume_id);
+                    }
+                }
+            }
+        }
+        self.mounts.write().remove(&execution_id);
+        debug!(
+            "Deregistered NFS volume contexts of execution {}: {} removed",
+            execution_id,
+            released.len()
+        );
+        released.len()
+    }
+
+    /// The volume's most recent registration still held, as the NFS server
+    /// sees it.
     pub fn lookup(&self, volume_id: VolumeId) -> Option<NfsVolumeContext> {
         self.contexts.read().get(&volume_id).cloned()
+    }
+
+    /// Whether the execution holds a registration of the volume.
+    pub fn holds(&self, volume_id: VolumeId, execution_id: ExecutionId) -> bool {
+        self.registrations
+            .read()
+            .contains_key(&(volume_id, execution_id))
     }
 
     /// Get all registered volume IDs
@@ -136,11 +251,7 @@ impl NfsVolumeRegistry {
         &self,
         execution_id: crate::domain::execution::ExecutionId,
     ) -> Option<NfsVolumeContext> {
-        self.contexts
-            .read()
-            .values()
-            .find(|ctx| ctx.execution_id == execution_id)
-            .cloned()
+        self.find_all_by_execution(execution_id).into_iter().next()
     }
 
     /// Returns all volume contexts for an execution.
@@ -148,32 +259,67 @@ impl NfsVolumeRegistry {
         &self,
         execution_id: crate::domain::execution::ExecutionId,
     ) -> Vec<NfsVolumeContext> {
-        self.contexts
+        self.registrations
             .read()
-            .values()
-            .filter(|ctx| ctx.execution_id == execution_id)
-            .cloned()
+            .iter()
+            .filter(|((_, execution), _)| *execution == execution_id)
+            .map(|(_, held)| held.context.clone())
             .collect()
     }
 
+    /// Resolve a container path of an execution against the mounts it
+    /// registered: the longest mount-point prefix wins, whether or not its
+    /// registration still holds.
+    fn resolve_path(&self, execution_id: ExecutionId, requested_path: &str) -> PathResolution {
+        let requested = requested_path.trim();
+        let mount = self.mounts.read().get(&execution_id).and_then(|mounts| {
+            mounts
+                .iter()
+                .filter(|(mount, _)| is_under(requested, &mount.to_string_lossy()))
+                .max_by_key(|(mount, _)| mount.as_os_str().len())
+                .map(|(mount, volume)| (mount.clone(), *volume))
+        });
+        let Some((mount_point, volume_id)) = mount else {
+            return PathResolution::NoMount;
+        };
+        match self
+            .registrations
+            .read()
+            .get(&(volume_id, execution_id))
+            .filter(|held| held.context.mount_point == mount_point)
+        {
+            Some(held) => PathResolution::Registered(held.context.clone()),
+            None => PathResolution::Unregistered(mount_point),
+        }
+    }
+
     /// Resolve the most specific mounted volume for a requested container path.
-    /// Chooses the longest mount-point prefix match under this execution.
+    /// Chooses the longest mount-point prefix match under this execution, and
+    /// answers `None` when that mount's registration no longer holds.
     pub fn find_by_execution_and_path(
         &self,
         execution_id: crate::domain::execution::ExecutionId,
         requested_path: &str,
     ) -> Option<NfsVolumeContext> {
-        let requested = requested_path.trim();
-        self.find_all_by_execution(execution_id)
-            .into_iter()
-            .filter(|ctx| {
-                let mount = ctx.mount_point.to_string_lossy();
-                requested == mount
-                    || requested
-                        .strip_prefix(mount.as_ref())
-                        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-            })
-            .max_by_key(|ctx| ctx.mount_point.as_os_str().len())
+        match self.resolve_path(execution_id, requested_path) {
+            PathResolution::Registered(context) => Some(context),
+            PathResolution::Unregistered(_) | PathResolution::NoMount => None,
+        }
+    }
+
+    /// The mount an execution registered that `requested_path` lies under,
+    /// when that mount's registration no longer holds for the execution: the
+    /// path is to be refused by the mount's name, never resolved into another
+    /// volume.
+    pub fn unregistered_mount_of_path(
+        &self,
+        execution_id: ExecutionId,
+        requested_path: &str,
+    ) -> Option<PathBuf> {
+        match self.resolve_path(execution_id, requested_path) {
+            PathResolution::Unregistered(mount_point) => Some(mount_point),
+            PathResolution::Registered(_) | PathResolution::NoMount => None,
+        }
     }
 
     /// Resolve primary workspace volume.
@@ -196,9 +342,9 @@ impl NfsVolumeRegistry {
         contexts.into_iter().next()
     }
 
-    /// Get count of registered volumes
+    /// Get count of registrations held
     pub fn count(&self) -> usize {
-        self.contexts.read().len()
+        self.registrations.read().len()
     }
 }
 
@@ -214,8 +360,8 @@ impl VolumeContextLookup for NfsVolumeRegistry {
             .and_then(|ctx| ctx.workflow_execution_id)
     }
 
-    fn lookup_execution_id(&self, volume_id: VolumeId) -> Option<ExecutionId> {
-        self.lookup(volume_id).map(|ctx| ctx.execution_id)
+    fn holds_registration(&self, volume_id: VolumeId, execution_id: ExecutionId) -> bool {
+        self.holds(volume_id, execution_id)
     }
 
     fn lookup_remote_path(&self, volume_id: VolumeId) -> Option<String> {
@@ -414,6 +560,12 @@ impl NfsGatewayService {
         metrics::gauge!("aegis_volumes_active").decrement(1.0);
     }
 
+    /// An execution's end: remove its own registrations, and only its own.
+    pub fn deregister_execution(&self, execution_id: ExecutionId) {
+        let removed = self.volume_registry.deregister_execution(execution_id);
+        metrics::gauge!("aegis_volumes_active").decrement(removed as f64);
+    }
+
     /// Get the volume registry (for introspection/testing)
     pub fn volume_registry(&self) -> &NfsVolumeRegistry {
         &self.volume_registry
@@ -443,8 +595,74 @@ impl EventPublisher for EventBusPublisher {
 
 #[cfg(test)]
 mod tests {
-    // Note: Full integration tests require nfsserve implementation
-    // These are unit tests for service lifecycle only
+    use super::*;
+
+    fn registration(
+        volume_id: VolumeId,
+        execution_id: ExecutionId,
+        mount_point: &str,
+    ) -> VolumeRegistration {
+        VolumeRegistration {
+            volume_id,
+            execution_id,
+            workflow_execution_id: None,
+            container_uid: 1000,
+            container_gid: 1000,
+            policy: FsalAccessPolicy {
+                read: vec!["/*".to_string()],
+                write: vec!["/*".to_string()],
+            },
+            mount_point: PathBuf::from(mount_point),
+            remote_path: String::new(),
+        }
+    }
+
+    /// The Forge's CODE child and its judge child both mount the run's
+    /// repository: the judge's registration is added beside the coder's, not
+    /// in its place, and the judge's end takes away only its own.
+    #[test]
+    fn two_executions_hold_one_volume_and_the_first_ends_without_taking_the_second() {
+        let registry = NfsVolumeRegistry::new();
+        let repository = VolumeId::new();
+        let coder = ExecutionId::new();
+        let judge = ExecutionId::new();
+        registry.register(registration(repository, coder, "/workspace/aegis-examples"));
+        registry.register(registration(repository, judge, "/workspace/aegis-examples"));
+
+        for (name, execution) in [("coder", coder), ("judge", judge)] {
+            let found = registry
+                .find_by_execution_and_path(execution, "/workspace/aegis-examples/.git")
+                .map(|ctx| (ctx.volume_id, ctx.execution_id));
+            assert_eq!(
+                found,
+                Some((repository, execution)),
+                "the {name}'s registration of the repository volume does not resolve once both executions registered it"
+            );
+            assert!(
+                registry.holds(repository, execution),
+                "the {name} holds no registration of the repository volume once both executions registered it"
+            );
+        }
+
+        registry.deregister_execution(judge);
+
+        assert!(
+            !registry.holds(repository, judge),
+            "the judge still holds the repository volume after its end"
+        );
+        assert_eq!(
+            registry
+                .find_by_execution_and_path(coder, "/workspace/aegis-examples/.git")
+                .map(|ctx| (ctx.volume_id, ctx.execution_id)),
+            Some((repository, coder)),
+            "the judge's end took the coder's registration of the repository volume with it"
+        );
+        assert_eq!(
+            registry.lookup(repository).map(|ctx| ctx.execution_id),
+            Some(coder),
+            "the gateway's view of the repository volume does not fall back to the coder after the judge's end"
+        );
+    }
 
     #[tokio::test]
     async fn test_gateway_lifecycle() {

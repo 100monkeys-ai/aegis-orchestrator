@@ -1659,15 +1659,30 @@ mod tests {
             "judge should no longer mount via the SEAL proxy path"
         );
 
-        let child_mounts = nfs_gateway
-            .volume_registry()
-            .find_all_by_execution(child_execution_id);
-        assert_eq!(child_mounts.len(), 1);
-        assert_eq!(
-            child_mounts[0].mount_point,
-            PathBuf::from("/workspace/project")
+        assert_ne!(spawned.volumes[0].volume_id, parent_volume.id);
+
+        // The judge's end takes away its own registration of the alias and
+        // leaves the worker's registration of the worker's volume.
+        let registry = nfs_gateway.volume_registry();
+        for _ in 0..200 {
+            if registry
+                .find_all_by_execution(child_execution_id)
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            registry
+                .find_all_by_execution(child_execution_id)
+                .is_empty(),
+            "the judge's registrations outlived its end"
         );
-        assert_ne!(child_mounts[0].volume_id, parent_volume.id);
+        assert!(
+            registry.holds(parent_volume.id, parent_execution.id),
+            "the judge's end took the worker's registration of its volume"
+        );
     }
 
     #[tokio::test]
@@ -8947,6 +8962,7 @@ impl ExecutionService for StandardExecutionService {
         let tenant_id_for_task = tenant_id.clone();
         let parent_execution_id_for_task = parent_execution_id;
         let parent_agent_id_for_task = parent_agent_id;
+        let nfs_gateway_for_task = self.nfs_gateway.clone();
 
         tokio::spawn(async move {
             let result = supervisor
@@ -8961,6 +8977,12 @@ impl ExecutionService for StandardExecutionService {
                 .await;
 
             tokens_map.remove(&child_execution_id);
+            // The child's end takes away its own volume registrations and
+            // only its own: the agent it judged keeps its registrations of
+            // the same volumes (ADR-036's registry, per execution).
+            if let Some(gateway) = nfs_gateway_for_task.as_ref() {
+                gateway.deregister_execution(child_execution_id);
+            }
 
             match result {
                 Ok(final_output) => {

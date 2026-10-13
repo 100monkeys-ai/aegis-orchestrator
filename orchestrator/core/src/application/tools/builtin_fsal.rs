@@ -151,6 +151,16 @@ pub async fn invoke_fs_tool(
         .get("path")
         .and_then(|v| v.as_str())
         .unwrap_or("/workspace");
+    // A path under a mount whose registration no longer holds for this
+    // execution is refused by the mount's name: resolving it into the
+    // `/workspace` volume would read and write the wrong tree.
+    if let Some(mount_point) = volume_registry.unregistered_mount_of_path(execution_id, path_arg) {
+        return Err(SealSessionError::NotFound(format!(
+            "[AEGIS] {path_arg} is under {}, whose volume is not registered for this execution",
+            mount_point.display()
+        ))
+        .answered(CallerAnswer::Internal(InternalFailure::Server)));
+    }
     let vol_ctx = volume_registry
         .find_by_execution_and_path(execution_id, path_arg)
         .or_else(|| volume_registry.find_primary_workspace_by_execution(execution_id))
@@ -604,6 +614,72 @@ async fn invoke_glob(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A path under a mount whose volume holds no registration for the
+    /// calling execution is refused by the mount's name; it is never
+    /// resolved into the execution's `/workspace` volume.
+    #[tokio::test]
+    async fn a_path_under_a_mount_unregistered_for_the_caller_is_refused_by_name() {
+        use crate::application::nfs_gateway::EventBusPublisher;
+        use crate::application::nfs_gateway::{NfsGatewayService, VolumeRegistration};
+        use crate::domain::fsal::FsalAccessPolicy;
+        use crate::domain::volume::VolumeId;
+        use crate::infrastructure::event_bus::EventBus;
+        use crate::infrastructure::repositories::InMemoryVolumeRepository;
+        use crate::infrastructure::storage::LocalHostStorageProvider;
+
+        let storage_root = tempfile::tempdir().unwrap();
+        let gateway = NfsGatewayService::new(
+            Arc::new(LocalHostStorageProvider::new(storage_root.path()).unwrap()),
+            Arc::new(InMemoryVolumeRepository::new()),
+            Arc::new(EventBusPublisher::new(Arc::new(
+                EventBus::with_default_capacity(),
+            ))),
+            Some(0),
+        );
+        let coder = ExecutionId::new();
+        let workspace = VolumeId::new();
+        let repository = VolumeId::new();
+        for (volume_id, mount_point) in [(workspace, "/workspace"), (repository, "/repo")] {
+            gateway.register_volume(VolumeRegistration {
+                volume_id,
+                execution_id: coder,
+                workflow_execution_id: None,
+                container_uid: 1000,
+                container_gid: 1000,
+                policy: FsalAccessPolicy {
+                    read: vec!["/*".to_string()],
+                    write: vec!["/*".to_string()],
+                },
+                mount_point: std::path::PathBuf::from(mount_point),
+                remote_path: String::new(),
+            });
+        }
+        // Another step's end deregistered the repository volume.
+        gateway.deregister_volume(repository);
+
+        let answer = invoke_fs_tool(
+            "fs.list",
+            &json!({"path": "/repo/.git"}),
+            coder,
+            gateway.fsal(),
+            gateway.volume_registry(),
+        )
+        .await;
+
+        let sentence =
+            "[AEGIS] /repo/.git is under /repo, whose volume is not registered for this execution";
+        match answer {
+            Err(refused) => assert!(
+                refused.to_string().contains(sentence),
+                "the refusal does not name the unregistered mount: {refused}"
+            ),
+            Ok(ToolInvocationResult::Direct(listed)) => {
+                panic!("the path under /repo was resolved into another volume: {listed}")
+            }
+            Ok(_) => panic!("the path under /repo was resolved into another volume"),
+        }
+    }
 
     /// A file of `n` lines, `line 1` to `line n`, each ending in a newline.
     fn numbered_lines(n: usize) -> String {

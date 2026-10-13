@@ -534,10 +534,9 @@ impl EphemeralCliEngine {
         // ephemeral container's scope.
         let mount_point = PathBuf::from(&self.paths.workspace);
         let execution_id = ExecutionId::new();
-        // A run that mounts this volume has its own registration, and there
-        // is one per volume: the step's replaces it for the step's length and
-        // it is put back afterwards (AEGIS ADR-136 G5e).
-        let found_on_entry = self.volume_registry.lookup(volume.id);
+        // A run that mounts this volume keeps its own registration beside
+        // the step's; the step removes only its own afterwards (AEGIS ADR-136
+        // G5e).
         self.volume_registry.register(VolumeRegistration {
             volume_id: volume.id,
             execution_id,
@@ -597,21 +596,9 @@ impl EphemeralCliEngine {
             .redacted(secrets)
         });
 
-        // Always put back the registration found on entry, or deregister,
-        // even on error.
-        match found_on_entry {
-            Some(context) => self.volume_registry.register(VolumeRegistration {
-                volume_id: context.volume_id,
-                execution_id: context.execution_id,
-                workflow_execution_id: context.workflow_execution_id,
-                container_uid: context.container_uid,
-                container_gid: context.container_gid,
-                policy: context.policy,
-                mount_point: context.mount_point,
-                remote_path: context.remote_path,
-            }),
-            None => self.volume_registry.deregister(volume.id),
-        }
+        // Always remove the step's own registration, and only its own, even
+        // on error.
+        self.volume_registry.deregister_execution(execution_id);
         result
     }
 }
@@ -2381,6 +2368,45 @@ mod credential_tests {
         assert!(
             registry.lookup(unregistered.id).is_none(),
             "a step left a registration on a volume nobody had registered"
+        );
+    }
+
+    /// A git step on a volume a run holds removes its own registration when
+    /// it ends and leaves the run's: the step's execution holds nothing
+    /// after the step.
+    #[tokio::test]
+    async fn a_git_step_removes_its_own_registration_and_leaves_the_runs() {
+        let registry = Arc::new(NfsVolumeRegistry::new());
+        let runner = Arc::new(CapturingRunner {
+            captured: Mutex::new(None),
+        });
+        let engine = EphemeralCliEngine::new(runner, registry.clone());
+        let volume = seaweed_volume();
+        let run = ExecutionId::new();
+        registry.register(VolumeRegistration {
+            volume_id: volume.id,
+            execution_id: run,
+            workflow_execution_id: None,
+            container_uid: 1000,
+            container_gid: 1000,
+            policy: FsalAccessPolicy::default(),
+            mount_point: PathBuf::from("/workspace/app"),
+            remote_path: "/aegis/seaweedfs/app/repo".to_string(),
+        });
+
+        engine
+            .commit_in_volume(&volume, "m", "A", "a@example.invalid")
+            .await
+            .expect("the captured step answers");
+
+        assert_eq!(
+            registry.count(),
+            1,
+            "the git step's own registration of the volume outlived the step"
+        );
+        assert!(
+            registry.holds(volume.id, run),
+            "the git step's end took the run's registration of the volume"
         );
     }
 
