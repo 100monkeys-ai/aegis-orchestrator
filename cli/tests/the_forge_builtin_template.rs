@@ -11,8 +11,10 @@ use aegis_orchestrator::commands::builtins::{
     deploy_all_builtins, BUILTIN_AGENTS, BUILTIN_WORKFLOWS,
 };
 use aegis_orchestrator::daemon::DaemonClient;
+use aegis_orchestrator_core::application::inner_loop_service::command_margin_secs;
 use aegis_orchestrator_core::application::temporal_mapper::TemporalWorkflowMapper;
 use aegis_orchestrator_core::domain::agent::ValidatorSpec;
+use aegis_orchestrator_core::domain::supervisor::iteration_timeout;
 use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::domain::workflow::{
     ConsensusStrategy, StateKind, TransitionRule, Workflow, WorkflowState,
@@ -716,5 +718,32 @@ async fn the_cli_deploy_path_deploys_the_forge() {
     assert_eq!(
         forges, 1,
         "the Forge's manifest reached the daemon {forges} times"
+    );
+}
+
+/// Run `108ba129`'s CODE tries 1 to 3 asked to run their command 412, 352 and
+/// 363 s into a 600 s try, and each was refused, because a command may start
+/// only while the try has the command margin (one model call's bound and the
+/// result's way back) still left after it. The coder's try must be long
+/// enough that a command asked for 412 s in still finds that margin.
+#[test]
+fn the_coder_can_run_a_command_412_seconds_into_a_try() {
+    let yaml = listed(BUILTIN_AGENTS, "coder-agent").expect("coder-agent is in BUILTIN_AGENTS");
+    let manifest = AgentManifestParser::parse_yaml(yaml)
+        .unwrap_or_else(|e| panic!("the orchestrator's parser refuses coder-agent: {e}"));
+    let execution = manifest
+        .spec
+        .execution
+        .expect("coder-agent declares spec.execution");
+    let try_secs = iteration_timeout(&execution).as_secs();
+    let margin_secs = command_margin_secs(
+        execution.llm_timeout_seconds,
+        std::time::Duration::from_secs(try_secs),
+    );
+    let window_secs = try_secs.saturating_sub(margin_secs);
+    assert!(
+        window_secs > 412,
+        "coder-agent's try is {try_secs} s and keeps its last {margin_secs} s after a command, \
+         so a command can start only in its first {window_secs} s, not 412 s in"
     );
 }

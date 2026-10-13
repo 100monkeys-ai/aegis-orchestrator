@@ -1694,7 +1694,7 @@ const COMMAND_TIMED_OUT: &str = "[AEGIS] Command timed out after";
 /// Seconds of a try kept after a command for the model to read its result and
 /// act on it: one model call's bound (`llm_timeout_seconds`) and the result's
 /// way back, at most half the try, so that a try can always run a command.
-fn command_margin_secs(llm_timeout_seconds: u64, iteration_bound: std::time::Duration) -> u64 {
+pub fn command_margin_secs(llm_timeout_seconds: u64, iteration_bound: std::time::Duration) -> u64 {
     llm_timeout_seconds
         .saturating_add(COMMAND_RESULT_TRANSPORT_SECS)
         .min(iteration_bound.as_secs() / 2)
