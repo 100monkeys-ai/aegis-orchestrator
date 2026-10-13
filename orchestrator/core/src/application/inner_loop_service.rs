@@ -104,6 +104,10 @@ struct ExecutionContext {
     tool_call_requirement: ToolCallRequirement,
     /// Whether a text answer was already sent back once for that requirement.
     tool_call_reminded: bool,
+    /// Whether the try clock already refused a command in this try: the first
+    /// refusal is the call's result and the model answers, a second ends the
+    /// try.
+    try_clock_refused: bool,
     /// How many messages of `conversation` an earlier generation's
     /// `LlmInteraction` already showed (AEGIS ADR-131 U34d): the next one's
     /// prompt is the messages after them.
@@ -705,6 +709,7 @@ impl InnerLoopService {
                         pending_command: None,
                         tool_call_requirement,
                         tool_call_reminded: false,
+                        try_clock_refused: false,
                         conversation_shown: 0,
                         attachment_parts,
                     },
@@ -1167,11 +1172,15 @@ impl InnerLoopService {
                                 ) {
                                     Ok(fitted) => fitted,
                                     Err(refusal) => {
-                                        // AEGIS ADR-131 U37: the try clock's
-                                        // refusal ends the try, failed with
-                                        // its sentence; the model is not
-                                        // called again in a try with no time
-                                        // left for a command.
+                                        // AEGIS ADR-131 U37, as amended on
+                                        // 2026-10-13: the try clock's first
+                                        // refusal in a try is the call's
+                                        // result, followed by the order to
+                                        // answer, and the model is called once
+                                        // more inside the margin the try
+                                        // keeps (one model call and the
+                                        // transport); a second refusal ends
+                                        // the try, failed with its sentence.
                                         let call_index = next_ctx.trajectory.len();
                                         let mut step = step;
                                         step.status = "refused".to_string();
@@ -1188,6 +1197,21 @@ impl InnerLoopService {
                                             None,
                                         )
                                         .await;
+                                        if !next_ctx.try_clock_refused {
+                                            next_ctx.try_clock_refused = true;
+                                            next_ctx.conversation.push(ConversationMessage {
+                                                role: "tool".to_string(),
+                                                content: format!("{refusal} {TRY_CLOCK_ANSWER_NOW}"),
+                                                tool_call_id: Some(tool_call.id.clone()),
+                                                tool_calls: None,
+                                            });
+                                            self.persist_trajectory(execution_id_str, &next_ctx).await;
+                                            self.active_executions
+                                                .write()
+                                                .await
+                                                .insert(execution_id_str.to_string(), next_ctx);
+                                            continue;
+                                        }
                                         self.persist_trajectory(execution_id_str, &next_ctx).await;
                                         self.active_executions.write().await.remove(execution_id_str);
                                         anyhow::bail!(refusal);
@@ -1846,6 +1870,11 @@ fn policy_feedback_message(tool_name: &str) -> String {
 
 /// Seconds a try's command result needs to come back to the orchestrator.
 const COMMAND_RESULT_TRANSPORT_SECS: u64 = 10;
+
+/// What follows the try clock's first refusal in a try when the model is
+/// given it as the refused call's result.
+const TRY_CLOCK_ANSWER_NOW: &str =
+    "Answer now with what you have; run no more commands in this try.";
 
 /// The line the bootstrap ends a timed-out command's stderr with.
 const COMMAND_TIMED_OUT: &str = "[AEGIS] Command timed out after";

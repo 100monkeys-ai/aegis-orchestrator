@@ -1108,12 +1108,17 @@ impl World {
     }
 }
 
-/// AEGIS ADR-131 U37: a command the try clock refuses is not run and ends
-/// the try, failed with the refusal's sentence; no model call follows it (in
-/// `da416e80` the refusal went back to the model, which asked again 24 times
-/// until the execution's time ran out).
+/// The sentence a try clock's refusal is followed by when the model is given
+/// it as its tool call's result.
+const ANSWER_NOW: &str = "Answer now with what you have; run no more commands in this try.";
+
+/// AEGIS ADR-131, amending U37: the first command the try clock refuses in a
+/// try is not run; its sentence, followed by the order to answer, is the tool
+/// call's result, and the model is called once more so it can answer within
+/// the margin the try keeps (on Forge run `dcf60c18` the tester's tries 1 to
+/// 4 each ended at the refusal with 53 to 255 s left, without an answer).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_try_clock_refusal_ends_the_try_and_the_model_is_not_called_again() {
+async fn a_try_clock_refusal_is_given_to_the_model_once_and_it_answers() {
     let w = a_try_with_no_time_left(vec![
         run_command(json!({"command": "echo never", "cwd": "/tmp"})),
         answer("as far as I got"),
@@ -1122,23 +1127,79 @@ async fn a_try_clock_refusal_ends_the_try_and_the_model_is_not_called_again() {
     let outcome = w.generate().await;
     let mut complaints = Vec::new();
     let calls = w.model.calls.lock().unwrap().len();
-    if calls != 1 {
+    if calls != 2 {
         complaints.push(format!(
-            "the model was called again after the try clock refused its command: {calls} calls"
+            "the model was not called once more after the try clock refused its command: {calls} calls"
         ));
     }
     match &outcome {
-        Err(e) if e.to_string().contains("cmd.run was not run") => {}
+        Ok(OrchestratorMessage::Final { content, .. }) if content == "as far as I got" => {}
         other => complaints.push(format!(
-            "the try did not end with the refusal's sentence: {other:?}"
+            "the try did not end on the model's answer: {other:?}"
         )),
+    }
+    if calls >= 2 {
+        let given = last_tool_message(&w.model.conversation(1));
+        if !(given.contains("cmd.run was not run") && given.ends_with(ANSWER_NOW)) {
+            complaints.push(format!("the refused call's result is {given:?}"));
+        }
     }
     let record = w.records.get(w.execution_id);
     let steps = record.iterations[0].trajectory.clone().unwrap_or_default();
     if steps.len() != 1 || steps[0].status != "refused" {
         complaints.push(format!("the try's trajectory is {steps:?}"));
     }
+    let dispatched = w.records.events_named("ToolDispatched");
+    if dispatched.len() != 1
+        || dispatched[0]["status"] != "refused"
+        || dispatched[0]["refused_by"] != "try_time_limit"
+    {
+        complaints.push(format!("the dispatch events are {dispatched:?}"));
+    }
     assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// AEGIS ADR-131 U37, as amended: a second command the try clock refuses in
+/// the same try ends the try, failed with the refusal's sentence; no model
+/// call follows it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_try_clock_refusal_in_a_try_ends_the_try_failed() {
+    let w = a_try_with_no_time_left(vec![
+        run_command(json!({"command": "echo never", "cwd": "/tmp"})),
+        run_command(json!({"command": "echo again", "cwd": "/tmp"})),
+        answer("as far as I got"),
+    ])
+    .await;
+    let outcome = w.generate().await;
+    let mut complaints = Vec::new();
+    match &outcome {
+        Err(e) if e.to_string().contains("cmd.run was not run") => {}
+        other => complaints.push(format!(
+            "the try did not end with the refusal's sentence: {other:?}"
+        )),
+    }
+    let calls = w.model.calls.lock().unwrap().len();
+    if calls > 2 {
+        complaints.push(format!(
+            "the model was called after the try clock's second refusal: {calls} calls"
+        ));
+    }
+    let record = w.records.get(w.execution_id);
+    let steps = record.iterations[0].trajectory.clone().unwrap_or_default();
+    if steps.iter().any(|s| s.status != "refused") {
+        complaints.push(format!("the try's trajectory is {steps:?}"));
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// A try of 900 s whose model calls are bounded at 120 s keeps 130 s after a
+/// command: one model call and the result's way back (the Forge's tester).
+#[test]
+fn a_900_s_try_with_120_s_model_calls_keeps_130_s_after_a_command() {
+    assert_eq!(
+        command_margin_secs(120, std::time::Duration::from_secs(900)),
+        130
+    );
 }
 
 /// AEGIS ADR-131 U34, U34a: the try clock's refusal is an event of the

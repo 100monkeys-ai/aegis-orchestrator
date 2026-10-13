@@ -34,9 +34,10 @@ spec:
       2. Write the tests that show each acceptance criterion met, in that
          layout and style, with fs.write and fs.edit, under the repository's
          path. Write tests only: change no implementation file.
-      3. Run the new tests with cmd.run where the image allows it (the suite
-         itself runs later in its own container). Against the unchanged tree
-         they fail; that is expected.
+      3. Run each new test at most once with cmd.run where the image allows
+         it (the suite itself runs later in its own container). Against the
+         unchanged tree they fail; that is expected: do not rewrite a test for
+         it. Answer as soon as each criterion has a test.
       4. Answer with every test file you wrote or changed, the tests in each,
          the acceptance criterion each test shows, and why each fails against
          the unchanged tree.
@@ -56,7 +57,8 @@ spec:
   execution:
     mode: "iterative"
     max_iterations: 5
-    llm_timeout_seconds: 300
+    iteration_timeout: "900s"
+    llm_timeout_seconds: 120
     require_tool_call: true
     validation:
       - type: semantic

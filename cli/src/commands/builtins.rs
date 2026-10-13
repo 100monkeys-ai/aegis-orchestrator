@@ -769,6 +769,34 @@ mod tests {
         }
     }
 
+    /// The Forge's tester: each try is 900 s and each model call is bounded
+    /// at 120 s, so a try keeps 130 s after a command and a command may start
+    /// until 770 s into it; the execution's 1800 s and its five tries stay.
+    /// On run `dcf60c18` its 600 s tries kept 300 s and four of five ended at
+    /// the try clock's refusal without an answer.
+    #[test]
+    fn tester_agent_tries_are_900_s_with_model_calls_bounded_at_120_s() {
+        use aegis_orchestrator_core::domain::agent::{ExecutionStrategy, ResourceLimits};
+        use aegis_orchestrator_core::domain::supervisor::iteration_timeout;
+
+        let (_, yaml) = BUILTIN_AGENTS
+            .iter()
+            .find(|(name, _)| *name == "tester-agent")
+            .expect("tester-agent is a built-in agent");
+        let doc: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let execution: ExecutionStrategy =
+            serde_yaml::from_value(doc["spec"]["execution"].clone()).unwrap();
+        let resources: ResourceLimits =
+            serde_yaml::from_value(doc["spec"]["security"]["resources"].clone()).unwrap();
+        assert_eq!(
+            iteration_timeout(&execution),
+            std::time::Duration::from_secs(900)
+        );
+        assert_eq!(execution.llm_timeout_seconds, 120);
+        assert_eq!(execution.max_retries, 5);
+        assert_eq!(resources.parse_timeout_seconds(), Some(1800));
+    }
+
     /// Every `timeout_seconds` a validator of `execution` carries, after the
     /// orchestrator's own defaults are applied.
     fn validator_timeouts(value: &serde_yaml::Value, out: &mut Vec<u64>) {
