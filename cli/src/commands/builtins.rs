@@ -977,6 +977,26 @@ mod tests {
         );
     }
 
+    /// The coder edits an existing file and never rewrites it: on run
+    /// `6b8987b3` CODE rewrote the whole README with `fs.write`, turning
+    /// every CRLF line into LF and joining its new sentence to the last line.
+    #[test]
+    fn the_coder_edits_existing_files_and_never_rewrites_them() {
+        const STEP: &str = "Change the implementation with fs.edit and fs.multi_edit, replacing only the lines the design touches; use fs.write only for a file that does not exist yet. Never rewrite a whole existing file, never change its line endings or its final newline, and add nothing the design does not ask for.";
+        let (_, yaml) = BUILTIN_AGENTS
+            .iter()
+            .find(|(name, _)| *name == "coder-agent")
+            .expect("coder-agent is a built-in agent");
+        let manifest: aegis_orchestrator_sdk::AgentManifest =
+            serde_yaml::from_str(yaml).expect("the coder template parses");
+        manifest.validate().expect("the coder template validates");
+        let instruction = folded_instruction(yaml);
+        assert!(
+            instruction.contains(&format!("2. {STEP}")),
+            "the coder's step 2 must read \"{STEP}\":\n{instruction}"
+        );
+    }
+
     /// The Forge's second CODE visit carries the diff the judges reviewed,
     /// beside their reports, and every judge is told that a diff's `-` and
     /// `+` are its markers: on run `e946aeab` a judge read a `-` marker as a

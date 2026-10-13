@@ -174,35 +174,7 @@ pub async fn invoke_fs_tool(
     let handle = AegisFileHandle::new(vol_ctx.execution_id, vol_ctx.volume_id, "/");
 
     match tool_name {
-        "fs.write" => {
-            let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
-            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-
-            let _file_handle = fsal
-                .create_file(CreateFsalFileRequest {
-                    execution_id: vol_ctx.execution_id,
-                    volume_id: vol_ctx.volume_id,
-                    path: &path,
-                    policy: &vol_ctx.policy,
-                    emit_event: false,
-                    caller_node_id: None,
-                    host_node_id: None,
-                    workflow_execution_id: None,
-                })
-                .await
-                .map_err(|e| fsal_refusal("FSAL create_file error", path_arg, e))?;
-
-            let bytes_written = fsal
-                .write(&handle, &path, &vol_ctx.policy, 0, content.as_bytes())
-                .await
-                .map_err(|e| fsal_refusal("FSAL write error", path_arg, e))?;
-
-            Ok(ToolInvocationResult::Direct(serde_json::json!({
-                "status": "success",
-                "path": path_arg,
-                "bytes_written": bytes_written
-            })))
-        }
+        "fs.write" => invoke_write(args, execution_id, fsal, vol_ctx).await,
         "fs.read" => {
             let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
 
@@ -333,6 +305,79 @@ fn keep_crlf_line_ending<'a>(content: &str, replacement: &'a str) -> std::borrow
         previous = Some(c);
     }
     std::borrow::Cow::Owned(converted)
+}
+
+/// `fs.write`: a new file is created with the content as sent. An existing
+/// file is overwritten in place and cut to the new length, and its line
+/// ending is kept by the rule `fs.edit` follows: when every line ending of
+/// the file is CRLF, the content's bare LF become CRLF and the answer says
+/// so. A file with mixed endings takes the content as sent.
+async fn invoke_write(
+    args: &Value,
+    _execution_id: ExecutionId,
+    fsal: &Arc<AegisFSAL>,
+    vol_ctx: crate::infrastructure::nfs::server::NfsVolumeContext,
+) -> Result<ToolInvocationResult, SealSessionError> {
+    let path_arg = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("/workspace");
+    let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
+    let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+    let handle = AegisFileHandle::new(vol_ctx.execution_id, vol_ctx.volume_id, "/");
+
+    let existing = fsal
+        .read(&handle, &path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
+        .await
+        .ok();
+
+    let (content, crlf_kept) = match &existing {
+        Some(data) => {
+            let kept = keep_crlf_line_ending(&String::from_utf8_lossy(data), content);
+            let changed = kept.len() != content.len();
+            (kept, changed)
+        }
+        None => (std::borrow::Cow::Borrowed(content), false),
+    };
+
+    let bytes_written = if existing.is_some() {
+        let written = fsal
+            .write(&handle, &path, &vol_ctx.policy, 0, content.as_bytes())
+            .await
+            .map_err(|e| fsal_refusal("FSAL write error", path_arg, e))?;
+        fsal.truncate(&handle, &path, &vol_ctx.policy, content.len() as u64)
+            .await
+            .map_err(|e| fsal_refusal("FSAL truncate error", path_arg, e))?;
+        written
+    } else {
+        let _file_handle = fsal
+            .create_file(CreateFsalFileRequest {
+                execution_id: vol_ctx.execution_id,
+                volume_id: vol_ctx.volume_id,
+                path: &path,
+                policy: &vol_ctx.policy,
+                emit_event: false,
+                caller_node_id: None,
+                host_node_id: None,
+                workflow_execution_id: None,
+            })
+            .await
+            .map_err(|e| fsal_refusal("FSAL create_file error", path_arg, e))?;
+        fsal.write(&handle, &path, &vol_ctx.policy, 0, content.as_bytes())
+            .await
+            .map_err(|e| fsal_refusal("FSAL write error", path_arg, e))?
+    };
+
+    let mut answer = serde_json::json!({
+        "status": "success",
+        "path": path_arg,
+        "bytes_written": bytes_written
+    });
+    if crlf_kept {
+        answer["message"] = Value::String("[AEGIS] line endings kept as CRLF".to_string());
+    }
+    Ok(ToolInvocationResult::Direct(answer))
 }
 
 async fn invoke_edit(
@@ -910,6 +955,27 @@ mod tests {
             .expect("the edit is applied");
             std::fs::read(self.on_disk(file)).expect("the edited file")
         }
+
+        /// `fs.write` of `content` to `file`: the bytes on disk after it and
+        /// the tool's answer.
+        async fn write(&self, file: &str, content: &str) -> (Vec<u8>, Value) {
+            let answer = invoke_write(
+                &json!({
+                    "path": format!("/workspace/{file}"),
+                    "content": content,
+                }),
+                self.context.execution_id,
+                &self.fsal,
+                self.context.clone(),
+            )
+            .await
+            .expect("the write is applied");
+            let ToolInvocationResult::Direct(answer) = answer else {
+                panic!("fs.write answers directly");
+            };
+            let on_disk = std::fs::read(self.on_disk(file)).expect("the written file");
+            (on_disk, answer)
+        }
     }
 
     /// Run `e946aeab`'s README edit: the file ends every line in CRLF, the
@@ -965,5 +1031,50 @@ mod tests {
             "alpha\n",
             "the edited file must end where the new text ends"
         );
+    }
+
+    /// Run `6b8987b3`'s README: CODE rewrote the whole file with `fs.write`
+    /// and every CRLF line became LF. A write over a file whose every line
+    /// ends in CRLF keeps that ending, as `fs.edit` does, and says so.
+    #[tokio::test]
+    async fn fs_write_over_a_crlf_file_keeps_its_crlf_line_ending() {
+        let fixture = edit_fixture("README.md", b"# Examples\r\n\r\nOne.\r\n").await;
+
+        let (written, answer) = fixture
+            .write("README.md", "# Examples\n\nOne.\nTwo.\n")
+            .await;
+
+        assert_eq!(
+            String::from_utf8_lossy(&written),
+            "# Examples\r\n\r\nOne.\r\nTwo.\r\n",
+            "an LF write over a file whose every line ends in CRLF must be written with CRLF"
+        );
+        assert_eq!(
+            answer["message"], "[AEGIS] line endings kept as CRLF",
+            "the answer names the kept line ending: {answer}"
+        );
+    }
+
+    /// A new file is written as sent, and the answer says nothing of line
+    /// endings.
+    #[tokio::test]
+    async fn fs_write_of_a_new_file_writes_the_content_as_sent() {
+        let fixture = edit_fixture("README.md", b"# Examples\r\n").await;
+
+        let (written, answer) = fixture.write("notes/new.txt", "one\ntwo\n").await;
+
+        assert_eq!(written, b"one\ntwo\n");
+        assert!(answer.get("message").is_none(), "{answer}");
+    }
+
+    /// A write over a file with mixed line endings is written as sent.
+    #[tokio::test]
+    async fn fs_write_over_a_mixed_ending_file_writes_the_content_as_sent() {
+        let fixture = edit_fixture("mixed.txt", b"one\r\ntwo\nthree\r\n").await;
+
+        let (written, answer) = fixture.write("mixed.txt", "1\n2\n").await;
+
+        assert_eq!(written, b"1\n2\n");
+        assert!(answer.get("message").is_none(), "{answer}");
     }
 }
