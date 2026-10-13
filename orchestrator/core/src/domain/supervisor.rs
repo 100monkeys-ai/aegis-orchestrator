@@ -42,7 +42,9 @@
 use crate::domain::agent::DeclaredOutput;
 use crate::domain::execution::{ExecutionId, ExecutionInput, ProducedFile, TrajectoryStep};
 use crate::domain::repository::ExecutionRepository;
-use crate::domain::runtime::{AgentRuntime, InstanceId, RuntimeConfig, RuntimeError, TaskInput};
+use crate::domain::runtime::{
+    with_exit_code, AgentRuntime, InstanceId, RuntimeConfig, RuntimeError, TaskInput,
+};
 use crate::domain::validation::{
     JudgeFault, ValidationContext, ValidationPipeline, ValidationResults,
 };
@@ -1009,12 +1011,17 @@ fn execution_failure_cause(error: &RuntimeError) -> String {
         RuntimeError::TimedOut(seconds) => {
             format!("the last attempt ran past its time limit of {seconds} s and was stopped")
         }
-        RuntimeError::ExecutionFailedWithLogs { error, logs } => {
+        RuntimeError::ExecutionFailedWithLogs {
+            error,
+            logs,
+            exit_code,
+        } => {
             let tail = stderr_tail(logs);
+            let named = with_exit_code(error, *exit_code);
             if tail.is_empty() || tail == *error {
-                format!("the last attempt failed: {error}")
+                format!("the last attempt failed: {named}")
             } else {
-                format!("the last attempt failed: {error}; the end of its standard error:\n{tail}")
+                format!("the last attempt failed: {named}; the end of its standard error:\n{tail}")
             }
         }
         RuntimeError::ExecutionFailed(detail) => format!("the last attempt failed: {detail}"),
@@ -1497,6 +1504,7 @@ mod tests {
                     "[BOOTSTRAP DEBUG] agent_id=2c54df3e".to_string(),
                     "RuntimeError: the model call failed".to_string(),
                 ],
+                exit_code: None,
             }));
 
         let supervisor = Supervisor::new(runtime.clone());
@@ -2418,10 +2426,12 @@ mod tests {
                 "ModuleNotFoundError: No module named 'requests'".to_string(),
                 "[BOOTSTRAP DEBUG] exiting".to_string(),
             ],
+            exit_code: None,
         };
         let killed = RuntimeError::ExecutionFailedWithLogs {
             error: "Bootstrap script exited with code 137".to_string(),
             logs: vec!["[BOOTSTRAP DEBUG] execution_id=9ba643ba".to_string()],
+            exit_code: Some(137),
         };
         let mut complaints = Vec::new();
         for (last, expected) in [
@@ -2454,6 +2464,33 @@ mod tests {
             }
         }
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// A failed process whose exit code the runtime read is named by it in the
+    /// ending, after its error line.
+    #[tokio::test]
+    async fn past_max_retries_after_a_failed_process_the_ending_names_its_exit_code() {
+        let runtime = Arc::new(TestRuntime::new().with_spawn_success(2));
+        {
+            let mut results = runtime.execute_results.lock().await;
+            results.push(Err(RuntimeError::ExecutionFailed(
+                "the first attempt's error".to_string(),
+            )));
+            results.push(Err(RuntimeError::ExecutionFailedWithLogs {
+                error: "ValueError: the input is not a route".to_string(),
+                logs: vec!["ValueError: the input is not a route".to_string()],
+                exit_code: Some(2),
+            }));
+        }
+        let reason = final_error(runtime, create_test_config(), 2, None).await;
+        assert_eq!(
+            reason,
+            Ok(
+                "Max retries exceeded after 2 attempts; the last attempt failed: ValueError: \
+                 the input is not a route (exited with code 2)"
+                    .to_string()
+            )
+        );
     }
 
     /// Every attempt's validation errored, as when its judge ran out of time:
@@ -2548,6 +2585,7 @@ mod tests {
                 return Err(RuntimeError::ExecutionFailedWithLogs {
                     error: "RuntimeError: the model answered HTTP 503, code 3045".to_string(),
                     logs: vec![],
+                    exit_code: None,
                 });
             }
             Ok(TaskOutput {

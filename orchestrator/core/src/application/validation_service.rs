@@ -73,7 +73,7 @@
 use crate::application::agent::AgentLifecycleService;
 use crate::application::execution::ExecutionService;
 use crate::domain::agent::{AgentId, AgentManifest, ValidatorSpec};
-use crate::domain::execution::{ExecutionId, ExecutionInput, ExecutionStatus};
+use crate::domain::execution::{Execution, ExecutionId, ExecutionInput, ExecutionStatus};
 use crate::domain::goal::{
     judge_context_or_default, JudgeContext, JudgeContextSource, OverLimit,
     JUDGE_PROMPT_RESERVE_BYTES,
@@ -494,16 +494,42 @@ async fn run_judge_once(
                 return Ok(read_judge_verdict(run.judge_name, output_str));
             }
             ExecutionStatus::Failed | ExecutionStatus::Cancelled => {
-                return Err(anyhow!(
-                    "Judge '{}' execution failed or was cancelled",
-                    run.judge_name
-                ));
+                return Err(anyhow!(judge_ended_error(run.judge_name, &exec)));
             }
             _ => {
                 tokio::time::sleep(Duration::from_millis(run.poll_interval_ms)).await;
                 attempts += 1;
             }
         }
+    }
+}
+
+/// The sentence for a judge execution that ended `Failed` or `Cancelled`: its
+/// status and its own error verbatim after the judge's name, then the judge's
+/// execution id, so the failure text of the run it judged names the judge's
+/// cause. The error is the execution's `error`, or else its last iteration's.
+fn judge_ended_error(judge_name: &str, exec: &Execution) -> String {
+    let error = exec
+        .error
+        .as_deref()
+        .or_else(|| {
+            exec.iterations()
+                .last()
+                .and_then(|iteration| iteration.error.as_ref())
+                .map(|error| error.message.as_str())
+        })
+        .map(str::trim)
+        .filter(|error| !error.is_empty());
+    let id = exec.id;
+    match (&exec.status, error) {
+        (ExecutionStatus::Cancelled, None) => {
+            format!("Judge '{judge_name}' was cancelled (judge execution {id})")
+        }
+        (ExecutionStatus::Cancelled, Some(error)) => {
+            format!("Judge '{judge_name}' was cancelled: {error} (judge execution {id})")
+        }
+        (_, Some(error)) => format!("Judge '{judge_name}' failed: {error} (judge execution {id})"),
+        (_, None) => format!("Judge '{judge_name}' failed (judge execution {id})"),
     }
 }
 
@@ -1359,7 +1385,50 @@ pub(crate) fn program_checks_of(
 
 #[cfg(test)]
 mod tests {
-    use super::calculate_max_attempts;
+    use super::{calculate_max_attempts, judge_ended_error};
+    use crate::domain::agent::AgentId;
+    use crate::domain::execution::{Execution, ExecutionStatus};
+
+    /// A judge execution as the poll loop reads it once it has ended.
+    fn ended_judge(status: ExecutionStatus, error: Option<&str>) -> Execution {
+        let input =
+            serde_json::from_value(serde_json::json!({ "input": {} })).expect("a judge's input");
+        let mut exec = Execution::new(AgentId::new(), input, 1, "judge".to_string());
+        exec.status = status;
+        exec.error = error.map(str::to_string);
+        exec
+    }
+
+    /// A judge that failed names its own error and its execution id, so the
+    /// failure text of the run it judged carries the judge's cause.
+    #[test]
+    fn a_failed_judge_names_its_error_and_execution_id() {
+        let exec = ended_judge(ExecutionStatus::Failed, Some("model refused: token budget"));
+        let text = judge_ended_error("email-draft-judge", &exec);
+        assert_eq!(
+            text,
+            format!(
+                "Judge 'email-draft-judge' failed: model refused: token budget \
+                 (judge execution {})",
+                exec.id
+            )
+        );
+    }
+
+    /// A judge that was cancelled with no error stored says it was cancelled,
+    /// with its execution id.
+    #[test]
+    fn a_cancelled_judge_with_no_error_says_it_was_cancelled() {
+        let exec = ended_judge(ExecutionStatus::Cancelled, None);
+        let text = judge_ended_error("email-draft-judge", &exec);
+        assert_eq!(
+            text,
+            format!(
+                "Judge 'email-draft-judge' was cancelled (judge execution {})",
+                exec.id
+            )
+        );
+    }
 
     #[test]
     fn calculate_max_attempts_rejects_zero_poll_interval() {

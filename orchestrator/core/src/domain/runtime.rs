@@ -300,6 +300,18 @@ pub struct ToolCall {
     pub timestamp: DateTime<Utc>,
 }
 
+/// A failed process's error sentence with its exit code named after it,
+/// `<error> (exited with code <n>)`, unless the sentence already ends naming
+/// that code (the runtime's own exit sentence) or no code was read.
+pub fn with_exit_code(error: &str, exit_code: Option<i64>) -> String {
+    match exit_code {
+        Some(code) if !error.ends_with(&format!("exited with code {code}")) => {
+            format!("{error} (exited with code {code})")
+        }
+        _ => error.to_string(),
+    }
+}
+
 /// Errors returned by [`AgentRuntime`] implementations.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -312,10 +324,15 @@ pub enum RuntimeError {
     #[error("Failed to execute task: {0}")]
     ExecutionFailed(String),
     /// The agent process exited non-zero: `error` is the sentence a person
-    /// reads (the process's last error line, or the exit sentence), and `logs`
-    /// is its whole standard error, kept as the execution's logs.
-    #[error("Failed to execute task: {error}")]
-    ExecutionFailedWithLogs { error: String, logs: Vec<String> },
+    /// reads (the process's last error line, or the exit sentence), `logs`
+    /// is its whole standard error, kept as the execution's logs, and
+    /// `exit_code` is the process's exit code where the runtime read it.
+    #[error("Failed to execute task: {}", with_exit_code(.error, *.exit_code))]
+    ExecutionFailedWithLogs {
+        error: String,
+        logs: Vec<String>,
+        exit_code: Option<i64>,
+    },
     /// [`AgentRuntime::terminate`] could not stop or remove the instance.
     #[error("Failed to terminate instance: {0}")]
     TerminationFailed(String),

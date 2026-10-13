@@ -907,7 +907,11 @@ impl ContainerRuntime {
                 .find(|line| !line.trim_start().starts_with(BOOTSTRAP_DEBUG_PREFIX))
                 .map(|line| line.trim().to_string())
                 .unwrap_or_else(|| format!("Bootstrap script exited with code {exit_code}"));
-            Err(RuntimeError::ExecutionFailedWithLogs { error, logs })
+            Err(RuntimeError::ExecutionFailedWithLogs {
+                error,
+                logs,
+                exit_code: Some(exit_code),
+            })
         } else {
             let result = serde_json::Value::String(stdout_logs.join(""));
             Ok(TaskOutput {
@@ -2573,7 +2577,7 @@ mod tests {
         }
 
         match ContainerRuntime::bootstrap_exec_result(127, Vec::new(), Vec::new()) {
-            Err(super::RuntimeError::ExecutionFailedWithLogs { error, logs }) => {
+            Err(super::RuntimeError::ExecutionFailedWithLogs { error, logs, .. }) => {
                 assert_eq!(error, "Bootstrap script exited with code 127");
                 assert!(logs.is_empty());
             }
@@ -2600,7 +2604,8 @@ mod tests {
             Err(err @ super::RuntimeError::ExecutionFailedWithLogs { .. }) => {
                 assert_eq!(
                     err.to_string(),
-                    "Failed to execute task: RuntimeError: the model call failed"
+                    "Failed to execute task: RuntimeError: the model call failed \
+                     (exited with code 1)"
                 );
                 let super::RuntimeError::ExecutionFailedWithLogs { logs, .. } = err else {
                     unreachable!()
@@ -2628,7 +2633,7 @@ mod tests {
             vec!["[BOOTSTRAP DEBUG] a\n\n[BOOTSTRAP DEBUG] b\n".to_string()],
         );
         match result {
-            Err(super::RuntimeError::ExecutionFailedWithLogs { error, logs }) => {
+            Err(super::RuntimeError::ExecutionFailedWithLogs { error, logs, .. }) => {
                 assert_eq!(error, "Bootstrap script exited with code 2");
                 assert_eq!(
                     logs,
@@ -2636,6 +2641,27 @@ mod tests {
                         "[BOOTSTRAP DEBUG] a".to_string(),
                         "[BOOTSTRAP DEBUG] b".to_string()
                     ]
+                );
+            }
+            other => panic!("expected ExecutionFailedWithLogs, got {other:?}"),
+        }
+    }
+
+    /// A process that exited non-zero is named by its exit code in the failure
+    /// text, beside its error line, so the person reads the code first.
+    #[test]
+    fn bootstrap_failure_text_names_the_exit_code() {
+        let result = ContainerRuntime::bootstrap_exec_result(
+            2,
+            Vec::new(),
+            vec!["ValueError: the input is not a route\n".to_string()],
+        );
+        match result {
+            Err(err @ super::RuntimeError::ExecutionFailedWithLogs { .. }) => {
+                assert_eq!(
+                    err.to_string(),
+                    "Failed to execute task: ValueError: the input is not a route \
+                     (exited with code 2)"
                 );
             }
             other => panic!("expected ExecutionFailedWithLogs, got {other:?}"),
