@@ -54,6 +54,8 @@ impl DispatchEncoder {
         args: &Value,
         env_denylist: &[String],
     ) -> Result<DispatchAction, SealSessionError> {
+        refuse_arguments_not_taken(args)?;
+
         let command = match args.get("command") {
             Some(Value::String(s)) => s.clone(),
             None | Some(Value::Null) => {
@@ -100,6 +102,51 @@ impl DispatchEncoder {
             stdin,
         })
     }
+}
+
+/// The arguments `cmd.run` takes, in the order a refusal names them.
+const TAKEN_ARGUMENTS: &[&str] = &[
+    "command",
+    "args",
+    "cwd",
+    "env_additions",
+    "stdin",
+    "timeout_secs",
+    "max_output_bytes",
+];
+
+/// Refuse a call naming an argument `cmd.run` does not take, rather than
+/// drop it: a dropped `path` ran every command of the Forge run `7a237b3a`'s
+/// coder in `/workspace`, with nothing telling the model so.
+fn refuse_arguments_not_taken(args: &Value) -> Result<(), SealSessionError> {
+    let Value::Object(map) = args else {
+        return Ok(());
+    };
+    let mut not_taken: Vec<&str> = map
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !TAKEN_ARGUMENTS.contains(key))
+        .collect();
+    if not_taken.is_empty() {
+        return Ok(());
+    }
+    not_taken.sort_unstable();
+    let quoted: Vec<String> = not_taken.iter().map(|key| format!("'{key}'")).collect();
+    let (named, verb) = match quoted.as_slice() {
+        [one] => (one.clone(), "is not an argument"),
+        [rest @ .., last] => (
+            format!("{} and {last}", rest.join(", ")),
+            "are not arguments",
+        ),
+        [] => unreachable!("not_taken is not empty"),
+    };
+    let (taken_rest, taken_last) = TAKEN_ARGUMENTS.split_at(TAKEN_ARGUMENTS.len() - 1);
+    Err(SealSessionError::MalformedPayload(format!(
+        "cmd.run: {named} {verb} of cmd.run; its arguments are {} and {}, and the directory \
+         a command runs in is cwd (/workspace when absent)",
+        taken_rest.join(", "),
+        taken_last[0]
+    )))
 }
 
 /// The longest excerpt of a refused value quoted back in the error.
@@ -517,5 +564,46 @@ mod tests {
     fn command_that_is_not_a_string_is_refused_naming_command() {
         let msg = refusal(json!({"command": ["ls"]}));
         assert!(msg.contains("command"), "{msg}");
+    }
+
+    /// The Forge run `7a237b3a`'s coder (child `a02281f2`, 2026-10-13) sent
+    /// `path` for the directory to run in; it was dropped and every command
+    /// ran in `/workspace`. An argument `cmd.run` does not take is refused,
+    /// naming it and the arguments it takes, `cwd` among them.
+    #[test]
+    fn an_argument_cmd_run_does_not_take_is_refused_naming_cwd() {
+        let msg = refusal(json!({"command": "ls", "path": "/x"}));
+        assert_eq!(
+            msg,
+            "cmd.run: 'path' is not an argument of cmd.run; its arguments are command, args, \
+             cwd, env_additions, stdin, timeout_secs and max_output_bytes, and the directory \
+             a command runs in is cwd (/workspace when absent)"
+        );
+    }
+
+    /// Every argument it does not take is named, in order, once.
+    #[test]
+    fn several_arguments_cmd_run_does_not_take_are_each_named() {
+        let msg = refusal(json!({"command": "ls", "workdir": "/x", "path": "/y", "cwd": "/z"}));
+        assert!(
+            msg.starts_with("cmd.run: 'path' and 'workdir' are not arguments of cmd.run; "),
+            "{msg}"
+        );
+    }
+
+    /// Each argument it takes, given together, is still accepted.
+    #[test]
+    fn every_argument_cmd_run_takes_is_accepted_together() {
+        let exec = encode_ok(json!({
+            "command": "cat",
+            "args": ["-"],
+            "cwd": "/workspace/app",
+            "env_additions": {"RUST_LOG": "debug"},
+            "stdin": "x",
+            "timeout_secs": 5,
+            "max_output_bytes": 10
+        }));
+        assert_eq!(exec.cwd, "/workspace/app");
+        assert_eq!(exec.stdin.as_deref(), Some("x"));
     }
 }
