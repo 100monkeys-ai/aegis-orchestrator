@@ -490,6 +490,52 @@ pub trait WorkflowExecutionRepository: Send + Sync {
         &self,
         id: ExecutionId,
     ) -> Result<Option<TenantId>, RepositoryError>;
+
+    /// The tenant's running workflow executions, each with the latest event
+    /// of its audit trail (the highest sequence number), or `None` before its
+    /// first. A workflow execution's trail holds the Temporal listener's
+    /// workflow events only, so the latest event is its latest workflow
+    /// event. Read-only.
+    ///
+    /// The default implementation reads each running execution's trail page
+    /// by page; the Postgres repository answers in two queries.
+    async fn find_running_with_latest_event_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<
+        Vec<(
+            crate::domain::workflow::WorkflowExecution,
+            Option<crate::domain::workflow::WorkflowExecutionEventRecord>,
+        )>,
+        RepositoryError,
+    > {
+        const PAGE: usize = 500;
+        let mut listed = Vec::new();
+        for execution in self.find_active_for_tenant(tenant_id).await? {
+            let mut latest: Option<crate::domain::workflow::WorkflowExecutionEventRecord> = None;
+            let mut offset = 0;
+            loop {
+                let page = self
+                    .find_events_by_execution(execution.id, PAGE, offset)
+                    .await?;
+                let read = page.len();
+                for event in page {
+                    if latest
+                        .as_ref()
+                        .is_none_or(|held| event.sequence > held.sequence)
+                    {
+                        latest = Some(event);
+                    }
+                }
+                if read < PAGE {
+                    break;
+                }
+                offset += read;
+            }
+            listed.push((execution, latest));
+        }
+        Ok(listed)
+    }
 }
 
 /// Repository interface for Volume aggregates

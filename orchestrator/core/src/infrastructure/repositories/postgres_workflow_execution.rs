@@ -580,6 +580,64 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
         Ok(records)
     }
 
+    async fn find_running_with_latest_event_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<
+        Vec<(
+            WorkflowExecution,
+            Option<crate::domain::workflow::WorkflowExecutionEventRecord>,
+        )>,
+        RepositoryError,
+    > {
+        let executions = self.find_active_for_tenant(tenant_id).await?;
+        if executions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<uuid::Uuid> = executions.iter().map(|execution| execution.id.0).collect();
+        let rows = sqlx::query(
+            r#"
+            SELECT DISTINCT ON (execution_id)
+                execution_id, sequence_number, event_type, event_payload,
+                iteration_number, created_at
+            FROM execution_events
+            WHERE execution_id = ANY($1)
+            ORDER BY execution_id, sequence_number DESC
+            "#,
+        )
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| {
+            RepositoryError::Database(format!("Failed to query latest execution events: {e}"))
+        })?;
+
+        let mut latest: HashMap<uuid::Uuid, crate::domain::workflow::WorkflowExecutionEventRecord> =
+            HashMap::new();
+        for row in rows {
+            let execution_id: uuid::Uuid = row.get("execution_id");
+            let iteration_number: Option<i16> = row.get("iteration_number");
+            latest.insert(
+                execution_id,
+                crate::domain::workflow::WorkflowExecutionEventRecord {
+                    sequence: row.get("sequence_number"),
+                    event_type: row.get("event_type"),
+                    state_name: None,
+                    iteration_number: iteration_number.map(|n| n as u8),
+                    payload: row.get("event_payload"),
+                    recorded_at: row.get("created_at"),
+                },
+            );
+        }
+        Ok(executions
+            .into_iter()
+            .map(|execution| {
+                let event = latest.remove(&execution.id.0);
+                (execution, event)
+            })
+            .collect())
+    }
+
     async fn count_by_workflow_for_tenant(
         &self,
         tenant_id: &TenantId,

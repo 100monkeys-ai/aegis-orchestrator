@@ -91,6 +91,7 @@ use crate::daemon::handlers::workflow_executions::{
     list_workflow_executions_handler, remove_workflow_execution_handler,
     signal_workflow_execution_handler, stream_workflow_logs_handler,
 };
+use crate::daemon::handlers::workflow_gates::{workflow_gates_router, WorkflowGatesState};
 use crate::daemon::handlers::workflows::{
     delete_workflow_handler, execute_temporal_workflow_handler, get_workflow_handler,
     list_workflow_versions_handler, list_workflows_handler, register_temporal_workflow_handler,
@@ -402,6 +403,14 @@ pub(crate) fn create_router(
     let router = router.merge(tool_approvals_router(ToolApprovalsState {
         service: app_state.tool_invocation_service.tool_approvals(),
         runner: app_state.tool_invocation_service.clone(),
+    }));
+
+    // The Human gates a person's running workflow executions wait on, over
+    // their own narrow state: the executions with their event trails, and
+    // the workflows for each gate's name.
+    let router = router.merge(workflow_gates_router(WorkflowGatesState {
+        executions: app_state.workflow_execution_repo.clone(),
+        workflows: app_state.workflow_repo.clone(),
     }));
 
     // Schedules (AEGIS ADR-139 N10) and the worker's fire route (N6), over

@@ -38,6 +38,7 @@ pub(crate) mod test_support;
 pub(crate) mod tool_approvals;
 pub(crate) mod volumes;
 pub(crate) mod workflow_executions;
+pub(crate) mod workflow_gates;
 pub(crate) mod workflows;
 
 /// Default maximum number of executions that can be returned by a single

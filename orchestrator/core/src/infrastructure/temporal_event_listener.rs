@@ -241,6 +241,15 @@ pub struct TemporalEventPayload {
     #[serde(default)]
     pub default_response: Option<String>,
 
+    /// The words the gate takes, in the order the gate gives them; empty for
+    /// a gate that takes any answer (HumanInputRequested)
+    #[serde(default)]
+    pub responses: Vec<String>,
+
+    /// When the gate stops waiting, as an RFC 3339 time (HumanInputRequested)
+    #[serde(default)]
+    pub expires_at: Option<String>,
+
     /// Event timestamp
     pub timestamp: String,
 }
@@ -602,11 +611,25 @@ impl TemporalEventMapper {
                     .clone()
                     .ok_or_else(|| anyhow!("prompt required for HumanInputRequested event"))?;
 
+                let expires_at = payload
+                    .expires_at
+                    .as_deref()
+                    .map(|text| {
+                        DateTime::parse_from_rfc3339(text)
+                            .map(|time| time.with_timezone(&Utc))
+                            .with_context(|| {
+                                format!("expires_at of HumanInputRequested is not an RFC 3339 time: {text}")
+                            })
+                    })
+                    .transpose()?;
+
                 Ok(WorkflowEvent::WorkflowHumanInputRequested {
                     execution_id,
                     state_name: payload.state_name.clone(),
                     prompt,
                     default_response: payload.default_response.clone(),
+                    responses: payload.responses.clone(),
+                    expires_at,
                     requested_at: timestamp,
                 })
             }
@@ -1965,6 +1988,8 @@ mod tests {
             json!({
                 "prompt": "Approve the requirements for the add command?",
                 "default_response": "reject",
+                "responses": ["yes", "no"],
+                "expires_at": "2026-10-04T07:00:00.000Z",
             }),
         );
 
@@ -1974,6 +1999,8 @@ mod tests {
             state_name,
             prompt,
             default_response,
+            responses,
+            expires_at,
             requested_at,
         } = event
         else {
@@ -1983,6 +2010,11 @@ mod tests {
         assert_eq!(state_name, None);
         assert_eq!(prompt, "Approve the requirements for the add command?");
         assert_eq!(default_response.as_deref(), Some("reject"));
+        assert_eq!(responses, vec!["yes".to_string(), "no".to_string()]);
+        assert_eq!(
+            expires_at.map(|time| time.to_rfc3339()).as_deref(),
+            Some("2026-10-04T07:00:00+00:00")
+        );
         assert_eq!(requested_at.to_rfc3339(), "2026-10-04T06:00:00+00:00");
     }
 

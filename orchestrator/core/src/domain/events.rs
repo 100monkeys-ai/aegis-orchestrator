@@ -704,13 +704,19 @@ pub enum WorkflowEvent {
     },
     /// A Human state posed its gate: the worker waits for the person's
     /// response. `prompt` is the gate's question rendered against the
-    /// blackboard; `default_response` is what the gate answers on timeout.
+    /// blackboard; `default_response` is what the gate answers on timeout;
+    /// `responses` are the words the gate takes, in its order (empty when it
+    /// takes any answer); `expires_at` is when it stops waiting.
     /// Informational: it moves no execution state.
     WorkflowHumanInputRequested {
         execution_id: ExecutionId,
         state_name: Option<String>,
         prompt: String,
         default_response: Option<String>,
+        #[serde(default)]
+        responses: Vec<String>,
+        #[serde(default)]
+        expires_at: Option<DateTime<Utc>>,
         requested_at: DateTime<Utc>,
     },
     WorkflowStateExited {
