@@ -723,10 +723,16 @@ pub enum WorkflowEvent {
         expires_at: Option<DateTime<Utc>>,
         requested_at: DateTime<Utc>,
     },
+    /// A state was left. For a Human state, `output` carries the gate's
+    /// answer, and `answered_by` names who answered (a person's sub, a
+    /// service account's client id), read from the output's `answered_by`;
+    /// `None` when the worker recorded no answerer.
     WorkflowStateExited {
         execution_id: ExecutionId,
         state_name: String,
         output: serde_json::Value,
+        #[serde(default)]
+        answered_by: Option<String>,
         exited_at: DateTime<Utc>,
     },
     WorkflowIterationStarted {

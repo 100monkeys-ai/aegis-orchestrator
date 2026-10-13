@@ -3,10 +3,11 @@
 //! # A person's feedback reaches the paused workflow
 //!
 //! AEGIS ADR-141 F4 and F11: a person answers a Human gate with
-//! `aegis.workflow.signal`, `yes` or `no`, with feedback. The worker reads
-//! the `humanInput` signal as `(response, feedback?)`, so the feedback goes
-//! as a second `json/plain` payload after the response, and a signal with no
-//! feedback is the response alone. The call runs through the tool service
+//! `aegis.workflow.signal`, `yes` or `no`, with feedback. The signal is
+//! three positional `json/plain` payloads, `[response, feedback or null,
+//! answered_by or null]`: the feedback goes second, `null` when there is
+//! none, and who answered third (`null` here: the run acts for nobody). The
+//! call runs through the tool service
 //! and a port wrapping the real `TemporalClient`, against a loopback
 //! stand-in for Temporal's `SignalWorkflowExecution` that keeps every
 //! request it was sent. The HTTP route sends through the same
@@ -14,8 +15,8 @@
 //!
 //! | Scenario | Test |
 //! |---|---|
-//! | With feedback, two payloads | `a_signal_with_feedback_sends_the_feedback_as_a_second_payload` |
-//! | Without feedback, one payload | `a_signal_without_feedback_sends_the_response_alone` |
+//! | With feedback, the feedback second | `a_signal_with_feedback_sends_the_feedback_as_a_second_payload` |
+//! | Without feedback, `null` second | `a_signal_without_feedback_sends_the_response_alone` |
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -147,9 +148,15 @@ impl WorkflowExecutionControlPort for ClientPort {
         execution_id: ExecutionId,
         response: &str,
         feedback: Option<&str>,
+        answered_by: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.0
-            .send_human_signal(&execution_id.0.to_string(), response.to_string(), feedback)
+            .send_human_signal(
+                &execution_id.0.to_string(),
+                response.to_string(),
+                feedback,
+                answered_by,
+            )
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })
     }
@@ -293,8 +300,8 @@ impl Harness {
 }
 
 /// F4 and F11: "no, with feedback" sends the response, then the feedback,
-/// each JSON-encoded as `json/plain`, as the worker's
-/// `defineSignal<[string, string?]>("humanInput")` reads them.
+/// then who answered (`null`: the run acts for nobody), each JSON-encoded as
+/// `json/plain`, as the worker's `humanInput` signal reads them.
 #[tokio::test]
 async fn a_signal_with_feedback_sends_the_feedback_as_a_second_payload() {
     let h = harness().await;
@@ -317,11 +324,13 @@ async fn a_signal_with_feedback_sends_the_feedback_as_a_second_payload() {
                 "json/plain".to_string(),
                 serde_json::to_vec("their words").unwrap()
             ),
+            ("json/plain".to_string(), b"null".to_vec()),
         ]],
     );
 }
 
-/// A signal with no feedback is the response alone, as before.
+/// A signal with no feedback carries `null` in the feedback's place, and
+/// `null` for who answered.
 #[tokio::test]
 async fn a_signal_without_feedback_sends_the_response_alone() {
     let h = harness().await;
@@ -334,10 +343,11 @@ async fn a_signal_without_feedback_sends_the_response_alone() {
     assert_eq!(answer["signalled"], json!(true), "{answer}");
     assert_eq!(
         h.payloads(),
-        vec![vec![(
-            "json/plain".to_string(),
-            serde_json::to_vec("yes").unwrap()
-        )]],
+        vec![vec![
+            ("json/plain".to_string(), serde_json::to_vec("yes").unwrap()),
+            ("json/plain".to_string(), b"null".to_vec()),
+            ("json/plain".to_string(), b"null".to_vec()),
+        ]],
     );
 }
 

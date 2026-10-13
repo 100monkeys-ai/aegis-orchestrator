@@ -18,7 +18,7 @@ use aegis_orchestrator_core::application::goal_service::{
 };
 use aegis_orchestrator_core::domain::events::WorkflowEvent;
 use aegis_orchestrator_core::domain::execution::ExecutionId;
-use aegis_orchestrator_core::domain::iam::UserIdentity;
+use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity};
 use aegis_orchestrator_core::domain::node_config::{resolve_env_value, NodeConfigManifest};
 use aegis_orchestrator_core::domain::repository::WorkflowExecutionRepository;
 use aegis_orchestrator_core::domain::tenant::TenantId;
@@ -671,7 +671,19 @@ pub(crate) struct WorkflowSignalRequest {
     feedback: Option<String>,
 }
 
+/// Who answers a gate through the signal route: a person's sub, or a
+/// service account's client id; `None` when the request names nobody.
+pub(crate) fn signal_answerer(identity: Option<&UserIdentity>) -> Option<String> {
+    identity.map(|identity| match &identity.identity_kind {
+        IdentityKind::ServiceAccount { client_id } => client_id.clone(),
+        _ => identity.sub.clone(),
+    })
+}
+
 /// POST /v1/workflows/executions/:execution_id/signal
+///
+/// The Temporal signal names the caller as `answered_by` (see
+/// [`signal_answerer`]), beside the response and feedback.
 pub(crate) async fn signal_workflow_execution_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
@@ -732,8 +744,14 @@ pub(crate) async fn signal_workflow_execution_handler(
     };
     drop(guard);
 
+    let answered_by = signal_answerer(identity.as_ref().map(|identity| &identity.0));
     match client
-        .send_human_signal(&execution_id, request.response, request.feedback.as_deref())
+        .send_human_signal(
+            &execution_id,
+            request.response,
+            request.feedback.as_deref(),
+            answered_by.as_deref(),
+        )
         .await
     {
         Ok(()) => Ok((
@@ -754,7 +772,54 @@ pub(crate) async fn signal_workflow_execution_handler(
 
 #[cfg(test)]
 mod signal_request_tests {
-    use super::WorkflowSignalRequest;
+    use super::{signal_answerer, WorkflowSignalRequest};
+    use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity, ZaruTier};
+    use aegis_orchestrator_core::domain::tenant::TenantId;
+
+    fn identity(sub: &str, identity_kind: IdentityKind) -> UserIdentity {
+        UserIdentity {
+            sub: sub.to_string(),
+            realm_slug: "zaru-consumer".to_string(),
+            email: None,
+            email_verified: false,
+            name: None,
+            identity_kind,
+        }
+    }
+
+    /// The route's Temporal signal names the person who answered by the sub
+    /// of their token.
+    #[test]
+    fn the_signal_names_the_person_by_their_sub() {
+        let person = identity(
+            "person-sub",
+            IdentityKind::ConsumerUser {
+                zaru_tier: ZaruTier::Free,
+                tenant_id: TenantId::for_consumer_user("person-sub").unwrap(),
+            },
+        );
+        assert_eq!(
+            signal_answerer(Some(&person)).as_deref(),
+            Some("person-sub")
+        );
+    }
+
+    /// A service account answers as its client id; a request with no
+    /// identity names nobody.
+    #[test]
+    fn the_signal_names_a_service_account_by_its_client_id_and_nobody_otherwise() {
+        let service_account = identity(
+            "service-account-sub",
+            IdentityKind::ServiceAccount {
+                client_id: "the-client".to_string(),
+            },
+        );
+        assert_eq!(
+            signal_answerer(Some(&service_account)).as_deref(),
+            Some("the-client")
+        );
+        assert_eq!(signal_answerer(None), None);
+    }
 
     /// The person's feedback travels with the response, read by the workflow
     /// as `{{human.feedback}}`.

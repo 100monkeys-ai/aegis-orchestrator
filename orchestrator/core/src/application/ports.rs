@@ -207,6 +207,7 @@ pub trait WorkflowExecutionControlPort: Send + Sync {
         execution_id: crate::domain::execution::ExecutionId,
         response: &str,
         feedback: Option<&str>,
+        answered_by: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     async fn remove_workflow_execution(

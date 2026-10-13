@@ -242,10 +242,12 @@ impl TemporalClient {
     ///
     /// Workflows using `StateKind::Human` call `defineSignal('humanInput')` and
     /// `await condition(...)` — they resume only when this signal arrives.
-    /// The `response` string is JSON-encoded and forwarded as the signal's first
-    /// payload; the person's `feedback`, when there is one, follows it as a
-    /// second JSON-encoded payload, read by the worker's
-    /// `defineSignal<[string, string?]>('humanInput')` as `{{human.feedback}}`.
+    /// The signal carries three positional `json/plain` payloads:
+    /// `[response, feedback or null, answered_by or null]`. The `response` is
+    /// the gate's answer; the person's `feedback` is read by the worker as
+    /// `{{human.feedback}}`; `answered_by` names who answered (a person's sub,
+    /// a service account's client id), which the worker echoes on the Human
+    /// state's `WorkflowStateExited`.
     ///
     /// # gRPC Endpoint
     ///
@@ -256,23 +258,27 @@ impl TemporalClient {
         execution_id: &str,
         response: String,
         feedback: Option<&str>,
+        answered_by: Option<&str>,
     ) -> Result<()> {
         use crate::infrastructure::temporal_proto::temporal::api::common::v1::WorkflowExecution;
         use crate::infrastructure::temporal_proto::temporal::api::workflowservice::v1::SignalWorkflowExecutionRequest;
 
-        let json_payload = |value: &str| -> Result<Payload> {
+        // A missing value is sent as JSON `null`, so each argument keeps its
+        // position.
+        let json_payload = |value: Option<&str>| -> Result<Payload> {
             let mut metadata = HashMap::new();
             metadata.insert("encoding".to_string(), "json/plain".as_bytes().to_vec());
             Ok(Payload {
                 metadata,
-                data: serde_json::to_vec(value)?,
+                data: serde_json::to_vec(&value)?,
                 ..Default::default()
             })
         };
-        let mut payloads = vec![json_payload(&response)?];
-        if let Some(feedback) = feedback {
-            payloads.push(json_payload(feedback)?);
-        }
+        let payloads = vec![
+            json_payload(Some(&response))?,
+            json_payload(feedback)?,
+            json_payload(answered_by)?,
+        ];
 
         let request = SignalWorkflowExecutionRequest {
             namespace: self.namespace.clone(),

@@ -225,6 +225,7 @@ impl aegis_orchestrator_core::application::ports::WorkflowExecutionControlPort
         execution_id: aegis_orchestrator_core::domain::execution::ExecutionId,
         response: &str,
         feedback: Option<&str>,
+        answered_by: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let guard = self.temporal_client_container.read().await;
         let client = guard
@@ -235,7 +236,12 @@ impl aegis_orchestrator_core::application::ports::WorkflowExecutionControlPort
             .clone();
         drop(guard);
         client
-            .send_human_signal(&execution_id.0.to_string(), response.to_string(), feedback)
+            .send_human_signal(
+                &execution_id.0.to_string(),
+                response.to_string(),
+                feedback,
+                answered_by,
+            )
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
         Ok(())

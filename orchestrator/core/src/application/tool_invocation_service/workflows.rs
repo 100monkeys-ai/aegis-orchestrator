@@ -864,9 +864,13 @@ impl ToolInvocationService {
     }
 
     /// Handler for `aegis.workflow.signal` — sends human input to a paused workflow.
+    ///
+    /// The signal names who answered as `answered_by`: the person's sub, or a
+    /// service account's client id; none when the call acts for nobody.
     pub(super) async fn invoke_aegis_workflow_signal_tool(
         &self,
         args: &mut Value,
+        caller_identity: Option<&crate::domain::iam::UserIdentity>,
         scope: &crate::domain::iam::TenantScope,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         // ADR-097: signal injection is more dangerous than read — without the
@@ -938,8 +942,15 @@ impl ToolInvocationService {
             }
         };
 
+        let answered_by = signal_answerer(caller_identity);
         match port
-            .signal_workflow_execution(&tenant_id, exec_id, &response, feedback.as_deref())
+            .signal_workflow_execution(
+                &tenant_id,
+                exec_id,
+                &response,
+                feedback.as_deref(),
+                answered_by.as_deref(),
+            )
             .await
         {
             Ok(()) => Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -2087,4 +2098,13 @@ mod workflow_log_page_tests {
         assert_eq!(page.events.len(), 200);
         assert!(page.has_more);
     }
+}
+
+/// Who answers a gate through `aegis.workflow.signal`: a person's sub, or a
+/// service account's client id; `None` when the call acts for nobody.
+fn signal_answerer(identity: Option<&crate::domain::iam::UserIdentity>) -> Option<String> {
+    identity.map(|identity| match &identity.identity_kind {
+        crate::domain::iam::IdentityKind::ServiceAccount { client_id } => client_id.clone(),
+        _ => identity.sub.clone(),
+    })
 }

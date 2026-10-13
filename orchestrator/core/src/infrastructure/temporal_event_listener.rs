@@ -338,11 +338,17 @@ impl TemporalEventMapper {
                     .output
                     .clone()
                     .ok_or_else(|| anyhow!("output required for WorkflowStateExited event"))?;
+                // A Human state's output names who answered its gate.
+                let answered_by = output
+                    .get("answered_by")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
 
                 Ok(WorkflowEvent::WorkflowStateExited {
                     execution_id,
                     state_name,
                     output,
+                    answered_by,
                     exited_at: timestamp,
                 })
             }
@@ -1969,6 +1975,58 @@ mod tests {
             receiver.recv().await.unwrap(),
             DomainEvent::Workflow(WorkflowEvent::WorkflowStateEntered { .. })
         ));
+    }
+
+    /// A Human state's exit carries who answered inside its `output`, beside
+    /// `response`, `feedback` and `timeout`; the mapped event names them in
+    /// `answered_by` and keeps the output whole.
+    #[test]
+    fn a_gate_exit_names_who_answered() {
+        let workflow = build_test_workflow("listener-gate-answerer");
+        let execution_id = ExecutionId::new();
+        let output = json!({
+            "response": "yes",
+            "timeout": false,
+            "answered_by": "person-sub",
+        });
+        let payload = worker_payload(
+            execution_id,
+            &workflow,
+            9,
+            "WorkflowStateExited",
+            json!({"state_name": "AWAIT_APPROVAL", "output": output}),
+        );
+
+        let event = TemporalEventMapper::to_domain_event(&payload).unwrap();
+        let WorkflowEvent::WorkflowStateExited {
+            output: mapped_output,
+            answered_by,
+            ..
+        } = event
+        else {
+            panic!("expected WorkflowStateExited, got {event:?}");
+        };
+        assert_eq!(answered_by.as_deref(), Some("person-sub"));
+        assert_eq!(mapped_output, output);
+    }
+
+    /// A state's exit that names no answerer maps to `answered_by: None`.
+    #[test]
+    fn a_state_exit_without_an_answerer_names_none() {
+        let workflow = build_test_workflow("listener-no-answerer");
+        let payload = worker_payload(
+            ExecutionId::new(),
+            &workflow,
+            9,
+            "WorkflowStateExited",
+            json!({"state_name": "AWAIT_APPROVAL", "output": {"response": "yes", "timeout": false}}),
+        );
+
+        let event = TemporalEventMapper::to_domain_event(&payload).unwrap();
+        let WorkflowEvent::WorkflowStateExited { answered_by, .. } = event else {
+            panic!("expected WorkflowStateExited, got {event:?}");
+        };
+        assert_eq!(answered_by, None);
     }
 
     /// The worker's Human state emits HumanInputRequested with the gate's

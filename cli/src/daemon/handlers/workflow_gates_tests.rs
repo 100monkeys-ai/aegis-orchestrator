@@ -515,6 +515,7 @@ async fn world(
                             "response": "no",
                             "feedback": "Narrow the scope.",
                             "timeout": false,
+                            "answered_by": OWNER,
                         },
                     }),
                 ),
@@ -864,7 +865,8 @@ fn answered_yes_view(world: &World) -> Value {
 }
 
 /// An answered gate is listed under `answered` with the word chosen, when,
-/// the feedback, and whether the run went on or ended; newest first.
+/// the feedback, who answered when the gate's exit names them (`null`
+/// otherwise), and whether the run went on or ended; newest first.
 #[tokio::test]
 async fn an_answered_gate_is_listed_with_its_word_and_time() {
     let world = in_memory_world().await;
@@ -885,7 +887,7 @@ async fn an_answered_gate_is_listed_with_its_word_and_time() {
             "response": "no",
             "feedback": "Narrow the scope.",
             "answered_at": "2026-10-13T05:40:00+00:00",
-            "answered_by": null,
+            "answered_by": OWNER,
             "sequence": 2,
             "requested_at": "2026-10-13T05:30:00+00:00",
             "outcome": "ended",

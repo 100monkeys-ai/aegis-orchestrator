@@ -5210,7 +5210,7 @@ async fn aegis_workflow_signal_rejects_cross_tenant_args() {
     });
 
     let err = service
-        .invoke_aegis_workflow_signal_tool(&mut args, &scope)
+        .invoke_aegis_workflow_signal_tool(&mut args, None, &scope)
         .await
         .expect_err("cross-tenant request must be rejected");
 
@@ -5218,6 +5218,106 @@ async fn aegis_workflow_signal_rejects_cross_tenant_args() {
         matches!(err, SealSessionError::TenantMismatch { .. }),
         "expected TenantMismatch, got {err:?}"
     );
+}
+
+/// Records each signal's `(response, feedback, answered_by)`, as the
+/// daemon's port would forward it.
+#[derive(Default)]
+struct RecordedSignals(std::sync::Mutex<Vec<(String, Option<String>, Option<String>)>>);
+
+#[async_trait]
+impl crate::application::ports::WorkflowExecutionControlPort for RecordedSignals {
+    async fn cancel_workflow_execution(
+        &self,
+        _: &TenantId,
+        _: ExecutionId,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err("not exercised".into())
+    }
+    async fn signal_workflow_execution(
+        &self,
+        _: &TenantId,
+        _: ExecutionId,
+        response: &str,
+        feedback: Option<&str>,
+        answered_by: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.0.lock().unwrap().push((
+            response.to_string(),
+            feedback.map(str::to_string),
+            answered_by.map(str::to_string),
+        ));
+        Ok(())
+    }
+    async fn remove_workflow_execution(
+        &self,
+        _: &TenantId,
+        _: ExecutionId,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err("not exercised".into())
+    }
+}
+
+/// A gate answered through `aegis.workflow.signal` names who answered: the
+/// person's sub, a service account's client id, or nobody.
+#[tokio::test]
+async fn aegis_workflow_signal_names_who_answered() {
+    let tenant = TenantId::for_consumer_user("user-a-sub").unwrap();
+    let person = crate::domain::iam::UserIdentity {
+        sub: "user-a-sub".to_string(),
+        realm_slug: "zaru-consumer".to_string(),
+        email: None,
+        email_verified: false,
+        name: None,
+        identity_kind: crate::domain::iam::IdentityKind::ConsumerUser {
+            zaru_tier: crate::domain::iam::ZaruTier::Free,
+            tenant_id: tenant.clone(),
+        },
+    };
+    let service_account = crate::domain::iam::UserIdentity {
+        sub: "service-account-sub".to_string(),
+        realm_slug: "aegis-system".to_string(),
+        email: None,
+        email_verified: false,
+        name: None,
+        identity_kind: crate::domain::iam::IdentityKind::ServiceAccount {
+            client_id: "the-client".to_string(),
+        },
+    };
+    for (identity, expected) in [
+        (Some(&person), Some("user-a-sub")),
+        (Some(&service_account), Some("the-client")),
+        (None, None),
+    ] {
+        let signals = Arc::new(RecordedSignals::default());
+        let service = build_minimal_tool_invocation_service()
+            .with_workflow_execution_control(signals.clone());
+        let scope = consumer_tenant_scope(tenant.clone());
+        let mut args = serde_json::json!({
+            "execution_id": uuid::Uuid::new_v4().to_string(),
+            "response": "yes",
+            "feedback": "their words",
+        });
+
+        let answer = service
+            .invoke_aegis_workflow_signal_tool(&mut args, identity, &scope)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(&answer, ToolInvocationResult::Direct(value) if value["signalled"] == serde_json::json!(true)),
+            "the signal was not sent: {answer:?}"
+        );
+        assert_eq!(
+            *signals.0.lock().unwrap(),
+            vec![(
+                "yes".to_string(),
+                Some("their words".to_string()),
+                expected.map(str::to_string),
+            )],
+            "the signal does not name its answerer as {expected:?}"
+        );
+    }
 }
 
 #[tokio::test]

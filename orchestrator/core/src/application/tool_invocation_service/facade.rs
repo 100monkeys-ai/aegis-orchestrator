@@ -2826,7 +2826,7 @@ impl ToolInvocationService {
                     .await,
             ),
             "aegis.workflow.signal" => Some(
-                self.invoke_aegis_workflow_signal_tool(args, tenant_scope)
+                self.invoke_aegis_workflow_signal_tool(args, caller_identity, tenant_scope)
                     .await,
             ),
             "aegis.workflow.remove" => Some(

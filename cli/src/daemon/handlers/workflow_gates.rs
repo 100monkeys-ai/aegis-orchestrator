@@ -25,8 +25,9 @@
 //! closed, its latest post's prompt and sequence, and `outcome`: `went_on`
 //! when the run entered another state after the answer, `ended` when the run
 //! ended on it, `timed_out` (with `response: null`) when it closed on its
-//! timeout. `answered_by` is the answerer's sub when the event carries it;
-//! the worker's events carry none today, so it is `null`. A gate the run
+//! timeout. `answered_by` is who answered (a person's sub, a service
+//! account's client id), read from the exit's `output.answered_by`, and
+//! `null` when the exit names nobody. A gate the run
 //! left without an answer recorded (it went on, ended or was cancelled with
 //! the gate open) is not listed. Newest first by `answered_at`, paged by
 //! `limit` (default 50, at most 200) and `offset`.
@@ -252,6 +253,7 @@ fn pending_gate(
 struct Closing<'a> {
     response: Option<&'a str>,
     feedback: Option<&'a str>,
+    answered_by: Option<&'a str>,
     state_name: Option<&'a str>,
     answered_at: DateTime<Utc>,
     outcome: &'static str,
@@ -278,8 +280,7 @@ fn answered_view(
             "response": closing.response,
             "feedback": closing.feedback,
             "answered_at": closing.answered_at.to_rfc3339(),
-            // The worker's events do not carry who answered.
-            "answered_by": Value::Null,
+            "answered_by": closing.answered_by,
             "sequence": gate.sequence,
             "requested_at": gate.requested_at.to_rfc3339(),
             "outcome": closing.outcome,
@@ -317,6 +318,7 @@ fn answered_gates(
             let Some(WorkflowEvent::WorkflowStateExited {
                 state_name,
                 output,
+                answered_by,
                 exited_at,
                 ..
             }) = read_event(execution, record)
@@ -329,6 +331,7 @@ fn answered_gates(
                 Closing {
                     response: None,
                     feedback: None,
+                    answered_by: None,
                     state_name: Some(&state_name),
                     answered_at: exited_at,
                     outcome: "timed_out",
@@ -346,6 +349,7 @@ fn answered_gates(
                 Closing {
                     response: Some(response),
                     feedback: output.get("feedback").and_then(Value::as_str),
+                    answered_by: answered_by.as_deref(),
                     state_name: Some(&state_name),
                     answered_at: exited_at,
                     outcome,
@@ -368,6 +372,7 @@ fn answered_gates(
                     let closing = Closing {
                         response: None,
                         feedback: None,
+                        answered_by: None,
                         state_name: None,
                         answered_at: failed_at,
                         outcome: "timed_out",
