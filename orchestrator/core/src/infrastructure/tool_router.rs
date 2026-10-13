@@ -134,7 +134,7 @@ pub const LAND_TOOL: &str = "aegis.git.land";
 /// truth — the daemon startup and every other consumer derives its data
 /// from this slice.
 const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
-    BuiltinToolDefinition::new("cmd.run", "Executes a shell command inside the agent's ephemeral container environment. Use this to build, run, or analyze code locally."),
+    BuiltinToolDefinition::new("cmd.run", "Runs a program inside the agent's container. `command` is the program, found on PATH; no shell runs unless you name one. `args` are that program's arguments: to run a shell line, use command \"sh\" and args [\"-c\", \"<line>\"]."),
     BuiltinToolDefinition::new("fs.read", "Read the contents of a file at the given POSIX path from the mounted Workspace volume.").skip_judge(),
     BuiltinToolDefinition::new("fs.write", "Write content to a file at the given POSIX path in the Workspace volume. Automatically creates missing parent directories."),
     BuiltinToolDefinition::new("fs.list", "List the contents of a directory in the Workspace volume.").skip_judge(),
@@ -546,12 +546,12 @@ impl ToolRouter {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "Command to execute"
+                    "description": "The program to run (found on PATH), not a shell line"
                 },
                 "args": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Arguments passed to the command, as an array of strings, such as [\"-c\", \"env\"]."
+                    "description": "Arguments passed to the command, as an array of strings, such as [\"-c\", \"echo ok\"] with command \"sh\"."
                 },
                 "env_additions": {
                     "type": "object",
@@ -3416,6 +3416,36 @@ mod tests {
             env_desc.contains("not a JSON string"),
             "env_additions description: {env_desc}"
         );
+    }
+
+    /// `cmd.run` says that `command` is a program found on PATH and that no
+    /// shell runs unless one is named: on Forge run `c0d37ca8` the coder,
+    /// told it "Executes a shell command", sent `command: "bash"` with
+    /// `args: ["tail", …]`, and every call exited 126.
+    #[test]
+    fn cmd_run_says_command_is_a_program_and_names_sh_for_a_shell_line() {
+        let mut complaints = Vec::new();
+        let description = BuiltinToolDefinition::lookup("cmd.run")
+            .expect("cmd.run is a builtin")
+            .description;
+        let expected = "Runs a program inside the agent's container. `command` is the program, found on PATH; no shell runs unless you name one. `args` are that program's arguments: to run a shell line, use command \"sh\" and args [\"-c\", \"<line>\"].";
+        if description != expected {
+            complaints.push(format!("cmd.run's description is {description:?}"));
+        }
+        let cmd_run = ToolRouter::schema_for_builtin("cmd.run");
+        let props = &cmd_run["properties"];
+        if props["command"]["description"] != "The program to run (found on PATH), not a shell line"
+        {
+            complaints.push(format!(
+                "command's description is {}",
+                props["command"]["description"]
+            ));
+        }
+        let args = props["args"]["description"].as_str().unwrap_or_default();
+        if !args.contains("[\"-c\", \"echo ok\"] with command \"sh\"") || args.contains("env") {
+            complaints.push(format!("args' description is {args:?}"));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
 
     /// AEGIS ADR-040, Update of 2026-10-06, R2: `cmd.run` declares `stdin`,

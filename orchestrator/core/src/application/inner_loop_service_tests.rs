@@ -2015,3 +2015,79 @@ async fn a_call_asked_for_after_the_executions_time_is_up_is_not_run() {
     }
     assert!(complaints.is_empty(), "{}", complaints.join("\n"));
 }
+
+/// The answer a `cmd.run` naming a shell as its program and a program as the
+/// shell's first argument gets in place of running.
+const SHELL_AS_COMMAND: &str = "[AEGIS] cmd.run was not run: \"bash tail\" would run tail as a shell script. To run the program tail, send command \"tail\" and its arguments as args; to run a shell line, send command \"sh\" and args [\"-c\", \"<line>\"].";
+
+/// On Forge run `c0d37ca8` the coder sent `command: "bash"` with
+/// `args: ["tail", …]`: bash read `tail` as a script and each call exited
+/// 126, "cannot execute binary file". Such a call is not run: its result is
+/// the sentence naming the call to send, the call is a `refused` step and
+/// event, and the model is called again in the same try.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shell_given_a_program_as_its_script_is_refused_with_the_call_to_send() {
+    let w = world(
+        agent("60s", 30),
+        vec![
+            run_command(json!({"command": "bash", "args": ["tail", "-c", "20", "x"]})),
+            answer("I will send tail itself"),
+        ],
+    )
+    .await;
+    w.records.update(w.execution_id, |e| {
+        e.start_iteration("count the ticks".to_string()).unwrap();
+    });
+    let outcome = w.generate().await;
+    let mut complaints = Vec::new();
+    match &outcome {
+        Ok(OrchestratorMessage::Final { content, .. }) if content == "I will send tail itself" => {}
+        other => complaints.push(format!(
+            "the try did not go on to the model's answer: {other:?}"
+        )),
+    }
+    let calls = w.model.calls.lock().unwrap().len();
+    if calls != 2 {
+        complaints.push(format!("the model was called {calls} times"));
+    } else {
+        let given = last_tool_message(&w.model.conversation(1));
+        if given != SHELL_AS_COMMAND {
+            complaints.push(format!("the refused call's result is {given:?}"));
+        }
+    }
+    let record = w.records.get(w.execution_id);
+    let steps = record.iterations[0].trajectory.clone().unwrap_or_default();
+    if steps.len() != 1 || steps[0].status != "refused" {
+        complaints.push(format!("the try's trajectory is {steps:?}"));
+    }
+    let dispatched = w.records.events_named("ToolDispatched");
+    if dispatched.len() != 1
+        || dispatched[0]["status"] != "refused"
+        || dispatched[0]["sentence"] != SHELL_AS_COMMAND
+    {
+        complaints.push(format!("the dispatch events are {dispatched:?}"));
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// A shell given a flag (`-c`) or a script (`./run.sh`), and a program sent
+/// as the command itself, are handed to the container as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shell_line_a_script_and_a_program_are_dispatched() {
+    let mut complaints = Vec::new();
+    for args in [
+        json!({"command": "bash", "args": ["-c", "echo ok"]}),
+        json!({"command": "bash", "args": ["./run.sh"]}),
+        json!({"command": "tail", "args": ["-c", "20", "x"]}),
+    ] {
+        let w = world(agent("60s", 30), vec![run_command(args.clone())]).await;
+        w.records.update(w.execution_id, |e| {
+            e.start_iteration("count the ticks".to_string()).unwrap();
+        });
+        match w.generate().await {
+            Ok(OrchestratorMessage::Dispatch { .. }) => {}
+            other => complaints.push(format!("{args} was answered {other:?}")),
+        }
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}

@@ -249,6 +249,34 @@ fn refused_by_security_context(e: &crate::domain::seal_session::SealSessionError
     }
 }
 
+/// The answer a `cmd.run` gets in place of running when its `command` is a
+/// shell (`sh`, `bash` or `dash`) and its first argument is neither a flag
+/// (`-c`, `-e`, …) nor a script (a path with `/`, or a name ending `.sh`):
+/// the shell would read that program as a script and fail. `None` for any
+/// other call, which runs as sent.
+fn shell_as_command_sentence(arguments: &Value) -> Option<String> {
+    let command = arguments.get("command")?.as_str()?;
+    if !matches!(command, "sh" | "bash" | "dash") {
+        return None;
+    }
+    let first = match arguments.get("args")? {
+        Value::Array(items) => items.first()?.as_str()?.to_string(),
+        Value::String(text) => serde_json::from_str::<Vec<String>>(text)
+            .ok()?
+            .into_iter()
+            .next()?,
+        _ => return None,
+    };
+    if first.starts_with('-') || first.contains('/') || first.ends_with(".sh") {
+        return None;
+    }
+    Some(format!(
+        "[AEGIS] cmd.run was not run: \"{command} {first}\" would run {first} as a shell \
+         script. To run the program {first}, send command \"{first}\" and its arguments as \
+         args; to run a shell line, send command \"sh\" and args [\"-c\", \"<line>\"]."
+    ))
+}
+
 /// Whether the try's tool calls so far meet `requirement`.
 /// The answer a call gets in place of running when the same call was run
 /// `runs` times in this try with the same answer (the repeated-call guard).
@@ -1131,6 +1159,45 @@ impl InnerLoopService {
                                             "execution context for '{execution_id_str}' not found in active_executions"
                                         ))?
                                 };
+
+                                // A shell named as the program with a program as its
+                                // first argument would read that program as a script
+                                // (Forge run c0d37ca8: `bash tail …`, exit 126). The
+                                // call is not run; its result names the call to send,
+                                // and the model goes on in the same try.
+                                if let Some(sentence) = (tool_call.name == "cmd.run")
+                                    .then(|| shell_as_command_sentence(&tool_call.arguments))
+                                    .flatten()
+                                {
+                                    let call_index = next_ctx.trajectory.len();
+                                    let mut step = step;
+                                    step.status = "refused".to_string();
+                                    step.error = Some(sentence.clone());
+                                    next_ctx.trajectory.push(step);
+                                    self.publish_dispatch(
+                                        execution_id_str,
+                                        &next_ctx,
+                                        call_index,
+                                        &tool_call,
+                                        "refused",
+                                        Some(sentence.clone()),
+                                        None,
+                                        None,
+                                    )
+                                    .await;
+                                    next_ctx.conversation.push(ConversationMessage {
+                                        role: "tool".to_string(),
+                                        content: sentence,
+                                        tool_call_id: Some(tool_call.id.clone()),
+                                        tool_calls: None,
+                                    });
+                                    self.persist_trajectory(execution_id_str, &next_ctx).await;
+                                    self.active_executions
+                                        .write()
+                                        .await
+                                        .insert(execution_id_str.to_string(), next_ctx);
+                                    continue;
+                                }
 
                                 // Concurrency gate: enforce max_concurrent from the matching Capability.
                                 if let Some(max) = self

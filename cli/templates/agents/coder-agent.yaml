@@ -41,7 +41,10 @@ spec:
       3. Run what you can with cmd.run to check your change.
       4. When your input carries a failed run of the suite, fix what its output
          names; when it carries a review below 0.95, fix every suggestion the
-         reports make.
+         reports make. If one test still fails after three of your attempts
+         and its assertion cannot be met by an implementation the design asks
+         for, stop and answer with the test's name, its assertion, and why it
+         cannot pass; do not change the test.
       5. Answer with every file you changed, what changed in each, and how the
          change meets each acceptance criterion. Commit nothing: the workflow
          commits.

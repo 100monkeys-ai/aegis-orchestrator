@@ -997,6 +997,46 @@ mod tests {
         );
     }
 
+    /// The tester tests only what an acceptance criterion names: on run
+    /// `c0d37ca8` it asserted `content.endswith('\\n')` on a text-mode read,
+    /// a final-newline test no criterion named and which cannot pass.
+    #[test]
+    fn the_tester_tests_only_what_a_criterion_names() {
+        const STEP: &str = "Write the tests that show each acceptance criterion met, in that layout and style, with fs.write and fs.edit, under the repository's path. Test only what an acceptance criterion names; never test formatting, whitespace or line endings that no criterion names. When a test reads a text file, read it the way the suite's own tests do, and never assert on an escaped sequence such as '\\\\n' where a newline is meant.";
+        let (_, yaml) = BUILTIN_AGENTS
+            .iter()
+            .find(|(name, _)| *name == "tester-agent")
+            .expect("tester-agent is a built-in agent");
+        let manifest: aegis_orchestrator_sdk::AgentManifest =
+            serde_yaml::from_str(yaml).expect("the tester template parses");
+        manifest.validate().expect("the tester template validates");
+        let instruction = folded_instruction(yaml);
+        assert!(
+            instruction.contains(&format!("2. {STEP}")),
+            "the tester's step 2 must read \"{STEP}\":\n{instruction}"
+        );
+    }
+
+    /// The coder stops on a test it cannot pass: on run `c0d37ca8` it spent
+    /// its 1800 s on the tester's final-newline test with no rule for
+    /// stopping.
+    #[test]
+    fn the_coder_stops_on_a_test_it_cannot_pass() {
+        const STEP: &str = "When your input carries a failed run of the suite, fix what its output names; when it carries a review below 0.95, fix every suggestion the reports make. If one test still fails after three of your attempts and its assertion cannot be met by an implementation the design asks for, stop and answer with the test's name, its assertion, and why it cannot pass; do not change the test.";
+        let (_, yaml) = BUILTIN_AGENTS
+            .iter()
+            .find(|(name, _)| *name == "coder-agent")
+            .expect("coder-agent is a built-in agent");
+        let manifest: aegis_orchestrator_sdk::AgentManifest =
+            serde_yaml::from_str(yaml).expect("the coder template parses");
+        manifest.validate().expect("the coder template validates");
+        let instruction = folded_instruction(yaml);
+        assert!(
+            instruction.contains(&format!("4. {STEP}")),
+            "the coder's step 4 must read \"{STEP}\":\n{instruction}"
+        );
+    }
+
     /// The Forge's second CODE visit carries the diff the judges reviewed,
     /// beside their reports, and every judge is told that a diff's `-` and
     /// `+` are its markers: on run `e946aeab` a judge read a `-` marker as a
