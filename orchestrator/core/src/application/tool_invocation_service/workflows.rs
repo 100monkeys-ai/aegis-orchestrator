@@ -705,17 +705,6 @@ impl ToolInvocationService {
             })?,
         );
 
-        let limit: usize = args
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .map(|n| (n as usize).min(200))
-            .unwrap_or(50);
-        let offset: usize = args
-            .get("offset")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as usize)
-            .unwrap_or(0);
-
         let repo = match &self.workflow_execution_repo {
             Some(r) => r.clone(),
             None => {
@@ -755,8 +744,8 @@ impl ToolInvocationService {
             }
         };
 
-        let events = match repo.find_events_by_execution(exec_id, limit, offset).await {
-            Ok(evts) => evts,
+        let page = match read_workflow_log_page(repo.as_ref(), exec_id, args).await {
+            Ok(page) => page,
             Err(e) => {
                 return Ok(ToolInvocationResult::Direct(serde_json::json!({
                     "tool": "aegis.workflow.logs",
@@ -765,17 +754,16 @@ impl ToolInvocationService {
             }
         };
 
-        let total = events.len();
-
         Ok(ToolInvocationResult::Direct(serde_json::json!({
             "tool": "aegis.workflow.logs",
             "execution_id": exec_id_str,
             "status": format!("{:?}", execution.status).to_lowercase(),
             "workflow_id": execution.workflow_id.to_string(),
-            "events": events,
-            "total": total,
-            "limit": limit,
-            "offset": offset,
+            "events": page.events,
+            "total": page.total,
+            "limit": page.limit,
+            "offset": page.offset,
+            "has_more": page.has_more,
         })))
     }
 
@@ -1858,4 +1846,245 @@ pub(super) fn is_thresholded_score_transition(condition: &TransitionCondition) -
             | TransitionCondition::ScoreBetween { .. }
             | TransitionCondition::ScoreAndConfidenceAbove { .. }
     )
+}
+
+/// One page of a workflow run's persisted events, in sequence order, with
+/// the paging values that were applied.
+#[derive(Debug)]
+struct WorkflowLogPage {
+    events: Vec<crate::domain::workflow::WorkflowExecutionEventRecord>,
+    total: usize,
+    limit: usize,
+    offset: usize,
+    has_more: bool,
+}
+
+/// The page size of `aegis.workflow.logs` when the caller names none.
+const WORKFLOW_LOG_DEFAULT_LIMIT: usize = 50;
+/// The largest page `aegis.workflow.logs` answers.
+const WORKFLOW_LOG_MAX_LIMIT: usize = 200;
+/// The page size the run's events are counted by.
+const WORKFLOW_LOG_COUNT_PAGE: usize = 500;
+
+/// Read the page that `aegis.workflow.logs`'s `limit` (default 50, at most
+/// 200) and `offset` (default 0) arguments name of a workflow run's events,
+/// in sequence order, with the run's total and whether events follow the
+/// page.
+async fn read_workflow_log_page(
+    repo: &dyn crate::domain::repository::WorkflowExecutionRepository,
+    execution_id: crate::domain::execution::ExecutionId,
+    args: &Value,
+) -> Result<WorkflowLogPage, crate::domain::repository::RepositoryError> {
+    let limit: usize = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+        .unwrap_or(WORKFLOW_LOG_DEFAULT_LIMIT)
+        .min(WORKFLOW_LOG_MAX_LIMIT);
+    let offset: usize = args
+        .get("offset")
+        .and_then(|v| v.as_u64())
+        .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+        .unwrap_or(0);
+    let events = repo
+        .find_events_by_execution(execution_id, limit, offset)
+        .await?;
+    // A page that holds events but is short of the limit ends the trail, so
+    // the total is known from it; otherwise the trail is counted.
+    let total = if !events.is_empty() && events.len() < limit {
+        offset + events.len()
+    } else {
+        let mut counted = 0;
+        loop {
+            let read = repo
+                .find_events_by_execution(execution_id, WORKFLOW_LOG_COUNT_PAGE, counted)
+                .await?
+                .len();
+            counted += read;
+            if read < WORKFLOW_LOG_COUNT_PAGE {
+                break counted;
+            }
+        }
+    };
+    let has_more = offset.saturating_add(events.len()) < total;
+    Ok(WorkflowLogPage {
+        events,
+        total,
+        limit,
+        offset,
+        has_more,
+    })
+}
+
+#[cfg(test)]
+mod workflow_log_page_tests {
+    //! `aegis.workflow.logs` maps its `limit` and `offset` arguments onto the
+    //! run's events in sequence order and answers the values it applied, the
+    //! run's total and whether more follow.
+
+    use super::read_workflow_log_page;
+    use crate::domain::execution::ExecutionId;
+    use crate::domain::repository::{RepositoryError, WorkflowExecutionRepository};
+    use crate::domain::tenant::TenantId;
+    use crate::domain::workflow::{WorkflowExecution, WorkflowExecutionEventRecord, WorkflowId};
+    use serde_json::json;
+
+    /// A run's event trail of `events` events, sequences 1 to `events`; the
+    /// repository pages it as the Postgres query does.
+    struct Trail(Vec<WorkflowExecutionEventRecord>);
+
+    impl Trail {
+        fn of(events: i64) -> Self {
+            Self(
+                (1..=events)
+                    .map(|sequence| WorkflowExecutionEventRecord {
+                        sequence,
+                        event_type: "WorkflowStateEntered".to_string(),
+                        state_name: None,
+                        iteration_number: None,
+                        payload: json!({}),
+                        recorded_at: chrono::Utc::now(),
+                    })
+                    .collect(),
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WorkflowExecutionRepository for Trail {
+        async fn save_for_tenant(
+            &self,
+            _: &TenantId,
+            _: &WorkflowExecution,
+        ) -> Result<(), RepositoryError> {
+            unreachable!("not read by the logs page")
+        }
+        async fn find_by_id_for_tenant(
+            &self,
+            _: &TenantId,
+            _: ExecutionId,
+        ) -> Result<Option<WorkflowExecution>, RepositoryError> {
+            unreachable!("not read by the logs page")
+        }
+        async fn find_active_for_tenant(
+            &self,
+            _: &TenantId,
+        ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+            unreachable!("not read by the logs page")
+        }
+        async fn find_by_workflow_for_tenant(
+            &self,
+            _: &TenantId,
+            _: WorkflowId,
+            _: usize,
+            _: usize,
+        ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+            unreachable!("not read by the logs page")
+        }
+        async fn list_paginated_for_tenant(
+            &self,
+            _: &TenantId,
+            _: usize,
+            _: usize,
+        ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+            unreachable!("not read by the logs page")
+        }
+        async fn list_paginated_all(
+            &self,
+            _: usize,
+            _: usize,
+        ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+            unreachable!("not read by the logs page")
+        }
+        async fn count_by_workflow_for_tenant(
+            &self,
+            _: &TenantId,
+            _: WorkflowId,
+        ) -> Result<i64, RepositoryError> {
+            unreachable!("not read by the logs page")
+        }
+        async fn update_temporal_linkage_for_tenant(
+            &self,
+            _: &TenantId,
+            _: ExecutionId,
+            _: &str,
+            _: &str,
+        ) -> Result<(), RepositoryError> {
+            unreachable!("not read by the logs page")
+        }
+        async fn append_event(
+            &self,
+            _: ExecutionId,
+            _: i64,
+            _: String,
+            _: serde_json::Value,
+            _: Option<u8>,
+        ) -> Result<(), RepositoryError> {
+            unreachable!("not read by the logs page")
+        }
+        async fn find_events_by_execution(
+            &self,
+            _: ExecutionId,
+            limit: usize,
+            offset: usize,
+        ) -> Result<Vec<WorkflowExecutionEventRecord>, RepositoryError> {
+            Ok(self.0.iter().skip(offset).take(limit).cloned().collect())
+        }
+        async fn find_tenant_id_by_execution(
+            &self,
+            _: ExecutionId,
+        ) -> Result<Option<TenantId>, RepositoryError> {
+            unreachable!("not read by the logs page")
+        }
+    }
+
+    fn sequences(page: &super::WorkflowLogPage) -> Vec<i64> {
+        page.events.iter().map(|event| event.sequence).collect()
+    }
+
+    #[tokio::test]
+    async fn limit_one_answers_one_event_and_says_more_follow() {
+        let args = json!({"execution_id": ExecutionId::new().to_string(), "limit": 1});
+        let page = read_workflow_log_page(&Trail::of(7), ExecutionId::new(), &args)
+            .await
+            .unwrap();
+        println!("aegis.workflow.logs limit 1 over seven events answered {page:?}");
+        assert_eq!(sequences(&page), vec![1], "one event, the first");
+        assert_eq!(page.limit, 1, "the limit applied is echoed");
+        assert_eq!(page.offset, 0);
+        assert_eq!(page.total, 7, "the run's total, not the page's length");
+        assert!(page.has_more, "six more events follow");
+    }
+
+    #[tokio::test]
+    async fn offset_five_answers_the_events_from_sequence_six() {
+        let args = json!({"execution_id": ExecutionId::new().to_string(), "offset": 5});
+        let page = read_workflow_log_page(&Trail::of(7), ExecutionId::new(), &args)
+            .await
+            .unwrap();
+        println!("aegis.workflow.logs offset 5 over seven events answered {page:?}");
+        assert_eq!(sequences(&page), vec![6, 7]);
+        assert_eq!(page.offset, 5);
+        assert_eq!(page.total, 7);
+        assert!(!page.has_more, "the last event is in the page");
+    }
+
+    #[tokio::test]
+    async fn no_limit_answers_fifty_and_a_larger_limit_is_bounded_at_two_hundred() {
+        let trail = Trail::of(250);
+        let page = read_workflow_log_page(&trail, ExecutionId::new(), &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(page.limit, 50, "the default limit");
+        assert_eq!(page.events.len(), 50);
+        assert_eq!(page.total, 250);
+        assert!(page.has_more);
+
+        let page = read_workflow_log_page(&trail, ExecutionId::new(), &json!({"limit": 500}))
+            .await
+            .unwrap();
+        assert_eq!(page.limit, 200, "the limit is bounded at 200");
+        assert_eq!(page.events.len(), 200);
+        assert!(page.has_more);
+    }
 }

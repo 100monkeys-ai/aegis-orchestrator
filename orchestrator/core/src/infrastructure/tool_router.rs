@@ -427,6 +427,7 @@ impl ToolRouter {
             "aegis.task.wait" => Self::schema_aegis_task_wait(),
             "aegis.agent.wait" => Self::schema_aegis_agent_wait(),
             "aegis.task.logs" => Self::schema_aegis_task_logs(),
+            "aegis.workflow.logs" => Self::schema_aegis_workflow_logs(),
             "aegis.task.list" => Self::schema_aegis_task_list(),
             "aegis.task.cancel" => Self::schema_aegis_task_cancel(),
             "aegis.task.remove" => Self::schema_aegis_task_remove(),
@@ -2293,6 +2294,37 @@ impl ToolRouter {
         })
     }
 
+    /// JSON schema for the `aegis.workflow.logs` builtin tool.
+    fn schema_aegis_workflow_logs() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "execution_id": {
+                    "type": "string",
+                    "description": "the id `aegis.workflow.run` answered"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of events to return, in sequence order.",
+                    "default": 50,
+                    "minimum": 0,
+                    "maximum": 200
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Number of events to skip from the run's first event.",
+                    "default": 0,
+                    "minimum": 0
+                },
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Optional tenant identifier. Defaults to the local tenant."
+                }
+            },
+            "required": ["execution_id"]
+        })
+    }
+
     /// JSON schema for the `aegis.task.logs` builtin tool.
     fn schema_aegis_task_logs() -> Value {
         json!({
@@ -2808,6 +2840,35 @@ mod tests {
             Some("execution_id"),
             "execution_id must be required for aegis.workflow.status"
         );
+    }
+
+    /// `aegis.workflow.logs` names the run it reads, `execution_id`, as
+    /// required, and its paging arguments as integers with their defaults,
+    /// so a caller sends them and the tool honours them.
+    #[tokio::test]
+    async fn workflow_logs_schema_requires_execution_id_and_declares_its_paging() {
+        let tools = ToolRouter::new(vec![]).list_tools().await.unwrap();
+        let schema = &tools
+            .iter()
+            .find(|tool| tool.name == "aegis.workflow.logs")
+            .expect("aegis.workflow.logs is advertised")
+            .input_schema;
+        println!("aegis.workflow.logs input schema: {schema}");
+        assert_eq!(
+            schema["required"],
+            json!(["execution_id"]),
+            "execution_id must be required for aegis.workflow.logs"
+        );
+        assert_eq!(schema["properties"]["execution_id"]["type"], "string");
+        assert_eq!(
+            schema["properties"]["execution_id"]["description"],
+            "the id `aegis.workflow.run` answered"
+        );
+        assert_eq!(schema["properties"]["limit"]["type"], "integer");
+        assert_eq!(schema["properties"]["limit"]["default"], json!(50));
+        assert_eq!(schema["properties"]["limit"]["maximum"], json!(200));
+        assert_eq!(schema["properties"]["offset"]["type"], "integer");
+        assert_eq!(schema["properties"]["offset"]["default"], json!(0));
     }
 
     #[tokio::test]
