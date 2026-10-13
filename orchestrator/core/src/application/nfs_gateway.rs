@@ -217,6 +217,12 @@ impl VolumeContextLookup for NfsVolumeRegistry {
     fn lookup_execution_id(&self, volume_id: VolumeId) -> Option<ExecutionId> {
         self.lookup(volume_id).map(|ctx| ctx.execution_id)
     }
+
+    fn lookup_remote_path(&self, volume_id: VolumeId) -> Option<String> {
+        self.lookup(volume_id)
+            .map(|ctx| ctx.remote_path)
+            .filter(|p| !p.is_empty())
+    }
 }
 
 /// NFS Gateway application service

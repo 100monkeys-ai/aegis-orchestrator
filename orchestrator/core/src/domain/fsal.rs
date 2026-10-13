@@ -329,6 +329,14 @@ pub trait VolumeContextLookup: Send + Sync {
 
     /// Returns the execution registered for the given volume, if any.
     fn lookup_execution_id(&self, volume_id: VolumeId) -> Option<ExecutionId>;
+
+    /// Returns the storage path registered for the given volume, if any: the
+    /// root a mount of the volume shows, which for a repository volume is its
+    /// `repo` directory below the volume's own root. A lookup that keeps no
+    /// such path answers `None`, and the volume's own root is used.
+    fn lookup_remote_path(&self, _volume_id: VolumeId) -> Option<String> {
+        None
+    }
 }
 
 /// Borrowed read-only access to an existing volume, exposed under a distinct alias volume ID.
@@ -379,9 +387,11 @@ impl AegisFSAL {
                 .join(path.trim_start_matches('/'))
                 .to_string_lossy()
                 .to_string(),
-            crate::domain::volume::VolumeBackend::SeaweedFS { remote_path, .. } => {
-                format!("{}/{}", remote_path, path.trim_start_matches('/'))
-            }
+            crate::domain::volume::VolumeBackend::SeaweedFS { remote_path, .. } => format!(
+                "{}/{}",
+                self.registered_root(volume.id, remote_path),
+                path.trim_start_matches('/')
+            ),
             crate::domain::volume::VolumeBackend::OpenDal { .. } => format!(
                 "/aegis/opendal/volumes/{}/{}/{}",
                 volume.tenant_id,
@@ -398,6 +408,27 @@ impl AegisFSAL {
                 path.trim_start_matches('/')
             ),
         }
+    }
+
+    /// The root a SeaweedFS volume's paths resolve under: the path registered
+    /// for the volume when it lies under the volume's own root (a
+    /// repository volume registers its `repo` directory, so a mount shows the
+    /// working tree at its root), else the volume's own root as it is
+    /// recorded, which a registration of the root itself also gives. The lookup is
+    /// keyed by the volume record's id, so a judge's read-only alias of a
+    /// volume resolves as the volume's own registration does.
+    fn registered_root(&self, volume_id: VolumeId, own_root: &str) -> String {
+        let own = own_root.trim_end_matches('/');
+        self.volume_context_lookup
+            .as_ref()
+            .and_then(|lookup| lookup.lookup_remote_path(volume_id))
+            .map(|registered| registered.trim_end_matches('/').to_string())
+            .filter(|registered| {
+                registered
+                    .strip_prefix(own)
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+            .unwrap_or_else(|| own_root.to_string())
     }
 
     fn routed_usage_path(&self, volume: &Volume) -> String {
@@ -2121,5 +2152,210 @@ mod tests {
              (Storage error expected from NoopStorage stat): {:?}",
             result
         );
+    }
+
+    // ── The registered remote path ────────────────────────────────────────
+
+    /// Storage holding files by their full storage path.
+    struct FilesAt(HashMap<String, Vec<u8>>);
+
+    #[async_trait::async_trait]
+    impl StorageProvider for FilesAt {
+        async fn create_directory(&self, _: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn delete_directory(&self, _: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn set_quota(&self, _: &str, _: u64) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn get_usage(&self, _: &str) -> Result<u64, StorageError> {
+            Ok(0)
+        }
+        async fn health_check(&self) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn open_file(&self, path: &str, _: OpenMode) -> Result<FileHandle, StorageError> {
+            if self.0.contains_key(path) {
+                Ok(FileHandle(path.as_bytes().to_vec()))
+            } else {
+                Err(StorageError::FileNotFound(path.to_string()))
+            }
+        }
+        async fn read_at(
+            &self,
+            handle: &FileHandle,
+            offset: u64,
+            length: usize,
+        ) -> Result<Vec<u8>, StorageError> {
+            let path = String::from_utf8_lossy(&handle.0).to_string();
+            let data = self.0.get(&path).ok_or(StorageError::FileNotFound(path))?;
+            let start = (offset as usize).min(data.len());
+            let end = start.saturating_add(length).min(data.len());
+            Ok(data[start..end].to_vec())
+        }
+        async fn write_at(
+            &self,
+            _: &FileHandle,
+            _: u64,
+            data: &[u8],
+        ) -> Result<usize, StorageError> {
+            Ok(data.len())
+        }
+        async fn close_file(&self, _: &FileHandle) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn stat(&self, path: &str) -> Result<FileAttributes, StorageError> {
+            Err(StorageError::FileNotFound(path.to_string()))
+        }
+        async fn readdir(&self, _: &str) -> Result<Vec<SDirEntry>, StorageError> {
+            Ok(vec![])
+        }
+        async fn create_file(&self, _: &str, _: u32) -> Result<FileHandle, StorageError> {
+            Ok(FileHandle(vec![]))
+        }
+        async fn delete_file(&self, _: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn rename(&self, _: &str, _: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+    }
+
+    /// The registry's answer for one volume: the execution it is open to and
+    /// the storage path its mounts show.
+    struct Registered {
+        execution_id: ExecutionId,
+        remote_path: Option<String>,
+    }
+
+    impl VolumeContextLookup for Registered {
+        fn lookup_workflow_execution_id(&self, _volume_id: VolumeId) -> Option<uuid::Uuid> {
+            None
+        }
+
+        fn lookup_execution_id(&self, _volume_id: VolumeId) -> Option<ExecutionId> {
+            Some(self.execution_id)
+        }
+
+        fn lookup_remote_path(&self, _volume_id: VolumeId) -> Option<String> {
+            self.remote_path.clone()
+        }
+    }
+
+    /// Read `/README.md` through the FSAL from a person's volume rooted at
+    /// `/aegis/volumes/test/v1`, holding `files`, registered with
+    /// `registered_remote_path`.
+    async fn read_readme(
+        files: &[(&str, &str)],
+        registered_remote_path: Option<&str>,
+    ) -> Result<Vec<u8>, FsalError> {
+        use parking_lot::RwLock;
+
+        let vol = make_available_persistent_volume("alice");
+        let repo = Arc::new(InMemoryVolumeRepository::new());
+        repo.save(&vol).await.unwrap();
+        let execution_id = ExecutionId::new();
+        let fsal = AegisFSAL::new(
+            Arc::new(FilesAt(
+                files
+                    .iter()
+                    .map(|(path, text)| (path.to_string(), text.as_bytes().to_vec()))
+                    .collect(),
+            )),
+            repo as Arc<dyn crate::domain::repository::VolumeRepository>,
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(NoopPublisher),
+        )
+        .with_volume_context_lookup(Arc::new(Registered {
+            execution_id,
+            remote_path: registered_remote_path.map(str::to_string),
+        }));
+        let policy = FsalAccessPolicy {
+            read: vec!["/*".to_string()],
+            write: Vec::new(),
+        };
+        fsal.read(
+            &AegisFileHandle::new(execution_id, vol.id, "/README.md"),
+            "/README.md",
+            &policy,
+            0,
+            1024,
+        )
+        .await
+    }
+
+    /// The Forge run `7a237b3a` (2026-10-13): its repository volume was
+    /// registered with `<root>/repo`, the clone's directory, and the test
+    /// step's `test -s README.md` ran one directory above it. A mount of a
+    /// volume registered with a path below its root shows that path's
+    /// contents at its root.
+    #[tokio::test]
+    async fn a_volume_registered_with_a_path_below_its_root_resolves_under_that_path() {
+        let read = read_readme(
+            &[("/aegis/volumes/test/v1/repo/README.md", "the tree's readme")],
+            Some("/aegis/volumes/test/v1/repo"),
+        )
+        .await;
+        assert_eq!(
+            read.map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                .map_err(|e| e.to_string()),
+            Ok("the tree's readme".to_string()),
+            "/README.md of a volume registered with <root>/repo was not read from <root>/repo/README.md"
+        );
+    }
+
+    /// A volume with no path registered, or registered with its own root,
+    /// resolves from its own root, as before.
+    #[tokio::test]
+    async fn a_volume_with_no_registered_path_resolves_from_its_own_root() {
+        for registered in [
+            None,
+            Some("/aegis/volumes/test/v1"),
+            Some("/aegis/volumes/test/v1/"),
+        ] {
+            let read = read_readme(
+                &[("/aegis/volumes/test/v1/README.md", "the root's readme")],
+                registered,
+            )
+            .await;
+            assert_eq!(
+                read.map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                    .map_err(|e| e.to_string()),
+                Ok("the root's readme".to_string()),
+                "registered path {registered:?}"
+            );
+        }
+    }
+
+    /// A registered path outside the volume's own root is never used: the
+    /// volume resolves from its own root.
+    #[tokio::test]
+    async fn a_registered_path_outside_the_volumes_root_is_not_used() {
+        for outside in ["/aegis/volumes/test/other", "/aegis/volumes/test/v10", "/"] {
+            let read = read_readme(
+                &[
+                    ("/aegis/volumes/test/v1/README.md", "the root's readme"),
+                    (
+                        "/aegis/volumes/test/other/README.md",
+                        "another volume's readme",
+                    ),
+                    (
+                        "/aegis/volumes/test/v10/README.md",
+                        "another volume's readme",
+                    ),
+                    ("/README.md", "another volume's readme"),
+                ],
+                Some(outside),
+            )
+            .await;
+            assert_eq!(
+                read.map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                    .map_err(|e| e.to_string()),
+                Ok("the root's readme".to_string()),
+                "registered path {outside}"
+            );
+        }
     }
 }
