@@ -11,7 +11,8 @@
 //! They cover: the starter round-trips through the repository and a later
 //! save that carries none leaves it in place; a row written before migration
 //! 041 reads as it did, with no starter; migration 041 run again changes
-//! nothing.
+//! nothing; a gate's trail, read for its starter, keeps who answered the gate
+//! from the gate exit's output and drops the rest of a state's output.
 
 use aegis_orchestrator_core::domain::execution::{ExecutionId, ExecutionStatus};
 use aegis_orchestrator_core::domain::repository::WorkflowExecutionRepository;
@@ -234,4 +235,72 @@ async fn migration_041_run_again_changes_nothing() {
     db.apply(41).await;
     assert_eq!(columns().await, before);
     db.remove().await;
+}
+
+#[tokio::test]
+async fn a_gate_trail_keeps_who_answered_from_the_gate_exit() {
+    let Some(db) = TestDb::create(None).await else {
+        return;
+    };
+    let repo = PostgresWorkflowExecutionRepository::new(db.pool.clone());
+    let tenant = TenantId::new(TENANT).unwrap();
+    let workflow = insert_workflow(&db.pool).await;
+    let run = execution(workflow, Some("u-starter"));
+    repo.save_for_tenant(&tenant, &run).await.unwrap();
+    let events = [
+        (
+            1,
+            "HumanInputRequested",
+            json!({"state_name": "AWAIT_REQUIREMENTS_APPROVAL", "prompt": "Approve?"}),
+        ),
+        (
+            2,
+            "WorkflowStateExited",
+            json!({
+                "state_name": "AWAIT_REQUIREMENTS_APPROVAL",
+                "output": {
+                    "response": "yes",
+                    "feedback": null,
+                    "timeout": false,
+                    "answered_by": "d7f81700-35d3-49b6-b237-c391ccc19035",
+                    "transcript": "an Agent state's output is not kept",
+                },
+            }),
+        ),
+        (
+            3,
+            "WorkflowStateExited",
+            json!({"state_name": "AWAIT_DESIGN_APPROVAL", "output": {"response": "no"}}),
+        ),
+    ];
+    for (sequence, event_type, payload) in events {
+        repo.append_event(run.id, sequence, event_type.to_string(), payload, None)
+            .await
+            .unwrap();
+    }
+
+    let trails = repo
+        .find_gate_trails_for_initiator(&tenant, "u-starter")
+        .await
+        .unwrap();
+    let outputs: Vec<_> = trails
+        .iter()
+        .flat_map(|(_, trail)| trail.iter())
+        .filter(|event| event.event_type == "WorkflowStateExited")
+        .map(|event| event.payload["output"].clone())
+        .collect();
+    db.remove().await;
+
+    assert_eq!(
+        outputs,
+        vec![
+            json!({
+                "response": "yes",
+                "timeout": false,
+                "answered_by": "d7f81700-35d3-49b6-b237-c391ccc19035",
+            }),
+            json!({"response": "no"}),
+        ],
+        "the gate exits' outputs as the gate trail reads them"
+    );
 }

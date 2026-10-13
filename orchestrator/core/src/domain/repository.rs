@@ -543,9 +543,10 @@ pub trait WorkflowExecutionRepository: Send + Sync {
     /// and close its gates, in sequence order. Read-only.
     ///
     /// The default implementation pages the tenant's executions and reads
-    /// each one's trail; the Postgres repository answers in two queries and
-    /// narrows a state exit's `output` to a gate answer's fields
-    /// (`response`, `feedback`, `timeout`).
+    /// each one's trail; the Postgres repository answers in two queries.
+    /// Both narrow a state exit's `output` to a gate answer's fields
+    /// (`response`, `feedback`, `timeout`, `answered_by`), dropping those
+    /// that are absent or null.
     async fn find_gate_trails_for_initiator(
         &self,
         tenant_id: &TenantId,
@@ -557,6 +558,42 @@ pub trait WorkflowExecutionRepository: Send + Sync {
         )>,
         RepositoryError,
     > {
+        /// A gate answer's fields: what the Postgres query keeps of a
+        /// state exit's `output`.
+        const GATE_ANSWER_FIELDS: [&str; 4] = ["response", "feedback", "timeout", "answered_by"];
+
+        /// `jsonb_strip_nulls`: drops every object field whose value is
+        /// null, at any depth.
+        fn strip_nulls(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    fields.retain(|_, field| !field.is_null());
+                    fields.values_mut().for_each(strip_nulls);
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(strip_nulls),
+                _ => {}
+            }
+        }
+
+        /// Narrows a state exit's `output` as the Postgres query does: the
+        /// gate answer's fields that are present and not null, `{}` when
+        /// none is.
+        fn narrow_to_gate_answer(payload: &mut serde_json::Value) {
+            let Some(event) = payload.as_object_mut() else {
+                return;
+            };
+            let output = event.get("output");
+            let mut narrowed = serde_json::Map::new();
+            for field in GATE_ANSWER_FIELDS {
+                if let Some(value) = output.and_then(|output| output.get(field)) {
+                    narrowed.insert(field.to_string(), value.clone());
+                }
+            }
+            let mut narrowed = serde_json::Value::Object(narrowed);
+            strip_nulls(&mut narrowed);
+            event.insert("output".to_string(), narrowed);
+        }
+
         const PAGE: usize = 500;
         let mut trails = Vec::new();
         let mut offset = 0;
@@ -589,6 +626,12 @@ pub trait WorkflowExecutionRepository: Send + Sync {
                     .any(|event| event.event_type == "HumanInputRequested")
                 {
                     trail.sort_by_key(|event| event.sequence);
+                    for event in trail
+                        .iter_mut()
+                        .filter(|event| event.event_type == "WorkflowStateExited")
+                    {
+                        narrow_to_gate_answer(&mut event.payload);
+                    }
                     trails.push((execution, trail));
                 }
             }

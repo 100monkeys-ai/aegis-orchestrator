@@ -1111,6 +1111,7 @@ async fn the_postgres_repository_lists_the_same_gates() {
     let answered_listed = (
         ids(&answered),
         gate_of(&answered, world.answered_yes).cloned(),
+        gate_of(&answered, world.answered_no).map(|gate| gate["answered_by"].clone()),
         ids(&listing(&world, "other", "status=answered").await),
         ids(&listing(&world, "owner", "status=any").await),
     );
@@ -1151,6 +1152,7 @@ async fn the_postgres_repository_lists_the_same_gates() {
                 world.timed_out.to_string(),
             ],
             Some(answered_yes_view(&world)),
+            Some(json!(OWNER)),
             vec![world.others_answered.to_string()],
             vec![
                 world.answered_yes.to_string(),

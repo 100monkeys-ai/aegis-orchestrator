@@ -735,9 +735,9 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
             .iter()
             .map(|event_type| event_type.to_string())
             .collect();
-        // A state exit's output is narrowed to a gate answer's fields: an
-        // Agent state's output can be large, and only a Human state's answer
-        // is read from it.
+        // A state exit's output is narrowed to a gate answer's fields (the
+        // word, the feedback, the timeout and who answered): an Agent state's
+        // output can be large, and only a Human state's answer is read from it.
         let rows = sqlx::query(
             r#"
             SELECT
@@ -749,7 +749,8 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                         jsonb_strip_nulls(jsonb_build_object(
                             'response', event_payload->'output'->'response',
                             'feedback', event_payload->'output'->'feedback',
-                            'timeout', event_payload->'output'->'timeout'
+                            'timeout', event_payload->'output'->'timeout',
+                            'answered_by', event_payload->'output'->'answered_by'
                         ))
                     )
                 ELSE event_payload END AS event_payload,
