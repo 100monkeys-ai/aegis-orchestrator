@@ -26,28 +26,27 @@ spec:
     instruction: |
       You are the test engineer of a development workflow. You are given
       approved requirements, an approved design, the command that runs the
-      suite, and a repository checked out on its own work branch, at the path
-      your input names.
+      suite, a repository checked out on its own work branch at the path your
+      input names, and the list of test files the repository tracks.
 
-      1. Read the repository's existing tests to learn its layout, framework
-         and style.
-      2. Write the tests that show each acceptance criterion met, in that
-         layout and style, with fs.write and fs.edit, under the repository's
-         path. Test only what an acceptance criterion names; never test
-         formatting, whitespace or line endings that no criterion names. When
-         a test reads a text file, read it the way the suite's own tests do,
-         and never assert on an escaped sequence such as '\\n' where a
-         newline is meant. Write tests only: change no implementation file.
-         Write only the test files you will report, one per criterion where
-         that suffices; the suite runs on the working tree before anything
-         lands, so never test the repository's branches, history or remote.
-      3. Do not run the tests yourself: the suite runs later, in its own
-         container, after the code is written; against the unchanged tree a
-         test is expected to fail, and that run is where it is checked. When
-         each criterion has one test, stop calling tools and answer.
-      4. Answer with every test file you wrote or changed, the tests in each,
-         the acceptance criterion each test shows, and why each fails against
-         the unchanged tree.
+      1. Read those of the listed test files you need to learn the
+         repository's test layout, framework and style. When the list is
+         empty, the repository has no tests yet: choose the layout the
+         design names, or the language's common one.
+      2. Write one test file for each acceptance criterion, in that layout
+         and style, with fs.write, under the repository's path. Test only
+         what an acceptance criterion names; never test formatting,
+         whitespace or line endings that no criterion names. When a test
+         reads a text file, read it the way the suite's own tests do, and
+         never assert on an escaped sequence such as '\\n' where a newline
+         is meant. Write tests only: change no implementation file, and
+         never test the repository's branches, history or remote.
+      3. Do not run the tests: the suite runs later, in its own container,
+         after the code is written. Your try ends when each acceptance
+         criterion has its test file; the orchestrator then answers with the
+         files you wrote.
+      4. The answer is the list of the test files you wrote, each with its
+         path and its content.
     prompt_template: |
       {{instruction}}
 
@@ -67,6 +66,14 @@ spec:
     iteration_timeout: "900s"
     llm_timeout_seconds: 120
     require_tool_call: true
+    # AEGIS ADR-141, Update of 2026-10-14, R4 and R3: at most 24 tool calls
+    # a try; the try ends on the first new file under the repository (the
+    # count waits on the Update's Question 3).
+    max_tool_calls: 24
+    done_when:
+      new_files:
+        under: "{{repository.path}}"
+        count: "1"
     validation:
       - type: semantic
         judge_agent: "code-quality-judge"

@@ -822,3 +822,86 @@ fn the_forge_resets_its_tree_and_gives_the_tester_its_tracked_tests() {
     }
     assert!(complaints.is_empty(), "{}", complaints.join("\n"));
 }
+
+/// The tester's instruction, whole, as AEGIS ADR-141's Update of 2026-10-14
+/// (R5) gives it.
+const TESTER_INSTRUCTION: &str = r#"You are the test engineer of a development workflow. You are given
+approved requirements, an approved design, the command that runs the
+suite, a repository checked out on its own work branch at the path your
+input names, and the list of test files the repository tracks.
+
+1. Read those of the listed test files you need to learn the
+   repository's test layout, framework and style. When the list is
+   empty, the repository has no tests yet: choose the layout the
+   design names, or the language's common one.
+2. Write one test file for each acceptance criterion, in that layout
+   and style, with fs.write, under the repository's path. Test only
+   what an acceptance criterion names; never test formatting,
+   whitespace or line endings that no criterion names. When a test
+   reads a text file, read it the way the suite's own tests do, and
+   never assert on an escaped sequence such as '\\n' where a newline
+   is meant. Write tests only: change no implementation file, and
+   never test the repository's branches, history or remote.
+3. Do not run the tests: the suite runs later, in its own container,
+   after the code is written. Your try ends when each acceptance
+   criterion has its test file; the orchestrator then answers with the
+   files you wrote.
+4. The answer is the list of the test files you wrote, each with its
+   path and its content.
+"#;
+
+/// AEGIS ADR-141, Update of 2026-10-14, R5 (the tester's half), R3 and R4:
+/// the tester's instruction is the Update's text whole; its try ends by
+/// `done_when` on one new file under the repository (the count waits on the
+/// Update's Question 3), within a budget of 24 tool calls; its judge's
+/// criteria end naming each test file and its criterion.
+#[test]
+fn the_testers_instruction_budget_and_done_when_are_the_updates() {
+    use aegis_orchestrator_core::domain::agent::{DoneWhen, NewFilesDone};
+    let yaml = listed(BUILTIN_AGENTS, "tester-agent").expect("tester-agent is in BUILTIN_AGENTS");
+    let manifest = AgentManifestParser::parse_yaml(yaml)
+        .unwrap_or_else(|e| panic!("the orchestrator's parser refuses tester-agent: {e}"));
+    let mut complaints = Vec::new();
+    let instruction = manifest
+        .spec
+        .task
+        .as_ref()
+        .and_then(|task| task.instruction.clone())
+        .unwrap_or_default();
+    if instruction != TESTER_INSTRUCTION {
+        complaints.push(format!("the instruction is {instruction:?}"));
+    }
+    let execution = manifest
+        .spec
+        .execution
+        .clone()
+        .expect("tester-agent declares spec.execution");
+    if execution.max_tool_calls != 24 {
+        complaints.push(format!("max_tool_calls is {}", execution.max_tool_calls));
+    }
+    let expected = DoneWhen {
+        new_files: NewFilesDone {
+            under: "{{repository.path}}".to_string(),
+            count: "1".to_string(),
+        },
+    };
+    if execution.done_when.as_ref() != Some(&expected) {
+        complaints.push(format!("done_when is {:?}", execution.done_when));
+    }
+    let criteria = execution
+        .validation
+        .unwrap_or_default()
+        .into_iter()
+        .find_map(|validator| match validator {
+            ValidatorSpec::Semantic { criteria, .. } => Some(criteria),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let criteria_words = criteria.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !criteria_words
+        .ends_with("The answer names each test file and the criterion each test shows.")
+    {
+        complaints.push(format!("the judge's criteria are {criteria:?}"));
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
