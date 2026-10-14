@@ -143,6 +143,36 @@ pub(crate) fn provider_time_limit_seconds(e: &LLMError) -> Option<Option<f64>> {
     )
 }
 
+/// The messages a request sends and the opening of the answer: a trailing
+/// assistant message with text and no tool call is split off as the
+/// opening; any other conversation is sent whole, with none.
+fn split_prefill(messages: &[ChatMessage]) -> (&[ChatMessage], Option<String>) {
+    match messages.split_last() {
+        Some((last, rest))
+            if last.role == "assistant"
+                && last.tool_calls.as_ref().is_none_or(Vec::is_empty)
+                && !last.content.is_empty() =>
+        {
+            (rest, Some(last.content.as_text()))
+        }
+        _ => (messages, None),
+    }
+}
+
+/// The answer, opening with `prefill` once. A model that was not shown the
+/// opening may write it itself, and then the answer holds it once. An empty
+/// text stays empty, so the registry still reads it as an empty generation.
+fn after_prefill(prefill: Option<&str>, text: String) -> String {
+    match prefill {
+        Some(opening)
+            if !text.trim().is_empty() && !text.trim_start().starts_with(opening.trim_end()) =>
+        {
+            format!("{opening}{text}")
+        }
+        _ => text,
+    }
+}
+
 pub struct OpenAIAdapter {
     client: reqwest::Client,
     endpoint: String,
@@ -323,6 +353,24 @@ impl LLMProvider for OpenAIAdapter {
         tools: &[ToolSchema],
         options: &GenerationOptions,
     ) -> Result<ChatResponse, LLMError> {
+        // A trailing assistant message with text and no tool call is the
+        // opening of the answer the caller wants (AEGIS ADR-141, Update of
+        // 2026-10-14, R2 as amended `r2-iteration-owns-prior-work`: the try
+        // after an exhausted one ends its opening with "Files written:\n").
+        // Neither endpoint this adapter serves documents continuing one:
+        // OpenAI's Chat Completions reads every assistant message as history
+        // and begins a new turn, and Workers AI's OpenAI-compatible
+        // `/chat/completions` (production's `smart`) documents no `messages`
+        // shape for continuation, no `continue_final_message`, no assistant
+        // `prefix` and, for chat, no `raw` (its model schemas, 2026-10-14).
+        // Sent as is, it would be read as a finished turn of the model's own.
+        // So it is not sent: the request ends where the conversation did
+        // before it, and its text is put before the model's answer, which
+        // then begins with the opening the caller wrote, the model's text
+        // following. The model does not see the opening, so its text is not
+        // a continuation of it.
+        let (messages, prefill) = split_prefill(messages);
+
         // Map domain ChatMessage → OpenAI message shape.
         //
         // An assistant message that carries tool calls and no text is sent
@@ -537,7 +585,7 @@ impl LLMProvider for OpenAIAdapter {
         }
 
         Ok(ChatResponse::FinalText(GenerationResponse {
-            text,
+            text: after_prefill(prefill.as_deref(), text),
             usage: Self::build_token_usage(&oai_response.usage),
             provider: "openai".to_string(),
             model: self.model.clone(),
@@ -863,6 +911,157 @@ mod tests {
             None,
             "the agent's own timeout is not the provider's limit"
         );
+    }
+
+    // ── A trailing assistant message: the answer's opening (AEGIS ADR-141,
+    // Update of 2026-10-14, R2 as amended `r2-iteration-owns-prior-work`) ──
+
+    fn message(role: &str, text: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.to_string(),
+            content: MessageContent::from(text),
+            tool_call_id: None,
+            tool_calls: None,
+        }
+    }
+
+    fn adapter_at(endpoint: String) -> OpenAIAdapter {
+        OpenAIAdapter::new(
+            endpoint,
+            "test-key".to_string(),
+            "test-model".to_string(),
+            HeaderMap::new(),
+        )
+    }
+
+    /// A Chat Completions answer whose message is `text`.
+    fn answer_body(text: &str) -> String {
+        serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })
+        .to_string()
+    }
+
+    /// Options that add no key to the request, so a test can name its body.
+    fn no_options() -> GenerationOptions {
+        GenerationOptions {
+            max_tokens: None,
+            temperature: None,
+            stop_sequences: None,
+        }
+    }
+
+    async fn final_text(response: Result<ChatResponse, LLMError>) -> String {
+        match response {
+            Ok(ChatResponse::FinalText(r)) => r.text,
+            other => panic!("expected a text answer, got {other:?}"),
+        }
+    }
+
+    /// Neither OpenAI's Chat Completions nor Workers AI's OpenAI-compatible
+    /// endpoint documents continuing a trailing assistant message, so the
+    /// adapter does not send it: the request ends with the user's message,
+    /// and the answer the adapter returns begins with the opening the caller
+    /// wrote, the model's text following.
+    #[tokio::test]
+    async fn a_trailing_assistant_message_is_left_off_the_wire_and_opens_the_answer() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/chat/completions")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "write the tests"}]
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(answer_body("t/a.py (12 bytes)"))
+            .expect(1)
+            .create_async()
+            .await;
+        let messages = [
+            message("user", "write the tests"),
+            message("assistant", "Files written:\n"),
+        ];
+
+        let text = final_text(
+            adapter_at(server.url())
+                .generate_chat(&messages, &[], &no_options())
+                .await,
+        )
+        .await;
+
+        mock.assert_async().await;
+        assert_eq!(text, "Files written:\nt/a.py (12 bytes)");
+    }
+
+    /// The model, not shown the opening, may write it itself: the answer
+    /// holds it once.
+    #[tokio::test]
+    async fn an_answer_that_already_opens_with_the_prefill_holds_it_once() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(answer_body("Files written:\nt/a.py (12 bytes)"))
+            .create_async()
+            .await;
+        let messages = [
+            message("user", "write the tests"),
+            message("assistant", "Files written:\n"),
+        ];
+
+        let text = final_text(
+            adapter_at(server.url())
+                .generate_chat(&messages, &[], &no_options())
+                .await,
+        )
+        .await;
+
+        assert_eq!(text, "Files written:\nt/a.py (12 bytes)");
+    }
+
+    /// A guard: a conversation that ends with the user's message is sent
+    /// whole, an earlier assistant message included, and the answer is the
+    /// model's text alone.
+    #[tokio::test]
+    async fn a_conversation_ending_with_the_user_is_sent_whole_and_answered_as_is() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/chat/completions")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "model": "test-model",
+                "messages": [
+                    {"role": "user", "content": "one"},
+                    {"role": "assistant", "content": "two"},
+                    {"role": "user", "content": "three"}
+                ]
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(answer_body("four"))
+            .expect(1)
+            .create_async()
+            .await;
+        let messages = [
+            message("user", "one"),
+            message("assistant", "two"),
+            message("user", "three"),
+        ];
+
+        let text = final_text(
+            adapter_at(server.url())
+                .generate_chat(&messages, &[], &no_options())
+                .await,
+        )
+        .await;
+
+        mock.assert_async().await;
+        assert_eq!(text, "four");
     }
 
     #[test]
