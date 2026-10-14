@@ -41,10 +41,10 @@ spec:
          Write only the test files you will report, one per criterion where
          that suffices; the suite runs on the working tree before anything
          lands, so never test the repository's branches, history or remote.
-      3. Run each new test at most once with cmd.run where the image allows
-         it (the suite itself runs later in its own container). Against the
-         unchanged tree they fail; that is expected: do not rewrite a test for
-         it. Answer as soon as each criterion has a test.
+      3. Do not run the tests yourself: the suite runs later, in its own
+         container, after the code is written; against the unchanged tree a
+         test is expected to fail, and that run is where it is checked. When
+         each criterion has one test, stop calling tools and answer.
       4. Answer with every test file you wrote or changed, the tests in each,
          the acceptance criterion each test shows, and why each fails against
          the unchanged tree.

@@ -1017,6 +1017,30 @@ mod tests {
         );
     }
 
+    /// The tester writes its tests and answers without running them: on run
+    /// `d92cb09a` it deleted its tests five times, re-ran the test expected to
+    /// fail on the unchanged tree and spent both its 900 s tries without
+    /// answering. The suite's own run after CODE is where a test is checked.
+    #[test]
+    fn the_tester_does_not_run_its_tests_and_answers_once_each_criterion_has_one() {
+        const STEP: &str = "Do not run the tests yourself: the suite runs later, in its own container, after the code is written; against the unchanged tree a test is expected to fail, and that run is where it is checked. When each criterion has one test, stop calling tools and answer.";
+        let (_, yaml) = BUILTIN_AGENTS
+            .iter()
+            .find(|(name, _)| *name == "tester-agent")
+            .expect("tester-agent is a built-in agent");
+        let manifest: aegis_orchestrator_sdk::AgentManifest =
+            serde_yaml::from_str(yaml).expect("the tester template parses");
+        manifest.validate().expect("the tester template validates");
+        let instruction = folded_instruction(yaml);
+        let step_3 = instruction.find("3. ").expect("step 3");
+        let step_4 = instruction.find("4. ").expect("step 4");
+        assert_eq!(
+            instruction[step_3..step_4].trim_end(),
+            format!("3. {STEP}"),
+            "the tester's step 3 must read \"{STEP}\""
+        );
+    }
+
     /// The coder stops on a test it cannot pass: on run `c0d37ca8` it spent
     /// its 1800 s on the tester's final-newline test with no rule for
     /// stopping.
