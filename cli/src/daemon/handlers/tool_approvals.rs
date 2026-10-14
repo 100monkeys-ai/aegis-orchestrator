@@ -398,6 +398,7 @@ mod tests {
                 security_context_name: "zaru-pro",
                 conversation_id: conversation,
                 profile_id: None,
+                contexts: None,
                 contract: ApprovalContract {
                     binding_argument: Some("mailbox".into()),
                     approval_summary: Some(vec![

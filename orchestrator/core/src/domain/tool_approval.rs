@@ -240,6 +240,16 @@ pub struct ToolApprovalRequest {
     /// with it.
     #[serde(default)]
     pub profile_id: Option<Uuid>,
+    /// The conversation's choice of bindings the gated call carried, its
+    /// `_meta.contexts` as the invoke route admitted it (AEGIS ADR-132
+    /// S11a), for a call of a session with no execution record and no
+    /// profile; absent for a call of an execution with a record (its record
+    /// governs), for a call on a profile ([`Self::profile_id`] stands for
+    /// it) and for a call that carried none. The approved re-run acts under
+    /// it (AEGIS ADR-126, Update of 2026-10-14). Sealed with `arguments`,
+    /// and never answered by the request view.
+    #[serde(default)]
+    pub contexts: Option<Value>,
     /// The policy an `auto_allowed` call matched.
     pub policy_id: Option<ToolApprovalPolicyId>,
     pub status: ToolApprovalStatus,

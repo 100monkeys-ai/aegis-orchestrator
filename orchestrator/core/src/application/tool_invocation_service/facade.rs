@@ -1165,6 +1165,24 @@ impl ToolInvocationService {
                     .await
                     .gated;
                 let conversation_id = gated_conversation.as_deref();
+                // ADR-126, Update of 2026-10-14, clause 1: a conversation's
+                // call keeps its choice of bindings for the approved re-run;
+                // a call of an execution with a record (its record governs)
+                // and a call on a profile (the profile stands for it, AEGIS
+                // ADR-140 D10) keep none.
+                let contexts = match (call_contexts, run_profile) {
+                    (Some(contexts), None) => match self
+                        .execution_service
+                        .get_execution_unscoped(execution_id)
+                        .await
+                    {
+                        Ok(_) => None,
+                        Err(_) => Some(crate::application::tool_approval_service::stored_contexts(
+                            contexts,
+                        )),
+                    },
+                    _ => None,
+                };
                 let gated = approvals
                     .gate(GatedCall {
                         tenant_id,
@@ -1176,6 +1194,7 @@ impl ToolInvocationService {
                         security_context_name: &security_context.name,
                         conversation_id,
                         profile_id: run_profile,
+                        contexts,
                         contract: self.tool_router.approval_contract(&tool_name),
                     })
                     .await;
@@ -1260,8 +1279,10 @@ impl ToolInvocationService {
     /// inner-loop judge, then edge, `aegis.*`, built-in, router and gateway
     /// dispatch. Called by [`Self::dispatch_tool_core`] for every call the
     /// gate lets through, and by the run of a stored call on its user's
-    /// approval (`approvals.rs`), with the stored arguments and no call
-    /// choices: a stored call carries no `_meta`.
+    /// approval (`approvals.rs`), with the stored arguments and the choice
+    /// the call was stored with (AEGIS ADR-126, Update of 2026-10-14, clause
+    /// 2): `call_contexts`, its stored `contexts` or its stored profile's
+    /// bindings, and `profile`, its stored `profile_id`.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn dispatch_after_gate(
         &self,
@@ -1276,6 +1297,8 @@ impl ToolInvocationService {
         caller_identity: Option<&crate::domain::iam::UserIdentity>,
         invocation_id: ToolInvocationId,
         started_at: Instant,
+        call_contexts: Option<&crate::domain::execution::ExecutionContexts>,
+        profile: Option<uuid::Uuid>,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         self.dispatch_after_gate_choosing(
             agent_id,
@@ -1289,14 +1312,14 @@ impl ToolInvocationService {
             caller_identity,
             invocation_id,
             started_at,
-            None,
+            call_contexts,
             // ADR-126, Update of 2026-10-07 (2), clause 3c: a stored call
             // run on its user's approval starts with no conversation.
             None,
-            // A stored call carries no `_meta`, and a starting tool is
-            // not gated: no profile is given.
-            None,
-            None,
+            // The stored profile is the call's, as its `_meta.profile` was
+            // (AEGIS ADR-140 D6, D12).
+            profile,
+            profile,
         )
         .await
     }

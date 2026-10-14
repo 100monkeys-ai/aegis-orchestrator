@@ -334,6 +334,7 @@ async fn gate_declaring(
         security_context_name: "zaru-pro",
         conversation_id: None,
         profile_id: None,
+        contexts: None,
         contract,
     })
     .await
@@ -610,6 +611,7 @@ fn request_in(conversation: Option<&str>) -> ToolApprovalRequest {
         schedule_id: None,
         schedule_name: None,
         profile_id: None,
+        contexts: None,
         policy_id: None,
         status: ToolApprovalStatus::Pending,
         created_at: chrono::Utc::now(),
@@ -822,6 +824,7 @@ async fn a_gated_call_of_a_scheduled_run_stores_its_schedule_and_reads_its_name(
                 security_context_name: "zaru-pro",
                 conversation_id: None,
                 profile_id: None,
+                contexts: None,
                 contract: contract(),
             })
             .await
@@ -914,6 +917,7 @@ async fn gate_for(svc: &ToolApprovalService, sub: &str, args: &Value) -> GateOut
         security_context_name: "zaru-pro",
         conversation_id: None,
         profile_id: None,
+        contexts: None,
         contract: contract(),
     })
     .await
@@ -1182,6 +1186,7 @@ async fn a_refused_seal_stores_nothing() {
             security_context_name: "zaru-pro",
             conversation_id: None,
             profile_id: None,
+            contexts: None,
             contract: contract(),
         })
         .await;
@@ -1337,6 +1342,7 @@ async fn a_call_matching_a_deny_policy_is_stored_auto_denied() {
             security_context_name: "zaru-pro",
             conversation_id: None,
             profile_id: None,
+            contexts: None,
             contract: contract(),
         })
         .await

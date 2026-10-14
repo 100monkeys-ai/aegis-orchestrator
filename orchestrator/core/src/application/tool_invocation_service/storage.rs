@@ -1420,6 +1420,7 @@ impl ToolInvocationService {
                         security_context_name: LANDING_SECURITY_CONTEXT,
                         conversation_id: None,
                         profile_id: None,
+                        contexts: None,
                         contract: self.tool_router.approval_contract(land_tool),
                     })
                     .await

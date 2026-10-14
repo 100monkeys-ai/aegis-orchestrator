@@ -7,7 +7,8 @@
 //! `036_tool_approvals.sql`, with the `conversation_id` column of
 //! `044_tool_approval_conversation.sql` and the policies' `effect` of
 //! `046_tool_approval_policy_effect.sql` and the `profile_id` columns of
-//! `050_profile_scoping.sql`; [`InMemoryToolApprovalRepository`] keeps them in
+//! `050_profile_scoping.sql` and the requests' `contexts` of
+//! `053_tool_approval_contexts.sql`; [`InMemoryToolApprovalRepository`] keeps them in
 //! process, for tests and for a daemon run without a database.
 //!
 //! ## One standing choice per key (ADR-126, Update of 2026-10-08 (2))
@@ -27,13 +28,15 @@
 //! ciphertext is a JSON string in the JSONB columns `arguments` and `result`
 //! and the text itself in the TEXT columns `summary` and `error`. A row
 //! written before the migration has `sealed = false` and is read as stored.
+//! A request's `contexts` (ADR-126, Update of 2026-10-14) is sealed with
+//! `arguments`, a JSON string in its JSONB column, and opened with it.
 //!
 //! The reads that answer the request's own user or run its stored call
 //! ([`ToolApprovalRepository::find_request`],
 //! [`ToolApprovalRepository::list_requests_for_user`],
 //! [`ToolApprovalRepository::decide_pending`]) unseal; the operator's list
 //! ([`ToolApprovalRepository::list_requests`]) and the expiry sweep
-//! ([`ToolApprovalRepository::expire_pending_before`]) answer the four fields
+//! ([`ToolApprovalRepository::expire_pending_before`]) answer the sealed fields
 //! still sealed and decrypt nothing. A refused seal stores nothing, and a
 //! refused unseal fails the read.
 
@@ -60,15 +63,16 @@ use crate::infrastructure::secrets_manager::SecretsManager;
 
 const REQUEST_COLUMNS: &str = "id, tenant_id, user_sub, execution_id, agent_id, tool_name, \
      arguments, summary, binding_id, security_context_name, policy_id, status, created_at, \
-     decided_at, decided_by, result, error, conversation_id, schedule_id, profile_id, sealed";
+     decided_at, decided_by, result, error, conversation_id, schedule_id, profile_id, contexts, \
+     sealed";
 
 /// What a read answers: the stored columns and the name of the schedule
 /// whose run made the call (AEGIS ADR-139 N9). A deleted schedule keeps its
 /// row, so its name is still answered.
 const READ_COLUMNS: &str = "id, tenant_id, user_sub, execution_id, agent_id, tool_name, \
      arguments, summary, binding_id, security_context_name, policy_id, status, created_at, \
-     decided_at, decided_by, result, error, conversation_id, schedule_id, profile_id, sealed, \
-     (SELECT s.name FROM schedules s WHERE s.id = tool_approval_requests.schedule_id) \
+     decided_at, decided_by, result, error, conversation_id, schedule_id, profile_id, contexts, \
+     sealed, (SELECT s.name FROM schedules s WHERE s.id = tool_approval_requests.schedule_id) \
      AS schedule_name";
 
 const POLICY_COLUMNS: &str =
@@ -174,7 +178,7 @@ impl PostgresToolApprovalRepository {
             .map_err(|e| RepositoryError::Serialization(format!("unsealed {name}: {e}")))
     }
 
-    /// The request with its four sealed fields opened; a row written before
+    /// The request with its sealed fields opened; a row written before
     /// the migration is answered as stored.
     async fn open(&self, stored: StoredRequest) -> Result<ToolApprovalRequest, RepositoryError> {
         let mut request = stored.request;
@@ -185,6 +189,9 @@ impl PostgresToolApprovalRepository {
         request.arguments = self
             .unseal_json(&tenant_id, "arguments", &request.arguments)
             .await?;
+        if let Some(contexts) = request.contexts.take() {
+            request.contexts = Some(self.unseal_json(&tenant_id, "contexts", &contexts).await?);
+        }
         request.summary = self
             .unseal_text(&tenant_id, "summary", &request.summary)
             .await?;
@@ -247,6 +254,7 @@ fn hydrate_request(row: &PgRow) -> Result<StoredRequest, RepositoryError> {
         schedule_id: column(row, "schedule_id")?,
         schedule_name: column(row, "schedule_name")?,
         profile_id: column(row, "profile_id")?,
+        contexts: column(row, "contexts")?,
         policy_id: policy_id.map(ToolApprovalPolicyId),
         status,
         created_at: column(row, "created_at")?,
@@ -285,6 +293,10 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
     async fn insert_request(&self, request: &ToolApprovalRequest) -> Result<(), RepositoryError> {
         let tenant_id = &request.tenant_id;
         let arguments = self.seal_json(tenant_id, &request.arguments).await?;
+        let contexts = match &request.contexts {
+            Some(contexts) => Some(self.seal_json(tenant_id, contexts).await?),
+            None => None,
+        };
         let summary = self.seal(tenant_id, request.summary.as_bytes()).await?;
         let result = match &request.result {
             Some(result) => Some(self.seal_json(tenant_id, result).await?),
@@ -296,7 +308,7 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
         };
         sqlx::query(&format!(
             "INSERT INTO tool_approval_requests ({REQUEST_COLUMNS}) VALUES \
-             ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, TRUE)"
+             ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, TRUE)"
         ))
         .bind(request.id.0)
         .bind(request.tenant_id.as_str())
@@ -318,6 +330,7 @@ impl ToolApprovalRepository for PostgresToolApprovalRepository {
         .bind(&request.conversation_id)
         .bind(request.schedule_id)
         .bind(request.profile_id)
+        .bind(&contexts)
         .execute(&self.pool)
         .await?;
         Ok(())

@@ -4080,3 +4080,362 @@ async fn a_run_with_chosen_mailboxes_lists_mailbox_as_their_names() {
     }
     assert!(complaints.is_empty(), "{}", complaints.join("\n"));
 }
+
+// ---------------------------------------------------------------------------
+// AEGIS ADR-126, Update of 2026-10-14: a conversation's gated call keeps its
+// context choice, and the approved re-run acts under it
+// ---------------------------------------------------------------------------
+
+const GITHUB: &str = "github";
+const PUSH_FILES: &str = "github.push_files";
+const GITHUB_CHOSEN: &str = "Mk14-github-chosen-token";
+const GITHUB_GRANTED: &str = "Mk14-github-granted-token";
+
+/// The approval gate over the in-memory store, and that store.
+type Approvals = (
+    Arc<crate::application::tool_approval_service::ToolApprovalService>,
+    Arc<
+        crate::infrastructure::repositories::postgres_tool_approval::InMemoryToolApprovalRepository,
+    >,
+);
+
+/// A harness on a TLS gateway that knows `github`, whose tools wait at the
+/// approval gate (a capability entry marks `github.*` `requires_approval`),
+/// its executions carrying `contexts` when given.
+async fn approving_github_harness(
+    url: &str,
+    tls: &Tls,
+    vault: &Vault,
+    contexts: Option<Value>,
+) -> (Harness, Approvals) {
+    let router = ToolRouter::new(ToolRouter::builtin_dispatchers()).with_tool_capabilities(&[
+        crate::domain::node_config::ToolCapabilityConfig {
+            tool_pattern: format!("{GITHUB}.*"),
+            requires_approval: true,
+            binding_argument: None,
+            approval_summary: None,
+        },
+    ]);
+    let repo = Arc::new(
+        crate::infrastructure::repositories::postgres_tool_approval::InMemoryToolApprovalRepository::new(),
+    );
+    let approvals = Arc::new(
+        crate::application::tool_approval_service::ToolApprovalService::new(
+            repo.clone(),
+            Arc::new(EventBus::new(64)),
+        ),
+    );
+    let h = harness(Setup {
+        ca: Some(tls.ca_path.clone()),
+        credentials: Some(vault.service.clone()),
+        remote_servers: vec![GITHUB.to_string()],
+        router,
+        approvals: Some(approvals.clone()),
+        contexts,
+        ..Setup::gateway(url)
+    })
+    .await;
+    (h, (approvals, repo))
+}
+
+/// `USER`'s two `github` bindings: the one a choice names, granted to
+/// nothing, and a newer one granted to all the person's agents, which the
+/// grant path would answer.
+async fn github_bindings(vault: &Vault, tenant: &TenantId) -> CredentialBindingId {
+    let chosen = vault
+        .bind(
+            tenant,
+            USER,
+            GITHUB,
+            CredentialType::Secret,
+            &[("value", GITHUB_CHOSEN)],
+            &[],
+        )
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    vault
+        .bind(
+            tenant,
+            USER,
+            GITHUB,
+            CredentialType::Secret,
+            &[("value", GITHUB_GRANTED)],
+            &[GrantTarget::AllAgents],
+        )
+        .await;
+    chosen
+}
+
+/// The one row the gate stored for `USER`.
+async fn the_stored_row(
+    repo: &crate::infrastructure::repositories::postgres_tool_approval::InMemoryToolApprovalRepository,
+    tenant: &TenantId,
+) -> crate::domain::tool_approval::ToolApprovalRequest {
+    use crate::domain::tool_approval::ToolApprovalRepository;
+    let rows = repo
+        .list_requests_for_user(tenant, USER, None)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "the gate stored {} rows", rows.len());
+    rows.into_iter().next().unwrap()
+}
+
+/// `USER`'s answer "once" to `row`, run by the harness's service.
+async fn approve_once(
+    h: &Harness,
+    approvals: &Approvals,
+    row: &crate::domain::tool_approval::ToolApprovalRequest,
+) -> crate::domain::tool_approval::ToolApprovalRequest {
+    approvals
+        .0
+        .decide(
+            row.id,
+            &h.tenant,
+            USER,
+            crate::domain::tool_approval::ToolApprovalDecision::Once,
+            &h.service,
+        )
+        .await
+        .expect("the answer is taken")
+}
+
+/// The credential of each `InvokeTool` the stub gateway received.
+fn credentials_received(stub: &StubGateway) -> Vec<String> {
+    stub.received
+        .lock()
+        .unwrap()
+        .tools
+        .iter()
+        .map(|call| {
+            call.credential
+                .as_ref()
+                .map(|c| c.value.clone())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// Clause 1 and clause 2: a conversation's gated remote-server call stores
+/// its `_meta.contexts` and no profile, and its re-run on approval sends the
+/// chosen binding's credential to the gateway, not the newest granted one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_conversations_gated_call_stores_its_contexts_and_its_approved_rerun_sends_the_chosen_credential(
+) {
+    let stub = StubGateway::new(vec![], remote_result());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let (h, approvals) = approving_github_harness(&url, &tls, &vault, None).await;
+    let chosen = github_bindings(&vault, &h.tenant).await;
+    let token = h
+        .session_for(AgentId::new(), ExecutionId::new(), &["*"])
+        .await;
+
+    let answer = h
+        .route_with_meta(
+            &token,
+            PUSH_FILES,
+            Some(json!({ "contexts": { GITHUB: chosen.0.to_string() } })),
+        )
+        .await
+        .expect("the gate answers");
+    assert_eq!(answer["status"], "approval_pending", "{answer}");
+    assert!(credentials_received(&stub).is_empty());
+    let row = the_stored_row(&approvals.1, &h.tenant).await;
+    assert_eq!(
+        (row.contexts.clone(), row.profile_id),
+        (Some(json!({ GITHUB: [chosen.0.to_string()] })), None),
+        "the stored call did not keep the conversation's _meta.contexts"
+    );
+
+    let decided = approve_once(&h, &approvals, &row).await;
+    assert_eq!(decided.error, None, "the approved re-run failed");
+    assert_eq!(
+        credentials_received(&stub),
+        vec![GITHUB_CHOSEN.to_string()],
+        "the approved re-run did not send the chosen binding's credential"
+    );
+}
+
+/// `USER`'s one profile over the chosen `github` binding, its list empty
+/// (every tool the security context admits for it).
+struct GithubProfile {
+    id: uuid::Uuid,
+    binding: CredentialBindingId,
+}
+
+#[async_trait]
+impl crate::application::profile_service::RunProfiles for GithubProfile {
+    async fn contexts_of(
+        &self,
+        _: &TenantId,
+        person: Option<&str>,
+        id: uuid::Uuid,
+    ) -> Result<serde_json::Map<String, Value>, crate::application::profile_service::ProfileError>
+    {
+        if id != self.id || person != Some(USER) {
+            return Err(crate::application::profile_service::ProfileError::NotFound);
+        }
+        Ok(json!({ GITHUB: [self.binding.0.to_string()] })
+            .as_object()
+            .unwrap()
+            .clone())
+    }
+    async fn admission_of(
+        &self,
+        _: &TenantId,
+        person: Option<&str>,
+        id: uuid::Uuid,
+    ) -> Result<
+        crate::application::profile_service::ProfileAdmission,
+        crate::application::profile_service::ProfileError,
+    > {
+        if id != self.id || person != Some(USER) {
+            return Err(crate::application::profile_service::ProfileError::NotFound);
+        }
+        Ok(crate::application::profile_service::ProfileAdmission {
+            tools: crate::domain::profile::ToolAllowList(Vec::new()),
+            families: vec![GITHUB.to_string()],
+        })
+    }
+}
+
+/// Clause 2 with the coordinator's dated line: a conversation's gated
+/// remote-server call on a profile stores the profile and no contexts
+/// (ADR-140 D10), and its re-run on approval acts under that profile's
+/// bindings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_conversations_gated_call_on_a_profile_is_rerun_under_the_profiles_bindings() {
+    let stub = StubGateway::new(vec![], remote_result());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let (mut h, approvals) = approving_github_harness(&url, &tls, &vault, None).await;
+    let chosen = github_bindings(&vault, &h.tenant).await;
+    let profile = uuid::Uuid::new_v4();
+    h.service = h.service.with_profiles(Arc::new(GithubProfile {
+        id: profile,
+        binding: chosen,
+    }));
+    let token = h
+        .session_for(AgentId::new(), ExecutionId::new(), &["*"])
+        .await;
+
+    let answer = h
+        .route_with_meta(
+            &token,
+            PUSH_FILES,
+            Some(json!({ "profile": profile.to_string() })),
+        )
+        .await
+        .expect("the gate answers");
+    assert_eq!(answer["status"], "approval_pending", "{answer}");
+    let row = the_stored_row(&approvals.1, &h.tenant).await;
+    assert_eq!(
+        (row.profile_id, row.contexts.clone()),
+        (Some(profile), None),
+        "the stored call on a profile did not keep the profile alone"
+    );
+
+    let decided = approve_once(&h, &approvals, &row).await;
+    assert_eq!(decided.error, None, "the approved re-run failed");
+    assert_eq!(
+        credentials_received(&stub),
+        vec![GITHUB_CHOSEN.to_string()],
+        "the approved re-run did not act under the profile's binding"
+    );
+}
+
+/// Clause 1: a gated call of an execution with a record stores no contexts,
+/// though its `_meta` names a binding; its record governs, at the call and
+/// at the re-run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gated_call_of_an_execution_with_a_record_stores_no_contexts() {
+    let stub = StubGateway::new(vec![], remote_result());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let tenant = TenantId::for_consumer_user(USER).unwrap();
+    let chosen = github_bindings(&vault, &tenant).await;
+    let in_meta = vault
+        .bind(
+            &tenant,
+            USER,
+            GITHUB,
+            CredentialType::Secret,
+            &[("value", NEWEST_GRANTED)],
+            &[],
+        )
+        .await;
+    let (h, approvals) = approving_github_harness(
+        &url,
+        &tls,
+        &vault,
+        Some(json!({ GITHUB: chosen.0.to_string() })),
+    )
+    .await;
+    let token = h.session_for(h.agent_id, h.execution, &["*"]).await;
+
+    let answer = h
+        .route_with_meta(
+            &token,
+            PUSH_FILES,
+            Some(json!({ "contexts": { GITHUB: in_meta.0.to_string() } })),
+        )
+        .await
+        .expect("the gate answers");
+    assert_eq!(answer["status"], "approval_pending", "{answer}");
+    let row = the_stored_row(&approvals.1, &h.tenant).await;
+    assert_eq!(
+        row.contexts, None,
+        "a call of an execution with a record stored the call's _meta.contexts"
+    );
+
+    let decided = approve_once(&h, &approvals, &row).await;
+    assert_eq!(decided.error, None, "the approved re-run failed");
+    assert_eq!(
+        credentials_received(&stub),
+        vec![GITHUB_CHOSEN.to_string()],
+        "the approved re-run did not act under the record's choice"
+    );
+}
+
+/// Clause 2: a stored binding that is no longer the person's own active one
+/// at the re-run is refused with D15's sentence, the row records it, and
+/// nothing reaches the gateway; the grant path is not tried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stored_binding_no_longer_active_is_refused_at_the_rerun_with_d15s_sentence() {
+    let stub = StubGateway::new(vec![], remote_result());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let (h, approvals) = approving_github_harness(&url, &tls, &vault, None).await;
+    let chosen = github_bindings(&vault, &h.tenant).await;
+    let token = h
+        .session_for(AgentId::new(), ExecutionId::new(), &["*"])
+        .await;
+    h.route_with_meta(
+        &token,
+        PUSH_FILES,
+        Some(json!({ "contexts": { GITHUB: chosen.0.to_string() } })),
+    )
+    .await
+    .expect("the gate answers");
+    let row = the_stored_row(&approvals.1, &h.tenant).await;
+    let mut binding = vault.bindings.find_by_id(&chosen).await.unwrap().unwrap();
+    binding.status = CredentialStatus::Revoked;
+    vault.bindings.save(&binding).await.unwrap();
+
+    let decided = approve_once(&h, &approvals, &row).await;
+    let sentence = format!(
+        "This tool needs your own credential for '{GITHUB}', and the one chosen for this run is not an active credential of yours for it."
+    );
+    let stored = the_stored_row(&approvals.1, &h.tenant).await;
+    let mut complaints = Vec::new();
+    for (whose, error) in [("the answer", &decided.error), ("the row", &stored.error)] {
+        if !error.as_deref().is_some_and(|e| e.contains(&sentence)) {
+            complaints.push(format!("{whose} recorded {error:?}"));
+        }
+    }
+    let sent = credentials_received(&stub);
+    if !sent.is_empty() {
+        complaints.push(format!("the re-run sent {sent:?}"));
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}

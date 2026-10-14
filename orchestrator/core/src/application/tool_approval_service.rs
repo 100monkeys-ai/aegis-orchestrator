@@ -30,7 +30,7 @@ use serde_json::Value;
 
 use crate::domain::agent::AgentId;
 use crate::domain::events::MCPToolEvent;
-use crate::domain::execution::ExecutionId;
+use crate::domain::execution::{ExecutionContexts, ExecutionId, ServerChoice};
 use crate::domain::repository::RepositoryError;
 use crate::domain::tenant::TenantId;
 use crate::domain::tool_approval::{
@@ -87,9 +87,43 @@ pub struct GatedCall<'a> {
     /// A standing choice matches only calls carrying the profile it was made
     /// in, and one made on raw bindings only raw-binding calls.
     pub profile_id: Option<uuid::Uuid>,
+    /// The conversation's choice of bindings, its `_meta.contexts` as the
+    /// invoke route admitted it (AEGIS ADR-132 S11a), for a call of a
+    /// session with no execution record and no profile; none for a call of
+    /// an execution with a record, for a call on a profile, and for a call
+    /// that carried none (AEGIS ADR-126, Update of 2026-10-14, clause 1).
+    /// The approved re-run acts under it.
+    pub contexts: Option<Value>,
     /// What the tool declares to the gate: its binding argument and its
     /// summary's arguments (ADR-126, Update of 2026-10-04, clause 1).
     pub contract: ApprovalContract,
+}
+
+/// A call's choice of bindings as a stored call keeps it (AEGIS ADR-126,
+/// Update of 2026-10-14, clause 1): the `contexts` object ADR-132 S11a
+/// admits, each server naming `null` or the list of its chosen binding ids
+/// in the person's order (a one-element list means the bare id). Read back
+/// by [`ExecutionContexts::from_value`] it is the same choice.
+pub fn stored_contexts(contexts: &ExecutionContexts) -> Value {
+    Value::Object(
+        contexts
+            .servers()
+            .filter_map(|(server, choice)| {
+                let value = match choice {
+                    ServerChoice::Bindings(ids) => Value::Array(
+                        ids.iter()
+                            .map(|id| Value::String(id.0.to_string()))
+                            .collect(),
+                    ),
+                    ServerChoice::None => Value::Null,
+                    // A server the call named nothing for is left out, so
+                    // the re-run takes the grant path for it as the call did.
+                    ServerChoice::NotGiven => return None,
+                };
+                Some((server.to_string(), value))
+            })
+            .collect(),
+    )
 }
 
 /// What the dispatch path does with a gated call.
@@ -159,6 +193,7 @@ impl ToolApprovalService {
             schedule_id,
             schedule_name: None,
             profile_id: call.profile_id,
+            contexts: call.contexts,
             policy_id: None,
             status: ToolApprovalStatus::Pending,
             created_at: now,

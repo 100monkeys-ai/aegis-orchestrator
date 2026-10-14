@@ -14,8 +14,9 @@ impl ApprovedCallRunner for ToolInvocationService {
     /// Run a stored call through the dispatch stages after the gate (the
     /// inner-loop judge, then dispatch), with the stored arguments, as the
     /// request's user, under the security context the call was evaluated
-    /// under, looked up by name now. The agent's iteration has ended, so the
-    /// run carries iteration 0 and no tool history, as a SEAL call does.
+    /// under, looked up by name now, and under the stored choice of bindings
+    /// (its profile, else its contexts). The agent's iteration has ended, so
+    /// the run carries iteration 0 and no tool history, as a SEAL call does.
     async fn run_approved_call(&self, request: &ToolApprovalRequest) -> Result<Value, String> {
         let security_context = self
             .security_context_repo
@@ -47,6 +48,23 @@ impl ApprovedCallRunner for ToolInvocationService {
         };
         let tenant_scope =
             TenantScope::new(request.tenant_id.clone(), identity.identity_kind.clone());
+        // ADR-126, Update of 2026-10-14, clause 2: the stored call acts under
+        // the choice it was made with: its profile, resolved to the
+        // profile's active bindings as a start resolves it (AEGIS ADR-140
+        // D6), else its stored contexts, never both (D10). A binding no
+        // longer the person's own active one is refused at dispatch with
+        // D15's sentence; a call that stored neither takes the grant path.
+        let call_contexts = match (request.profile_id, &request.contexts) {
+            (Some(profile), _) => Some(
+                self.profile_contexts(&request.tenant_id, Some(request.user_sub.as_str()), profile)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            ),
+            (None, Some(contexts)) => Some(
+                crate::domain::execution::ExecutionContexts::from_value(Some(contexts)),
+            ),
+            (None, None) => None,
+        };
         let invocation_id = ToolInvocationId::new();
         let started_at = Instant::now();
         self.publish_invocation_requested(
@@ -75,6 +93,8 @@ impl ApprovedCallRunner for ToolInvocationService {
                 Some(&identity),
                 invocation_id,
                 started_at,
+                call_contexts.as_ref(),
+                request.profile_id,
             )
             .await
         {
