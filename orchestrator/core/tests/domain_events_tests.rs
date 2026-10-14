@@ -347,6 +347,7 @@ fn execution_event_refinement_applied_serde_roundtrip() {
         cortex_pattern_category: Some("error_handling".to_string()),
         cortex_success_score: Some(0.92),
         cortex_solution_approach: None,
+        constructed: None,
     };
     let json = serde_json::to_string(&event).unwrap();
     let deser: ExecutionEvent = serde_json::from_str(&json).unwrap();

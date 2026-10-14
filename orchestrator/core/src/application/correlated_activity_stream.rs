@@ -411,6 +411,7 @@ fn execution_to_history(execution: &Execution) -> Vec<CorrelatedActivityEvent> {
                     cortex_pattern_category: None,
                     cortex_success_score: None,
                     cortex_solution_approach: None,
+                    constructed: None,
                 }),
                 None,
             ));
@@ -591,9 +592,16 @@ fn event_message(event: &DomainEvent) -> String {
         DomainEvent::Execution(ExecutionEvent::RefinementApplied {
             iteration_number,
             code_diff,
+            constructed,
             ..
         }) => {
-            if code_diff.diff.is_empty() {
+            if let Some(history) = constructed {
+                format!(
+                    "Applied refinement after iteration {iteration_number}: a constructed history of {} calls and {} files",
+                    history.calls,
+                    history.files.len()
+                )
+            } else if code_diff.diff.is_empty() {
                 format!("Applied refinement after iteration {iteration_number}")
             } else {
                 format!(
@@ -1599,12 +1607,47 @@ mod tests {
                 cortex_pattern_category: None,
                 cortex_success_score: None,
                 cortex_solution_approach: None,
+                constructed: None,
             }),
             None,
         );
         assert_eq!(refinement_event.event_type, "refinement_applied");
         assert_eq!(refinement_event.iteration, Some(2));
         assert!(refinement_event.message.contains("refinement"));
+    }
+
+    /// AEGIS ADR-141, Update of 2026-10-14, R2: the narrative's line for a
+    /// refinement that carries a constructed history counts its calls and
+    /// its files.
+    #[test]
+    fn refinement_line_names_a_constructed_history() {
+        let line = normalize_domain_event(
+            &DomainEvent::Execution(ExecutionEvent::RefinementApplied {
+                execution_id: ExecutionId::new(),
+                agent_id: AgentId::new(),
+                iteration_number: 1,
+                code_diff: CodeDiff {
+                    file_path: String::new(),
+                    diff: String::new(),
+                },
+                applied_at: Utc::now(),
+                cortex_pattern_id: None,
+                cortex_pattern_category: None,
+                cortex_success_score: None,
+                cortex_solution_approach: None,
+                constructed: Some(crate::domain::execution::ConstructedHistory {
+                    facts: "# This task so far\nTry 1 ran 39 tool calls in 900 s.".to_string(),
+                    files: vec!["/workspace/a.py".to_string(), "/workspace/b.py".to_string()],
+                    calls: 39,
+                }),
+            }),
+            None,
+        )
+        .message;
+        assert_eq!(
+            line,
+            "Applied refinement after iteration 1: a constructed history of 39 calls and 2 files"
+        );
     }
 
     /// The narrative's line for a refinement reads the refinement itself
@@ -1626,6 +1669,7 @@ mod tests {
                     cortex_pattern_category: None,
                     cortex_success_score: None,
                     cortex_solution_approach: None,
+                    constructed: None,
                 }),
                 None,
             )

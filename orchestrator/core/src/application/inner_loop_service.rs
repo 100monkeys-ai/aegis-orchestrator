@@ -18,7 +18,10 @@ use crate::domain::dispatch::{
     AgentMessage, ConversationMessage, DispatchAction, DispatchId, OrchestratorMessage, ToolCall,
 };
 use crate::domain::events::{ExecutionEvent, RefusalLayer};
-use crate::domain::execution::{AttachmentRef, ExecutionId, Iteration, TrajectoryStep};
+use crate::domain::execution::{
+    AttachmentRef, ConstructedHistory, ExecutionId, ExhaustedBy, Exhaustion, Iteration,
+    TrajectoryStep,
+};
 use crate::domain::goal::{judge_context_or_default, JudgeContextSource};
 use crate::domain::iam::UserIdentity;
 use crate::domain::llm::{ChatMessage, ContentPart, GenerationOptions, ImageSource, ToolSchema};
@@ -28,9 +31,6 @@ use crate::infrastructure::llm::registry::{ApiKeySource, ProviderRegistry};
 /// The share of the alias's prompt limit one command's output may take in
 /// the conversation: an eighth.
 const COMMAND_OUTPUT_SHARE_OF_PROMPT_LIMIT: usize = 8;
-
-/// Maximum number of tool-call iterations before the inner loop is forcibly terminated.
-const MAX_INNER_LOOP_ITERATIONS: usize = 50;
 
 /// System-level guidance injected at the start of every conversation.
 ///
@@ -75,7 +75,14 @@ struct ExecutionContext {
     model_alias: String,
     iteration_number: u8,
     conversation: Vec<ConversationMessage>,
+    /// The model turns of this try that asked for tools.
     iterations: usize,
+    /// The tool calls the model asked for in this try, refused ones included
+    /// (AEGIS ADR-141, Update of 2026-10-14, R4).
+    tool_calls: usize,
+    /// The most tool calls this try dispatches: the agent's
+    /// `spec.execution.max_tool_calls`.
+    max_tool_calls: u32,
     pending_dispatch_id: Option<DispatchId>,
     pending_tool_call_id: Option<String>,
     trajectory: Vec<TrajectoryStep>,
@@ -104,10 +111,6 @@ struct ExecutionContext {
     tool_call_requirement: ToolCallRequirement,
     /// Whether a text answer was already sent back once for that requirement.
     tool_call_reminded: bool,
-    /// Whether the try clock already refused a command in this try: the first
-    /// refusal is the call's result and the model answers, a second ends the
-    /// try.
-    try_clock_refused: bool,
     /// How many messages of `conversation` an earlier generation's
     /// `LlmInteraction` already showed (AEGIS ADR-131 U34d): the next one's
     /// prompt is the messages after them.
@@ -283,7 +286,7 @@ fn shell_as_command_sentence(arguments: &Value) -> Option<String> {
 fn repeated_call_sentence(runs: usize) -> String {
     format!(
         "This call was already run {runs} times in this try with the same answer; it is not \
-         run again. Change the call, or answer with what you have."
+         run again."
     )
 }
 
@@ -326,8 +329,19 @@ fn past_deadline_sentence(tool: &str) -> String {
     format!("[AEGIS] {tool} was not run: this try's time is up. The try ends here.")
 }
 
+/// The sentence a try ends with when the model asks for a call past its
+/// call budget (AEGIS ADR-141, Update of 2026-10-14, R4): the call is not run.
+fn past_the_budget_sentence(tool: &str, budget: u32) -> String {
+    format!(
+        "[AEGIS] {tool} was not run: this try has made its {budget} tool calls, the most one \
+         try makes. The try ends here."
+    )
+}
+
 /// Why a tool call of the model's is not run, decided before it would run.
 enum CallNotRun {
+    /// The try's call budget was spent (R4).
+    PastTheBudget(u32),
     /// The try's or the execution's deadline had passed.
     PastDeadline,
     /// The same call was already run this many times to the same answer.
@@ -647,6 +661,16 @@ impl InnerLoopService {
                             parsed_agent_id.0
                         )
                     })?;
+                let max_tool_calls = self
+                    .tool_invocation_service
+                    .agent_max_tool_calls(&tenant_id, parsed_agent_id)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "loading agent {} for its max_tool_calls: {e}",
+                            parsed_agent_id.0
+                        )
+                    })?;
                 let now = chrono::Utc::now();
                 let iteration_bound_delta =
                     chrono::Duration::seconds(iteration_bound.as_secs() as i64);
@@ -668,9 +692,48 @@ impl InnerLoopService {
                     Err(_) => now + iteration_bound_delta,
                 };
 
-                // What the earlier tries did (retry-knows-what-failed, (a)),
-                // from the trajectory the record keeps of each.
-                if prompt_is_ours {
+                // After a try that ran out of its budget, the opening is
+                // constructed from the record (AEGIS ADR-141, Update of
+                // 2026-10-14, R2): the facts paragraph appended to the user
+                // message, then a constructed `fs.list` of each directory
+                // holding a file the earlier tries left and an `fs.read` of
+                // each such file, read now through the tools' own path. After
+                // a try that ended any other way, what the earlier tries did
+                // (retry-knows-what-failed, (a)), from the trajectory the
+                // record keeps of each.
+                let after_exhausted = match exec_record {
+                    Ok(ref e) if prompt_is_ours => e
+                        .iterations
+                        .iter()
+                        .find(|i| Some(i.number) == iteration_number.checked_sub(1))
+                        .and_then(|i| i.exhausted.as_ref())
+                        .map(|exhaustion| {
+                            exhaustion.constructed.clone().unwrap_or_else(|| {
+                                ConstructedHistory::after(
+                                    &e.iterations,
+                                    iteration_number.saturating_sub(1),
+                                    now,
+                                )
+                            })
+                        }),
+                    _ => None,
+                };
+                if let Some(history) = after_exhausted {
+                    if let Some(user) = conversation.iter_mut().find(|m| m.role == "user") {
+                        user.content.push_str("\n\n");
+                        user.content.push_str(&history.facts);
+                    }
+                    let turns = self
+                        .constructed_turns(
+                            parsed_agent_id,
+                            ExecutionId(execution_id_uuid),
+                            &tenant_id,
+                            iteration_number,
+                            &history.files,
+                        )
+                        .await;
+                    conversation.extend(turns);
+                } else if prompt_is_ours {
                     if let Ok(ref e) = exec_record {
                         let section = previous_tries_section(
                             &e.iterations,
@@ -721,6 +784,8 @@ impl InnerLoopService {
                         iteration_number,
                         conversation,
                         iterations: 0,
+                        tool_calls: 0,
+                        max_tool_calls,
                         pending_dispatch_id: None,
                         pending_tool_call_id: None,
                         trajectory: Vec::new(),
@@ -737,7 +802,6 @@ impl InnerLoopService {
                         pending_command: None,
                         tool_call_requirement,
                         tool_call_reminded: false,
-                        try_clock_refused: false,
                         conversation_shown: 0,
                         attachment_parts,
                     },
@@ -849,14 +913,6 @@ impl InnerLoopService {
                     anyhow::anyhow!("Execution context not found for {execution_id_str}")
                 })?
             };
-
-            if ctx.iterations >= MAX_INNER_LOOP_ITERATIONS {
-                self.active_executions
-                    .write()
-                    .await
-                    .remove(execution_id_str);
-                anyhow::bail!("Inner loop exceeded max iterations ({MAX_INNER_LOOP_ITERATIONS})");
-            }
 
             // The run's own list (AEGIS ADR-132 G5, H4): with the remote
             // servers' tools its person bound and granted this agent; every
@@ -1022,13 +1078,18 @@ impl InnerLoopService {
                         // uses), and no third run of a call this try already
                         // ran twice to the same answer.
                         let not_run = {
-                            let lock = self.active_executions.read().await;
-                            let current = lock.get(execution_id_str).ok_or_else(|| {
+                            let mut lock = self.active_executions.write().await;
+                            let current = lock.get_mut(execution_id_str).ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "execution context for '{execution_id_str}' not found in active_executions"
                                 )
                             })?;
-                            if current
+                            // Every call the model asks for counts against
+                            // the try's budget, refused ones included (R4).
+                            current.tool_calls += 1;
+                            if current.tool_calls > current.max_tool_calls as usize {
+                                Some(CallNotRun::PastTheBudget(current.max_tool_calls))
+                            } else if current
                                 .deadline
                                 .is_some_and(|deadline| chrono::Utc::now() >= deadline)
                             {
@@ -1043,6 +1104,40 @@ impl InnerLoopService {
                             }
                         };
                         match not_run {
+                            Some(CallNotRun::PastTheBudget(budget)) => {
+                                let sentence = past_the_budget_sentence(&tool_call.name, budget);
+                                if let Some(mut ended_ctx) = self
+                                    .active_executions
+                                    .write()
+                                    .await
+                                    .remove(execution_id_str)
+                                {
+                                    let call_index = ended_ctx.trajectory.len();
+                                    let mut step = step;
+                                    step.status = "refused".to_string();
+                                    step.error = Some(sentence.clone());
+                                    ended_ctx.trajectory.push(step);
+                                    self.publish_dispatch(
+                                        execution_id_str,
+                                        &ended_ctx,
+                                        call_index,
+                                        &tool_call,
+                                        "refused",
+                                        Some(sentence.clone()),
+                                        Some(RefusalLayer::CallBudget),
+                                        None,
+                                    )
+                                    .await;
+                                    self.persist_trajectory(execution_id_str, &ended_ctx).await;
+                                    self.record_exhausted(
+                                        execution_id_str,
+                                        ended_ctx.iteration_number,
+                                        ExhaustedBy::CallBudget,
+                                    )
+                                    .await;
+                                }
+                                anyhow::bail!(sentence);
+                            }
                             Some(CallNotRun::PastDeadline) => {
                                 let sentence = past_deadline_sentence(&tool_call.name);
                                 if let Some(mut ended_ctx) = self
@@ -1239,15 +1334,11 @@ impl InnerLoopService {
                                 ) {
                                     Ok(fitted) => fitted,
                                     Err(refusal) => {
-                                        // AEGIS ADR-131 U37, as amended on
-                                        // 2026-10-13: the try clock's first
-                                        // refusal in a try is the call's
-                                        // result, followed by the order to
-                                        // answer, and the model is called once
-                                        // more inside the margin the try
-                                        // keeps (one model call and the
-                                        // transport); a second refusal ends
-                                        // the try, failed with its sentence.
+                                        // AEGIS ADR-141, Update of 2026-10-14,
+                                        // Question 2's default (U37's
+                                        // amendment of 2026-10-13 reversed):
+                                        // the try clock's refusal ends the
+                                        // try, exhausted, with its sentence.
                                         let call_index = next_ctx.trajectory.len();
                                         let mut step = step;
                                         step.status = "refused".to_string();
@@ -1264,23 +1355,14 @@ impl InnerLoopService {
                                             None,
                                         )
                                         .await;
-                                        if !next_ctx.try_clock_refused {
-                                            next_ctx.try_clock_refused = true;
-                                            next_ctx.conversation.push(ConversationMessage {
-                                                role: "tool".to_string(),
-                                                content: format!("{refusal} {TRY_CLOCK_ANSWER_NOW}"),
-                                                tool_call_id: Some(tool_call.id.clone()),
-                                                tool_calls: None,
-                                            });
-                                            self.persist_trajectory(execution_id_str, &next_ctx).await;
-                                            self.active_executions
-                                                .write()
-                                                .await
-                                                .insert(execution_id_str.to_string(), next_ctx);
-                                            continue;
-                                        }
                                         self.persist_trajectory(execution_id_str, &next_ctx).await;
                                         self.active_executions.write().await.remove(execution_id_str);
+                                        self.record_exhausted(
+                                            execution_id_str,
+                                            next_ctx.iteration_number,
+                                            ExhaustedBy::TryClock,
+                                        )
+                                        .await;
                                         anyhow::bail!(refusal);
                                     }
                                 };
@@ -1470,6 +1552,163 @@ impl InnerLoopService {
                     }
                 }
             }
+        }
+    }
+
+    /// The constructed turns of an opening after an exhausted try (R2): an
+    /// `fs.list` of each directory holding one of `files`, then an `fs.read`
+    /// of each, each an assistant message with its one call and the call's
+    /// result, read now through the tools' own path so the turns are true
+    /// when the model sees them. A file that cannot be read is left out, and
+    /// so is a directory holding none that can.
+    async fn constructed_turns(
+        &self,
+        agent_id: AgentId,
+        execution_id: ExecutionId,
+        tenant_id: &TenantId,
+        iteration_number: u8,
+        files: &[String],
+    ) -> Vec<ConversationMessage> {
+        let mut reads: Vec<(Value, String)> = Vec::new();
+        for path in files {
+            let arguments = serde_json::json!({ "path": path });
+            if let Some(result) = self
+                .constructed_call(
+                    agent_id,
+                    execution_id,
+                    tenant_id,
+                    iteration_number,
+                    "fs.read",
+                    &arguments,
+                )
+                .await
+            {
+                reads.push((arguments, result));
+            }
+        }
+        let mut directories: Vec<String> = Vec::new();
+        for (arguments, _) in &reads {
+            let path = arguments["path"].as_str().unwrap_or_default();
+            let directory = match path.rfind('/') {
+                Some(0) => "/".to_string(),
+                Some(at) => path[..at].to_string(),
+                None => continue,
+            };
+            if !directories.contains(&directory) {
+                directories.push(directory);
+            }
+        }
+        let mut calls: Vec<(&str, Value, String)> = Vec::new();
+        for directory in directories {
+            let arguments = serde_json::json!({ "path": directory });
+            if let Some(result) = self
+                .constructed_call(
+                    agent_id,
+                    execution_id,
+                    tenant_id,
+                    iteration_number,
+                    "fs.list",
+                    &arguments,
+                )
+                .await
+            {
+                calls.push(("fs.list", arguments, result));
+            }
+        }
+        calls.extend(reads.into_iter().map(|(a, r)| ("fs.read", a, r)));
+        let mut turns = Vec::new();
+        for (n, (tool, arguments, result)) in calls.into_iter().enumerate() {
+            let id = format!("constructed-{}", n + 1);
+            turns.push(ConversationMessage {
+                role: "assistant".to_string(),
+                content: String::new(),
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: id.clone(),
+                    name: tool.to_string(),
+                    arguments,
+                }]),
+            });
+            turns.push(ConversationMessage {
+                role: "tool".to_string(),
+                content: result,
+                tool_call_id: Some(id),
+                tool_calls: None,
+            });
+        }
+        turns
+    }
+
+    /// One constructed call's result, as the tool answers it now; `None`
+    /// when it does not answer directly.
+    async fn constructed_call(
+        &self,
+        agent_id: AgentId,
+        execution_id: ExecutionId,
+        tenant_id: &TenantId,
+        iteration_number: u8,
+        tool: &str,
+        arguments: &Value,
+    ) -> Option<String> {
+        match self
+            .tool_invocation_service
+            .invoke_tool_internal(
+                &agent_id,
+                execution_id,
+                tenant_id.clone(),
+                iteration_number,
+                Vec::new(),
+                tool.to_string(),
+                arguments.clone(),
+            )
+            .await
+        {
+            Ok(crate::application::tool_invocation_service::ToolInvocationResult::Direct(
+                value,
+            )) => Some(serde_json::to_string(&value).unwrap_or_default()),
+            _ => None,
+        }
+    }
+
+    /// Record on the iteration that its call budget or the try clock ended
+    /// it (AEGIS ADR-141, Update of 2026-10-14, R2), with the history the
+    /// next try is opened from, built from the record as it stands, the
+    /// try's trajectory stored, before the gateway answers and the try fails.
+    async fn record_exhausted(&self, execution_id_str: &str, iteration: u8, by: ExhaustedBy) {
+        let Ok(id) = uuid::Uuid::parse_str(execution_id_str) else {
+            return;
+        };
+        let constructed = match self
+            .execution_service
+            .get_execution_unscoped(ExecutionId(id))
+            .await
+        {
+            Ok(e) => Some(ConstructedHistory::after(
+                &e.iterations,
+                iteration,
+                chrono::Utc::now(),
+            )),
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution_id_str,
+                    iteration,
+                    error = %err,
+                    "The record was not read for the constructed history"
+                );
+                None
+            }
+        };
+        if let Err(err) = self
+            .execution_service
+            .record_constructed_history(ExecutionId(id), iteration, Exhaustion { by, constructed })
+            .await
+        {
+            tracing::warn!(
+                execution_id = %execution_id_str,
+                iteration,
+                error = %err,
+                "Failed to record the exhausted try"
+            );
         }
     }
 
@@ -1937,11 +2176,6 @@ fn policy_feedback_message(tool_name: &str) -> String {
 
 /// Seconds a try's command result needs to come back to the orchestrator.
 const COMMAND_RESULT_TRANSPORT_SECS: u64 = 10;
-
-/// What follows the try clock's first refusal in a try when the model is
-/// given it as the refused call's result.
-const TRY_CLOCK_ANSWER_NOW: &str =
-    "Answer now with what you have; run no more commands in this try.";
 
 /// The line the bootstrap ends a timed-out command's stderr with.
 const COMMAND_TIMED_OUT: &str = "[AEGIS] Command timed out after";

@@ -131,6 +131,7 @@ impl ExecutionService for MockExecutionService {
             trajectory: None,
             policy_violations: vec![],
             produced_files: vec![],
+            exhausted: None,
         };
         Ok(vec![iteration])
     }

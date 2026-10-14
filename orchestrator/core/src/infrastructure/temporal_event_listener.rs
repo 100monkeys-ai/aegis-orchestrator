@@ -920,6 +920,7 @@ impl TemporalEventListener {
                 cortex_pattern_category: None,
                 cortex_success_score: None,
                 cortex_solution_approach: None,
+                constructed: None,
             };
 
             self.persist_and_publish_execution_event(

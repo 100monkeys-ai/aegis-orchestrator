@@ -630,6 +630,15 @@ pub struct ExecutionStrategy {
     /// the try.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub require_tool_call: bool,
+    // AEGIS ADR-141, Update of 2026-10-14, R4; the doc comment is the manifest schema's text.
+    /// The most tool calls one try dispatches, counting every call the model
+    /// asks for, refused ones included. A call past it is not run, and the
+    /// try ends exhausted. 50 when unset.
+    #[serde(
+        default = "default_max_tool_calls",
+        skip_serializing_if = "is_default_max_tool_calls"
+    )]
+    pub max_tool_calls: u32,
 }
 
 /// One file an execution must produce: `spec.execution.outputs[]` in the
@@ -691,6 +700,7 @@ impl Default for ExecutionStrategy {
             delivery: None,
             outputs: Vec::new(),
             require_tool_call: false,
+            max_tool_calls: default_max_tool_calls(),
         }
     }
 }
@@ -1066,6 +1076,14 @@ fn default_max_retries() -> u32 {
 }
 fn default_llm_timeout() -> u64 {
     300
+}
+/// A try's call budget when the manifest sets none (AEGIS ADR-141, Update of
+/// 2026-10-14, R4): the inner loop's fixed cap before it.
+pub fn default_max_tool_calls() -> u32 {
+    50
+}
+fn is_default_max_tool_calls(budget: &u32) -> bool {
+    *budget == default_max_tool_calls()
 }
 fn default_validation_timeout() -> u64 {
     // 300 s matches default_llm_timeout so a judge's LLM call (typically 30–120 s)

@@ -644,6 +644,7 @@ fn execution_strategy_iterative_with_validation() {
         delivery: None,
         outputs: Vec::new(),
         require_tool_call: false,
+        max_tool_calls: 50,
     };
     assert!(matches!(es.mode, ExecutionMode::Iterative));
     assert_eq!(es.max_retries, 10);
@@ -929,6 +930,7 @@ fn execution_strategy_json_round_trip() {
         delivery: None,
         outputs: Vec::new(),
         require_tool_call: false,
+        max_tool_calls: 50,
     };
     let json = serde_json::to_string(&original).expect("serialize");
     let deserialized: ExecutionStrategy = serde_json::from_str(&json).expect("deserialize");

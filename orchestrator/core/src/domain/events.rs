@@ -388,6 +388,11 @@ pub enum ExecutionEvent {
         cortex_success_score: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         cortex_solution_approach: Option<String>,
+        /// The history the next try is opened from, when the iteration ran
+        /// out of its budget (AEGIS ADR-141, Update of 2026-10-14, R2): the
+        /// facts paragraph and the files shown to it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        constructed: Option<crate::domain::execution::ConstructedHistory>,
     },
     ExecutionCompleted {
         execution_id: ExecutionId,
@@ -686,8 +691,10 @@ impl From<&crate::domain::llm::LLMError> for LlmErrorClass {
 /// The layer that refused a tool call (AEGIS ADR-131 U34a): the execution's
 /// security context; the try's time limit (a command asked for with too
 /// little of the try left to run it and read its result); the try's or the
-/// execution's deadline, already past when the call was asked for; or the
-/// repeated-call guard (the same call, answered alike twice in the try).
+/// execution's deadline, already past when the call was asked for; the
+/// repeated-call guard (the same call, answered alike twice in the try); or
+/// the try's call budget, `spec.execution.max_tool_calls` (AEGIS ADR-141,
+/// Update of 2026-10-14, R4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RefusalLayer {
@@ -695,6 +702,7 @@ pub enum RefusalLayer {
     TryTimeLimit,
     Deadline,
     RepeatedCall,
+    CallBudget,
 }
 
 /// Workflow FSM lifecycle events (BC-3 Workflow Orchestration Context).

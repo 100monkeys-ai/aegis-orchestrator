@@ -216,6 +216,18 @@ impl ExecutionService for Records {
         }
         Ok(())
     }
+    async fn record_constructed_history(
+        &self,
+        execution_id: ExecutionId,
+        iteration: u8,
+        exhaustion: crate::domain::execution::Exhaustion,
+    ) -> anyhow::Result<()> {
+        let mut map = self.0.lock().unwrap();
+        if let Some(exec) = map.get_mut(&execution_id) {
+            let _ = exec.store_constructed_history(iteration, exhaustion);
+        }
+        Ok(())
+    }
     async fn record_execution_event(&self, event: ExecutionEvent) {
         self.1.lock().unwrap().push(event);
     }
@@ -340,6 +352,29 @@ impl SupervisorObserver for RecordingObserver {
     async fn on_instance_spawned(&self, _iteration: u8, _instance_id: &InstanceId) {}
     async fn on_instance_terminated(&self, _iteration: u8, _instance_id: &InstanceId) {}
     async fn on_validation_complete(&self, _: u8, _: &ValidationResults, _: bool) {}
+    /// As the execution monitor: the iteration recorded exhausted, with the
+    /// history the next try is opened from.
+    async fn on_iteration_exhausted(
+        &self,
+        iteration: u8,
+        by: crate::domain::execution::ExhaustedBy,
+    ) {
+        self.records.update(self.execution_id, |e| {
+            let constructed = crate::domain::execution::ConstructedHistory::after(
+                &e.iterations,
+                iteration,
+                chrono::Utc::now(),
+            );
+            e.store_constructed_history(
+                iteration,
+                crate::domain::execution::Exhaustion {
+                    by,
+                    constructed: Some(constructed),
+                },
+            )
+            .expect("the iteration exists");
+        });
+    }
 }
 
 struct OneAgent(Agent);
@@ -768,6 +803,8 @@ struct World {
     execution_id: ExecutionId,
     /// The volumes the file tools find for an execution.
     volumes: crate::application::nfs_gateway::NfsVolumeRegistry,
+    /// The volume records the file system layer reads.
+    volume_records: Arc<crate::infrastructure::repositories::InMemoryVolumeRepository>,
 }
 
 async fn world(agent: Agent, turns: Vec<Turn>) -> World {
@@ -817,11 +854,13 @@ async fn world_full(
     contexts.save(context).await.unwrap();
     let storage_root =
         std::env::temp_dir().join(format!("aegis-inner-loop-tests-{}", uuid::Uuid::new_v4()));
+    let volume_records =
+        Arc::new(crate::infrastructure::repositories::InMemoryVolumeRepository::new());
     let fsal = Arc::new(crate::domain::fsal::AegisFSAL::new(
         Arc::new(
             crate::infrastructure::storage::LocalHostStorageProvider::new(&storage_root).unwrap(),
         ),
-        Arc::new(crate::infrastructure::repositories::InMemoryVolumeRepository::new()),
+        volume_records.clone(),
         Arc::new(parking_lot::RwLock::new(HashMap::new())),
         Arc::new(NoOpPublisher),
     ));
@@ -860,6 +899,7 @@ async fn world_full(
         agent,
         execution_id,
         volumes,
+        volume_records,
     }
 }
 
@@ -1108,17 +1148,14 @@ impl World {
     }
 }
 
-/// The sentence a try clock's refusal is followed by when the model is given
-/// it as its tool call's result.
-const ANSWER_NOW: &str = "Answer now with what you have; run no more commands in this try.";
-
-/// AEGIS ADR-131, amending U37: the first command the try clock refuses in a
-/// try is not run; its sentence, followed by the order to answer, is the tool
-/// call's result, and the model is called once more so it can answer within
-/// the margin the try keeps (on Forge run `dcf60c18` the tester's tries 1 to
-/// 4 each ended at the refusal with 53 to 255 s left, without an answer).
+/// AEGIS ADR-141, Update of 2026-10-14, Question 2's default (U37's
+/// amendment of 2026-10-13 reversed): the first command the try clock
+/// refuses is not run, and the try ends there, exhausted by the try clock,
+/// with its refusal's sentence and no order to answer; the model is not
+/// called again. The iteration records the end and the history the next try
+/// is opened from.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_try_clock_refusal_is_given_to_the_model_once_and_it_answers() {
+async fn a_try_clock_refusal_ends_the_try_exhausted() {
     let w = a_try_with_no_time_left(vec![
         run_command(json!({"command": "echo never", "cwd": "/tmp"})),
         answer("as far as I got"),
@@ -1126,23 +1163,20 @@ async fn a_try_clock_refusal_is_given_to_the_model_once_and_it_answers() {
     .await;
     let outcome = w.generate().await;
     let mut complaints = Vec::new();
-    let calls = w.model.calls.lock().unwrap().len();
-    if calls != 2 {
-        complaints.push(format!(
-            "the model was not called once more after the try clock refused its command: {calls} calls"
-        ));
-    }
     match &outcome {
-        Ok(OrchestratorMessage::Final { content, .. }) if content == "as far as I got" => {}
+        Err(e)
+            if e.to_string()
+                .starts_with("[AEGIS] cmd.run was not run: this try has")
+                && e.to_string().ends_with("The try ends here.") => {}
         other => complaints.push(format!(
-            "the try did not end on the model's answer: {other:?}"
+            "the try did not end with the refusal's sentence: {other:?}"
         )),
     }
-    if calls >= 2 {
-        let given = last_tool_message(&w.model.conversation(1));
-        if !(given.contains("cmd.run was not run") && given.ends_with(ANSWER_NOW)) {
-            complaints.push(format!("the refused call's result is {given:?}"));
-        }
+    let calls = w.model.calls.lock().unwrap().len();
+    if calls != 1 {
+        complaints.push(format!(
+            "the model was called after the try clock refused its command: {calls} calls"
+        ));
     }
     let record = w.records.get(w.execution_id);
     let steps = record.iterations[0].trajectory.clone().unwrap_or_default();
@@ -1156,38 +1190,15 @@ async fn a_try_clock_refusal_is_given_to_the_model_once_and_it_answers() {
     {
         complaints.push(format!("the dispatch events are {dispatched:?}"));
     }
-    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
-}
-
-/// AEGIS ADR-131 U37, as amended: a second command the try clock refuses in
-/// the same try ends the try, failed with the refusal's sentence; no model
-/// call follows it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_second_try_clock_refusal_in_a_try_ends_the_try_failed() {
-    let w = a_try_with_no_time_left(vec![
-        run_command(json!({"command": "echo never", "cwd": "/tmp"})),
-        run_command(json!({"command": "echo again", "cwd": "/tmp"})),
-        answer("as far as I got"),
-    ])
-    .await;
-    let outcome = w.generate().await;
-    let mut complaints = Vec::new();
-    match &outcome {
-        Err(e) if e.to_string().contains("cmd.run was not run") => {}
-        other => complaints.push(format!(
-            "the try did not end with the refusal's sentence: {other:?}"
-        )),
-    }
-    let calls = w.model.calls.lock().unwrap().len();
-    if calls > 2 {
-        complaints.push(format!(
-            "the model was called after the try clock's second refusal: {calls} calls"
-        ));
-    }
-    let record = w.records.get(w.execution_id);
-    let steps = record.iterations[0].trajectory.clone().unwrap_or_default();
-    if steps.iter().any(|s| s.status != "refused") {
-        complaints.push(format!("the try's trajectory is {steps:?}"));
+    match &record.iterations[0].exhausted {
+        Some(crate::domain::execution::Exhaustion {
+            by: crate::domain::execution::ExhaustedBy::TryClock,
+            constructed: Some(history),
+        }) if history
+            .facts
+            .starts_with("# This task so far\nTry 1 ran 1 tool calls in ")
+            && history.facts.ends_with(": cmd.run 1. Files it left: none.") => {}
+        other => complaints.push(format!("the iteration's end is {other:?}")),
     }
     assert!(complaints.is_empty(), "{}", complaints.join("\n"));
 }
@@ -1825,9 +1836,8 @@ fn the_refinement_without_seconds_says_the_provider_ended_it() {
 // ---------------------------------------------------------------------------
 
 /// The sentence a call answered twice alike gets in place of a third run.
-const RAN_TWICE_ALIKE: &str = "This call was already run 2 times in this try with the same \
-                               answer; it is not run again. Change the call, or answer with \
-                               what you have.";
+const RAN_TWICE_ALIKE: &str =
+    "This call was already run 2 times in this try with the same answer; it is not run again.";
 
 /// The search the requirements analyst of run `ea6d7814` (child `e5f2d38f`)
 /// ran about fourteen times in one try, 0 matches each time.
@@ -1855,6 +1865,47 @@ impl World {
                 policy: crate::domain::fsal::FsalAccessPolicy {
                     read: vec!["/*".to_string()],
                     write: vec!["/*".to_string()],
+                },
+                mount_point: std::path::PathBuf::from("/workspace"),
+                remote_path: String::new(),
+            });
+        self
+    }
+
+    /// Gives this world's execution a `/workspace` volume the file tools
+    /// write to and read from, recorded as the file system layer reads it.
+    /// (On a host directory a second file created in one directory is
+    /// refused, `host-path-create-file-refuses-existing-dir`, so the tests
+    /// write each file in a directory of its own.)
+    async fn with_a_writable_workspace(self) -> Self {
+        use crate::domain::repository::VolumeRepository;
+        use crate::domain::volume::{StorageClass, Volume, VolumeBackend, VolumeOwnership};
+        let mut volume = Volume::new(
+            "workspace".to_string(),
+            self.agent.tenant_id.clone(),
+            StorageClass::persistent(),
+            VolumeBackend::HostPath {
+                path: std::path::PathBuf::from("/placeholder"),
+            },
+            64 * 1024 * 1024,
+            VolumeOwnership::execution(self.execution_id),
+        )
+        .expect("volume");
+        volume.backend = VolumeBackend::HostPath {
+            path: std::path::PathBuf::from(format!("/hosts/{}", volume.id)),
+        };
+        volume.mark_available().expect("available");
+        self.volume_records.save(&volume).await.expect("saved");
+        self.volumes
+            .register(crate::application::nfs_gateway::VolumeRegistration {
+                volume_id: volume.id,
+                execution_id: self.execution_id,
+                workflow_execution_id: None,
+                container_uid: 1000,
+                container_gid: 1000,
+                policy: crate::domain::fsal::FsalAccessPolicy {
+                    read: vec!["/**".to_string()],
+                    write: vec!["/**".to_string()],
                 },
                 mount_point: std::path::PathBuf::from("/workspace"),
                 remote_path: String::new(),
@@ -2088,6 +2139,408 @@ async fn a_shell_line_a_script_and_a_program_are_dispatched() {
             Ok(OrchestratorMessage::Dispatch { .. }) => {}
             other => complaints.push(format!("{args} was answered {other:?}")),
         }
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// AEGIS ADR-141, Update of 2026-10-14, R4: a try's call budget
+// ---------------------------------------------------------------------------
+
+/// An agent of one 60 s try whose `spec.execution` adds `extra` (each line
+/// indented four spaces).
+fn agent_executing(extra: &str) -> Agent {
+    let manifest: AgentManifest = serde_yaml::from_str(&format!(
+        r#"
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: budget-test-agent
+  version: "1.0.0"
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+    isolation: inherit
+    model: {ALIAS}
+  execution:
+    mode: iterative
+    max_retries: 1
+    iteration_timeout: "60s"
+    llm_timeout_seconds: 30
+{extra}
+  tools: []
+"#
+    ))
+    .unwrap();
+    Agent {
+        id: AgentId::new(),
+        tenant_id: TenantId::default(),
+        scope: crate::domain::agent::AgentScope::default(),
+        name: manifest.metadata.name.clone(),
+        manifest,
+        status: AgentStatus::Active,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+/// A search of the empty workspace for `pattern`: a distinct call per
+/// pattern, answered 0 matches, never a repeat.
+fn grep_args(pattern: &str) -> serde_json::Value {
+    json!({"path": "/workspace", "pattern": pattern})
+}
+
+/// The model asks for every call of `calls` in one turn.
+fn calls_in_one_turn(calls: Vec<(&str, serde_json::Value)>) -> Turn {
+    let calls: Vec<(String, serde_json::Value)> = calls
+        .into_iter()
+        .map(|(tool, args)| (tool.to_string(), args))
+        .collect();
+    Box::new(move |_| {
+        Ok(ChatResponse::ToolCalls(
+            calls
+                .iter()
+                .map(|(tool, args)| ChatToolCall {
+                    id: format!("call-{}", uuid::Uuid::new_v4()),
+                    name: tool.clone(),
+                    arguments: args.clone(),
+                })
+                .collect(),
+        ))
+    })
+}
+
+/// The sentence a call past a budget of `budget` calls is refused with.
+fn past_the_budget(tool: &str, budget: u32) -> String {
+    format!(
+        "[AEGIS] {tool} was not run: this try has made its {budget} tool calls, the most one \
+         try makes. The try ends here."
+    )
+}
+
+impl World {
+    /// The world's execution with its first iteration started, as the
+    /// supervisor leaves it before the try's first generate request.
+    fn with_the_first_try_started(self) -> Self {
+        self.records.update(self.execution_id, |e| {
+            e.start_iteration("count the ticks".to_string()).unwrap();
+        });
+        self
+    }
+}
+
+/// R4: with `max_tool_calls: 3` the model's fourth call is not run: it is a
+/// refused `ToolDispatched` naming the call budget, the try ends with the
+/// refusal's sentence, and the model is not called again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_past_the_budget_is_refused_not_run_and_ends_the_try() {
+    let w = world(
+        agent_executing("    max_tool_calls: 3"),
+        vec![
+            call_tool("fs.grep", grep_args("one")),
+            call_tool("fs.grep", grep_args("two")),
+            call_tool("fs.grep", grep_args("three")),
+            call_tool("fs.grep", grep_args("four")),
+            answer("never reached"),
+        ],
+    )
+    .await
+    .with_an_empty_workspace()
+    .with_the_first_try_started();
+    let outcome = w.generate().await;
+    let mut complaints = Vec::new();
+    let sentence = past_the_budget("fs.grep", 3);
+    match &outcome {
+        Err(e) if e.to_string() == sentence => {}
+        other => complaints.push(format!(
+            "the try did not end with the budget's sentence: {other:?}"
+        )),
+    }
+    let calls = w.model.calls.lock().unwrap().len();
+    if calls != 4 {
+        complaints.push(format!("the model was called {calls} times, not 4"));
+    }
+    let statuses = w.dispatch_statuses();
+    let expected = ["succeeded", "succeeded", "succeeded", "refused call_budget"];
+    if statuses != expected {
+        complaints.push(format!("the calls were {statuses:?}, not {expected:?}"));
+    }
+    if let Some(event) = w.records.events_named("ToolDispatched").get(3) {
+        if event["sentence"] != sentence.as_str() {
+            complaints.push(format!(
+                "the refused event's sentence is {}",
+                event["sentence"]
+            ));
+        }
+    }
+    let steps: Vec<String> = w.records.get(w.execution_id).iterations[0]
+        .trajectory
+        .clone()
+        .unwrap_or_default()
+        .iter()
+        .map(|s| s.status.clone())
+        .collect();
+    if steps != ["succeeded", "succeeded", "succeeded", "refused"] {
+        complaints.push(format!("the try's trajectory is {steps:?}"));
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// R4: two calls asked for in one turn count two: with `max_tool_calls: 3`,
+/// two turns of two calls run three and refuse the fourth.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_calls_in_one_turn_count_two_against_the_budget() {
+    let w = world(
+        agent_executing("    max_tool_calls: 3"),
+        vec![
+            calls_in_one_turn(vec![
+                ("fs.grep", grep_args("one")),
+                ("fs.grep", grep_args("two")),
+            ]),
+            calls_in_one_turn(vec![
+                ("fs.grep", grep_args("three")),
+                ("fs.grep", grep_args("four")),
+            ]),
+            answer("never reached"),
+        ],
+    )
+    .await
+    .with_an_empty_workspace()
+    .with_the_first_try_started();
+    let outcome = w.generate().await;
+    let mut complaints = Vec::new();
+    if !matches!(&outcome, Err(e) if e.to_string() == past_the_budget("fs.grep", 3)) {
+        complaints.push(format!("the try ended {outcome:?}"));
+    }
+    let statuses = w.dispatch_statuses();
+    let expected = ["succeeded", "succeeded", "succeeded", "refused call_budget"];
+    if statuses != expected {
+        complaints.push(format!("the calls were {statuses:?}, not {expected:?}"));
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// R4, a guard of the default: a manifest that sets no budget runs 50 calls
+/// (here 25 turns of two) and refuses the 51st.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unset_budget_runs_fifty_calls_and_refuses_the_fifty_first() {
+    let mut turns: Vec<Turn> = (0..25)
+        .map(|n| {
+            calls_in_one_turn(vec![
+                ("fs.grep", grep_args(&format!("a{n}"))),
+                ("fs.grep", grep_args(&format!("b{n}"))),
+            ])
+        })
+        .collect();
+    turns.push(call_tool("fs.grep", grep_args("the fifty-first")));
+    turns.push(answer("never reached"));
+    let w = world(agent_executing(""), turns)
+        .await
+        .with_an_empty_workspace()
+        .with_the_first_try_started();
+    let outcome = w.generate().await;
+    let mut complaints = Vec::new();
+    if !matches!(&outcome, Err(e) if e.to_string() == past_the_budget("fs.grep", 50)) {
+        complaints.push(format!("the try ended {outcome:?}"));
+    }
+    let statuses = w.dispatch_statuses();
+    let ran = statuses.iter().filter(|s| *s == "succeeded").count();
+    if ran != 50 || statuses.last().map(String::as_str) != Some("refused call_budget") {
+        complaints.push(format!(
+            "{ran} calls ran; the last was {:?}",
+            statuses.last()
+        ));
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// AEGIS ADR-141, Update of 2026-10-14, R2: a try that runs out of its budget
+// is followed by one opened from a constructed history
+// ---------------------------------------------------------------------------
+
+/// The content try 1 writes to the file it leaves.
+const LEFT_CONTENT: &str = "def test_readme():\n    assert True\n";
+
+/// The fourteenth proof's shape, shortened: try 1 writes `a.py`, writes and
+/// deletes `b.py`, lists the workspace eleven times (two run, nine refused as
+/// repeats), and its clock ends it while the model is silent. Try 2 opens
+/// with the prompt, the facts paragraph, a constructed `fs.list` of the
+/// workspace and a constructed `fs.read` of `a.py` with its content: no
+/// replay of try 1, nothing about how it ended, nothing of `b.py` or of the
+/// refusals.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_try_after_an_exhausted_one_opens_from_a_constructed_history() {
+    let mut turns: Vec<Turn> = vec![
+        call_tool(
+            "fs.write",
+            json!({"path": "/workspace/t/a.py", "content": LEFT_CONTENT}),
+        ),
+        call_tool(
+            "fs.write",
+            json!({"path": "/workspace/u/b.py", "content": "print(2)\n"}),
+        ),
+        call_tool("fs.delete", json!({"path": "/workspace/u/b.py"})),
+    ];
+    for _ in 0..11 {
+        turns.push(call_tool("fs.list", json!({"path": "/workspace/t"})));
+    }
+    turns.push(answer("never: the model is silent here"));
+    turns.push(answer("the tests are written"));
+    let w = world_with_silent_calls(agent("8s", 30), turns, vec![14])
+        .await
+        .with_a_writable_workspace()
+        .await;
+
+    let outcome = w.run(None).await;
+    let mut complaints = Vec::new();
+    if !matches!(outcome.as_deref(), Ok("the tests are written")) {
+        complaints.push(format!("the execution ended {outcome:?}"));
+    }
+    let record = w.records.get(w.execution_id);
+    match record.iterations.first().and_then(|i| i.exhausted.as_ref()) {
+        Some(e) if e.by == crate::domain::execution::ExhaustedBy::Clock => {}
+        other => complaints.push(format!("try 1's end is {other:?}")),
+    }
+    let calls = w.model.calls.lock().unwrap().len();
+    if calls != 16 {
+        complaints.push(format!("the model was called {calls} times, not 16"));
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+    let opening = w.model.conversation(15);
+    let roles: Vec<&str> = opening.iter().map(|m| m.role.as_str()).collect();
+    if roles != ["system", "user", "assistant", "tool", "assistant", "tool"] {
+        complaints.push(format!("try 2 opened with the messages {roles:?}"));
+    }
+    let user = first_user_message(&opening);
+    let facts = "\n\n# This task so far\nTry 1 ran 14 tool calls in ";
+    if !user.starts_with("count the ticks") || !user.contains(facts) {
+        complaints.push(format!("the user message is {user:?}"));
+    }
+    if !user.ends_with(": fs.list 11, fs.write 2, fs.delete 1. Files it left: /workspace/t/a.py.") {
+        complaints.push(format!("the facts paragraph is {user:?}"));
+    }
+    let constructed: Vec<(String, Value)> = opening
+        .iter()
+        .filter_map(|m| m.tool_calls.as_ref())
+        .flatten()
+        .map(|c| (c.name.clone(), c.arguments.clone()))
+        .collect();
+    let expected = vec![
+        ("fs.list".to_string(), json!({"path": "/workspace/t"})),
+        ("fs.read".to_string(), json!({"path": "/workspace/t/a.py"})),
+    ];
+    if constructed != expected {
+        complaints.push(format!("the constructed calls are {constructed:?}"));
+    }
+    let results: Vec<String> = opening
+        .iter()
+        .filter(|m| m.role == "tool")
+        .map(|m| m.content.as_text())
+        .collect();
+    if !results.first().is_some_and(|r| r.contains("a.py")) {
+        complaints.push(format!("the listing is {:?}", results.first()));
+    }
+    let read: Option<Value> = results.get(1).and_then(|r| serde_json::from_str(r).ok());
+    if read.as_ref().map(|r| r["content"].clone()) != Some(json!(LEFT_CONTENT)) {
+        complaints.push(format!("the read is {:?}", results.get(1)));
+    }
+    let whole: String = opening
+        .iter()
+        .map(|m| m.content.as_text())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for absent in [
+        "Previous Attempts",
+        "What the previous tries did",
+        "timed out",
+        "b.py",
+        "already run",
+    ] {
+        if whole.contains(absent) {
+            complaints.push(format!("try 2's opening holds {absent:?}"));
+        }
+    }
+    let applied = w.records.get(w.execution_id).iterations[0]
+        .exhausted
+        .clone();
+    if applied.and_then(|e| e.constructed).map(|c| c.files)
+        != Some(vec!["/workspace/t/a.py".to_string()])
+    {
+        complaints.push("the constructed history does not name a.py alone".to_string());
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// R2, a guard: a try that ended another way (here its model call failed)
+/// keeps today's opening for the next try, the replay of what it did, and
+/// is not recorded exhausted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_try_after_one_that_failed_otherwise_keeps_the_replay() {
+    let w = world(
+        agent("60s", 30),
+        vec![
+            run_command(json!({"command": "echo one", "cwd": "/tmp"})),
+            fails("model call failed: 502"),
+            answer("done"),
+        ],
+    )
+    .await;
+    let outcome = w.run(None).await;
+    let mut complaints = Vec::new();
+    if !matches!(outcome.as_deref(), Ok("done")) {
+        complaints.push(format!("the execution ended {outcome:?}"));
+    }
+    let told = first_user_message(&w.model.conversation(2));
+    if !told.contains("What the previous tries did") || told.contains("# This task so far") {
+        complaints.push(format!("try 2 was told {told:?}"));
+    }
+    if w.records.get(w.execution_id).iterations[0]
+        .exhausted
+        .is_some()
+    {
+        complaints.push("try 1 was recorded exhausted".to_string());
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// R2 and R4: a try its call budget ends is recorded exhausted by the call
+/// budget, with the history the next try is opened from, before the try
+/// fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_try_its_call_budget_ends_is_recorded_exhausted() {
+    let w = world(
+        agent_executing("    max_tool_calls: 2"),
+        vec![
+            call_tool(
+                "fs.write",
+                json!({"path": "/workspace/t/a.py", "content": LEFT_CONTENT}),
+            ),
+            call_tool("fs.grep", grep_args("one")),
+            call_tool("fs.grep", grep_args("two")),
+            answer("never reached"),
+        ],
+    )
+    .await
+    .with_a_writable_workspace()
+    .await
+    .with_the_first_try_started();
+    let outcome = w.generate().await;
+    let mut complaints = Vec::new();
+    if outcome.is_ok() {
+        complaints.push(format!("the try ended {outcome:?}"));
+    }
+    match &w.records.get(w.execution_id).iterations[0].exhausted {
+        Some(crate::domain::execution::Exhaustion {
+            by: crate::domain::execution::ExhaustedBy::CallBudget,
+            constructed: Some(history),
+        }) if history.calls == 3
+            && history.files == ["/workspace/t/a.py"]
+            && history
+                .facts
+                .ends_with(": fs.grep 2, fs.write 1. Files it left: /workspace/t/a.py.") => {}
+        other => complaints.push(format!("the iteration's end is {other:?}")),
     }
     assert!(complaints.is_empty(), "{}", complaints.join("\n"));
 }

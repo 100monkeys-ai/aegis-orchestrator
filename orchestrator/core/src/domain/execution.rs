@@ -569,6 +569,137 @@ pub struct Iteration {
         serialize_with = "stored_produced_files"
     )]
     pub produced_files: Vec<ProducedFile>,
+    /// How the iteration ran out of its budget, when it did (AEGIS ADR-141,
+    /// Update of 2026-10-14, R2): its clock, its call budget, or the try
+    /// clock's refusal; with the history the next try is opened from. Absent
+    /// in a stored iteration that did not, and read as none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exhausted: Option<Exhaustion>,
+}
+
+/// What ended an exhausted iteration (AEGIS ADR-141, Update of 2026-10-14,
+/// R2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExhaustedBy {
+    /// The iteration's clock: the supervisor ended it at `iteration_timeout`.
+    Clock,
+    /// Its call budget, `spec.execution.max_tool_calls`.
+    CallBudget,
+    /// The try clock's refusal of a command with too little of the try left.
+    TryClock,
+}
+
+/// An iteration that ran out of its budget, and the history the next try is
+/// opened from (AEGIS ADR-141, Update of 2026-10-14, R2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Exhaustion {
+    pub by: ExhaustedBy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constructed: Option<ConstructedHistory>,
+}
+
+/// The history the try after an exhausted one is opened from (AEGIS
+/// ADR-141, Update of 2026-10-14, R2): the facts paragraph appended to its
+/// user message, the files the earlier tries left (each shown to it as a
+/// constructed `fs.list` of its directory and `fs.read` of the file, read at
+/// that try's start), and the tool calls the facts account for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConstructedHistory {
+    pub facts: String,
+    pub files: Vec<String>,
+    pub calls: usize,
+}
+
+/// The tools whose successful call writes, edits or creates the file at its
+/// `path`.
+const FILE_LEAVING_TOOLS: &[&str] = &["fs.write", "fs.edit", "fs.multi_edit"];
+
+/// The files the tries of `iterations` numbered up to `through` left, in the
+/// order each was first written: a file a successful `fs.write`, `fs.edit` or
+/// `fs.multi_edit` wrote and no later successful `fs.delete` removed (a
+/// recursive one removes what is under its path).
+pub fn files_left(iterations: &[Iteration], through: u8) -> Vec<String> {
+    let mut left: Vec<String> = Vec::new();
+    for iteration in iterations.iter().filter(|i| i.number <= through) {
+        for step in iteration.trajectory.as_deref().unwrap_or_default() {
+            if step.status != "succeeded" {
+                continue;
+            }
+            let Some(path) = serde_json::from_str::<serde_json::Value>(&step.arguments_json)
+                .ok()
+                .and_then(|a| a["path"].as_str().map(str::to_string))
+            else {
+                continue;
+            };
+            if FILE_LEAVING_TOOLS.contains(&step.tool_name.as_str()) {
+                if !left.contains(&path) {
+                    left.push(path);
+                }
+            } else if step.tool_name == "fs.delete" {
+                let under = format!("{}/", path.trim_end_matches('/'));
+                left.retain(|kept| *kept != path && !kept.starts_with(&under));
+            }
+        }
+    }
+    left
+}
+
+impl ConstructedHistory {
+    /// The history after try `through` of `iterations` ran out of its budget
+    /// at `now`: one line of facts for each exhausted try up to it (the try
+    /// `through` counted exhausted), each its own calls by tool, most first,
+    /// its duration, and the files the tries had left by its end.
+    pub fn after(iterations: &[Iteration], through: u8, now: DateTime<Utc>) -> Self {
+        let mut lines = Vec::new();
+        let mut calls = 0;
+        for iteration in iterations
+            .iter()
+            .filter(|i| (i.number < through && i.exhausted.is_some()) || i.number == through)
+        {
+            let steps = iteration.trajectory.as_deref().unwrap_or_default();
+            let mut by_tool: Vec<(String, usize)> = Vec::new();
+            for step in steps {
+                match by_tool.iter_mut().find(|(tool, _)| *tool == step.tool_name) {
+                    Some((_, count)) => *count += 1,
+                    None => by_tool.push((step.tool_name.clone(), 1)),
+                }
+            }
+            by_tool.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let seconds = (iteration.ended_at.unwrap_or(now) - iteration.started_at)
+                .num_seconds()
+                .max(0);
+            let tools = if by_tool.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ": {}",
+                    by_tool
+                        .iter()
+                        .map(|(tool, count)| format!("{tool} {count}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            let left = files_left(iterations, iteration.number);
+            let left = if left.is_empty() {
+                "none".to_string()
+            } else {
+                left.join(", ")
+            };
+            lines.push(format!(
+                "Try {} ran {} tool calls in {seconds} s{tools}. Files it left: {left}.",
+                iteration.number,
+                steps.len()
+            ));
+            calls += steps.len();
+        }
+        Self {
+            facts: format!("# This task so far\n{}", lines.join("\n")),
+            files: files_left(iterations, through),
+            calls,
+        }
+    }
 }
 
 /// The stored form of one produced file: its answer form and where the
@@ -851,6 +982,7 @@ impl Execution {
             trajectory: None,
             policy_violations: Vec::new(),
             produced_files: Vec::new(),
+            exhausted: None,
         };
 
         self.iterations.push(iteration);
@@ -907,6 +1039,19 @@ impl Execution {
         } else {
             Err(ExecutionError::IterationNotFound(iteration_number))
         }
+    }
+
+    /// Record on iteration `iteration_number` that it ran out of its budget,
+    /// and the history the next try is opened from (AEGIS ADR-141, Update of
+    /// 2026-10-14, R2), beside the refinement [`Self::store_refinement`]
+    /// records: `RefinementApplied` and the narrative carry it.
+    pub fn store_constructed_history(
+        &mut self,
+        iteration_number: u8,
+        exhaustion: Exhaustion,
+    ) -> Result<(), ExecutionError> {
+        self.iteration_mut(iteration_number)?.exhausted = Some(exhaustion);
+        Ok(())
     }
 
     pub fn store_iteration_trajectory(

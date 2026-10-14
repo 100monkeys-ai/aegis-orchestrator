@@ -366,6 +366,17 @@ impl ExecutionService for ClusterAwareExecutionService {
             .await
     }
 
+    async fn record_constructed_history(
+        &self,
+        execution_id: ExecutionId,
+        iteration: u8,
+        exhaustion: crate::domain::execution::Exhaustion,
+    ) -> Result<()> {
+        self.inner
+            .record_constructed_history(execution_id, iteration, exhaustion)
+            .await
+    }
+
     async fn store_iteration_trajectory(
         &self,
         execution_id: ExecutionId,

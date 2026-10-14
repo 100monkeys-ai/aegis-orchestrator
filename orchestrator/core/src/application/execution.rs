@@ -294,6 +294,22 @@ pub trait ExecutionService: Send + Sync {
         Ok(())
     }
 
+    /// Record on an iteration that it ran out of its budget, and the history
+    /// the next try is opened from (AEGIS ADR-141, Update of 2026-10-14, R2):
+    /// written by the inner loop when its call budget or the try clock ends
+    /// the try.
+    ///
+    /// The default implementation is a no-op; `StandardExecutionService`
+    /// persists it and `ClusterAwareExecutionService` delegates.
+    async fn record_constructed_history(
+        &self,
+        _execution_id: ExecutionId,
+        _iteration: u8,
+        _exhaustion: crate::domain::execution::Exhaustion,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Publish an event of an execution on its stream, where the execution
     /// events are persisted and `aegis.task.logs` reads them: the inner
     /// loop's tool dispatches and model generations (AEGIS ADR-131 U34e).
@@ -1431,6 +1447,77 @@ mod tests {
                 "RefinementApplied must carry the iteration's refinement where set and the empty diff otherwise"
             );
         }
+    }
+
+    /// AEGIS ADR-141, Update of 2026-10-14, R2: a try its clock ended is
+    /// recorded exhausted by the monitor, with the history the next try is
+    /// opened from, and `RefinementApplied` carries that history.
+    #[tokio::test]
+    async fn an_exhausted_try_is_recorded_and_its_refinement_carries_the_history() {
+        use crate::domain::supervisor::SupervisorObserver;
+        use crate::infrastructure::event_bus::DomainEvent;
+
+        let repo: Arc<InMemoryExecutionRepository> = Arc::new(InMemoryExecutionRepository::new());
+        let bus = Arc::new(EventBus::new(64));
+        let agent_id = AgentId::new();
+        let mut exec = make_parent_execution(agent_id);
+        exec.start_iteration("try".to_string()).unwrap();
+        exec.store_iteration_trajectory(
+            1,
+            vec![crate::domain::execution::TrajectoryStep {
+                tool_name: "fs.write".to_string(),
+                arguments_json: serde_json::json!({"path": "/workspace/a.py", "content": "x"})
+                    .to_string(),
+                status: "succeeded".to_string(),
+                result_json: None,
+                error: None,
+            }],
+        )
+        .unwrap();
+        let tenant_id = exec.tenant_id.clone();
+        repo.save_for_tenant(&tenant_id, &exec).await.unwrap();
+        let monitor = ExecutionMonitor {
+            execution_id: exec.id,
+            agent_id,
+            tenant_id: tenant_id.clone(),
+            repository: repo.clone(),
+            event_bus: bus.clone(),
+        };
+        let mut receiver = bus.subscribe();
+        monitor
+            .on_iteration_exhausted(1, crate::domain::execution::ExhaustedBy::Clock)
+            .await;
+        monitor
+            .on_iteration_fail(1, "Execution failed: Execution timed out after 900 seconds")
+            .await;
+        let constructed = loop {
+            match receiver.recv().await.unwrap() {
+                DomainEvent::Execution(ExecutionEvent::RefinementApplied {
+                    constructed, ..
+                }) => break constructed,
+                _ => continue,
+            }
+        };
+        let stored = repo
+            .find_by_id_for_tenant(&tenant_id, exec.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .iterations[0]
+            .exhausted
+            .clone();
+        let mut complaints = Vec::new();
+        match &stored {
+            Some(crate::domain::execution::Exhaustion {
+                by: crate::domain::execution::ExhaustedBy::Clock,
+                constructed: Some(history),
+            }) if history.files == ["/workspace/a.py"] && history.calls == 1 => {}
+            other => complaints.push(format!("the iteration's end is {other:?}")),
+        }
+        if constructed != stored.and_then(|e| e.constructed) {
+            complaints.push(format!("RefinementApplied carried {constructed:?}"));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
 
     async fn wait_for_spawn(runtime: &TestRuntime) -> WorkerRuntimeConfig {
@@ -6231,17 +6318,20 @@ impl SupervisorObserver for ExecutionMonitor {
         // (its `code_changes`, recorded by the inner loop before the try
         // failed); otherwise the empty diff.
         let mut refinement = None;
+        // The history the next try is opened from, where the iteration ran
+        // out of its budget (AEGIS ADR-141, Update of 2026-10-14, R2).
+        let mut constructed = None;
         if let Ok(Some(mut exec)) = self
             .repository
             .find_by_id_for_tenant(&self.tenant_id, self.execution_id)
             .await
         {
             exec.fail_iteration(iter_error.clone());
-            refinement = exec
-                .iterations()
-                .iter()
-                .find(|i| i.number == iteration)
-                .and_then(|i| i.code_changes.clone());
+            let failed = exec.iterations().iter().find(|i| i.number == iteration);
+            refinement = failed.and_then(|i| i.code_changes.clone());
+            constructed = failed
+                .and_then(|i| i.exhausted.as_ref())
+                .and_then(|e| e.constructed.clone());
             let _ = self
                 .repository
                 .save_for_tenant(&self.tenant_id, &exec)
@@ -6274,7 +6364,41 @@ impl SupervisorObserver for ExecutionMonitor {
                 cortex_pattern_category: None,
                 cortex_success_score: None,
                 cortex_solution_approach: None,
+                constructed,
             });
+    }
+
+    async fn on_iteration_exhausted(
+        &self,
+        iteration: u8,
+        by: crate::domain::execution::ExhaustedBy,
+    ) {
+        if let Ok(Some(mut exec)) = self
+            .repository
+            .find_by_id_for_tenant(&self.tenant_id, self.execution_id)
+            .await
+        {
+            let constructed = crate::domain::execution::ConstructedHistory::after(
+                exec.iterations(),
+                iteration,
+                Utc::now(),
+            );
+            if exec
+                .store_constructed_history(
+                    iteration,
+                    crate::domain::execution::Exhaustion {
+                        by,
+                        constructed: Some(constructed),
+                    },
+                )
+                .is_ok()
+            {
+                let _ = self
+                    .repository
+                    .save_for_tenant(&self.tenant_id, &exec)
+                    .await;
+            }
+        }
     }
 
     async fn on_instance_spawned(
@@ -9175,6 +9299,28 @@ impl ExecutionService for StandardExecutionService {
             if let Err(e) = exec.store_refinement(iteration, refinement) {
                 tracing::warn!(
                     "Failed to record the refinement for execution {} iteration {}: {}",
+                    execution_id.0,
+                    iteration,
+                    e
+                );
+            } else {
+                self.repository.save_for_tenant(&tenant_id, &exec).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn record_constructed_history(
+        &self,
+        execution_id: ExecutionId,
+        iteration: u8,
+        exhaustion: crate::domain::execution::Exhaustion,
+    ) -> Result<()> {
+        if let Some(mut exec) = self.repository.find_by_id_unscoped(execution_id).await? {
+            let tenant_id = exec.tenant_id.clone();
+            if let Err(e) = exec.store_constructed_history(iteration, exhaustion) {
+                tracing::warn!(
+                    "Failed to record the constructed history for execution {} iteration {}: {}",
                     execution_id.0,
                     iteration,
                     e

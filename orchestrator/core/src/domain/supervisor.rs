@@ -148,6 +148,26 @@ pub fn failed_execution_backoff(failed: u32) -> Duration {
     Duration::from_secs((15u64 << failed.saturating_sub(1).min(3)).min(120))
 }
 
+/// Whether iteration `iteration` of the execution is recorded exhausted
+/// (AEGIS ADR-141, Update of 2026-10-14, R2): the inner loop records it when
+/// the try's call budget or the try clock ends the try.
+async fn recorded_exhausted(
+    repository: Option<&Arc<dyn ExecutionRepository>>,
+    execution_id: Option<ExecutionId>,
+    iteration: u8,
+) -> bool {
+    let (Some(repository), Some(execution_id)) = (repository, execution_id) else {
+        return false;
+    };
+    match repository.find_by_id_unscoped(execution_id).await {
+        Ok(Some(execution)) => execution
+            .iterations()
+            .iter()
+            .any(|i| i.number == iteration && i.exhausted.is_some()),
+        _ => false,
+    }
+}
+
 #[async_trait]
 pub trait SupervisorObserver: Send + Sync {
     async fn on_iteration_start(&self, iteration: u8, prompt: &str);
@@ -178,6 +198,17 @@ pub trait SupervisorObserver: Send + Sync {
     /// stores the output before failing the iteration.
     async fn on_outputs_missing(&self, iteration: u8, _output: &str, reason: &str) {
         self.on_iteration_fail(iteration, reason).await;
+    }
+
+    /// Called before [`Self::on_iteration_fail`] when the iteration ran out
+    /// of its clock (AEGIS ADR-141, Update of 2026-10-14, R2): an observer
+    /// that keeps a record stores the iteration as exhausted, with the
+    /// history the next try is opened from.
+    async fn on_iteration_exhausted(
+        &self,
+        _iteration: u8,
+        _by: crate::domain::execution::ExhaustedBy,
+    ) {
     }
 }
 
@@ -669,14 +700,37 @@ impl Supervisor {
                     }
                     let error_msg = format!("Execution failed: {e}");
                     warn!("{}", error_msg);
+                    // A try its clock ended is exhausted (AEGIS ADR-141,
+                    // Update of 2026-10-14, R2); the inner loop records the
+                    // tries its call budget or the try clock ended.
+                    let exhausted = if matches!(e, RuntimeError::TimedOut(_)) {
+                        observer
+                            .on_iteration_exhausted(
+                                attempts as u8,
+                                crate::domain::execution::ExhaustedBy::Clock,
+                            )
+                            .await;
+                        true
+                    } else {
+                        recorded_exhausted(
+                            execution_repository.as_ref(),
+                            execution_id_for_trajectory,
+                            attempts as u8,
+                        )
+                        .await
+                    };
                     observer.on_iteration_fail(attempts as u8, &error_msg).await;
                     last_end = Some(AttemptEnd::Cause(execution_failure_cause(&e)));
 
-                    // Record execution failure in history
-                    iteration_history.push(serde_json::json!({
-                        "iteration": attempts,
-                        "error": error_msg
-                    }));
+                    // Record execution failure in history; an exhausted try
+                    // is not an item of it: the next try is opened from its
+                    // constructed history instead.
+                    if !exhausted {
+                        iteration_history.push(serde_json::json!({
+                            "iteration": attempts,
+                            "error": error_msg
+                        }));
+                    }
 
                     if attempts < max_retries {
                         let wait = failed_execution_backoff(attempts);
@@ -1196,6 +1250,8 @@ mod tests {
         verified: Arc<Mutex<Vec<VerifiedOutputs>>>,
         /// Each console output, as (iteration, stream, content), in order.
         console: Arc<Mutex<Vec<(u8, String, String)>>>,
+        /// Each exhausted iteration and what ended it, in order.
+        exhausted: Arc<Mutex<Vec<(u8, crate::domain::execution::ExhaustedBy)>>>,
     }
 
     #[async_trait]
@@ -1246,6 +1302,14 @@ mod tests {
             _passed: bool,
         ) {
         }
+
+        async fn on_iteration_exhausted(
+            &self,
+            iteration: u8,
+            by: crate::domain::execution::ExhaustedBy,
+        ) {
+            self.exhausted.lock().await.push((iteration, by));
+        }
     }
 
     fn create_test_config() -> RuntimeConfig {
@@ -1273,6 +1337,7 @@ mod tests {
                 delivery: None,
                 outputs: Vec::new(),
                 require_tool_call: false,
+                max_tool_calls: crate::domain::agent::default_max_tool_calls(),
             },
             volumes: Vec::new(),
             keep_container_on_failure: false,
@@ -2680,5 +2745,55 @@ mod tests {
             1,
             "no try is spawned after the cancel"
         );
+    }
+
+    /// AEGIS ADR-141, Update of 2026-10-14, R2: a try its clock ends is
+    /// exhausted: the observer is told so before the failure, and the next
+    /// try is handed no history item for it, so the agent runtime writes no
+    /// "Previous Attempts" for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_try_its_clock_ends_is_exhausted_and_hands_the_next_no_history() {
+        let runtime = Arc::new(
+            TestRuntime::new()
+                .with_spawn_success(2)
+                .with_execute_success(vec!["late".to_string(), "late".to_string()])
+                .with_execute_delay(Duration::from_secs(5)),
+        );
+        let observer = Arc::new(TestObserver::default());
+        let mut config = create_test_config();
+        config.execution.iteration_timeout = Some("1s".to_string());
+        let result = Supervisor::new(runtime.clone())
+            .run_loop(
+                config,
+                create_test_input(),
+                2,
+                observer.clone(),
+                CancellationToken::new(),
+                None,
+            )
+            .await;
+        let mut complaints = Vec::new();
+        if result.is_ok() {
+            complaints.push(format!("the execution ended {result:?}"));
+        }
+        let exhausted = observer.exhausted.lock().await.clone();
+        let expected = vec![
+            (1, crate::domain::execution::ExhaustedBy::Clock),
+            (2, crate::domain::execution::ExhaustedBy::Clock),
+        ];
+        if exhausted != expected {
+            complaints.push(format!("the observer was told {exhausted:?}"));
+        }
+        let handed = runtime
+            .spawn_envs
+            .lock()
+            .await
+            .iter()
+            .filter(|env| env.contains_key("AEGIS_ITERATION_HISTORY"))
+            .count();
+        if handed != 0 {
+            complaints.push(format!("{handed} tries were handed a history item"));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
 }

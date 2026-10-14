@@ -656,6 +656,7 @@ mod tests {
                 trajectory: None,
                 policy_violations: Vec::new(),
                 produced_files: Vec::new(),
+                exhausted: None,
             });
             Ok(exec)
         }

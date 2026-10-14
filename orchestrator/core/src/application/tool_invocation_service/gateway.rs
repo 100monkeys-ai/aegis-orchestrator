@@ -179,6 +179,26 @@ impl ToolInvocationService {
         ))
     }
 
+    /// The agent's call budget for one try (`spec.execution.max_tool_calls`,
+    /// AEGIS ADR-141, Update of 2026-10-14, R4): 50 when unset.
+    pub(crate) async fn agent_max_tool_calls(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: AgentId,
+    ) -> anyhow::Result<u32> {
+        let agent = self
+            .agent_lifecycle
+            .get_agent_visible(tenant_id, agent_id)
+            .await?;
+        Ok(agent
+            .manifest
+            .spec
+            .execution
+            .as_ref()
+            .map(|execution| execution.max_tool_calls)
+            .unwrap_or_else(crate::domain::agent::default_max_tool_calls))
+    }
+
     pub async fn get_available_tools_for_agent_in_context(
         &self,
         tenant_id: &TenantId,
