@@ -228,6 +228,8 @@ spec:
         The three judges scored the change {{AUDIT.consensus.score}} (0.95 passes). Their reports:
         {{{json AUDIT.consensus.metadata.individual_outputs}}}
 
+        A review's suggestion to change, delete or add a test is not yours to apply: leave the tests as the tester wrote them and name the suggestion in your answer.
+
         # The change they reviewed (a unified diff: lines beginning with - and + are the diff's markers, not the text)
         {{{DIFF.output.diff}}}
         {{/if}}

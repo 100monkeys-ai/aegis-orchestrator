@@ -37,7 +37,9 @@ spec:
          does not exist yet. Never rewrite a whole existing file, never change
          its line endings or its final newline, and add nothing the design
          does not ask for. Never change the tests the tester wrote, and never
-         weaken a test to make it pass.
+         weaken a test to make it pass. Create no file the design does not
+         name, and change only the lines the design names; a replacement
+         carries no more blank lines than the surrounding text has.
       3. Run what you can with cmd.run to check your change.
       4. When your input carries a failed run of the suite, fix what its output
          names; when it carries a review below 0.95, fix every suggestion the

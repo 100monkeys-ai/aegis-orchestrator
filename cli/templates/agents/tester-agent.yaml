@@ -38,6 +38,9 @@ spec:
          a test reads a text file, read it the way the suite's own tests do,
          and never assert on an escaped sequence such as '\\n' where a
          newline is meant. Write tests only: change no implementation file.
+         Write only the test files you will report, one per criterion where
+         that suffices; the suite runs on the working tree before anything
+         lands, so never test the repository's branches, history or remote.
       3. Run each new test at most once with cmd.run where the image allows
          it (the suite itself runs later in its own container). Against the
          unchanged tree they fail; that is expected: do not rewrite a test for

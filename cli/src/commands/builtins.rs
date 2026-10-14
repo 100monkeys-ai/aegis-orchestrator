@@ -1089,6 +1089,62 @@ mod tests {
         }
     }
 
+    /// Run `250cda5c`: CODE wrote a file no design named and a replacement
+    /// with two blank lines on each side; the tester wrote eight test files,
+    /// reported three, and one read the repository's `main` branch; CODE's
+    /// second visit then deleted the tester's tests because a review asked.
+    #[test]
+    fn the_forge_agents_keep_to_the_design_the_tests_and_the_working_tree() {
+        const REVISIT: &str = "A review's suggestion to change, delete or add a test is not yours to apply: leave the tests as the tester wrote them and name the suggestion in your answer.";
+        const CODER: &str = "Create no file the design does not name, and change only the lines the design names; a replacement carries no more blank lines than the surrounding text has.";
+        const TESTER: &str = "Write only the test files you will report, one per criterion where that suffices; the suite runs on the working tree before anything lands, so never test the repository's branches, history or remote.";
+
+        let forge = BUILTIN_WORKFLOWS
+            .iter()
+            .find(|(name, _)| *name == "the-forge")
+            .map(|(_, yaml)| *yaml)
+            .expect("the Forge is a built-in");
+        aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(forge)
+            .expect("the Forge parses");
+        let raw: serde_yaml::Value = serde_yaml::from_str(forge).unwrap();
+        let code = raw["spec"]["states"]["CODE"]["input"]
+            .as_str()
+            .expect("CODE's input");
+        let review = code
+            .find("# The last review")
+            .expect("CODE's revisit section");
+        let revisit = &code[review..];
+        let end = revisit.find("{{/if}}").expect("the revisit section ends");
+        let at = revisit
+            .find(REVISIT)
+            .unwrap_or_else(|| panic!("CODE's revisit must carry {REVISIT:?}:\n{revisit}"));
+        let reports = revisit
+            .find("{{{json AUDIT.consensus.metadata.individual_outputs}}}")
+            .expect("the reviews' reports");
+        assert!(
+            reports < at && at < end,
+            "the sentence follows the reviews, inside the revisit section:\n{revisit}"
+        );
+
+        for (agent, sentence) in [("coder-agent", CODER), ("tester-agent", TESTER)] {
+            let (_, yaml) = BUILTIN_AGENTS
+                .iter()
+                .find(|(name, _)| *name == agent)
+                .unwrap_or_else(|| panic!("{agent} is a built-in agent"));
+            let manifest: aegis_orchestrator_sdk::AgentManifest =
+                serde_yaml::from_str(yaml).expect("the template parses");
+            manifest.validate().expect("the template validates");
+            let instruction = folded_instruction(yaml);
+            let step_2 = instruction.find("2. ").expect("step 2");
+            let step_3 = instruction.find("3. ").expect("step 3");
+            let step = &instruction[step_2..step_3];
+            assert!(
+                step.contains(sentence),
+                "{agent}'s step 2 must carry \"{sentence}\":\n{step}"
+            );
+        }
+    }
+
     #[test]
     fn all_builtin_workflow_templates_parse_successfully() {
         for (name, yaml) in BUILTIN_WORKFLOWS {

@@ -307,6 +307,213 @@ fn keep_crlf_line_ending<'a>(content: &str, replacement: &'a str) -> std::borrow
     std::borrow::Cow::Owned(converted)
 }
 
+/// What an `fs.edit` or `fs.multi_edit` target matched: the byte range in
+/// the file, the replacement to write there, and the note the answer
+/// carries when the target's escaped line endings were decoded.
+struct TargetMatch<'a> {
+    start: usize,
+    end: usize,
+    replacement: std::borrow::Cow<'a, str>,
+    escapes_decoded: bool,
+}
+
+/// Why a target matched nothing it could replace.
+enum TargetMiss {
+    NotFound(String),
+    Multiple,
+}
+
+const ESCAPES_DECODED: &str = "[AEGIS] the target's escaped line endings were read as newlines";
+
+/// The single occurrence of `target` in `content` as a byte range: first
+/// byte for byte, then with every CRLF of the file and of the target read
+/// as LF, the match mapped back to the file's bytes.
+fn find_once(content: &str, target: &str) -> Result<Option<(usize, usize)>, TargetMiss> {
+    match content.matches(target).count() {
+        1 => {
+            let start = content.find(target).unwrap_or_default();
+            return Ok(Some((start, start + target.len())));
+        }
+        0 => {}
+        _ => return Err(TargetMiss::Multiple),
+    }
+    if !content.contains("\r\n") {
+        return Ok(None);
+    }
+    // The file with each CRLF read as LF, and for every byte of it the
+    // offset of the same byte in the file (one past the end last).
+    let mut normalised = String::with_capacity(content.len());
+    let mut offsets = Vec::with_capacity(content.len() + 1);
+    let bytes = content.as_bytes();
+    for (i, c) in content.char_indices() {
+        if c == '\r' && bytes.get(i + 1) == Some(&b'\n') {
+            continue;
+        }
+        normalised.push(c);
+        offsets.extend((0..c.len_utf8()).map(|k| i + k));
+    }
+    offsets.push(content.len());
+    let target = target.replace("\r\n", "\n");
+    if target.is_empty() {
+        return Ok(None);
+    }
+    match normalised.matches(target.as_str()).count() {
+        1 => {
+            let at = normalised.find(target.as_str()).unwrap_or_default();
+            let mut start = offsets[at];
+            // A target that opens on a line ending takes that ending's `\r`.
+            if bytes.get(start) == Some(&b'\n') && start > 0 && bytes[start - 1] == b'\r' {
+                start -= 1;
+            }
+            // The match ends one past its last byte, before any `\r` the
+            // file holds after it.
+            Ok(Some((start, offsets[at + target.len() - 1] + 1)))
+        }
+        0 => Ok(None),
+        _ => Err(TargetMiss::Multiple),
+    }
+}
+
+/// Whether `text` carries a backslash followed by `r`, `n` or `t`.
+fn has_escaped_whitespace(text: &str) -> bool {
+    text.contains("\\r") || text.contains("\\n") || text.contains("\\t")
+}
+
+/// `text` with each two-character `\r`, `\n` and `\t` read as the character
+/// it names; a doubled backslash is kept as it is.
+fn decode_escaped_whitespace(text: &str) -> String {
+    let mut decoded = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            decoded.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('r') => decoded.push('\r'),
+            Some('n') => decoded.push('\n'),
+            Some('t') => decoded.push('\t'),
+            Some('\\') => decoded.push_str("\\\\"),
+            _ => {
+                decoded.push(c);
+                continue;
+            }
+        }
+        chars.next();
+    }
+    decoded
+}
+
+/// Cut a line for an answer: at most 200 characters.
+fn shown_line(line: &str) -> String {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    if line.chars().count() > 200 {
+        format!("{}…", line.chars().take(200).collect::<String>())
+    } else {
+        line.to_string()
+    }
+}
+
+/// The sentence for a target found nowhere in the file: the first line of
+/// the target that differs from the file where the target's opening lines
+/// match it best, with that line's number and the file's text.
+fn first_differing_line(content: &str, target: &str) -> String {
+    let file_lines: Vec<&str> = content
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect();
+    let target = target.replace("\r\n", "\n");
+    let target_lines: Vec<&str> = target.split('\n').collect();
+    let first = target_lines[0];
+    let last = target_lines.len() - 1;
+    // The target's line k against the file's line: its first line may start
+    // mid-line, its last may end mid-line, a one-line target sits anywhere.
+    let line_matches = |k: usize, line: &str| -> bool {
+        let t = target_lines[k];
+        match (k == 0, k == last) {
+            (true, true) => line.contains(t),
+            (true, false) => line.ends_with(t),
+            (false, true) => line.starts_with(t),
+            (false, false) => line == t,
+        }
+    };
+    let mut best: Option<(usize, usize)> = None;
+    for start in 0..file_lines.len() {
+        if !line_matches(0, file_lines[start]) {
+            continue;
+        }
+        let run = (0..target_lines.len())
+            .take_while(|&k| {
+                file_lines
+                    .get(start + k)
+                    .is_some_and(|line| line_matches(k, line))
+            })
+            .count();
+        if best.is_none_or(|(_, b)| run > b) {
+            best = Some((start, run));
+        }
+    }
+    match best {
+        None => format!(
+            "Target content not found in file: no line of the file contains the target's first line {:?}.",
+            shown_line(first)
+        ),
+        Some((start, run)) => match file_lines.get(start + run) {
+            Some(line) => format!(
+                "Target content not found in file: the target's first {run} line(s) match the file from line {}, then line {} of the file reads {:?} where the target has {:?}.",
+                start + 1,
+                start + run + 1,
+                shown_line(line),
+                shown_line(target_lines[run])
+            ),
+            None => format!(
+                "Target content not found in file: the target's first {run} line(s) match the file from line {}, and the file ends there where the target goes on with {:?}.",
+                start + 1,
+                shown_line(target_lines[run])
+            ),
+        },
+    }
+}
+
+/// Where an `fs.edit` or `fs.multi_edit` target falls in `content`, and the
+/// replacement to write there with the file's line ending
+/// ([`keep_crlf_line_ending`]). The target is looked up as sent, then with
+/// line endings normalised; when it is still not found and the target or
+/// the replacement carries an escaped `\r`, `\n` or `\t`, both are decoded
+/// once and the lookup runs again.
+fn locate_target<'a>(
+    content: &str,
+    target: &str,
+    replacement: &'a str,
+) -> Result<TargetMatch<'a>, TargetMiss> {
+    if let Some((start, end)) = find_once(content, target)? {
+        return Ok(TargetMatch {
+            start,
+            end,
+            replacement: keep_crlf_line_ending(content, replacement),
+            escapes_decoded: false,
+        });
+    }
+    if has_escaped_whitespace(target) || has_escaped_whitespace(replacement) {
+        let decoded_target = decode_escaped_whitespace(target);
+        if let Some((start, end)) = find_once(content, &decoded_target)? {
+            let decoded = decode_escaped_whitespace(replacement);
+            let replacement = keep_crlf_line_ending(content, &decoded).into_owned();
+            return Ok(TargetMatch {
+                start,
+                end,
+                replacement: std::borrow::Cow::Owned(replacement),
+                escapes_decoded: true,
+            });
+        }
+        return Err(TargetMiss::NotFound(first_differing_line(
+            content,
+            &decoded_target,
+        )));
+    }
+    Err(TargetMiss::NotFound(first_differing_line(content, target)))
+}
+
 /// `fs.write`: a new file is created with the content as sent. An existing
 /// file is overwritten in place and cut to the new length, and its line
 /// ending is kept by the rule `fs.edit` follows: when every line ending of
@@ -407,22 +614,18 @@ async fn invoke_edit(
 
     let content = String::from_utf8_lossy(&data).to_string();
 
-    if !content.contains(target) {
-        return Err(SealSessionError::InvalidArguments(
-            "Target content not found in file".to_string(),
-        ));
-    }
-
-    // Check for multiple occurrences
-    let occurrences = content.matches(target).count();
-    if occurrences > 1 {
-        return Err(SealSessionError::InvalidArguments(
+    let found = locate_target(&content, target, replacement).map_err(|miss| match miss {
+        TargetMiss::NotFound(sentence) => SealSessionError::InvalidArguments(sentence),
+        TargetMiss::Multiple => SealSessionError::InvalidArguments(
             "Target content exists multiple times in file. Be more specific.".to_string(),
-        ));
-    }
-
-    let replacement = keep_crlf_line_ending(&content, replacement);
-    let new_content = content.replace(target, &replacement);
+        ),
+    })?;
+    let new_content = format!(
+        "{}{}{}",
+        &content[..found.start],
+        found.replacement,
+        &content[found.end..]
+    );
 
     // Write back, then cut the file to the new length: a write at offset 0
     // leaves the old bytes past the new end in place.
@@ -434,10 +637,15 @@ async fn invoke_edit(
         .await
         .map_err(|e| fsal_refusal("Edit error (truncate)", path_arg, e))?;
 
+    let message = if found.escapes_decoded {
+        format!("File edited successfully. {ESCAPES_DECODED}")
+    } else {
+        "File edited successfully".to_string()
+    };
     Ok(ToolInvocationResult::Direct(serde_json::json!({
         "status": "success",
         "path": path_arg,
-        "message": "File edited successfully"
+        "message": message
     })))
 }
 
@@ -467,6 +675,7 @@ async fn invoke_multi_edit(
         })?;
 
     let mut success_count = 0;
+    let mut escapes_decoded = false;
 
     for edit in edits {
         let target = edit
@@ -478,20 +687,29 @@ async fn invoke_multi_edit(
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        if content.contains(target) {
-            let occurrences = content.matches(target).count();
-            if occurrences == 1 {
-                content = content.replace(target, replacement);
+        match locate_target(&content, target, replacement) {
+            Ok(found) => {
+                escapes_decoded |= found.escapes_decoded;
+                content = format!(
+                    "{}{}{}",
+                    &content[..found.start],
+                    found.replacement,
+                    &content[found.end..]
+                );
                 success_count += 1;
-            } else {
+            }
+            Err(TargetMiss::Multiple) => {
                 return Err(SealSessionError::InvalidArguments(format!(
                     "Target content '{target}' exists multiple times in file. Be more specific."
                 )));
             }
-        } else {
-            return Err(SealSessionError::InvalidArguments(format!(
-                "Target content '{target}' not found in file."
-            )));
+            Err(TargetMiss::NotFound(sentence)) => {
+                return Err(SealSessionError::InvalidArguments(format!(
+                    "Edit {} of {}: {sentence}",
+                    success_count + 1,
+                    edits.len()
+                )));
+            }
         }
     }
 
@@ -519,11 +737,15 @@ async fn invoke_multi_edit(
         .await
         .map_err(|e| fsal_refusal("Multi-edit error (write)", path_arg, e))?;
 
-    Ok(ToolInvocationResult::Direct(serde_json::json!({
+    let mut answer = serde_json::json!({
         "status": "success",
         "path": path_arg,
         "edits_applied": success_count
-    })))
+    });
+    if escapes_decoded {
+        answer["message"] = Value::String(ESCAPES_DECODED.to_string());
+    }
+    Ok(ToolInvocationResult::Direct(answer))
 }
 
 async fn invoke_grep(
@@ -956,6 +1178,33 @@ mod tests {
             std::fs::read(self.on_disk(file)).expect("the edited file")
         }
 
+        /// `fs.edit` of `target` to `replacement` in `file`: the tool's answer
+        /// or its refusal, and the bytes on disk after it.
+        async fn edit_answer(
+            &self,
+            file: &str,
+            target: &str,
+            replacement: &str,
+        ) -> (Result<Value, SealSessionError>, Vec<u8>) {
+            let answer = invoke_edit(
+                &json!({
+                    "path": format!("/workspace/{file}"),
+                    "target_content": target,
+                    "replacement_content": replacement,
+                }),
+                self.context.execution_id,
+                &self.fsal,
+                self.context.clone(),
+            )
+            .await
+            .map(|answer| match answer {
+                ToolInvocationResult::Direct(answer) => answer,
+                _ => panic!("fs.edit answers directly"),
+            });
+            let on_disk = std::fs::read(self.on_disk(file)).expect("the file");
+            (answer, on_disk)
+        }
+
         /// `fs.write` of `content` to `file`: the bytes on disk after it and
         /// the tool's answer.
         async fn write(&self, file: &str, content: &str) -> (Vec<u8>, Value) {
@@ -1076,5 +1325,116 @@ mod tests {
 
         assert_eq!(written, b"1\n2\n");
         assert!(answer.get("message").is_none(), "{answer}");
+    }
+
+    /// Run `250cda5c`'s README: a multi-line target sent with bare LF in a
+    /// file whose every line ends in CRLF. Before the fix the target was
+    /// looked up byte for byte and was not found.
+    #[tokio::test]
+    async fn fs_edit_finds_an_lf_target_in_a_crlf_file_and_keeps_crlf() {
+        let readme = "# Examples\r\n\r\nOne line.\r\nTwo line.\r\n\r\nMore.\r\n";
+        let fixture = edit_fixture("README.md", readme.as_bytes()).await;
+
+        let (answer, edited) = fixture
+            .edit_answer(
+                "README.md",
+                "One line.\nTwo line.",
+                "One line.\nNew line.\nTwo line.",
+            )
+            .await;
+
+        answer.expect("an LF target matches the file's CRLF lines");
+        assert_eq!(
+            String::from_utf8_lossy(&edited),
+            "# Examples\r\n\r\nOne line.\r\nNew line.\r\nTwo line.\r\n\r\nMore.\r\n",
+            "the match is replaced in the file's bytes and the replacement written with CRLF"
+        );
+    }
+
+    /// Run `250cda5c`'s second CODE visit: the target carried the two
+    /// characters backslash and r, backslash and n, where the file has real
+    /// CRLF, and ten edits were answered "Target content not found in file".
+    #[tokio::test]
+    async fn fs_edit_reads_a_targets_escaped_line_endings_as_newlines() {
+        let readme = "- API keys (OpenAI, GitHub, etc.)\r\n\r\n\r\nThis change validates.\r\n\r\n\r\n## Next\r\n";
+        let fixture = edit_fixture("README.md", readme.as_bytes()).await;
+
+        let (answer, edited) = fixture
+            .edit_answer(
+                "README.md",
+                "etc.)\n\\r\\n\\r\\nThis change validates.\\r\\n\\r\\n\\r\\n## Next",
+                "etc.)\\r\\n\\r\\nThis change validates.\\r\\n\\r\\n## Next",
+            )
+            .await;
+
+        let answer = answer.expect("the escaped target is decoded and matched");
+        assert_eq!(
+            String::from_utf8_lossy(&edited),
+            "- API keys (OpenAI, GitHub, etc.)\r\n\r\nThis change validates.\r\n\r\n## Next\r\n",
+            "the decoded replacement is written with the file's CRLF"
+        );
+        assert!(
+            answer["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("[AEGIS] the target's escaped line endings were read as newlines"),
+            "the answer names the decoding: {answer}"
+        );
+    }
+
+    /// A target that is still not found answers with the first line that
+    /// differs, its number and the file's text, so the model can see the
+    /// mismatch; the file is left as it was.
+    #[tokio::test]
+    async fn fs_edit_of_a_target_not_found_names_the_first_differing_line() {
+        let fixture = edit_fixture("notes.txt", b"alpha\r\nbeta\r\ngamma\r\n").await;
+
+        let (answer, on_disk) = fixture
+            .edit_answer("notes.txt", "alpha\nbeta\ndelta", "x")
+            .await;
+
+        let refusal = answer
+            .expect_err("the target is not in the file")
+            .to_string();
+        assert!(
+            refusal.contains("Target content not found in file")
+                && refusal.contains("line 3 of the file reads \"gamma\"")
+                && refusal.contains("\"delta\""),
+            "the refusal names the first differing line: {refusal}"
+        );
+        assert_eq!(on_disk, b"alpha\r\nbeta\r\ngamma\r\n");
+    }
+
+    /// `fs.multi_edit` matches as `fs.edit` does: its first edit, an LF
+    /// target in a CRLF file, is found, and its second, found nowhere, is
+    /// answered with the first differing line. The refusal comes before
+    /// anything is written, so the file is left as it was.
+    #[tokio::test]
+    async fn fs_multi_edit_finds_an_lf_target_in_a_crlf_file_and_names_a_miss() {
+        let fixture = edit_fixture("notes.txt", b"one\r\ntwo\r\nthree\r\n").await;
+
+        let refusal = invoke_multi_edit(
+            &json!({
+                "path": "/workspace/notes.txt",
+                "edits": [
+                    { "target_content": "one\ntwo", "replacement_content": "one\n2\ntwo" },
+                    { "target_content": "two\nfour", "replacement_content": "x" },
+                ],
+            }),
+            fixture.context.execution_id,
+            &fixture.fsal,
+            fixture.context.clone(),
+        )
+        .await
+        .expect_err("the second edit is not in the file")
+        .to_string();
+
+        assert!(
+            refusal.contains("Edit 2 of 2")
+                && refusal.contains("line 4 of the file reads \"three\""),
+            "the first edit matched and the second names its differing line: {refusal}"
+        );
+        let on_disk = std::fs::read(fixture.on_disk("notes.txt")).expect("the file");
+        assert_eq!(on_disk, b"one\r\ntwo\r\nthree\r\n");
     }
 }
