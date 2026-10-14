@@ -3739,6 +3739,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             .unwrap_or(false);
 
         let system_tenant = aegis_orchestrator_core::domain::tenant::TenantId::system();
+        let mut registered = 0usize;
+        let mut failed = 0usize;
         for (name, yaml) in builtins::BUILTIN_AGENTS {
             match serde_yaml::from_str::<aegis_orchestrator_sdk::AgentManifest>(yaml) {
                 Ok(manifest) => {
@@ -3821,12 +3823,24 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                             )
                             .await
                         {
-                            Ok(id) => info!("Deployed built-in agent '{}' (id: {})", name, id),
-                            Err(e) => warn!("Failed to deploy built-in agent '{}': {}", name, e),
+                            Ok(id) => {
+                                registered += 1;
+                                info!("Deployed built-in agent '{}' (id: {})", name, id)
+                            }
+                            Err(e) => {
+                                failed += 1;
+                                error!("Failed to deploy built-in agent '{}': {:#}", name, e)
+                            }
                         }
                     }
                 }
-                Err(e) => warn!("Failed to parse built-in agent template '{}': {}", name, e),
+                Err(e) => {
+                    failed += 1;
+                    error!(
+                        "Failed to parse built-in agent template '{}': {:#}",
+                        name, e
+                    )
+                }
             }
         }
 
@@ -3885,13 +3899,28 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     )
                     .await
                 {
-                    Ok(_) => info!("Deployed built-in workflow '{}'", wf_name),
-                    Err(e) => warn!("Failed to deploy built-in workflow '{}': {:#}", wf_name, e),
+                    Ok(_) => {
+                        registered += 1;
+                        info!("Deployed built-in workflow '{}'", wf_name)
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        error!("Failed to deploy built-in workflow '{}': {:#}", wf_name, e)
+                    }
                 }
             }
         }
 
-        info!("Built-in template deployment complete");
+        let summary = builtin_deploy_summary(
+            registered,
+            failed,
+            builtins::BUILTIN_AGENTS.len() + builtins::BUILTIN_WORKFLOWS.len(),
+        );
+        if failed == 0 {
+            info!("{summary}");
+        } else {
+            error!("{summary}");
+        }
     } else {
         info!("Built-in template deployment disabled (spec.deploy_builtins = false)");
     }
@@ -3918,6 +3947,15 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     info!("Daemon shutting down");
 
     Ok(())
+}
+
+/// The startup's closing line for the built-in deploy: how many built-ins were
+/// registered, how many failed, of how many shipped. Built-ins already up to
+/// date count in neither.
+fn builtin_deploy_summary(registered: usize, failed: usize, total: usize) -> String {
+    format!(
+        "Built-in template deployment complete: {registered} registered, {failed} failed, of {total} built-ins"
+    )
 }
 
 /// Support `.env` single-line PEM values where newlines are escaped as `\n`.
@@ -4022,13 +4060,29 @@ fn share_llm_registry<L>(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_generated_artifacts_root, temporal_connection_max_retries};
+    use super::{
+        builtin_deploy_summary, resolve_generated_artifacts_root, temporal_connection_max_retries,
+    };
     use crate::daemon::container_helpers::managed_container_reap_reason;
     use aegis_orchestrator_core::domain::execution::ExecutionStatus;
     use aegis_orchestrator_core::infrastructure::runtime::ManagedAgentContainer;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// The startup's closing line names how many built-ins registered and
+    /// how many failed, so a refused registration is visible in one line.
+    #[test]
+    fn builtin_deploy_summary_names_registered_and_failed() {
+        assert_eq!(
+            builtin_deploy_summary(0, 5, 21),
+            "Built-in template deployment complete: 0 registered, 5 failed, of 21 built-ins"
+        );
+        assert_eq!(
+            builtin_deploy_summary(2, 0, 21),
+            "Built-in template deployment complete: 2 registered, 0 failed, of 21 built-ins"
+        );
+    }
 
     fn temp_dir() -> PathBuf {
         let mut dir = std::env::temp_dir();
