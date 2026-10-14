@@ -2364,12 +2364,13 @@ async fn an_unset_budget_runs_fifty_calls_and_refuses_the_fifty_first() {
 const LEFT_CONTENT: &str = "def test_readme():\n    assert True\n";
 
 /// The fourteenth proof's shape, shortened: try 1 writes `a.py`, writes and
-/// deletes `b.py`, lists the workspace eleven times (two run, nine refused as
-/// repeats), and its clock ends it while the model is silent. Try 2 opens
-/// with the prompt, the facts paragraph, a constructed `fs.list` of the
-/// workspace and a constructed `fs.read` of `a.py` with its content: no
-/// replay of try 1, nothing about how it ended, nothing of `b.py` or of the
-/// refusals.
+/// deletes `b.py`, lists `a.py`'s directory eleven times (two run, nine
+/// refused as repeats), and its clock ends it while the model is silent. Try
+/// 2 opens with the prompt as try 1 had it, then a constructed `fs.list` of
+/// `a.py`'s directory and a constructed `fs.read` of `a.py` with its true
+/// content, as its own completed calls (correction C3): no replay of try 1,
+/// no paragraph naming it, nothing about how it ended, nothing of `b.py` or
+/// of the refusals. The facts stay on the record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_try_after_an_exhausted_one_opens_from_a_constructed_history() {
     let mut turns: Vec<Turn> = vec![
@@ -2413,13 +2414,11 @@ async fn the_try_after_an_exhausted_one_opens_from_a_constructed_history() {
     if roles != ["system", "user", "assistant", "tool", "assistant", "tool"] {
         complaints.push(format!("try 2 opened with the messages {roles:?}"));
     }
+    // Correction C3: the try owns the earlier tries' work; its user message
+    // is the prompt as the first try had it, and nothing names another try.
     let user = first_user_message(&opening);
-    let facts = "\n\n# This task so far\nTry 1 ran 14 tool calls in ";
-    if !user.starts_with("count the ticks") || !user.contains(facts) {
+    if user != "count the ticks" {
         complaints.push(format!("the user message is {user:?}"));
-    }
-    if !user.ends_with(": fs.list 11, fs.write 2, fs.delete 1. Files it left: /workspace/t/a.py.") {
-        complaints.push(format!("the facts paragraph is {user:?}"));
     }
     let constructed: Vec<(String, Value)> = opening
         .iter()
@@ -2455,6 +2454,8 @@ async fn the_try_after_an_exhausted_one_opens_from_a_constructed_history() {
         "Previous Attempts",
         "What the previous tries did",
         "timed out",
+        "Try 1",
+        "This task so far",
         "b.py",
         "already run",
     ] {
@@ -2462,13 +2463,21 @@ async fn the_try_after_an_exhausted_one_opens_from_a_constructed_history() {
             complaints.push(format!("try 2's opening holds {absent:?}"));
         }
     }
-    let applied = w.records.get(w.execution_id).iterations[0]
+    // The facts stay on the record, for the person and the narrative.
+    match w.records.get(w.execution_id).iterations[0]
         .exhausted
-        .clone();
-    if applied.and_then(|e| e.constructed).map(|c| c.files)
-        != Some(vec!["/workspace/t/a.py".to_string()])
+        .clone()
+        .and_then(|e| e.constructed)
     {
-        complaints.push("the constructed history does not name a.py alone".to_string());
+        Some(history)
+            if history.files == ["/workspace/t/a.py"]
+                && history
+                    .facts
+                    .starts_with("# This task so far\nTry 1 ran 14 tool calls in ")
+                && history.facts.ends_with(
+                    ": fs.list 11, fs.write 2, fs.delete 1. Files it left: /workspace/t/a.py.",
+                ) => {}
+        other => complaints.push(format!("the record's constructed history is {other:?}")),
     }
     assert!(complaints.is_empty(), "{}", complaints.join("\n"));
 }

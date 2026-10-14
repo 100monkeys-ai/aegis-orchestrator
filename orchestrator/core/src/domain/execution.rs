@@ -600,10 +600,12 @@ pub struct Exhaustion {
 }
 
 /// The history the try after an exhausted one is opened from (AEGIS
-/// ADR-141, Update of 2026-10-14, R2): the facts paragraph appended to its
-/// user message, the files the earlier tries left (each shown to it as a
-/// constructed `fs.list` of its directory and `fs.read` of the file, read at
-/// that try's start), and the tool calls the facts account for.
+/// ADR-141, Update of 2026-10-14, R2, as correction C3 rules it): the files
+/// the earlier tries left, each shown to that try as a constructed `fs.list`
+/// of its directory and `fs.read` of the file, read at its start; and the
+/// facts of the exhausted tries (their calls by tool, their time, the files
+/// they left) with the count of calls they account for, kept for the person
+/// and the narrative and never put in the model's context.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConstructedHistory {
     pub facts: String,

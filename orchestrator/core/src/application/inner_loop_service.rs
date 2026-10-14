@@ -694,10 +694,13 @@ impl InnerLoopService {
 
                 // After a try that ran out of its budget, the opening is
                 // constructed from the record (AEGIS ADR-141, Update of
-                // 2026-10-14, R2): the facts paragraph appended to the user
-                // message, then a constructed `fs.list` of each directory
-                // holding a file the earlier tries left and an `fs.read` of
-                // each such file, read now through the tools' own path. After
+                // 2026-10-14, R2, as correction C3 rules it: the try owns the
+                // earlier tries' work): the prompt as the first try had it,
+                // then a constructed `fs.list` of each directory holding a
+                // file the earlier tries left and an `fs.read` of each such
+                // file, read now through the tools' own path, as this try's
+                // own completed calls. Nothing names another try; the facts
+                // stay on the record (`RefinementApplied.constructed`). After
                 // a try that ended any other way, what the earlier tries did
                 // (retry-knows-what-failed, (a)), from the trajectory the
                 // record keeps of each.
@@ -719,10 +722,6 @@ impl InnerLoopService {
                     _ => None,
                 };
                 if let Some(history) = after_exhausted {
-                    if let Some(user) = conversation.iter_mut().find(|m| m.role == "user") {
-                        user.content.push_str("\n\n");
-                        user.content.push_str(&history.facts);
-                    }
                     let turns = self
                         .constructed_turns(
                             parsed_agent_id,
