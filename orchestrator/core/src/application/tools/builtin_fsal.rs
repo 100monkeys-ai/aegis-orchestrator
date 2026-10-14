@@ -360,18 +360,43 @@ fn find_once(content: &str, target: &str) -> Result<Option<(usize, usize)>, Targ
     match normalised.matches(target.as_str()).count() {
         1 => {
             let at = normalised.find(target.as_str()).unwrap_or_default();
-            let mut start = offsets[at];
-            // A target that opens on a line ending takes that ending's `\r`.
-            if bytes.get(start) == Some(&b'\n') && start > 0 && bytes[start - 1] == b'\r' {
-                start -= 1;
-            }
             // The match ends one past its last byte, before any `\r` the
             // file holds after it.
-            Ok(Some((start, offsets[at + target.len() - 1] + 1)))
+            Ok(Some((offsets[at], offsets[at + target.len() - 1] + 1)))
         }
         0 => Ok(None),
         _ => Err(TargetMiss::Multiple),
     }
+}
+
+/// A match never splits a CRLF pair of the file. A span that opens on the
+/// LF of a pair takes its `\r`, and a replacement that opens on a bare LF
+/// gets that `\r` back; a span that closes on the `\r` of a pair takes its
+/// LF, and a replacement that closes on a `\r` gets that LF back. A target
+/// matched byte for byte can open on the LF of a CRLF: without this the
+/// file's `\r` stayed before the replacement, which wrote its own line
+/// ending after it, leaving `\r\r\n`.
+fn keep_crlf_pairs<'a>(
+    content: &str,
+    start: usize,
+    end: usize,
+    replacement: std::borrow::Cow<'a, str>,
+) -> (usize, usize, std::borrow::Cow<'a, str>) {
+    let bytes = content.as_bytes();
+    let (mut start, mut end, mut replacement) = (start, end, replacement);
+    if start > 0 && bytes.get(start) == Some(&b'\n') && bytes[start - 1] == b'\r' {
+        start -= 1;
+        if replacement.starts_with('\n') {
+            replacement.to_mut().insert(0, '\r');
+        }
+    }
+    if end > start && bytes[end - 1] == b'\r' && bytes.get(end) == Some(&b'\n') {
+        end += 1;
+        if replacement.ends_with('\r') {
+            replacement.to_mut().push('\n');
+        }
+    }
+    (start, end, replacement)
 }
 
 /// Whether `text` carries a backslash followed by `r`, `n` or `t`.
@@ -480,17 +505,24 @@ fn first_differing_line(content: &str, target: &str) -> String {
 /// ([`keep_crlf_line_ending`]). The target is looked up as sent, then with
 /// line endings normalised; when it is still not found and the target or
 /// the replacement carries an escaped `\r`, `\n` or `\t`, both are decoded
-/// once and the lookup runs again.
+/// once and the lookup runs again. Either way the match keeps the file's
+/// CRLF pairs whole ([`keep_crlf_pairs`]).
 fn locate_target<'a>(
     content: &str,
     target: &str,
     replacement: &'a str,
 ) -> Result<TargetMatch<'a>, TargetMiss> {
     if let Some((start, end)) = find_once(content, target)? {
+        let (start, end, replacement) = keep_crlf_pairs(
+            content,
+            start,
+            end,
+            keep_crlf_line_ending(content, replacement),
+        );
         return Ok(TargetMatch {
             start,
             end,
-            replacement: keep_crlf_line_ending(content, replacement),
+            replacement,
             escapes_decoded: false,
         });
     }
@@ -499,10 +531,12 @@ fn locate_target<'a>(
         if let Some((start, end)) = find_once(content, &decoded_target)? {
             let decoded = decode_escaped_whitespace(replacement);
             let replacement = keep_crlf_line_ending(content, &decoded).into_owned();
+            let (start, end, replacement) =
+                keep_crlf_pairs(content, start, end, std::borrow::Cow::Owned(replacement));
             return Ok(TargetMatch {
                 start,
                 end,
-                replacement: std::borrow::Cow::Owned(replacement),
+                replacement,
                 escapes_decoded: true,
             });
         }
@@ -512,6 +546,35 @@ fn locate_target<'a>(
         )));
     }
     Err(TargetMiss::NotFound(first_differing_line(content, target)))
+}
+
+/// The `target_content` and `replacement_content` of an `fs.edit` call or
+/// of one `fs.multi_edit` edit, or, when either is missing, not a string or
+/// empty, the keys it sent. A missing key must not read as an empty target,
+/// which matches everywhere.
+fn edit_pair(edit: &Value) -> Result<(&str, &str), String> {
+    fn text<'v>(edit: &'v Value, key: &str) -> Option<&'v str> {
+        edit.get(key)
+            .and_then(|v| v.as_str())
+            .filter(|text| !text.is_empty())
+    }
+    match (
+        text(edit, "target_content"),
+        text(edit, "replacement_content"),
+    ) {
+        (Some(target), Some(replacement)) => Ok((target, replacement)),
+        _ => {
+            let keys: Vec<String> = edit
+                .as_object()
+                .map(|object| object.keys().map(|key| format!("`{key}`")).collect())
+                .unwrap_or_default();
+            Err(if keys.is_empty() {
+                "no keys".to_string()
+            } else {
+                keys.join(", ")
+            })
+        }
+    }
 }
 
 /// `fs.write`: a new file is created with the content as sent. An existing
@@ -595,14 +658,11 @@ async fn invoke_edit(
 ) -> Result<ToolInvocationResult, SealSessionError> {
     let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
     let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
-    let target = args
-        .get("target_content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let replacement = args
-        .get("replacement_content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let (target, replacement) = edit_pair(args).map_err(|sent| {
+        SealSessionError::InvalidArguments(format!(
+            "[AEGIS] fs.edit needs `target_content` and `replacement_content`; the call sent {sent}"
+        ))
+    })?;
 
     let handle = AegisFileHandle::new(vol_ctx.execution_id, vol_ctx.volume_id, "/");
 
@@ -659,6 +719,26 @@ async fn invoke_multi_edit(
     let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
     let handle = AegisFileHandle::new(vol_ctx.execution_id, vol_ctx.volume_id, "/");
 
+    let edits = args
+        .get("edits")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            SealSessionError::InvalidArguments("Missing or invalid 'edits' array".to_string())
+        })?;
+    let pairs = edits
+        .iter()
+        .enumerate()
+        .map(|(i, edit)| {
+            edit_pair(edit).map_err(|sent| {
+                SealSessionError::InvalidArguments(format!(
+                    "[AEGIS] fs.multi_edit needs `target_content` and `replacement_content` in every edit; edit {} of {} sent {sent}",
+                    i + 1,
+                    edits.len()
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
     let data = fsal
         .read(&handle, &path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
         .await
@@ -667,26 +747,10 @@ async fn invoke_multi_edit(
     let mut content = String::from_utf8(data)
         .map_err(|_| SealSessionError::InvalidArguments("File is not valid UTF-8".to_string()))?;
 
-    let edits = args
-        .get("edits")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| {
-            SealSessionError::InvalidArguments("Missing or invalid 'edits' array".to_string())
-        })?;
-
     let mut success_count = 0;
     let mut escapes_decoded = false;
 
-    for edit in edits {
-        let target = edit
-            .get("target_content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let replacement = edit
-            .get("replacement_content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
+    for (target, replacement) in pairs {
         match locate_target(&content, target, replacement) {
             Ok(found) => {
                 escapes_decoded |= found.escapes_decoded;
@@ -762,10 +826,50 @@ async fn invoke_grep(
     let regex = regex::Regex::new(pattern_str)
         .map_err(|e| SealSessionError::InvalidArguments(format!("Invalid regex pattern: {e}")))?;
 
-    // We will do a recursive walk using AegisFSAL
     let mut matches = Vec::new();
-    let mut stack = vec![path];
     let handle = AegisFileHandle::new(vol_ctx.execution_id, vol_ctx.volume_id, "/");
+
+    // A file path searches that file: listing it as a directory fails, and
+    // the walk skipped it, answering 0 for text the file holds.
+    let is_file = fsal
+        .getattr(
+            vol_ctx.execution_id,
+            vol_ctx.volume_id,
+            &path,
+            vol_ctx.container_uid,
+            vol_ctx.container_gid,
+            vol_ctx.workflow_execution_id,
+        )
+        .await
+        .is_ok_and(|attrs| attrs.file_type == crate::domain::storage::FileType::File);
+    if is_file {
+        let data = fsal
+            .read(&handle, &path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
+            .await
+            .map_err(|e| fsal_refusal("FSAL read error", path_arg, e))?;
+        if let Ok(content) = String::from_utf8(data) {
+            for (i, line) in content.lines().enumerate() {
+                if regex.is_match(line) {
+                    matches.push(serde_json::json!({
+                        "file": path,
+                        "line_number": i + 1,
+                        "line": line.trim()
+                    }));
+                    if matches.len() > 1000 {
+                        break;
+                    }
+                }
+            }
+        }
+        return Ok(ToolInvocationResult::Direct(serde_json::json!({
+            "status": "success",
+            "matches": matches,
+            "count": matches.len()
+        })));
+    }
+
+    // We will do a recursive walk using AegisFSAL
+    let mut stack = vec![path];
 
     while let Some(current_dir) = stack.pop() {
         if matches.len() > 1000 {
@@ -1436,5 +1540,134 @@ mod tests {
         );
         let on_disk = std::fs::read(fixture.on_disk("notes.txt")).expect("the file");
         assert_eq!(on_disk, b"one\r\ntwo\r\nthree\r\n");
+    }
+
+    /// Run `53ae66ac`'s first edit: the target opens on the LF of a CRLF
+    /// line ending and runs to the end of a line. Before the fix the match
+    /// began at that LF, so the file's `\r` stayed before it and the
+    /// replacement's own CRLF followed it, leaving `\r\r\n`; a replacement
+    /// that drops the line ending left the `\r` alone before the text.
+    #[tokio::test]
+    async fn fs_edit_on_a_crlf_file_leaves_no_lone_cr() {
+        let see = "See the [Workflow Manifest Reference](https://docs.100monkeys.ai/docs/reference/workflow-manifest) and the [Building Workflows guide](https://docs.100monkeys.ai/docs/guides/building-workflows) for full documentation.";
+        let sentence = "You can also deploy and run the the-forge workflow using `aegis workflow deploy ./agents/workflows/the-forge.yaml`.";
+        let readme = format!(
+            "aegis workflow status <execution-id> --follow\r\n```\r\n\r\n{see}\r\n\r\nMore.\r\n"
+        );
+        let lone_cr = |text: &str| text.replace("\r\n", "").contains('\r');
+
+        let fixture = edit_fixture("README.md", readme.as_bytes()).await;
+        let edited = fixture
+            .edit(
+                "README.md",
+                &format!("\n{see}"),
+                &format!("\n{sentence}\n\n{see}"),
+            )
+            .await;
+        let edited = String::from_utf8(edited).expect("utf-8");
+        assert!(!lone_cr(&edited), "the edit left a lone \\r: {edited:?}");
+        assert_eq!(
+            edited,
+            format!("aegis workflow status <execution-id> --follow\r\n```\r\n\r\n{sentence}\r\n\r\n{see}\r\n\r\nMore.\r\n")
+        );
+
+        let fixture = edit_fixture("README.md", readme.as_bytes()).await;
+        let joined = fixture.edit("README.md", &format!("\n{see}"), see).await;
+        let joined = String::from_utf8(joined).expect("utf-8");
+        assert!(!lone_cr(&joined), "the edit left a lone \\r: {joined:?}");
+        assert_eq!(
+            joined,
+            format!(
+                "aegis workflow status <execution-id> --follow\r\n```\r\n{see}\r\n\r\nMore.\r\n"
+            )
+        );
+    }
+
+    /// Run `53ae66ac` sent four `fs.edit` calls with `target` in place of
+    /// `target_content`; the missing key read as an empty target, which
+    /// matched everywhere and was answered "exists multiple times". A call
+    /// without both keys is refused before the file is read, naming the keys
+    /// it sent; `fs.multi_edit` refuses an edit the same way.
+    #[tokio::test]
+    async fn fs_edit_without_target_content_is_refused_naming_the_keys_sent() {
+        let fixture = edit_fixture("notes.txt", b"one\r\ntwo\r\n").await;
+
+        let refusal = invoke_edit(
+            &json!({
+                "path": "/workspace/notes.txt",
+                "target": "one",
+                "replacement": "1",
+            }),
+            fixture.context.execution_id,
+            &fixture.fsal,
+            fixture.context.clone(),
+        )
+        .await
+        .expect_err("the call names neither key")
+        .to_string();
+        assert!(
+            refusal.contains("[AEGIS] fs.edit needs `target_content` and `replacement_content`; the call sent `path`, `replacement`, `target`"),
+            "the refusal names the keys the call sent: {refusal}"
+        );
+
+        let (answer, _) = fixture.edit_answer("notes.txt", "", "1").await;
+        let refusal = answer.expect_err("an empty target").to_string();
+        assert!(
+            refusal.contains("[AEGIS] fs.edit needs `target_content` and `replacement_content`; the call sent `path`, `replacement_content`, `target_content`"),
+            "an empty target is refused the same way: {refusal}"
+        );
+
+        let refusal = invoke_multi_edit(
+            &json!({
+                "path": "/workspace/notes.txt",
+                "edits": [
+                    { "target_content": "one", "replacement_content": "1" },
+                    { "target": "two", "replacement_content": "2" },
+                ],
+            }),
+            fixture.context.execution_id,
+            &fixture.fsal,
+            fixture.context.clone(),
+        )
+        .await
+        .expect_err("the second edit names no target_content")
+        .to_string();
+        assert!(
+            refusal.contains("[AEGIS] fs.multi_edit needs `target_content` and `replacement_content` in every edit; edit 2 of 2 sent `replacement_content`, `target`"),
+            "the refusal names the edit and the keys it sent: {refusal}"
+        );
+        let on_disk = std::fs::read(fixture.on_disk("notes.txt")).expect("the file");
+        assert_eq!(on_disk, b"one\r\ntwo\r\n");
+    }
+
+    /// Run `53ae66ac`'s CODE child grepped `README.md` by its own path and
+    /// was answered 0 for text the same pattern found in it by its
+    /// directory: the walk listed the path as a directory, and a file
+    /// cannot be listed. A file path searches that file.
+    #[tokio::test]
+    async fn fs_grep_with_a_file_path_searches_that_file() {
+        let fixture = edit_fixture(
+            "README.md",
+            b"# Examples\r\n```bash\r\nSee the [Workflow Manifest Reference](x)\r\n",
+        )
+        .await;
+
+        let answer = invoke_grep(
+            &json!({
+                "path": "/workspace/README.md",
+                "pattern": "See the \\[Workflow Manifest Reference\\]",
+            }),
+            fixture.context.execution_id,
+            &fixture.fsal,
+            fixture.context.clone(),
+        )
+        .await
+        .expect("the grep runs");
+        let ToolInvocationResult::Direct(answer) = answer else {
+            panic!("fs.grep answers directly");
+        };
+        assert_eq!(answer["count"], 1, "the file holds the text once: {answer}");
+        assert_eq!(answer["matches"][0]["line_number"], 3, "{answer}");
+        assert_eq!(answer["matches"][0]["file"], "/README.md", "{answer}");
     }
 }
