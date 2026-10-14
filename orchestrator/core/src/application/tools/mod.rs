@@ -4,7 +4,9 @@ pub mod builtin_execution_file;
 pub mod builtin_fsal;
 pub mod builtin_mail;
 pub mod builtin_schema;
+pub mod builtin_search;
 pub mod builtin_web;
+mod codebase;
 
 use crate::application::nfs_gateway::NfsVolumeRegistry;
 pub use crate::application::ports::ExternalWebToolPort;

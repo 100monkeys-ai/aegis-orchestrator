@@ -136,6 +136,21 @@ pub struct ToolSearchResponse {
 // Service
 // ---------------------------------------------------------------------------
 
+/// The tools tagged read-only by name, beside those whose name ends in a
+/// read-only suffix.
+const READ_ONLY_NAMES: &[&str] = &[
+    "fs.read",
+    "fs.list",
+    "fs.grep",
+    "fs.glob",
+    "fs.search",
+    "web.search",
+    "web.fetch",
+    "mail.read",
+    "calendar.calendars",
+    "calendar.read",
+];
+
 /// In-memory tool catalog with periodic refresh.
 ///
 /// The catalog does **not** own the refresh schedule — the host process calls
@@ -373,18 +388,7 @@ impl StandardToolCatalog {
         let read_only_suffixes = [
             ".list", ".search", ".get", ".export", ".status", ".logs", ".info", ".config",
         ];
-        let read_only_names = [
-            "fs.read",
-            "fs.list",
-            "fs.grep",
-            "fs.glob",
-            "web.search",
-            "web.fetch",
-            "mail.read",
-            "calendar.calendars",
-            "calendar.read",
-        ];
-        if read_only_suffixes.iter().any(|s| name.ends_with(s)) || read_only_names.contains(&name) {
+        if read_only_suffixes.iter().any(|s| name.ends_with(s)) || READ_ONLY_NAMES.contains(&name) {
             tags.push("read-only".to_string());
         }
 
@@ -453,6 +457,17 @@ impl StandardToolCatalog {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `fs.search` is read-only by its name in the catalogue (AEGIS ADR-145
+    /// S1, T2), not only by its `.search` ending.
+    #[test]
+    fn fs_search_core_fs_search_is_named_read_only() {
+        assert!(
+            READ_ONLY_NAMES.contains(&"fs.search"),
+            "fs.search is not in the read-only names: {READ_ONLY_NAMES:?}"
+        );
+        assert!(StandardToolCatalog::infer_tags("fs.search").contains(&"read-only".to_string()));
+    }
 
     fn sample_metadata() -> crate::infrastructure::tool_router::ToolMetadata {
         crate::infrastructure::tool_router::ToolMetadata {

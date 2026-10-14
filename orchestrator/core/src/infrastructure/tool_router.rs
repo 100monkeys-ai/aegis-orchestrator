@@ -144,6 +144,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("fs.multi_edit", "Performs multiple sequential string replacements in a file."),
     BuiltinToolDefinition::new("fs.grep", "Recursively searches for a regex pattern within files in a given directory.").skip_judge(),
     BuiltinToolDefinition::new("fs.glob", "Recursively matches files against a glob pattern.").skip_judge(),
+    BuiltinToolDefinition::new("fs.search", "Search the files under path for needle, plain text and not a pattern. With no path it searches the run's repository, or /workspace when the run holds none or several. A needle with no capital letters matches any case. Optional: exact_case, whole_word, file_type (an extension such as rs), include_ignored. Ignored files, build output, dependency folders and lock files are skipped unless include_ignored is true. Results are grouped by file and ranked: definitions, then source, then tests, then generated files; at most 40 lines are shown, with a count of the rest, and every path is one fs.read takes as written. Two or more words also find declarations named or commented with those words. Use it to find where something is; use fs.read to read around a result.").skip_judge(),
     BuiltinToolDefinition::new("web.search", "Performs an internet search query.").skip_judge(),
     BuiltinToolDefinition::new("web.fetch", "Fetches content from a URL, optionally converting HTML to Markdown. Returns at most 50,000 characters of the page per call: a longer page comes back cut, with truncated, total_chars, next_offset and a notice, and the offset argument reads on.").skip_judge(),
     BuiltinToolDefinition::new("mail.draft", "Saves a plain-text message as a draft in a connected mailbox's Drafts folder, optionally as a reply in a thread. Sends nothing."),
@@ -368,6 +369,7 @@ impl ToolRouter {
             "fs.multi_edit" => Self::schema_fs_multi_edit(),
             "fs.grep" => Self::schema_fs_grep(),
             "fs.glob" => Self::schema_fs_glob(),
+            "fs.search" => Self::schema_fs_search(),
             "web.search" => Self::schema_web_search(),
             "web.fetch" => Self::schema_web_fetch(),
             "mail.draft" => Self::schema_mail_outbound(OutboundShape::Draft),
@@ -750,6 +752,40 @@ impl ToolRouter {
                 }
             },
             "required": ["pattern", "path"]
+        })
+    }
+
+    /// JSON schema for the `fs.search` builtin tool (AEGIS ADR-145 S1).
+    fn schema_fs_search() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "needle": {
+                    "type": "string",
+                    "description": "The text to search for, plain text and not a pattern."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "The folder or file to search. Omit it to search the run's repository."
+                },
+                "exact_case": {
+                    "type": "boolean",
+                    "description": "Match the needle's case exactly, even when it has no capital letter."
+                },
+                "whole_word": {
+                    "type": "boolean",
+                    "description": "Match only where the needle is not part of a longer word."
+                },
+                "file_type": {
+                    "type": "string",
+                    "description": "Search only files with this extension, such as rs."
+                },
+                "include_ignored": {
+                    "type": "boolean",
+                    "description": "Also search ignored files, build output, dependency folders and lock files."
+                }
+            },
+            "required": ["needle"]
         })
     }
 
@@ -3100,6 +3136,9 @@ mod tests {
         "fs.list",
         "fs.grep",
         "fs.glob",
+        // AEGIS ADR-145 S1: the structural search changes nothing on any
+        // volume, added deliberately.
+        "fs.search",
         "web.search",
         "web.fetch",
         "mail.list",
@@ -3185,6 +3224,34 @@ mod tests {
 
     /// Pre-consolidation `FLEET_CAPABLE_TOOLS` membership (frozen).
     const FROZEN_FLEET_CAPABLE_TOOLS: &[&str] = &["aegis.edge.fleet.invoke"];
+
+    /// `fs.search` is a builtin tool no judge reviews, with its schema
+    /// (AEGIS ADR-145 S1, T2).
+    #[test]
+    fn fs_search_core_fs_search_is_a_skip_judge_builtin_with_its_schema() {
+        let def = BuiltinToolDefinition::lookup("fs.search")
+            .expect("fs.search is not in BUILTIN_TOOL_DEFINITIONS");
+        assert!(def.skip_judge, "fs.search is judged");
+        assert!(
+            def.description.starts_with(
+                "Search the files under path for needle, plain text and not a pattern."
+            ),
+            "{}",
+            def.description
+        );
+        let schema = ToolRouter::schema_for_builtin("fs.search");
+        assert_eq!(schema["required"], json!(["needle"]), "{schema}");
+        for (key, kind) in [
+            ("needle", "string"),
+            ("path", "string"),
+            ("exact_case", "boolean"),
+            ("whole_word", "boolean"),
+            ("file_type", "string"),
+            ("include_ignored", "boolean"),
+        ] {
+            assert_eq!(schema["properties"][key]["type"], kind, "{key}: {schema}");
+        }
+    }
 
     #[test]
     fn every_skip_judge_tool_in_old_list_remains_skip_judge() {

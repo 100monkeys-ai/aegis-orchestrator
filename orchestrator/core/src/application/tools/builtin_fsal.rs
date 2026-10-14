@@ -12,7 +12,7 @@ use std::sync::Arc;
 /// An FSAL error of a `fs.*` tool, answered by its variant and the caller's
 /// own `path` (AEGIS ADR-035, Update of 2026-10-04, R5). What the inner loop
 /// and the log see is the text it always had, `"<context>: <error>"`.
-fn fsal_refusal(context: &str, path_arg: &str, e: FsalError) -> SealSessionError {
+pub(crate) fn fsal_refusal(context: &str, path_arg: &str, e: FsalError) -> SealSessionError {
     let answer = match &e {
         FsalError::VolumeNotFound(_)
         | FsalError::Storage(StorageError::FileNotFound(_))
@@ -44,7 +44,7 @@ fn fsal_refusal(context: &str, path_arg: &str, e: FsalError) -> SealSessionError
 /// Converts paths like `/workspace/solution.py` → `/solution.py` so they are
 /// volume-relative before being passed to AegisFSAL. Paths that do not begin
 /// with the mount point are returned unchanged.
-fn to_volume_relative(mount_point: &Path, path: &str) -> String {
+pub(crate) fn to_volume_relative(mount_point: &Path, path: &str) -> String {
     let base = mount_point
         .to_str()
         .unwrap_or("/workspace")
@@ -140,17 +140,14 @@ fn read_answer(path_arg: &str, data: &[u8], args: &Value) -> Result<Value, SealS
     }))
 }
 
-pub async fn invoke_fs_tool(
-    tool_name: &str,
-    args: &Value,
+/// The volume a `fs.*` tool's `path_arg` is read from or written to: the
+/// execution's most specific registered mount above it, else its primary
+/// `/workspace` volume.
+pub(crate) fn resolve_volume(
     execution_id: ExecutionId,
-    fsal: &Arc<AegisFSAL>,
+    path_arg: &str,
     volume_registry: &NfsVolumeRegistry,
-) -> Result<ToolInvocationResult, SealSessionError> {
-    let path_arg = args
-        .get("path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("/workspace");
+) -> Result<crate::infrastructure::nfs::server::NfsVolumeContext, SealSessionError> {
     // A path under a mount whose registration no longer holds for this
     // execution is refused by the mount's name: resolving it into the
     // `/workspace` volume would read and write the wrong tree.
@@ -161,7 +158,7 @@ pub async fn invoke_fs_tool(
         ))
         .answered(CallerAnswer::Internal(InternalFailure::Server)));
     }
-    let vol_ctx = volume_registry
+    volume_registry
         .find_by_execution_and_path(execution_id, path_arg)
         .or_else(|| volume_registry.find_primary_workspace_by_execution(execution_id))
         .ok_or_else(|| {
@@ -169,7 +166,27 @@ pub async fn invoke_fs_tool(
             // orchestrator's to register (AEGIS ADR-035, Update of 2026-10-04, R5).
             SealSessionError::NotFound(format!("No volume registered for execution {execution_id}"))
                 .answered(CallerAnswer::Internal(InternalFailure::Server))
-        })?;
+        })
+}
+
+pub async fn invoke_fs_tool(
+    tool_name: &str,
+    args: &Value,
+    execution_id: ExecutionId,
+    fsal: &Arc<AegisFSAL>,
+    volume_registry: &NfsVolumeRegistry,
+) -> Result<ToolInvocationResult, SealSessionError> {
+    // `fs.search` resolves its own root: with no `path` it searches the
+    // run's repository (AEGIS ADR-145 S2).
+    if tool_name == "fs.search" {
+        return super::builtin_search::invoke_search(args, execution_id, fsal, volume_registry)
+            .await;
+    }
+    let path_arg = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("/workspace");
+    let vol_ctx = resolve_volume(execution_id, path_arg, volume_registry)?;
 
     let handle = AegisFileHandle::new(vol_ctx.execution_id, vol_ctx.volume_id, "/");
 

@@ -1,0 +1,1336 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+//! `fs.search`: plain-text search of what a run holds, with the parsed
+//! declarations of its source, in one bounded answer (AEGIS ADR-145 S1 to
+//! S7).
+//!
+//! # What it does
+//!
+//! - **It searches what the run holds** (S2). With no `path` it searches the
+//!   run's repository when exactly one volume is mounted directly beneath
+//!   `/workspace` (`/workspace/<label>`), else `/workspace`. A `path`
+//!   resolves to the run's most specific registered mount, as every `fs.*`
+//!   tool's does, with the same refusals. A folder beneath which another
+//!   volume of the same execution is mounted lists that mount as a folder,
+//!   and the walk descends into it: one volume's listing never shows another
+//!   volume, because each volume's paths resolve under its own storage root
+//!   (`AegisFSAL::readdir` through `routed_storage_path`).
+//! - **It answers in the paths the agent sees.** Every path in an answer is
+//!   container-absolute, the one `fs.read` takes as written.
+//! - **It walks what the repository keeps** (S3), through `AegisFSAL` only,
+//!   in path order: `.git` is never walked, the folders of
+//!   [`SKIPPED_FOLDERS`] and the files of [`GENERATED_NAMES`] and
+//!   [`GENERATED_ENDINGS`] are skipped unless `include_ignored` is true, and
+//!   each `.gitignore` met on the way (and those of the folders above the
+//!   root, up to its mount point) is honoured. A `path` named inside a skipped
+//!   folder is searched. Files over [`LARGEST_FILE`] bytes are skipped on
+//!   their size and never opened; binary and non-UTF-8 files are counted and
+//!   skipped.
+//! - **Structure comes only from a parse** (S4): the module `codebase` parses
+//!   the project's own source, and gives no declaration for a file that does
+//!   not parse.
+//! - **The answer is bounded and stable** (S5, S6): at most [`SHOWN_LINES`]
+//!   lines, [`SHOWN_NAMES`] file names and [`SHOWN_DECLARATIONS`]
+//!   declarations within [`LONGEST_ANSWER`] bytes; the walk reads at most
+//!   [`MOST_FILES_READ`] files. Nothing in the answer depends on anything but
+//!   the tree and the arguments, so two identical calls answer byte for byte
+//!   the same.
+//! - **Nothing is stored and nothing leaves the orchestrator** (S7): the
+//!   index lives for one call, and this module opens no network client.
+//!
+//! The constants and the answer's behaviour are those of `zaru-cli`'s
+//! `fs.search` at commit f9deca3d (`crates/zaru-cli/src/tools/searching.rs`),
+//! written anew over `AegisFSAL` (S8).
+
+use super::builtin_fsal::{fsal_refusal, resolve_volume, to_volume_relative};
+use super::codebase::{self, Symbol};
+use crate::application::nfs_gateway::NfsVolumeRegistry;
+use crate::application::tool_invocation_service::ToolInvocationResult;
+use crate::domain::execution::ExecutionId;
+use crate::domain::fsal::{AegisFSAL, AegisFileHandle};
+use crate::domain::seal_session::SealSessionError;
+use crate::domain::storage::{DirEntry, FileType};
+use crate::infrastructure::nfs::server::NfsVolumeContext;
+use regex::Regex;
+use serde_json::Value;
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::sync::Arc;
+
+/// How many matching lines an answer shows at most.
+pub const SHOWN_LINES: usize = 40;
+
+/// How many rows one file gets before other files get theirs.
+const ROWS_PER_FILE_FIRST: usize = 8;
+
+/// How many files whose names hold the needle are listed at most.
+pub const SHOWN_NAMES: usize = 10;
+
+/// How many characters of a line are shown before it is shortened.
+pub const LONGEST_SHOWN_LINE: usize = 200;
+
+/// How many declarations an answer lists at most.
+pub const SHOWN_DECLARATIONS: usize = 8;
+
+/// The most bytes an answer holds.
+pub const LONGEST_ANSWER: usize = 30_720;
+
+/// The most files one call reads.
+pub const MOST_FILES_READ: usize = 10_000;
+
+/// The largest file read, the bound `fs.read` holds.
+pub const LARGEST_FILE: u64 = 10 * 1024 * 1024;
+
+/// How many characters of the needle an answer repeats.
+const SHOWN_NEEDLE: usize = 200;
+
+/// Folders skipped by default: repository metadata, build output and
+/// dependencies. `.git` is skipped even with `include_ignored`.
+pub const SKIPPED_FOLDERS: [&str; 9] = [
+    ".git",
+    "target",
+    "node_modules",
+    "vendor",
+    "dist",
+    "build",
+    "__pycache__",
+    ".venv",
+    "venv",
+];
+
+/// Files that a tool writes rather than a person: skipped by default.
+pub const GENERATED_NAMES: [&str; 8] = [
+    "Cargo.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "go.sum",
+    "composer.lock",
+    "Gemfile.lock",
+];
+
+/// Endings of generated file names: skipped by default.
+pub const GENERATED_ENDINGS: [&str; 3] = [".min.js", ".min.css", ".map"];
+
+/// Words in the head of a file that say a tool wrote it. Such a file is
+/// searched and ranked last.
+const GENERATED_MARKS: [&str; 4] = [
+    "@generated",
+    "DO NOT EDIT",
+    "Code generated",
+    "autogenerated",
+];
+
+/// How many bytes of a file are looked at to tell binary from text, and for
+/// a generated mark.
+const HEAD_BYTES: usize = 8 * 1024;
+
+/// The refusal of an empty needle (S6).
+pub const EMPTY_NEEDLE: &str = "the string to search for is empty, which occurs everywhere in every file; fs.search needs something to look for";
+
+/// The heading of the part of an answer that lists declarations.
+const DECLARATIONS_HEADING: &str = "Declarations whose names or comments share words with";
+
+/// The optional fields of an `fs.search` call.
+#[derive(Debug, Clone, Default)]
+struct Options {
+    exact_case: bool,
+    whole_word: bool,
+    file_type: Option<String>,
+    include_ignored: bool,
+}
+
+/// A boolean argument: absent or null is false.
+fn flag(args: &Value, key: &str) -> Result<bool, SealSessionError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(other) => Err(SealSessionError::InvalidArguments(format!(
+            "{key} must be true or false; got {other}."
+        ))),
+    }
+}
+
+/// A string argument: absent or null is `None`.
+fn text_arg<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, SealSessionError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.as_str())),
+        Some(other) => Err(SealSessionError::InvalidArguments(format!(
+            "{key} must be a string; got {other}."
+        ))),
+    }
+}
+
+/// `raw` as a container-absolute path without `.` or empty parts: a relative
+/// path is taken under `/workspace`, as `fs.read` takes it. `None` for a path
+/// that climbs with `..`.
+fn container_path(raw: &str) -> Option<String> {
+    let joined = if raw.starts_with('/') {
+        raw.to_string()
+    } else {
+        format!("/workspace/{raw}")
+    };
+    let mut parts = Vec::new();
+    for part in joined.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return None,
+            part => parts.push(part),
+        }
+    }
+    Some(format!("/{}", parts.join("/")))
+}
+
+/// Whether `path` is `folder` or lies beneath it.
+fn is_within(path: &str, folder: &str) -> bool {
+    folder == "/"
+        || path == folder
+        || path
+            .strip_prefix(folder)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// `path` below `folder`, without the leading slash; `None` when it is not
+/// strictly beneath it.
+fn below<'a>(path: &'a str, folder: &str) -> Option<&'a str> {
+    let rest = if folder == "/" {
+        path.strip_prefix('/')
+    } else {
+        path.strip_prefix(folder)?.strip_prefix('/')
+    }?;
+    (!rest.is_empty()).then_some(rest)
+}
+
+/// `folder` joined with `name`.
+fn join(folder: &str, name: &str) -> String {
+    if folder == "/" {
+        format!("/{name}")
+    } else {
+        format!("{folder}/{name}")
+    }
+}
+
+/// The mount points of the execution's registered volumes.
+fn mount_points(registry: &NfsVolumeRegistry, execution_id: ExecutionId) -> Vec<String> {
+    let mut mounts: Vec<String> = registry
+        .find_all_by_execution(execution_id)
+        .iter()
+        .filter_map(|context| container_path(&context.mount_point.to_string_lossy()))
+        .collect();
+    mounts.sort();
+    mounts.dedup();
+    mounts
+}
+
+/// The folder a call with no `path` searches: the run's repository when
+/// exactly one volume is mounted directly beneath `/workspace`, else
+/// `/workspace`.
+fn default_root(mounts: &[String]) -> String {
+    let repositories: Vec<&String> = mounts
+        .iter()
+        .filter(|mount| below(mount, "/workspace").is_some_and(|rest| !rest.contains('/')))
+        .collect();
+    match repositories.as_slice() {
+        [only] => (*only).clone(),
+        _ => "/workspace".to_string(),
+    }
+}
+
+/// How the needle is matched.
+struct Matcher {
+    needle: String,
+    any_case: bool,
+    whole_word: bool,
+}
+
+impl Matcher {
+    fn new(needle: &str, options: &Options) -> Self {
+        let any_case = !options.exact_case && !needle.chars().any(char::is_uppercase);
+        Self {
+            needle: if any_case {
+                needle.to_lowercase()
+            } else {
+                needle.to_owned()
+            },
+            any_case,
+            whole_word: options.whole_word,
+        }
+    }
+
+    /// Whether `name` is the needle itself, in the case this search uses.
+    fn is(&self, name: &str) -> bool {
+        if self.any_case {
+            name.to_lowercase() == self.needle
+        } else {
+            name == self.needle
+        }
+    }
+
+    fn matches(&self, text: &str) -> bool {
+        let folded;
+        let haystack = if self.any_case {
+            folded = text.to_lowercase();
+            folded.as_str()
+        } else {
+            text
+        };
+        if !self.whole_word {
+            return haystack.contains(&self.needle);
+        }
+        let in_a_word = |character: char| character.is_alphanumeric() || character == '_';
+        haystack.match_indices(&self.needle).any(|(at, _)| {
+            let before = haystack[..at].chars().next_back();
+            let after = haystack[at + self.needle.len()..].chars().next();
+            !before.is_some_and(in_a_word) && !after.is_some_and(in_a_word)
+        })
+    }
+}
+
+/// One rule of a `.gitignore`: the folder it was read in, and its pattern.
+#[derive(Clone)]
+struct IgnoreRule {
+    folder: String,
+    pattern: Regex,
+    negated: bool,
+    folders_only: bool,
+    anchored: bool,
+}
+
+/// A gitignore glob as an anchored regular expression over a `/`-separated
+/// path.
+fn glob_regex(glob: &str) -> String {
+    let chars: Vec<char> = glob.chars().collect();
+    let mut out = String::from("^");
+    let mut at = 0;
+    while at < chars.len() {
+        let character = chars[at];
+        match character {
+            '*' if chars.get(at + 1) == Some(&'*') => {
+                let starts_a_part = at == 0 || chars[at - 1] == '/';
+                if starts_a_part && at + 2 == chars.len() {
+                    out.push_str(".*");
+                    at += 2;
+                } else if starts_a_part && chars.get(at + 2) == Some(&'/') {
+                    out.push_str("(?:.*/)?");
+                    at += 3;
+                } else {
+                    out.push_str("[^/]*");
+                    at += 2;
+                }
+                continue;
+            }
+            '*' => out.push_str("[^/]*"),
+            '?' => out.push_str("[^/]"),
+            '[' => {
+                let first = at + 1 + usize::from(chars.get(at + 1) == Some(&'!'));
+                let close = chars
+                    .iter()
+                    .enumerate()
+                    .skip(first + 1)
+                    .find(|(_, c)| **c == ']')
+                    .map(|(close, _)| close);
+                if let Some(close) = close {
+                    out.push('[');
+                    if first > at + 1 {
+                        out.push('^');
+                    }
+                    for inner in &chars[first..close] {
+                        if matches!(inner, '\\' | '[' | ']' | '&' | '~' | '^') {
+                            out.push('\\');
+                        }
+                        out.push(*inner);
+                    }
+                    out.push(']');
+                    at = close + 1;
+                    continue;
+                }
+                out.push_str("\\[");
+            }
+            '\\' if at + 1 < chars.len() => {
+                out.push_str(&regex::escape(&chars[at + 1].to_string()));
+                at += 2;
+                continue;
+            }
+            other => out.push_str(&regex::escape(&other.to_string())),
+        }
+        at += 1;
+    }
+    out.push('$');
+    out
+}
+
+/// The rules of the `.gitignore` read in `folder`.
+fn gitignore_rules(folder: &str, text: &str) -> Vec<IgnoreRule> {
+    let mut rules = Vec::new();
+    for raw in text.lines() {
+        let mut line = raw.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Trailing spaces are dropped unless escaped.
+        while line.ends_with(' ') && !line.ends_with("\\ ") {
+            line = &line[..line.len() - 1];
+        }
+        let (negated, line) = match line.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, line),
+        };
+        let line = if line.starts_with("\\#") || line.starts_with("\\!") {
+            &line[1..]
+        } else {
+            line
+        };
+        let (folders_only, line) = match line.strip_suffix('/') {
+            Some(rest) => (true, rest),
+            None => (false, line),
+        };
+        if line.is_empty() {
+            continue;
+        }
+        let anchored = line.contains('/');
+        let glob = line.trim_start_matches('/');
+        if let Ok(pattern) = Regex::new(&glob_regex(glob)) {
+            rules.push(IgnoreRule {
+                folder: folder.to_string(),
+                pattern,
+                negated,
+                folders_only,
+                anchored,
+            });
+        }
+    }
+    rules
+}
+
+/// Whether the rules, read shallowest first, ignore the entry at `path`:
+/// the last rule that matches decides.
+fn is_ignored(rules: &[IgnoreRule], path: &str, name: &str, is_folder: bool) -> bool {
+    let mut ignored = false;
+    for rule in rules {
+        if rule.folders_only && !is_folder {
+            continue;
+        }
+        let Some(relative) = below(path, &rule.folder) else {
+            continue;
+        };
+        let target = if rule.anchored { relative } else { name };
+        if rule.pattern.is_match(target) {
+            ignored = !rule.negated;
+        }
+    }
+    ignored
+}
+
+/// How a matching line ranks. Lower comes first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Tier {
+    /// A declaration whose name is the needle starts on this line.
+    Named,
+    /// A declaration whose name holds the needle starts on this line.
+    Definition,
+    /// The project's own source.
+    Source,
+    /// A test.
+    Test,
+    /// A file a tool wrote, or one skipped by default and searched on
+    /// `include_ignored`.
+    Generated,
+}
+
+/// One matching line.
+struct Hit {
+    file: usize,
+    line: usize,
+    text: String,
+    tier: Tier,
+}
+
+/// What was not looked at, and why.
+#[derive(Default)]
+struct Skipped {
+    folders: BTreeSet<String>,
+    ignored: Vec<String>,
+    generated: Vec<String>,
+    binary: Vec<String>,
+    large: Vec<String>,
+    not_utf8: Vec<String>,
+    other: Vec<String>,
+    unreadable: Vec<String>,
+}
+
+/// Everything the walk found.
+#[derive(Default)]
+struct Walked {
+    files: Vec<String>,
+    hits: Vec<Hit>,
+    names: Vec<String>,
+    symbols: Vec<Symbol>,
+    read: usize,
+    stopped_in: Option<String>,
+    skipped: Skipped,
+}
+
+/// One folder still to walk, with the `.gitignore` rules that reach it.
+struct Pending {
+    folder: String,
+    rules: Arc<Vec<IgnoreRule>>,
+    ignored_by_default: bool,
+}
+
+/// The walk of one call.
+struct Search<'a> {
+    fsal: &'a Arc<AegisFSAL>,
+    registry: &'a NfsVolumeRegistry,
+    execution_id: ExecutionId,
+    mounts: Vec<String>,
+    root: String,
+    options: Options,
+    matcher: Matcher,
+    words: Vec<String>,
+    walked: Walked,
+}
+
+impl Search<'_> {
+    /// The volume a container path is read from, as every `fs.*` tool
+    /// resolves it.
+    fn volume_of(&self, path: &str) -> Option<NfsVolumeContext> {
+        self.registry
+            .find_by_execution_and_path(self.execution_id, path)
+            .or_else(|| {
+                self.registry
+                    .find_primary_workspace_by_execution(self.execution_id)
+            })
+    }
+
+    /// Whether `path` lies under a registered mount of the execution, rather
+    /// than only in the primary volume by default.
+    fn is_mounted(&self, path: &str) -> bool {
+        self.mounts.iter().any(|mount| is_within(path, mount))
+    }
+
+    /// The names of the mounts strictly beneath `folder`, as folder entries
+    /// of it: the first part of each mount's path below `folder`.
+    fn mounted_children(&self, folder: &str) -> BTreeSet<String> {
+        self.mounts
+            .iter()
+            .filter_map(|mount| below(mount, folder))
+            .filter_map(|rest| rest.split('/').next())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The entries of `folder`: its volume's listing, with each mount
+    /// beneath it as a folder in place of an entry of the same name. `None`
+    /// when the folder cannot be listed and holds no mount.
+    async fn entries(&self, folder: &str) -> Option<Vec<DirEntry>> {
+        let mounted = self.mounted_children(folder);
+        let listed = if self.is_mounted(folder) || mounted.is_empty() {
+            match self.volume_of(folder) {
+                Some(context) => self
+                    .fsal
+                    .readdir(
+                        context.execution_id,
+                        context.volume_id,
+                        &to_volume_relative(&context.mount_point, folder),
+                        &context.policy,
+                        None,
+                        None,
+                        context.workflow_execution_id,
+                    )
+                    .await
+                    .ok(),
+                None => None,
+            }
+        } else {
+            // A folder under no mount, above one: only the mounts are in it.
+            Some(Vec::new())
+        };
+        let mut entries = match listed {
+            Some(entries) => entries,
+            None if mounted.is_empty() => return None,
+            None => Vec::new(),
+        };
+        entries.retain(|entry| !mounted.contains(&entry.name));
+        entries.extend(mounted.into_iter().map(|name| DirEntry {
+            name,
+            file_type: FileType::Directory,
+        }));
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        Some(entries)
+    }
+
+    /// The bytes of the file at `path`, at most `length` of them.
+    async fn read(&self, path: &str, length: usize) -> Result<Vec<u8>, String> {
+        let context = self
+            .volume_of(path)
+            .ok_or_else(|| "no volume holds it".to_string())?;
+        let handle = AegisFileHandle::new(context.execution_id, context.volume_id, "/");
+        self.fsal
+            .read(
+                &handle,
+                &to_volume_relative(&context.mount_point, path),
+                &context.policy,
+                0,
+                length,
+            )
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// The size of the file at `path`.
+    async fn size(&self, path: &str) -> Result<u64, String> {
+        let context = self
+            .volume_of(path)
+            .ok_or_else(|| "no volume holds it".to_string())?;
+        self.fsal
+            .getattr(
+                context.execution_id,
+                context.volume_id,
+                &to_volume_relative(&context.mount_point, path),
+                context.container_uid,
+                context.container_gid,
+                context.workflow_execution_id,
+            )
+            .await
+            .map(|attributes| attributes.size)
+            .map_err(|e| e.to_string())
+    }
+
+    /// The `.gitignore` rules of the folders from the root's mount point down
+    /// to the root's parent, which reach the root.
+    async fn rules_above_root(&self) -> Vec<IgnoreRule> {
+        let top = self
+            .mounts
+            .iter()
+            .filter(|mount| is_within(&self.root, mount))
+            .max_by_key(|mount| mount.len())
+            .cloned()
+            .unwrap_or_else(|| "/workspace".to_string());
+        let mut folders = Vec::new();
+        let mut folder = self.root.clone();
+        while folder != top && is_within(&folder, &top) {
+            folder = match folder.rsplit_once('/') {
+                Some(("", _)) => "/".to_string(),
+                Some((parent, _)) => parent.to_string(),
+                None => break,
+            };
+            folders.push(folder.clone());
+        }
+        let mut rules = Vec::new();
+        for folder in folders.into_iter().rev() {
+            if let Ok(bytes) = self
+                .read(&join(&folder, ".gitignore"), HEAD_BYTES * 8)
+                .await
+            {
+                rules.extend(gitignore_rules(&folder, &String::from_utf8_lossy(&bytes)));
+            }
+        }
+        rules
+    }
+
+    /// Walk the folders under the root in path order.
+    async fn walk(&mut self) {
+        let rules = Arc::new(self.rules_above_root().await);
+        let mut stack = vec![Pending {
+            folder: self.root.clone(),
+            rules,
+            ignored_by_default: false,
+        }];
+        while let Some(pending) = stack.pop() {
+            if self.walked.stopped_in.is_some() {
+                return;
+            }
+            let folder = pending.folder;
+            if let Some(mount) = self
+                .registry
+                .unregistered_mount_of_path(self.execution_id, &folder)
+            {
+                self.walked.skipped.unreadable.push(format!(
+                    "{folder} (it is under {}, whose volume is not registered for this execution)",
+                    mount.display()
+                ));
+                continue;
+            }
+            let Some(entries) = self.entries(&folder).await else {
+                self.walked.skipped.unreadable.push(folder);
+                continue;
+            };
+            let mut rules = pending.rules;
+            if entries
+                .iter()
+                .any(|entry| entry.name == ".gitignore" && entry.file_type == FileType::File)
+            {
+                if let Ok(bytes) = self
+                    .read(&join(&folder, ".gitignore"), HEAD_BYTES * 8)
+                    .await
+                {
+                    let mut more = rules.as_ref().clone();
+                    more.extend(gitignore_rules(&folder, &String::from_utf8_lossy(&bytes)));
+                    rules = Arc::new(more);
+                }
+            }
+            let mut folders = Vec::new();
+            for entry in entries {
+                let path = join(&folder, &entry.name);
+                match entry.file_type {
+                    FileType::Directory => {
+                        if entry.name == ".git" {
+                            self.walked.skipped.folders.insert(entry.name);
+                            continue;
+                        }
+                        let skipped_folder = SKIPPED_FOLDERS.contains(&entry.name.as_str());
+                        let ignored = is_ignored(&rules, &path, &entry.name, true);
+                        if !self.options.include_ignored {
+                            if skipped_folder {
+                                self.walked.skipped.folders.insert(entry.name);
+                                continue;
+                            }
+                            if ignored {
+                                self.walked.skipped.ignored.push(format!("{path}/"));
+                                continue;
+                            }
+                        }
+                        folders.push(Pending {
+                            folder: path,
+                            rules: Arc::clone(&rules),
+                            ignored_by_default: pending.ignored_by_default
+                                || skipped_folder
+                                || ignored,
+                        });
+                    }
+                    FileType::File => {
+                        let ignored = is_ignored(&rules, &path, &entry.name, false);
+                        if ignored && !self.options.include_ignored {
+                            self.walked.skipped.ignored.push(path);
+                            continue;
+                        }
+                        self.consider(
+                            &path,
+                            &entry.name,
+                            pending.ignored_by_default || ignored,
+                            false,
+                        )
+                        .await;
+                        if self.walked.stopped_in.is_some() {
+                            return;
+                        }
+                    }
+                    FileType::Symlink => self.walked.skipped.other.push(path),
+                }
+            }
+            // Pushed last first, so the stack pops them in path order.
+            stack.extend(folders.into_iter().rev());
+        }
+    }
+
+    /// Match one file by name and, where it can be read, by its lines.
+    /// `named` is a file the caller named as the path: it is searched
+    /// whatever its name.
+    async fn consider(&mut self, path: &str, name: &str, ignored_by_default: bool, named: bool) {
+        if let Some(wanted) = &self.options.file_type {
+            let wanted = wanted.trim_start_matches('.').to_lowercase();
+            let extension = Path::new(name)
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase());
+            if extension.as_deref() != Some(wanted.as_str()) {
+                return;
+            }
+        }
+        let generated_name = GENERATED_NAMES.contains(&name)
+            || GENERATED_ENDINGS
+                .iter()
+                .any(|ending| name.ends_with(ending));
+        if generated_name && !self.options.include_ignored && !named {
+            self.walked.skipped.generated.push(path.to_string());
+            return;
+        }
+        if self.matcher.matches(name) {
+            self.walked.names.push(path.to_string());
+        }
+        let size = match self.size(path).await {
+            Ok(size) if size > LARGEST_FILE => {
+                self.walked.skipped.large.push(path.to_string());
+                return;
+            }
+            Ok(size) => size,
+            Err(error) => {
+                self.walked
+                    .skipped
+                    .unreadable
+                    .push(format!("{path} ({error})"));
+                return;
+            }
+        };
+        if self.walked.read == MOST_FILES_READ {
+            let folder = match path.rsplit_once('/') {
+                Some(("", _)) | None => "/".to_string(),
+                Some((folder, _)) => folder.to_string(),
+            };
+            self.walked.stopped_in = Some(folder);
+            return;
+        }
+        self.walked.read += 1;
+        // At most the size the file had a moment ago, never past the bound.
+        let length = usize::try_from(size.min(LARGEST_FILE)).unwrap_or(usize::MAX);
+        let bytes = match self.read(path, length).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.walked
+                    .skipped
+                    .unreadable
+                    .push(format!("{path} ({error})"));
+                return;
+            }
+        };
+        if bytes[..bytes.len().min(HEAD_BYTES)].contains(&0) {
+            self.walked.skipped.binary.push(path.to_string());
+            return;
+        }
+        let Ok(text) = String::from_utf8(bytes) else {
+            self.walked.skipped.not_utf8.push(path.to_string());
+            return;
+        };
+
+        let head: String = text.chars().take(HEAD_BYTES).collect();
+        let tier = if generated_name
+            || ignored_by_default
+            || GENERATED_MARKS.iter().any(|mark| head.contains(mark))
+        {
+            Tier::Generated
+        } else if is_test(path) {
+            Tier::Test
+        } else {
+            Tier::Source
+        };
+
+        let file = self.walked.files.len();
+        let first_hit = self.walked.hits.len();
+        for (at, line) in text.lines().enumerate() {
+            if self.matcher.matches(line) {
+                self.walked.hits.push(Hit {
+                    file,
+                    line: at + 1,
+                    text: line.to_owned(),
+                    tier,
+                });
+            }
+        }
+        let has_hits = self.walked.hits.len() > first_hit;
+        // Parsed only where the result is used: to lift a source line that
+        // declares the needle, or for the declarations part. A test, a
+        // generated or an ignored file is never parsed.
+        if tier == Tier::Source && (has_hits || self.words.len() >= 2) {
+            let mut here = Vec::new();
+            codebase::collect(Path::new(path), &text, &mut here);
+            here.retain(Symbol::is_declaration);
+            for hit in &mut self.walked.hits[first_hit..] {
+                for symbol in here.iter().filter(|symbol| symbol.line == hit.line) {
+                    if self.matcher.is(&symbol.name) {
+                        hit.tier = Tier::Named;
+                    } else if self.matcher.matches(&symbol.name) && hit.tier != Tier::Named {
+                        hit.tier = Tier::Definition;
+                    }
+                }
+            }
+            if self.words.len() >= 2 {
+                self.walked.symbols.extend(here);
+            }
+        }
+        self.walked.files.push(path.to_string());
+    }
+}
+
+/// Whether a path is a test by the common conventions.
+fn is_test(path: &str) -> bool {
+    let path = Path::new(path);
+    let in_tests = path.components().any(|part| {
+        matches!(
+            part.as_os_str().to_string_lossy().as_ref(),
+            "tests" | "test" | "__tests__" | "spec"
+        )
+    });
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stem = name.split('.').next().unwrap_or_default();
+    in_tests
+        || name == "tests.rs"
+        || stem.ends_with("_test")
+        || stem.ends_with("_tests")
+        || stem.starts_with("test_")
+        || name.contains(".test.")
+        || name.contains(".spec.")
+}
+
+/// At most `most` characters of `text`, and how many more there were.
+fn cut(text: &str, most: usize) -> String {
+    let length = text.chars().count();
+    if length <= most {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(most).collect();
+    format!("{kept}… ({} more characters)", length - most)
+}
+
+/// `n` and a noun, singular for one.
+fn counted(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// Up to three examples, and how many more.
+fn such_as(names: &[String]) -> String {
+    let shown: Vec<String> = names.iter().take(3).map(|name| cut(name, 200)).collect();
+    let mut said = format!("such as {}", shown.join(", "));
+    if names.len() > shown.len() {
+        said.push_str(&format!(" and {} more", names.len() - shown.len()));
+    }
+    said
+}
+
+/// The matching lines, best first, grouped by file, within `room` bytes.
+/// Returns the text and how many lines it shows of each file, by file index.
+fn lines_part(walked: &Walked, room: usize) -> (String, Vec<usize>) {
+    // Files in the order of their best line, then by path.
+    let mut order: Vec<usize> = walked.hits.iter().map(|hit| hit.file).collect();
+    order.sort_unstable();
+    order.dedup();
+    let best = |file: usize| {
+        walked
+            .hits
+            .iter()
+            .filter(|hit| hit.file == file)
+            .map(|hit| hit.tier)
+            .min()
+            .unwrap_or(Tier::Generated)
+    };
+    order.sort_by_key(|file| (best(*file), walked.files[*file].clone()));
+
+    // Each file's lines: declarations first, then in line order.
+    let rows_of = |file: usize| {
+        let mut rows: Vec<&Hit> = walked.hits.iter().filter(|hit| hit.file == file).collect();
+        rows.sort_by_key(|hit| (hit.tier.min(Tier::Source), hit.line));
+        rows
+    };
+    // First every file gets a few, then the first files get the rest.
+    let mut taken: Vec<usize> = vec![0; order.len()];
+    let mut total = 0;
+    for pass in [ROWS_PER_FILE_FIRST, usize::MAX] {
+        for (at, file) in order.iter().enumerate() {
+            let available = rows_of(*file).len().min(pass);
+            while taken[at] < available && total < SHOWN_LINES {
+                taken[at] += 1;
+                total += 1;
+            }
+        }
+    }
+
+    let mut text = String::new();
+    let mut shown = vec![0; walked.files.len()];
+    'files: for (at, file) in order.iter().enumerate() {
+        if taken[at] == 0 {
+            continue;
+        }
+        let heading = match best(*file) {
+            Tier::Test => format!("\n{} (test)\n", walked.files[*file]),
+            Tier::Generated => format!("\n{} (generated or ignored)\n", walked.files[*file]),
+            Tier::Named | Tier::Definition | Tier::Source => {
+                format!("\n{}\n", walked.files[*file])
+            }
+        };
+        let mut group = heading;
+        for (in_group, hit) in rows_of(*file).into_iter().take(taken[at]).enumerate() {
+            let mark = if hit.tier <= Tier::Definition {
+                "  (definition)"
+            } else {
+                ""
+            };
+            let row = format!(
+                "  {}: {}{mark}\n",
+                hit.line,
+                cut(hit.text.trim(), LONGEST_SHOWN_LINE)
+            );
+            if text.len() + group.len() + row.len() > room {
+                if in_group > 0 {
+                    text.push_str(&group);
+                }
+                break 'files;
+            }
+            group.push_str(&row);
+            shown[*file] += 1;
+        }
+        text.push_str(&group);
+    }
+    (text, shown)
+}
+
+/// The files whose names hold the needle.
+fn names_part(walked: &Walked, needle: &str) -> String {
+    if walked.names.is_empty() {
+        return String::new();
+    }
+    let mut text = format!("\nFiles whose names hold \"{needle}\":\n");
+    for name in walked.names.iter().take(SHOWN_NAMES) {
+        text.push_str(&format!("  {name}\n"));
+    }
+    if walked.names.len() > SHOWN_NAMES {
+        text.push_str(&format!(
+            "  and {} more\n",
+            walked.names.len() - SHOWN_NAMES
+        ));
+    }
+    text
+}
+
+/// The declarations whose names, scopes or comments share words with the
+/// needle, within `room` bytes.
+fn declarations_part(needle: &str, shown_needle: &str, walked: &Walked, room: usize) -> String {
+    let found = codebase::retrieve(&walked.symbols, needle);
+    if found.is_empty() {
+        return String::new();
+    }
+    let mut text = format!("\n{DECLARATIONS_HEADING} \"{shown_needle}\":\n");
+    if text.len() > room {
+        return String::new();
+    }
+    let mut current = "";
+    for symbol in found.into_iter().take(SHOWN_DECLARATIONS) {
+        let mut piece = String::new();
+        if symbol.path != current {
+            piece.push_str(&format!("{}\n", symbol.path));
+        }
+        piece.push_str(&format!("  {}\n", symbol.row()));
+        if text.len() + piece.len() > room {
+            break;
+        }
+        current = &symbol.path;
+        text.push_str(&piece);
+    }
+    text
+}
+
+/// What was read and what was not, and why, and how to include it.
+fn closing(walked: &Walked, options: &Options) -> String {
+    let skipped = &walked.skipped;
+    let mut not = Vec::new();
+    if !skipped.folders.is_empty() {
+        let folders: Vec<&str> = skipped.folders.iter().map(String::as_str).collect();
+        not.push(format!(
+            "the {} {} (build output, dependencies or repository data)",
+            if folders.len() == 1 {
+                "folder"
+            } else {
+                "folders"
+            },
+            folders.join(", ")
+        ));
+    }
+    let mut kind = |list: &[String], one: &str, many: &str| {
+        if !list.is_empty() {
+            not.push(format!(
+                "{} ({})",
+                counted(list.len(), one, many),
+                such_as(list)
+            ));
+        }
+    };
+    kind(
+        &skipped.ignored,
+        "file or folder a .gitignore names",
+        "files and folders a .gitignore names",
+    );
+    kind(
+        &skipped.generated,
+        "lock or minified file",
+        "lock or minified files",
+    );
+    kind(&skipped.binary, "binary file", "binary files");
+    kind(
+        &skipped.large,
+        &format!("file over {LARGEST_FILE} bytes"),
+        &format!("files over {LARGEST_FILE} bytes"),
+    );
+    kind(
+        &skipped.not_utf8,
+        "file that is not UTF-8",
+        "files that are not UTF-8",
+    );
+    kind(
+        &skipped.other,
+        "entry that is neither a file nor a folder",
+        "entries that are neither files nor folders",
+    );
+    kind(
+        &skipped.unreadable,
+        "entry that could not be read",
+        "entries that could not be read",
+    );
+
+    let mut said = format!("Read {}.", counted(walked.read, "file", "files"));
+    if let Some(folder) = &walked.stopped_in {
+        said.push_str(&format!(
+            " The walk stopped at {MOST_FILES_READ} files read, in {}; what comes after it in path order was not searched. Set path to a folder to search the rest.",
+            cut(folder, 400)
+        ));
+    }
+    if !not.is_empty() {
+        said.push_str(&format!(" Not searched: {}.", not.join("; ")));
+    }
+    if !options.include_ignored {
+        said.push_str(
+            " Set include_ignored to true to search ignored files, build output, dependency folders and lock files too.",
+        );
+    }
+    said.push('\n');
+    said
+}
+
+/// The answer, in the order: counts, lines, file names, declarations, what
+/// was not shown and what was skipped.
+fn compose(
+    root: &str,
+    needle: &str,
+    options: &Options,
+    matcher: &Matcher,
+    words: &[String],
+    walked: &Walked,
+) -> String {
+    let shown_needle = cut(needle, SHOWN_NEEDLE);
+    let mut what = format!("\"{shown_needle}\"");
+    what.push_str(if matcher.any_case {
+        " in any case"
+    } else {
+        " in exact case"
+    });
+    if options.whole_word {
+        what.push_str(", whole words only");
+    }
+    if let Some(kind) = &options.file_type {
+        what.push_str(&format!(
+            ", in .{} files only",
+            cut(kind.trim_start_matches('.'), 40)
+        ));
+    }
+    let matched_files: BTreeSet<usize> = walked.hits.iter().map(|hit| hit.file).collect();
+    let read = counted(walked.read, "file", "files");
+    let header = if walked.hits.is_empty() {
+        format!("Searched {root} for {what}: no line holds it; {read} read.\n")
+    } else {
+        format!(
+            "Searched {root} for {what}: {} in {}; {read} read.\n",
+            counted(walked.hits.len(), "line", "lines"),
+            counted(matched_files.len(), "file", "files"),
+        )
+    };
+    let names = names_part(walked, &shown_needle);
+    let closing = closing(walked, options);
+    // Room kept for the count of what is not shown.
+    let reserve = 600;
+    let room = LONGEST_ANSWER.saturating_sub(header.len() + names.len() + closing.len() + reserve);
+    let (lines, shown) = lines_part(walked, room);
+    let declarations = if words.len() >= 2 {
+        declarations_part(
+            needle,
+            &shown_needle,
+            walked,
+            room.saturating_sub(lines.len()),
+        )
+    } else {
+        String::new()
+    };
+
+    let shown_lines = shown.iter().sum::<usize>();
+    let hidden = walked.hits.len() - shown_lines;
+    let mut not_shown = String::new();
+    if hidden > 0 {
+        let files_with_hidden = matched_files
+            .iter()
+            .filter(|file| {
+                let all = walked.hits.iter().filter(|hit| hit.file == **file).count();
+                shown.get(**file).copied().unwrap_or(0) < all
+            })
+            .count();
+        not_shown = format!(
+            "\n{} more {} not shown, in {} of the {} that match. To narrow the search, set path to a folder or a file, file_type to an extension such as rs, whole_word or exact_case to true, or search for a longer needle.\n",
+            hidden,
+            if hidden == 1 { "line is" } else { "lines are" },
+            files_with_hidden,
+            counted(matched_files.len(), "file", "files"),
+        );
+    }
+
+    let mut answer = header;
+    answer.push_str(&lines);
+    answer.push_str(&names);
+    answer.push_str(&declarations);
+    answer.push_str(&not_shown);
+    answer.push('\n');
+    answer.push_str(&closing);
+    if answer.len() > LONGEST_ANSWER {
+        // Only a closing past its room reaches here: cut at a line's end.
+        let mut end = LONGEST_ANSWER;
+        while !answer.is_char_boundary(end) {
+            end -= 1;
+        }
+        let end = answer[..end].rfind('\n').map_or(end, |at| at + 1);
+        answer.truncate(end);
+    }
+    answer
+}
+
+/// `fs.search`: search the files under `path` (or the run's repository) for
+/// `needle`.
+pub async fn invoke_search(
+    args: &Value,
+    execution_id: ExecutionId,
+    fsal: &Arc<AegisFSAL>,
+    registry: &NfsVolumeRegistry,
+) -> Result<ToolInvocationResult, SealSessionError> {
+    let needle = text_arg(args, "needle")?.ok_or_else(|| {
+        SealSessionError::InvalidArguments(
+            "fs.search needs a needle, the plain text to search for.".to_string(),
+        )
+    })?;
+    if needle.is_empty() {
+        return Err(SealSessionError::InvalidArguments(EMPTY_NEEDLE.to_string()));
+    }
+    let options = Options {
+        exact_case: flag(args, "exact_case")?,
+        whole_word: flag(args, "whole_word")?,
+        file_type: text_arg(args, "file_type")?
+            .filter(|kind| !kind.trim_start_matches('.').is_empty())
+            .map(str::to_string),
+        include_ignored: flag(args, "include_ignored")?,
+    };
+    let mounts = mount_points(registry, execution_id);
+    let path_arg = match text_arg(args, "path")? {
+        Some(path) => path.to_string(),
+        None => default_root(&mounts),
+    };
+    let root = container_path(&path_arg).ok_or_else(|| {
+        SealSessionError::InvalidArguments(format!("'{path_arg}' is not a valid path in a volume."))
+    })?;
+    let context = resolve_volume(execution_id, &root, registry)?;
+
+    let matcher = Matcher::new(needle, &options);
+    // A call that asks for exact case or whole words wants the text as
+    // written, so the declarations part, which matches any form of a word,
+    // is left out. Otherwise it is given for a needle of two or more
+    // meaningful words, counted as the parse counts them: split at spaces,
+    // punctuation and case changes, so `refreshTurnClock`,
+    // `refresh_turn_clock` and `refresh turn clock` are each three words and
+    // find the same declaration (T1 (b)).
+    let words = if options.exact_case || options.whole_word {
+        Vec::new()
+    } else {
+        codebase::query_terms(needle)
+    };
+    let mut search = Search {
+        fsal,
+        registry,
+        execution_id,
+        mounts,
+        root: root.clone(),
+        options,
+        matcher,
+        words,
+        walked: Walked::default(),
+    };
+
+    let attributes = fsal
+        .getattr(
+            context.execution_id,
+            context.volume_id,
+            &to_volume_relative(&context.mount_point, &root),
+            context.container_uid,
+            context.container_gid,
+            context.workflow_execution_id,
+        )
+        .await;
+    match attributes {
+        Ok(attributes) if attributes.file_type == FileType::File => {
+            let name = root.rsplit('/').next().unwrap_or_default().to_string();
+            search.consider(&root, &name, false, true).await;
+        }
+        Ok(_) => search.walk().await,
+        Err(_) if !search.mounted_children(&root).is_empty() => search.walk().await,
+        Err(e) => return Err(fsal_refusal("FSAL getattr error", &path_arg, e)),
+    }
+
+    let answer = compose(
+        &root,
+        needle,
+        &search.options,
+        &search.matcher,
+        &search.words,
+        &search.walked,
+    );
+    Ok(ToolInvocationResult::Direct(serde_json::json!({
+        "status": "success",
+        "path": root,
+        "answer": answer,
+    })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rules(text: &str) -> Vec<IgnoreRule> {
+        gitignore_rules("/workspace/repo", text)
+    }
+
+    #[test]
+    fn a_gitignore_names_files_folders_and_exceptions_as_git_does() {
+        let rules =
+            rules("# comment\n*.log\n!keep.log\n/build-out/\ndocs/**/draft.md\nsecret?.txt\n");
+        let ignored = |path: &str, is_folder: bool| {
+            let name = path.rsplit('/').next().unwrap();
+            is_ignored(&rules, path, name, is_folder)
+        };
+        assert!(ignored("/workspace/repo/a/b/run.log", false));
+        assert!(!ignored("/workspace/repo/a/keep.log", false));
+        assert!(ignored("/workspace/repo/build-out", true));
+        assert!(!ignored("/workspace/repo/build-out", false));
+        assert!(!ignored("/workspace/repo/a/build-out", true));
+        assert!(ignored("/workspace/repo/docs/draft.md", false));
+        assert!(ignored("/workspace/repo/docs/x/y/draft.md", false));
+        assert!(ignored("/workspace/repo/secret1.txt", false));
+        assert!(!ignored("/workspace/repo/secret12.txt", false));
+        assert!(!ignored("/workspace/other/run.log", false));
+    }
+
+    #[test]
+    fn a_path_is_taken_as_fs_read_takes_it_and_may_not_climb() {
+        assert_eq!(
+            container_path("README.md").as_deref(),
+            Some("/workspace/README.md")
+        );
+        assert_eq!(
+            container_path("/workspace//repo/./src/").as_deref(),
+            Some("/workspace/repo/src")
+        );
+        assert_eq!(container_path("/").as_deref(), Some("/"));
+        assert_eq!(container_path("/workspace/../etc"), None);
+    }
+
+    #[test]
+    fn with_no_path_the_one_repository_is_searched_else_the_workspace() {
+        let mounts = |list: &[&str]| list.iter().map(|m| m.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            default_root(&mounts(&["/workspace", "/workspace/aegis-examples"])),
+            "/workspace/aegis-examples"
+        );
+        assert_eq!(default_root(&mounts(&["/workspace"])), "/workspace");
+        assert_eq!(
+            default_root(&mounts(&["/workspace", "/workspace/a", "/workspace/b"])),
+            "/workspace"
+        );
+        assert_eq!(
+            default_root(&mounts(&["/workspace", "/workspace/a/b"])),
+            "/workspace"
+        );
+    }
+}

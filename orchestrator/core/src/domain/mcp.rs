@@ -428,6 +428,7 @@ impl ToolInputContract {
             "fs.edit" => &["path", "target_content", "replacement_content"],
             "fs.multi_edit" => &["path", "edits"],
             "fs.grep" | "fs.glob" => &["pattern", "path"],
+            "fs.search" => &["needle"],
             "web.search" => &["query"],
             "web.fetch" => &["url"],
             "mail.list" => &["mailbox"],
@@ -569,6 +570,17 @@ mod tests {
             result,
             Err(PolicyViolation::PathTraversalAttempt { .. })
         ));
+    }
+
+    /// `fs.search` requires its needle and nothing else (AEGIS ADR-145 S1,
+    /// T2).
+    #[test]
+    fn fs_search_core_fs_search_requires_only_its_needle() {
+        assert_eq!(ToolInputContract::required_fields("fs.search"), &["needle"]);
+        assert_eq!(
+            ToolInputContract::validate("fs.search", &json!({"path": "/workspace"})).unwrap_err(),
+            "required field 'needle' is missing or null for tool 'fs.search'"
+        );
     }
 
     #[test]
