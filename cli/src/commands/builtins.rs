@@ -1002,7 +1002,7 @@ mod tests {
     /// a final-newline test no criterion named and which cannot pass.
     #[test]
     fn the_tester_tests_only_what_a_criterion_names() {
-        const STEP: &str = "Write the tests that show each acceptance criterion met, in that layout and style, with fs.write and fs.edit, under the repository's path. Test only what an acceptance criterion names; never test formatting, whitespace or line endings that no criterion names. When a test reads a text file, read it the way the suite's own tests do, and never assert on an escaped sequence such as '\\\\n' where a newline is meant.";
+        const STEP: &str = "Write one test file for each acceptance criterion, in that layout and style, with fs.write, under the repository's path. Test only what an acceptance criterion names; never test formatting, whitespace or line endings that no criterion names. When a test reads a text file, read it the way the suite's own tests do, and never assert on an escaped sequence such as '\\\\n' where a newline is meant.";
         let (_, yaml) = BUILTIN_AGENTS
             .iter()
             .find(|(name, _)| *name == "tester-agent")
@@ -1023,7 +1023,7 @@ mod tests {
     /// answering. The suite's own run after CODE is where a test is checked.
     #[test]
     fn the_tester_does_not_run_its_tests_and_answers_once_each_criterion_has_one() {
-        const STEP: &str = "Do not run the tests yourself: the suite runs later, in its own container, after the code is written; against the unchanged tree a test is expected to fail, and that run is where it is checked. When each criterion has one test, stop calling tools and answer.";
+        const STEP: &str = "Do not run the tests: the suite runs later, in its own container, after the code is written. Your try ends when each acceptance criterion has its test file; the orchestrator then answers with the files you wrote.";
         let (_, yaml) = BUILTIN_AGENTS
             .iter()
             .find(|(name, _)| *name == "tester-agent")
@@ -1121,7 +1121,7 @@ mod tests {
     fn the_forge_agents_keep_to_the_design_the_tests_and_the_working_tree() {
         const REVISIT: &str = "A review's suggestion to change, delete or add a test is not yours to apply: leave the tests as the tester wrote them and name the suggestion in your answer.";
         const CODER: &str = "Create no file the design does not name, and change only the lines the design names; a replacement carries no more blank lines than the surrounding text has.";
-        const TESTER: &str = "Write only the test files you will report, one per criterion where that suffices; the suite runs on the working tree before anything lands, so never test the repository's branches, history or remote.";
+        const TESTER: &str = "Write tests only: change no implementation file, and never test the repository's branches, history or remote.";
 
         let forge = BUILTIN_WORKFLOWS
             .iter()
