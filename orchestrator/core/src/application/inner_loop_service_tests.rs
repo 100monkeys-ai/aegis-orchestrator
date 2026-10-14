@@ -2561,3 +2561,121 @@ async fn a_try_its_call_budget_ends_is_recorded_exhausted() {
     }
     assert!(complaints.is_empty(), "{}", complaints.join("\n"));
 }
+
+// ---------------------------------------------------------------------------
+// AEGIS ADR-141, Update of 2026-10-14, R3: an agent declares when its work is
+// done, and the loop ends the try on it
+// ---------------------------------------------------------------------------
+
+const DONE_WHEN_TWO_UNDER_THE_REPOSITORY: &str = "    done_when:\n      new_files:\n        under: \"{{repository.path}}\"\n        count: \"2\"";
+
+impl World {
+    /// The execution's input carries `context_overrides`, the workflow's
+    /// blackboard, with the repository at `/workspace/r`.
+    fn on_a_blackboard_naming_the_repository(self) -> Self {
+        self.records.update(self.execution_id, |e| {
+            e.input.input = json!({
+                "context_overrides": {"repository": {"path": "/workspace/r"}}
+            });
+        });
+        self
+    }
+}
+
+fn write_turn(path: &str, content: &str) -> Turn {
+    call_tool("fs.write", json!({"path": path, "content": content}))
+}
+
+/// R3: with `done_when: {new_files: {under: "{{repository.path}}", count:
+/// "2"}}` rendered against the blackboard, the try ends after the second
+/// file written under the repository, with the answer the loop writes
+/// ("Files written:" then each file's path, bytes and content), and the
+/// model is not called again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_when_ends_the_try_with_the_files_written() {
+    let w = world(
+        agent_executing(DONE_WHEN_TWO_UNDER_THE_REPOSITORY),
+        vec![
+            write_turn("/workspace/r/one/x_test.py", "assert 1\n"),
+            write_turn("/workspace/r/two/y_test.py", "assert 2\n"),
+            answer("the model should not be called again"),
+        ],
+    )
+    .await
+    .with_a_writable_workspace()
+    .await
+    .on_a_blackboard_naming_the_repository()
+    .with_the_first_try_started();
+    let outcome = w.generate().await;
+    let mut complaints = Vec::new();
+    let expected = "Files written:\n/workspace/r/one/x_test.py (9 bytes)\n```\nassert 1\n\n```\n/workspace/r/two/y_test.py (9 bytes)\n```\nassert 2\n\n```";
+    match &outcome {
+        Ok(OrchestratorMessage::Final { content, .. }) if content == expected => {}
+        other => complaints.push(format!("the try ended {other:?}")),
+    }
+    let calls = w.model.calls.lock().unwrap().len();
+    if calls != 2 {
+        complaints.push(format!("the model was called {calls} times, not 2"));
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// R3: a file written then deleted does not count; the try ends when two
+/// files the execution created exist, and the answer names those two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_when_does_not_count_a_file_written_then_deleted() {
+    let w = world(
+        agent_executing(DONE_WHEN_TWO_UNDER_THE_REPOSITORY),
+        vec![
+            write_turn("/workspace/r/one/x_test.py", "assert 1\n"),
+            call_tool("fs.delete", json!({"path": "/workspace/r/one/x_test.py"})),
+            write_turn("/workspace/r/two/y_test.py", "assert 2\n"),
+            write_turn("/workspace/r/three/z_test.py", "assert 3\n"),
+            answer("the model should not be called again"),
+        ],
+    )
+    .await
+    .with_a_writable_workspace()
+    .await
+    .on_a_blackboard_naming_the_repository()
+    .with_the_first_try_started();
+    let outcome = w.generate().await;
+    let mut complaints = Vec::new();
+    match &outcome {
+        Ok(OrchestratorMessage::Final { content, .. })
+            if content.starts_with("Files written:\n/workspace/r/two/y_test.py (9 bytes)")
+                && content.contains("/workspace/r/three/z_test.py (9 bytes)")
+                && !content.contains("x_test.py") => {}
+        other => complaints.push(format!("the try ended {other:?}")),
+    }
+    let calls = w.model.calls.lock().unwrap().len();
+    if calls != 4 {
+        complaints.push(format!("the model was called {calls} times, not 4"));
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// R3, a guard: a manifest without `done_when` keeps today's end: after the
+/// same two files the model is called again and its text is the answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_done_when_the_model_answers() {
+    let w = world(
+        agent_executing(""),
+        vec![
+            write_turn("/workspace/r/one/x_test.py", "assert 1\n"),
+            write_turn("/workspace/r/two/y_test.py", "assert 2\n"),
+            answer("two tests written"),
+        ],
+    )
+    .await
+    .with_a_writable_workspace()
+    .await
+    .on_a_blackboard_naming_the_repository()
+    .with_the_first_try_started();
+    let outcome = w.generate().await;
+    assert!(
+        matches!(&outcome, Ok(OrchestratorMessage::Final { content, .. }) if content == "two tests written"),
+        "the try ended {outcome:?}"
+    );
+    assert_eq!(w.model.calls.lock().unwrap().len(), 3);
+}

@@ -199,6 +199,25 @@ impl ToolInvocationService {
             .unwrap_or_else(crate::domain::agent::default_max_tool_calls))
     }
 
+    /// When the agent's try is done (`spec.execution.done_when`, AEGIS
+    /// ADR-141, Update of 2026-10-14, R3): none when unset.
+    pub(crate) async fn agent_done_when(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: AgentId,
+    ) -> anyhow::Result<Option<crate::domain::agent::DoneWhen>> {
+        let agent = self
+            .agent_lifecycle
+            .get_agent_visible(tenant_id, agent_id)
+            .await?;
+        Ok(agent
+            .manifest
+            .spec
+            .execution
+            .as_ref()
+            .and_then(|execution| execution.done_when.clone()))
+    }
+
     pub async fn get_available_tools_for_agent_in_context(
         &self,
         tenant_id: &TenantId,

@@ -639,6 +639,42 @@ pub struct ExecutionStrategy {
         skip_serializing_if = "is_default_max_tool_calls"
     )]
     pub max_tool_calls: u32,
+    // AEGIS ADR-141, Update of 2026-10-14, R3; the doc comment is the manifest schema's text.
+    /// When a try's work is done: checked after every tool result, it ends
+    /// the try with an answer the orchestrator writes from the files. Its one
+    /// kind, `new_files: {under, count}`, holds when at least `count` files
+    /// the execution created exist under `under`; both are templates over
+    /// the workflow's blackboard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done_when: Option<DoneWhen>,
+}
+
+/// When a try's work is done (`spec.execution.done_when`, AEGIS ADR-141,
+/// Update of 2026-10-14, R3). Its one kind is `new_files`; any other key is
+/// refused.
+///
+/// # YAML example
+/// ```yaml
+/// done_when:
+///   new_files:
+///     under: "{{repository.path}}"
+///     count: "1"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DoneWhen {
+    pub new_files: NewFilesDone,
+}
+
+/// `done_when.new_files`: at least `count` files the execution created
+/// (written by a tool of any of its tries, not deleted since) exist under
+/// `under`. Both are templates rendered against the execution's
+/// `context_overrides` (the workflow's blackboard).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NewFilesDone {
+    pub under: String,
+    pub count: String,
 }
 
 /// One file an execution must produce: `spec.execution.outputs[]` in the
@@ -701,6 +737,7 @@ impl Default for ExecutionStrategy {
             outputs: Vec::new(),
             require_tool_call: false,
             max_tool_calls: default_max_tool_calls(),
+            done_when: None,
         }
     }
 }

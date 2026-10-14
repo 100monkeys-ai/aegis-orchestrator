@@ -83,6 +83,9 @@ struct ExecutionContext {
     /// The most tool calls this try dispatches: the agent's
     /// `spec.execution.max_tool_calls`.
     max_tool_calls: u32,
+    /// When this try is done, rendered from the agent's
+    /// `spec.execution.done_when` (AEGIS ADR-141, Update of 2026-10-14, R3).
+    done_when: Option<DoneCheck>,
     pending_dispatch_id: Option<DispatchId>,
     pending_tool_call_id: Option<String>,
     trajectory: Vec<TrajectoryStep>,
@@ -381,6 +384,99 @@ fn tool_call_reminder(requirement: &ToolCallRequirement) -> String {
     }
 }
 
+/// `done_when.new_files` rendered against the execution's
+/// `context_overrides` (R3): the try is done when at least `count` files the
+/// execution created exist under `under`.
+#[derive(Debug, Clone)]
+struct DoneCheck {
+    under: String,
+    count: usize,
+}
+
+/// Render `done_when` against the execution's `context_overrides` (the
+/// workflow's blackboard): `None`, with a warning, when a template does not
+/// render or its count is not a whole number, so the try ends as without it.
+fn render_done_when(
+    done_when: &crate::domain::agent::DoneWhen,
+    input: &Value,
+) -> Option<DoneCheck> {
+    let mut templates = handlebars::Handlebars::new();
+    templates.register_escape_fn(handlebars::no_escape);
+    let context = input
+        .get("context_overrides")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    let render = |template: &str| templates.render_template(template, &context);
+    let new_files = &done_when.new_files;
+    match (render(&new_files.under), render(&new_files.count)) {
+        (Ok(under), Ok(count)) => match count.trim().parse::<usize>() {
+            Ok(count) if !under.trim().is_empty() => Some(DoneCheck {
+                under: under.trim().to_string(),
+                count,
+            }),
+            _ => {
+                tracing::warn!(
+                    under = %under,
+                    count = %count,
+                    "done_when rendered to no directory or no whole count; the try ends as without it"
+                );
+                None
+            }
+        },
+        (under, count) => {
+            tracing::warn!(
+                under = ?under.err(),
+                count = ?count.err(),
+                "done_when did not render; the try ends as without it"
+            );
+            None
+        }
+    }
+}
+
+/// The files this execution created, in the order each was first written,
+/// from its tries' trajectories (`earlier`, then this try's `current`): a
+/// path whose first successful touch was an `fs.write` (one read or edited
+/// first existed before), not deleted since.
+fn files_created(earlier: &[Iteration], current: &[TrajectoryStep]) -> Vec<String> {
+    let mut first_touch: HashMap<String, bool> = HashMap::new();
+    let mut created: Vec<String> = Vec::new();
+    let steps = earlier
+        .iter()
+        .flat_map(|i| i.trajectory.as_deref().unwrap_or_default())
+        .chain(current.iter());
+    for step in steps.filter(|s| s.status == "succeeded") {
+        let Some(path) = serde_json::from_str::<Value>(&step.arguments_json)
+            .ok()
+            .and_then(|a| a["path"].as_str().map(str::to_string))
+        else {
+            continue;
+        };
+        match step.tool_name.as_str() {
+            "fs.write" => {
+                if *first_touch.entry(path.clone()).or_insert(true) && !created.contains(&path) {
+                    created.push(path);
+                }
+            }
+            "fs.read" | "fs.edit" | "fs.multi_edit" => {
+                first_touch.entry(path).or_insert(false);
+            }
+            "fs.delete" => {
+                let under = format!("{}/", path.trim_end_matches('/'));
+                created.retain(|kept| *kept != path && !kept.starts_with(&under));
+            }
+            _ => {}
+        }
+    }
+    created
+}
+
+/// Whether `path` is `under` or inside it.
+fn is_under(path: &str, under: &str) -> bool {
+    let under = under.trim_end_matches('/');
+    path == under || path.starts_with(&format!("{under}/"))
+}
+
 /// A dispatched command: the timeout the model asked for, the one it was
 /// given, and its output cap.
 #[derive(Debug, Clone)]
@@ -671,6 +767,23 @@ impl InnerLoopService {
                             parsed_agent_id.0
                         )
                     })?;
+                let done_when = self
+                    .tool_invocation_service
+                    .agent_done_when(&tenant_id, parsed_agent_id)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "loading agent {} for its done_when: {e}",
+                            parsed_agent_id.0
+                        )
+                    })?
+                    .and_then(|done_when| {
+                        let input = match exec_record {
+                            Ok(ref e) => e.input.input.clone(),
+                            Err(_) => Value::Null,
+                        };
+                        render_done_when(&done_when, &input)
+                    });
                 let now = chrono::Utc::now();
                 let iteration_bound_delta =
                     chrono::Duration::seconds(iteration_bound.as_secs() as i64);
@@ -785,6 +898,7 @@ impl InnerLoopService {
                         iterations: 0,
                         tool_calls: 0,
                         max_tool_calls,
+                        done_when,
                         pending_dispatch_id: None,
                         pending_tool_call_id: None,
                         trajectory: Vec::new(),
@@ -893,6 +1007,10 @@ impl InnerLoopService {
                 ctx.pending_dispatch_id = None;
                 ctx.pending_tool_call_id = None;
                 ctx.active_dispatch_count = ctx.active_dispatch_count.saturating_sub(1);
+
+                if let Some(done) = self.done_answer(&execution_id, &mut ctx).await {
+                    return Ok(done);
+                }
 
                 self.active_executions
                     .write()
@@ -1442,6 +1560,12 @@ impl InnerLoopService {
                                     tool_calls: None,
                                 });
                                 self.persist_trajectory(execution_id_str, &next_ctx).await;
+                                if let Some(done) =
+                                    self.done_answer(execution_id_str, &mut next_ctx).await
+                                {
+                                    self.active_executions.write().await.remove(execution_id_str);
+                                    return Ok(done);
+                                }
                                 self.active_executions.write().await.insert(execution_id_str.to_string(), next_ctx);
                             }
                             Err(e) => {
@@ -1552,6 +1676,91 @@ impl InnerLoopService {
                 }
             }
         }
+    }
+
+    /// When the try's `done_when` holds after a tool result (AEGIS ADR-141,
+    /// Update of 2026-10-14, R3), the try's end: the answer the loop writes
+    /// from the files, "Files written:" then each file's path, bytes and
+    /// content, which goes to the agent's judges as any answer does. `None`
+    /// while it does not hold, and for an agent without one.
+    async fn done_answer(
+        &self,
+        execution_id_str: &str,
+        ctx: &mut ExecutionContext,
+    ) -> Option<OrchestratorMessage> {
+        let done = ctx.done_when.clone()?;
+        let execution_id = ExecutionId(uuid::Uuid::parse_str(execution_id_str).ok()?);
+        let earlier: Vec<Iteration> = match self
+            .execution_service
+            .get_execution_unscoped(execution_id)
+            .await
+        {
+            Ok(e) => e
+                .iterations
+                .into_iter()
+                .filter(|i| i.number < ctx.iteration_number)
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let candidates: Vec<String> = files_created(&earlier, &ctx.trajectory)
+            .into_iter()
+            .filter(|path| is_under(path, &done.under))
+            .collect();
+        if candidates.len() < done.count {
+            return None;
+        }
+        let mut files: Vec<(String, u64, String)> = Vec::new();
+        for path in candidates {
+            let read = self
+                .constructed_call(
+                    ctx.agent_id,
+                    execution_id,
+                    &ctx.tenant_id,
+                    ctx.iteration_number,
+                    "fs.read",
+                    &serde_json::json!({ "path": path }),
+                )
+                .await
+                .and_then(|r| serde_json::from_str::<Value>(&r).ok());
+            if let Some(read) = read {
+                files.push((
+                    path,
+                    read["size_bytes"].as_u64().unwrap_or_default(),
+                    read["content"].as_str().unwrap_or_default().to_string(),
+                ));
+            }
+        }
+        if files.len() < done.count {
+            return None;
+        }
+        let answer = format!(
+            "Files written:\n{}",
+            files
+                .iter()
+                .map(|(path, bytes, content)| format!(
+                    "{path} ({bytes} bytes)\n```\n{content}\n```"
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        tracing::debug!(
+            execution_id = %execution_id_str,
+            files = files.len(),
+            "done_when holds: the try ends with the files written"
+        );
+        ctx.conversation.push(ConversationMessage {
+            role: "assistant".to_string(),
+            content: answer.clone(),
+            tool_call_id: None,
+            tool_calls: None,
+        });
+        self.persist_trajectory(execution_id_str, ctx).await;
+        Some(OrchestratorMessage::Final {
+            content: answer,
+            tool_calls_executed: ctx.iterations as u32,
+            conversation: ctx.conversation.clone(),
+            trajectory: ctx.trajectory.clone(),
+        })
     }
 
     /// The constructed turns of an opening after an exhausted try (R2): an

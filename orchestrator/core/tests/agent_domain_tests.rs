@@ -645,6 +645,7 @@ fn execution_strategy_iterative_with_validation() {
         outputs: Vec::new(),
         require_tool_call: false,
         max_tool_calls: 50,
+        done_when: None,
     };
     assert!(matches!(es.mode, ExecutionMode::Iterative));
     assert_eq!(es.max_retries, 10);
@@ -931,6 +932,7 @@ fn execution_strategy_json_round_trip() {
         outputs: Vec::new(),
         require_tool_call: false,
         max_tool_calls: 50,
+        done_when: None,
     };
     let json = serde_json::to_string(&original).expect("serialize");
     let deserialized: ExecutionStrategy = serde_json::from_str(&json).expect("deserialize");
@@ -1249,4 +1251,37 @@ fn a_filled_declared_context_adds_its_servers_pattern_to_the_sessions_patterns()
         vec!["*"],
         "a pattern allowing every tool was widened"
     );
+}
+
+/// AEGIS ADR-141, Update of 2026-10-14, R3 and R4: `spec.execution` parses
+/// `done_when` with its one kind, `new_files {under, count}`, and
+/// `max_tool_calls`; an unknown kind is refused; a manifest that sets
+/// neither has no `done_when` and a budget of 50.
+#[test]
+fn execution_strategy_parses_done_when_and_max_tool_calls() {
+    use aegis_orchestrator_core::domain::agent::{DoneWhen, NewFilesDone};
+    let parsed: ExecutionStrategy = serde_yaml::from_str(
+        "mode: iterative\nmax_tool_calls: 24\ndone_when:\n  new_files:\n    under: \"{{repository.path}}\"\n    count: \"1\"\n",
+    )
+    .expect("parses");
+    assert_eq!(parsed.max_tool_calls, 24);
+    assert_eq!(
+        parsed.done_when,
+        Some(DoneWhen {
+            new_files: NewFilesDone {
+                under: "{{repository.path}}".to_string(),
+                count: "1".to_string(),
+            }
+        })
+    );
+    let unknown = serde_yaml::from_str::<ExecutionStrategy>(
+        "mode: iterative\ndone_when:\n  tests_pass:\n    command: make test\n",
+    );
+    assert!(
+        unknown.is_err(),
+        "an unknown kind was accepted: {unknown:?}"
+    );
+    let plain: ExecutionStrategy = serde_yaml::from_str("mode: iterative\n").expect("parses");
+    assert_eq!(plain.done_when, None);
+    assert_eq!(plain.max_tool_calls, 50);
 }

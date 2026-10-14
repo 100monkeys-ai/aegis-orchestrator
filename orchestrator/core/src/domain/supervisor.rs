@@ -1338,6 +1338,7 @@ mod tests {
                 outputs: Vec::new(),
                 require_tool_call: false,
                 max_tool_calls: crate::domain::agent::default_max_tool_calls(),
+                done_when: None,
             },
             volumes: Vec::new(),
             keep_container_on_failure: false,
