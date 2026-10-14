@@ -2370,7 +2370,10 @@ const LEFT_CONTENT: &str = "def test_readme():\n    assert True\n";
 /// `a.py`'s directory and a constructed `fs.read` of `a.py` with its true
 /// content, as its own completed calls (correction C3): no replay of try 1,
 /// no paragraph naming it, nothing about how it ended, nothing of `b.py` or
-/// of the refusals. The facts stay on the record.
+/// of the refusals. The facts stay on the record. The opening ends with the
+/// prefilled assistant turn "Files written:\n" (the R2 amendment
+/// `r2-iteration-owns-prior-work-2026-10-14`), and the model's reply is the
+/// rest of that answer: the try answers "Files written:\n" then the reply.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_try_after_an_exhausted_one_opens_from_a_constructed_history() {
     let mut turns: Vec<Turn> = vec![
@@ -2396,7 +2399,10 @@ async fn the_try_after_an_exhausted_one_opens_from_a_constructed_history() {
 
     let outcome = w.run(None).await;
     let mut complaints = Vec::new();
-    if !matches!(outcome.as_deref(), Ok("the tests are written")) {
+    if !matches!(
+        outcome.as_deref(),
+        Ok("Files written:\nthe tests are written")
+    ) {
         complaints.push(format!("the execution ended {outcome:?}"));
     }
     let record = w.records.get(w.execution_id);
@@ -2409,10 +2415,35 @@ async fn the_try_after_an_exhausted_one_opens_from_a_constructed_history() {
         complaints.push(format!("the model was called {calls} times, not 16"));
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
+    // A guard: the first try's opening carries no prefill.
+    let first = w.model.conversation(0);
+    if first.last().map(|m| m.role.as_str()) != Some("user") {
+        complaints.push(format!(
+            "try 1 opened ending with {:?}",
+            first.last().map(|m| (&m.role, m.content.as_text()))
+        ));
+    }
     let opening = w.model.conversation(15);
     let roles: Vec<&str> = opening.iter().map(|m| m.role.as_str()).collect();
-    if roles != ["system", "user", "assistant", "tool", "assistant", "tool"] {
+    if roles
+        != [
+            "system",
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+            "assistant",
+        ]
+    {
         complaints.push(format!("try 2 opened with the messages {roles:?}"));
+    }
+    match opening.last() {
+        Some(m)
+            if m.role == "assistant"
+                && m.content.as_text() == "Files written:\n"
+                && m.tool_calls.is_none() => {}
+        other => complaints.push(format!("try 2's opening ends with {other:?}")),
     }
     // Correction C3: the try owns the earlier tries' work; its user message
     // is the prompt as the first try had it, and nothing names another try.
@@ -2482,6 +2513,60 @@ async fn the_try_after_an_exhausted_one_opens_from_a_constructed_history() {
     assert!(complaints.is_empty(), "{}", complaints.join("\n"));
 }
 
+/// The prefill opens the answer of the opening's own turn only: when the
+/// model calls a tool instead, the prefill is gone from the conversation
+/// that follows, and the try's later answer is the model's text as it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_prefill_is_gone_once_the_model_calls_a_tool_instead() {
+    let mut turns: Vec<Turn> = vec![call_tool(
+        "fs.write",
+        json!({"path": "/workspace/t/a.py", "content": LEFT_CONTENT}),
+    )];
+    for _ in 0..3 {
+        turns.push(call_tool("fs.list", json!({"path": "/workspace/t"})));
+    }
+    turns.push(answer("never: the model is silent here"));
+    turns.push(call_tool("fs.read", json!({"path": "/workspace/t/a.py"})));
+    turns.push(answer("done"));
+    let w = world_with_silent_calls(agent("8s", 30), turns, vec![4])
+        .await
+        .with_a_writable_workspace()
+        .await;
+
+    let outcome = w.run(None).await;
+    let mut complaints = Vec::new();
+    if !matches!(outcome.as_deref(), Ok("done")) {
+        complaints.push(format!("the execution ended {outcome:?}"));
+    }
+    let calls = w.model.calls.lock().unwrap().len();
+    if calls != 7 {
+        complaints.push(format!("the model was called {calls} times, not 7"));
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+    if w.model.conversation(5).last().map(|m| m.content.as_text())
+        != Some("Files written:\n".to_string())
+    {
+        complaints.push("try 2's opening carries no prefill".to_string());
+    }
+    let after = w.model.conversation(6);
+    if after
+        .iter()
+        .any(|m| m.role == "assistant" && m.content.as_text() == "Files written:\n")
+    {
+        complaints.push(format!(
+            "the prefill is still in the conversation after the tool call: {:?}",
+            after.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+        ));
+    }
+    if after.last().map(|m| m.role.as_str()) != Some("tool") {
+        complaints.push(format!(
+            "the second call of try 2 ends with {:?}",
+            after.last().map(|m| m.role.as_str())
+        ));
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
 /// R2, a guard: a try that ended another way (here its model call failed)
 /// keeps today's opening for the next try, the replay of what it did, and
 /// is not recorded exhausted; the replay carries no imperative sentence
@@ -2505,6 +2590,10 @@ async fn the_try_after_one_that_failed_otherwise_keeps_the_replay() {
     let told = first_user_message(&w.model.conversation(2));
     if !told.contains("What the previous tries did") || told.contains("# This task so far") {
         complaints.push(format!("try 2 was told {told:?}"));
+    }
+    // The prefill is for the try after an exhausted one only.
+    if w.model.conversation(2).last().map(|m| m.role.as_str()) != Some("user") {
+        complaints.push("try 2's opening ends with other than its user message".to_string());
     }
     // Correction C2 (Question 4): the replay carries facts only, no
     // imperative sentence.

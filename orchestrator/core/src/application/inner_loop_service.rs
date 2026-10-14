@@ -63,6 +63,41 @@ is a policy violation and will terminate the execution.\n\
 Additional tools may be present from MCP servers configured for this execution. Always prefer \
 the most specific tool available.";
 
+/// The opening of the answer the try after an exhausted one is prefilled
+/// with (AEGIS ADR-141, Update of 2026-10-14, R2 as amended
+/// `r2-iteration-owns-prior-work-2026-10-14`): the model completes the
+/// report of the files it wrote rather than being told to write one.
+const ANSWER_PREFILL: &str = "Files written:\n";
+
+/// Takes the prefill off the end of a conversation: a trailing assistant
+/// message with text and no tool call, which only the opening after an
+/// exhausted try ends with.
+fn take_prefill(conversation: &mut Vec<ConversationMessage>) -> Option<String> {
+    match conversation.last() {
+        Some(m)
+            if m.role == "assistant"
+                && m.tool_calls.as_ref().is_none_or(Vec::is_empty)
+                && !m.content.is_empty() =>
+        {
+            conversation.pop().map(|m| m.content)
+        }
+        _ => None,
+    }
+}
+
+/// The model's answer to a prefilled turn, opening with the prefill once: a
+/// provider that continues the turn answers the continuation alone, and an
+/// adapter that cannot carry it answers with the prefill already put first
+/// (`infrastructure/llm/openai.rs`).
+fn answer_after_prefill(prefill: Option<&str>, text: String) -> String {
+    match prefill {
+        Some(opening) if !text.trim_start().starts_with(opening.trim_end()) => {
+            format!("{opening}{text}")
+        }
+        _ => text,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum LlmOutput {
     FinalText(String),
@@ -813,7 +848,10 @@ impl InnerLoopService {
                 // file the earlier tries left and an `fs.read` of each such
                 // file, read now through the tools' own path, as this try's
                 // own completed calls. Nothing names another try; the facts
-                // stay on the record (`RefinementApplied.constructed`). After
+                // stay on the record (`RefinementApplied.constructed`). The
+                // opening ends with the prefilled assistant turn
+                // `ANSWER_PREFILL`, the opening of the answer the model
+                // completes (the R2 amendment of 2026-10-14). After
                 // a try that ended any other way, what the earlier tries did
                 // (retry-knows-what-failed, (a)), from the trajectory the
                 // record keeps of each.
@@ -845,6 +883,12 @@ impl InnerLoopService {
                         )
                         .await;
                     conversation.extend(turns);
+                    conversation.push(ConversationMessage {
+                        role: "assistant".to_string(),
+                        content: ANSWER_PREFILL.to_string(),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    });
                 } else if prompt_is_ours {
                     if let Ok(ref e) = exec_record {
                         let section = previous_tries_section(
@@ -1080,8 +1124,13 @@ impl InnerLoopService {
                 }
             };
 
+            // The prefill opens the answer of this one model turn: it leaves
+            // the conversation whatever the model did, and a text answer is
+            // that answer, opening with it.
+            let prefill = take_prefill(&mut ctx.conversation);
             match llm_output {
                 LlmOutput::FinalText(text) => {
+                    let text = answer_after_prefill(prefill.as_deref(), text);
                     self.publish_generation(execution_id_str, &mut ctx, text.clone())
                         .await;
                     // AEGIS ADR-135 D5, ADR-005 O7e: a text answer completes the
