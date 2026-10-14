@@ -649,9 +649,9 @@ pub struct ExecutionStrategy {
     pub done_when: Option<DoneWhen>,
 }
 
-/// When a try's work is done (`spec.execution.done_when`, AEGIS ADR-141,
-/// Update of 2026-10-14, R3). Its one kind is `new_files`; any other key is
-/// refused.
+// AEGIS ADR-141, Update of 2026-10-14, R3; the doc comment is the manifest schema's text.
+/// When a try's work is done (`spec.execution.done_when`). Its one kind is
+/// `new_files`; any other key is refused.
 ///
 /// # YAML example
 /// ```yaml
