@@ -747,3 +747,78 @@ fn the_coder_can_run_a_command_412_seconds_into_a_try() {
          so a command can start only in its first {window_secs} s, not 412 s in"
     );
 }
+
+/// AEGIS ADR-141's Update of 2026-10-14, R1 and R5: the Forge resets its
+/// tree hard by default, names no purge patterns, lists the tracked test
+/// files by its test globs, and gives the tester that list in place of the
+/// sentence that every new test fails on the unchanged tree.
+#[test]
+fn the_forge_resets_its_tree_and_gives_the_tester_its_tracked_tests() {
+    use aegis_orchestrator_core::domain::git_repo::{RunTreePreparation, TreeReset};
+    let workflow = forge();
+    let schema = workflow.metadata.input_schema.clone().unwrap_or_default();
+    let mut complaints = Vec::new();
+    let globs = [
+        "**/test/**",
+        "**/tests/**",
+        "**/__tests__/**",
+        "**/test_*",
+        "**/*_test.*",
+        "**/*.test.*",
+    ];
+    for (field, want) in [
+        (
+            "tree_reset",
+            serde_json::json!({"type": "string", "enum": ["hard", "list", "none"], "default": "hard"}),
+        ),
+        (
+            "purge",
+            serde_json::json!({"type": "array", "items": {"type": "string"}, "default": []}),
+        ),
+        (
+            "test_globs",
+            serde_json::json!({"type": "array", "items": {"type": "string"}, "default": globs}),
+        ),
+    ] {
+        let mut got = schema["properties"][field].clone();
+        if let Some(map) = got.as_object_mut() {
+            map.remove("description");
+        }
+        if got != want {
+            complaints.push(format!("input {field} is {got}, not {want}"));
+        }
+    }
+    match RunTreePreparation::from_input(&serde_json::json!({"task": "t"}), Some(&schema)) {
+        Ok(tree) => {
+            if tree.tree_reset != TreeReset::Hard
+                || !tree.purge.is_empty()
+                || tree.test_globs != Some(globs.iter().map(|g| g.to_string()).collect())
+            {
+                complaints.push(format!("a run naming none prepares {tree:?}"));
+            }
+        }
+        Err(sentence) => complaints.push(format!("a run naming none is refused: {sentence}")),
+    }
+    let want = "# The approved requirements\n\
+                {{{json ANALYZE.output}}}\n\
+                \n\
+                # The approved design\n\
+                {{{json ARCHITECT.output}}}\n\
+                \n\
+                # The repository\n\
+                The repository is at {{repository.path}}, on the work branch {{repository.branch}}. The suite will be run in its root with: {{{input.test_command}}}\n\
+                \n\
+                # The test files it tracks\n\
+                {{#if repository.tests}}{{{json repository.tests}}}{{else}}None: it tracks no test file.{{/if}}\n\
+                \n\
+                Write the tests that show each acceptance criterion met, in the repository's own test layout and style, under {{repository.path}}. Write tests only: change no implementation file.";
+    match &state(&workflow, "TEST").kind {
+        StateKind::Agent { input, .. } => {
+            if input != want {
+                complaints.push(format!("TEST's input is:\n{input}"));
+            }
+        }
+        _ => complaints.push("TEST is not an Agent state".to_string()),
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}

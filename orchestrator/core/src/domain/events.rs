@@ -580,6 +580,21 @@ pub enum ExecutionEvent {
         /// Whether the branch was created from the binding's ref (else the
         /// remote's copy was checked out).
         created: bool,
+        /// How the tree was reset (AEGIS ADR-141's Update of 2026-10-14,
+        /// R1).
+        #[serde(default)]
+        tree_reset: crate::domain::git_repo::TreeReset,
+        /// The paths the reset removed, as `git clean` prints them, at most
+        /// 200.
+        #[serde(default)]
+        removed: Vec<String>,
+        /// How many paths were removed, when more than `removed` holds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        removed_count: Option<usize>,
+        /// The tracked files matching the run's test globs (R5); `None`
+        /// when it names none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tests: Option<Vec<String>>,
         prepared_at: DateTime<Utc>,
     },
 

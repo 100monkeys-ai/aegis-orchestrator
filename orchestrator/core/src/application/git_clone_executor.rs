@@ -50,7 +50,9 @@ use crate::application::nfs_gateway::{NfsVolumeRegistry, VolumeRegistration};
 use crate::domain::execution::ExecutionId;
 use crate::domain::fsal::{AegisFSAL, FsalAccessPolicy};
 use crate::domain::git_host_keys::{host_keys_for, known_hosts_file, SshHostKey};
-use crate::domain::git_repo::{CloneStrategy, GitRef, GitRepoBinding};
+use crate::domain::git_repo::{
+    CloneStrategy, GitRef, GitRepoBinding, RunTreePreparation, TreeReset,
+};
 use crate::domain::runtime::{
     ContainerStepConfig, ContainerStepError, ContainerStepResult, ContainerStepRunner,
     ContainerVolumeMount,
@@ -271,16 +273,17 @@ impl EphemeralCliEngine {
     /// Check out the run's work branch `branch` in the tree on `volume`
     /// (AEGIS ADR-136 G5, G5a): `origin` pointed at the binding's URL, the
     /// binding's ref fetched; the remote's copy of `branch` checked out when
-    /// the remote has one, else `branch` created from the ref; untracked
-    /// files removed. Returns the commit the run starts from and whether the
-    /// branch was created.
+    /// the remote has one, else `branch` created from the ref; then the tree
+    /// reset as `tree` says and its tracked test files listed (AEGIS
+    /// ADR-141's Update of 2026-10-14, R1 and R5), all in the one step.
     async fn check_out_work_branch_in_volume(
         &self,
         binding: &GitRepoBinding,
         volume: &Volume,
         branch: &str,
+        tree: &RunTreePreparation,
         credential: Option<ResolvedCredential>,
-    ) -> Result<(String, bool), CloneError> {
+    ) -> Result<WorkBranchCheckout, CloneError> {
         let (url, credential) = clone_credential(binding.repo_url.expose(), credential);
         let secrets = credential_secrets(credential.as_ref());
         let host_keys = host_keys_for(&url, &binding.ssh_host_keys).map_err(CloneError::Git)?;
@@ -288,6 +291,7 @@ impl EphemeralCliEngine {
             &self.paths,
             &binding.git_ref,
             branch,
+            tree,
             &url,
             credential.as_ref(),
             host_keys.as_deref(),
@@ -312,7 +316,14 @@ impl EphemeralCliEngine {
                 ))
             }
         };
-        Ok((sha, created))
+        let stdout = redact_git_output(&result.stdout, &secrets);
+        let (removed, tests) = removed_and_tests(&stdout, tree.test_globs.is_some());
+        Ok(WorkBranchCheckout {
+            started_from: sha,
+            created,
+            removed,
+            tests,
+        })
     }
 
     /// Stage every change of the tree on `volume` and commit it on HEAD
@@ -859,15 +870,99 @@ fn fetch_step(
     Ok(GitStep { script: s, stdin })
 }
 
+/// What a run's work-branch checkout did (AEGIS ADR-136 G5a; ADR-141's
+/// Update of 2026-10-14, R1 and R5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkBranchCheckout {
+    /// The commit the work branch stood at once checked out.
+    pub started_from: String,
+    /// Whether the branch was created from the binding's ref.
+    pub created: bool,
+    /// Every path the reset removed, as `git clean` prints it: a directory
+    /// removed whole with its trailing `/`.
+    pub removed: Vec<String>,
+    /// The tracked files matching the run's test globs; `None` when it
+    /// names none.
+    pub tests: Option<Vec<String>>,
+}
+
+/// The line a work-branch step prints before its tracked test files.
+const TESTS_BEGIN: &str = "tests-begin";
+/// The line a work-branch step prints after its tracked test files.
+const TESTS_END: &str = "tests-end";
+
+/// The paths a work-branch step's `git clean` printed (`Removing <path>`),
+/// and, when `listed`, the tracked files it printed between
+/// [`TESTS_BEGIN`] and [`TESTS_END`].
+fn removed_and_tests(stdout: &str, listed: bool) -> (Vec<String>, Option<Vec<String>>) {
+    let mut removed = Vec::new();
+    let mut tests = Vec::new();
+    let mut in_tests = false;
+    for line in stdout.lines() {
+        if in_tests {
+            if line == TESTS_END {
+                in_tests = false;
+            } else {
+                tests.push(line.to_string());
+            }
+        } else if line == TESTS_BEGIN {
+            in_tests = true;
+        } else if let Some(path) = line.strip_prefix("Removing ") {
+            removed.push(path.to_string());
+        }
+    }
+    (removed, listed.then_some(tests))
+}
+
+/// The part of a work-branch step after the checkout: the tree reset as
+/// `tree` says, each removed path printed, then the tracked files matching
+/// its test globs between [`TESTS_BEGIN`] and [`TESTS_END`] (AEGIS
+/// ADR-141's Update of 2026-10-14, R1 and R5).
+fn tree_reset_script(tree: &RunTreePreparation) -> String {
+    // Paths printed as they are, so `removed` and `tests` read them back.
+    let g = "g -c core.quotepath=off";
+    let mut s = String::new();
+    match tree.tree_reset {
+        TreeReset::None => s.push_str("g clean -ffdq\n"),
+        TreeReset::Hard => {
+            s.push_str("g reset --quiet --hard HEAD\n");
+            s.push_str(&format!("{g} clean -ffdx\n"));
+        }
+        TreeReset::List => {
+            s.push_str(&format!("{g} clean -ffd\n"));
+            for pattern in &tree.purge {
+                s.push_str(&format!(
+                    "{g} clean -ffdx -- {}\n",
+                    shell_escape(&format!(":(glob){pattern}"))
+                ));
+            }
+        }
+    }
+    if let Some(globs) = &tree.test_globs {
+        s.push_str(&format!("printf '%s\\n' {TESTS_BEGIN}\n"));
+        if !globs.is_empty() {
+            let specs: Vec<String> = globs
+                .iter()
+                .map(|glob| shell_escape(&format!(":(glob){glob}")))
+                .collect();
+            s.push_str(&format!("{g} ls-files -- {}\n", specs.join(" ")));
+        }
+        s.push_str(&format!("printf '%s\\n' {TESTS_END}\n"));
+    }
+    s
+}
+
 /// Build the work-branch step (AEGIS ADR-136 G5a): `origin` pointed at
 /// `url` and `git_ref` fetched as the fetch step does; then the remote's copy
 /// of `branch` checked out when `ls-remote` finds it, else `branch` created
-/// from the ref, both with `checkout --force -B`; untracked files removed.
+/// from the ref, both with `checkout --force -B`; then the tree reset as
+/// `tree` says and its tracked test files listed ([`tree_reset_script`]).
 /// Prints `created` or `existing`, then the HEAD SHA.
 fn work_branch_step(
     paths: &EphemeralCliPaths,
     git_ref: &GitRef,
     branch: &str,
+    tree: &RunTreePreparation,
     url: &str,
     credential: Option<&ResolvedCredential>,
     host_keys: Option<&[SshHostKey]>,
@@ -916,11 +1011,10 @@ fn work_branch_step(
          if [ \"$rc\" -ne 2 ]; then exit \"$rc\"; fi\n\
          g checkout --quiet --force -B \"$branch\" \"$target\"\n\
          made=created\n\
-         fi\n\
-         g clean -ffdq\n\
-         printf '%s\\n' \"$made\"\n\
-         g rev-parse HEAD\n"
+         fi\n"
     ));
+    s.push_str(&tree_reset_script(tree));
+    s.push_str("printf '%s\\n' \"$made\"\ng rev-parse HEAD\n");
     Ok(GitStep { script: s, stdin })
 }
 
@@ -1450,18 +1544,19 @@ impl GitCloneExecutor {
     }
 
     /// Check out the run's work branch in the tree on a non-HostPath
-    /// `volume`, through a git step (AEGIS ADR-136 G5a). Returns the commit
-    /// the run starts from and whether the branch was created.
+    /// `volume` and reset the tree as `tree` says, through one git step
+    /// (AEGIS ADR-136 G5a; ADR-141's Update of 2026-10-14, R1).
     #[instrument(skip(self, volume, credential), fields(binding_id = %binding.id, volume_id = %volume.id))]
     pub async fn work_branch_ephemeral(
         &self,
         binding: &GitRepoBinding,
         volume: &Volume,
         branch: &str,
+        tree: &RunTreePreparation,
         credential: Option<ResolvedCredential>,
-    ) -> Result<(String, bool), CloneError> {
+    ) -> Result<WorkBranchCheckout, CloneError> {
         self.engine()?
-            .check_out_work_branch_in_volume(binding, volume, branch, credential)
+            .check_out_work_branch_in_volume(binding, volume, branch, tree, credential)
             .await
     }
 

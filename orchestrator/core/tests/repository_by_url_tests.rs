@@ -727,6 +727,10 @@ async fn a_url_with_a_binding_of_that_url_and_ref_reuses_it_before_any_credentia
             label: None,
             git_ref: None,
             started_from: None,
+            tree_reset: None,
+            purge: None,
+            test_globs: None,
+            tests: None,
         }],
         "the URL did not resolve to the binding of that URL and ref (main), \
          the one on release being {on_release}"
@@ -931,6 +935,10 @@ impl RunRepositories for Resolving {
                     label: None,
                     git_ref: None,
                     started_from: None,
+                    tree_reset: None,
+                    purge: None,
+                    test_globs: None,
+                    tests: None,
                 },
             })
             .collect())

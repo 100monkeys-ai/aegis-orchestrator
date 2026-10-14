@@ -662,9 +662,12 @@ fn event_message(event: &DomainEvent) -> String {
             branch,
             started_from,
             created,
+            tree_reset,
+            removed,
+            removed_count,
             ..
         }) => {
-            if *created {
+            let line = if *created {
                 format!(
                     "Prepared repository {label} at /workspace/{label}: branch {branch} created from {started_from}"
                 )
@@ -672,6 +675,24 @@ fn event_message(event: &DomainEvent) -> String {
                 format!(
                     "Prepared repository {label} at /workspace/{label}: branch {branch} checked out at {started_from}"
                 )
+            };
+            // AEGIS ADR-141's Update of 2026-10-14, R1: what the reset
+            // removed, the first five named.
+            if *tree_reset == crate::domain::git_repo::TreeReset::None && removed.is_empty() {
+                line
+            } else {
+                let count = removed_count.unwrap_or(removed.len());
+                let named = removed.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+                let more = if count > 5 {
+                    format!(" and {} more", count - 5)
+                } else {
+                    String::new()
+                };
+                if count == 0 {
+                    format!("{line}; removed 0 paths")
+                } else {
+                    format!("{line}; removed {count} paths ({named}{more})")
+                }
             }
         }
         DomainEvent::Execution(ExecutionEvent::RepositoryCommitted {
@@ -1420,6 +1441,23 @@ mod tests {
             branch: "aegis/1234abcd".to_string(),
             started_from: sha.clone(),
             created,
+            tree_reset: crate::domain::git_repo::TreeReset::None,
+            removed: Vec::new(),
+            removed_count: None,
+            tests: None,
+            prepared_at: Utc::now(),
+        };
+        let reset = |removed: Vec<&str>, removed_count| ExecutionEvent::RepositoryPrepared {
+            execution_id,
+            agent_id,
+            label: "app".to_string(),
+            branch: "aegis/1234abcd".to_string(),
+            started_from: sha.clone(),
+            created: true,
+            tree_reset: crate::domain::git_repo::TreeReset::Hard,
+            removed: removed.into_iter().map(str::to_string).collect(),
+            removed_count,
+            tests: None,
             prepared_at: Utc::now(),
         };
         let repository = Some("repository".to_string());
@@ -1439,6 +1477,30 @@ mod tests {
                     "repository_prepared".to_string(),
                     repository.clone(),
                     format!("Prepared repository app at /workspace/app: branch aegis/1234abcd checked out at {sha}"),
+                ),
+            ),
+            (
+                row(reset(vec!["test/__pycache__/", "test/old.py"], None)),
+                (
+                    "repository_prepared".to_string(),
+                    repository.clone(),
+                    format!("Prepared repository app at /workspace/app: branch aegis/1234abcd created from {sha}; removed 2 paths (test/__pycache__/, test/old.py)"),
+                ),
+            ),
+            (
+                row(reset(vec!["a/", "b/", "c/", "d/", "e/", "f/", "g/"], Some(250))),
+                (
+                    "repository_prepared".to_string(),
+                    repository.clone(),
+                    format!("Prepared repository app at /workspace/app: branch aegis/1234abcd created from {sha}; removed 250 paths (a/, b/, c/, d/, e/ and 245 more)"),
+                ),
+            ),
+            (
+                row(reset(Vec::new(), None)),
+                (
+                    "repository_prepared".to_string(),
+                    repository.clone(),
+                    format!("Prepared repository app at /workspace/app: branch aegis/1234abcd created from {sha}; removed 0 paths"),
                 ),
             ),
             (

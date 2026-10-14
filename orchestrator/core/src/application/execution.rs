@@ -5324,6 +5324,10 @@ mod tests {
                             label: None,
                             git_ref: None,
                             started_from: None,
+                            tree_reset: None,
+                            purge: None,
+                            test_globs: None,
+                            tests: None,
                         }
                     }
                 })
@@ -5365,6 +5369,10 @@ mod tests {
                     label: None,
                     git_ref: None,
                     started_from: None,
+                    tree_reset: None,
+                    purge: None,
+                    test_globs: None,
+                    tests: None,
                 })
                 .collect())
         }
@@ -5421,6 +5429,10 @@ mod tests {
                 branch: crate::domain::git_repo::default_work_branch(run),
                 started_from: "0123456789abcdef0123456789abcdef01234567".to_string(),
                 created: true,
+                tree_reset: crate::domain::git_repo::TreeReset::None,
+                removed: Vec::new(),
+                removed_count: None,
+                tests: None,
                 prepared_at: Utc::now(),
             }]
         }
@@ -7614,6 +7626,10 @@ impl StandardExecutionService {
                             branch: prepared.branch,
                             started_from: prepared.started_from,
                             created: prepared.created,
+                            tree_reset: prepared.tree_reset,
+                            removed: prepared.removed,
+                            removed_count: prepared.removed_count,
+                            tests: prepared.tests,
                             prepared_at: prepared.prepared_at,
                         });
                 }

@@ -31,6 +31,11 @@
 //! | A child of a run that has ended (G4) | `a_child_of_a_failed_run_is_refused_and_takes_no_hold` |
 //! | A container step of a run that has ended (G4) | `a_container_step_of_a_failed_run_is_refused_and_takes_no_hold` |
 //! | A child of a running run, after a restart (G4) | `a_child_of_a_running_run_mounts_and_holds_under_the_run` |
+//! | Host directory, tree reset `hard` (ADR-141 R1, R5) | `a_hard_tree_reset_on_a_host_directory_removes_ignored_and_untracked_paths` |
+//! | Host directory, tree reset `list` (ADR-141 R1) | `a_list_tree_reset_on_a_host_directory_removes_what_the_purge_patterns_match` |
+//! | Host directory, tree reset `none` (ADR-141 R1) | `no_tree_reset_on_a_host_directory_keeps_ignored_paths` |
+//! | An unknown tree reset (ADR-141 R1) | `an_unknown_tree_reset_is_refused_with_the_sentence` |
+//! | A purge pattern outside the repository (ADR-141 R1) | `a_purge_pattern_outside_the_repository_is_refused_before_anything_is_held` |
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -44,7 +49,8 @@ use aegis_orchestrator_core::application::git_clone_executor::{
     EphemeralCliEngine, EphemeralCliPaths, GitCloneExecutor,
 };
 use aegis_orchestrator_core::application::git_repo_service::{
-    GitRepoError, GitRepoService, PersonProfiles, RunRepositories, RunRepositoryError,
+    GitRepoError, GitRepoService, PersonProfiles, PreparedRepository, RunRepositories,
+    RunRepositoryError,
 };
 use aegis_orchestrator_core::application::nfs_gateway::NfsVolumeRegistry;
 use aegis_orchestrator_core::application::user_volume_service::UserVolumeService;
@@ -52,7 +58,7 @@ use aegis_orchestrator_core::application::volume_manager::VolumeService;
 use aegis_orchestrator_core::domain::fsal::{AegisFSAL, EventPublisher};
 use aegis_orchestrator_core::domain::git_repo::{
     default_work_branch, CloneStrategy, GitRef, GitRepoBinding, GitRepoBindingId,
-    GitRepoBindingRepository, RunAuthor, RunRepository,
+    GitRepoBindingRepository, RunAuthor, RunRepository, RunTreePreparation, TreeReset,
 };
 use aegis_orchestrator_core::domain::repository::{RepositoryError, VolumeRepository};
 use aegis_orchestrator_core::domain::runtime::{
@@ -629,6 +635,10 @@ fn entry(id: GitRepoBindingId, branch: Option<&str>) -> RunRepository {
         label: None,
         git_ref: None,
         started_from: None,
+        tree_reset: None,
+        purge: None,
+        test_globs: None,
+        tests: None,
     }
 }
 
@@ -1812,5 +1822,198 @@ async fn a_judges_own_volume_beneath_its_inherited_workspace_is_refused() {
             "Child execution own mount '/workspace/x' overlaps with inherited mount '/workspace'"
         ),
         Ok(id) => panic!("a judge's own volume beneath its inherited workspace started: {id}"),
+    }
+}
+
+// ===========================================================================
+// A run's tree reset on a host directory (AEGIS ADR-141's Update of
+// 2026-10-14, R1 and R5)
+// ===========================================================================
+
+/// Push a commit to the remote's `main` tracking `.gitignore`
+/// (`__pycache__/`), `test/a_test.py`, `src/b.py` and, forced past the
+/// ignore rule, `lib/__pycache__/keep.pyc`.
+fn push_tests_and_sources(fx: &Fixture) {
+    let pusher = fx
+        .dirs
+        .path()
+        .join(format!("pusher-{}", uuid::Uuid::new_v4()));
+    let out = Command::new("git")
+        .args([
+            "clone",
+            "--quiet",
+            fx.bare.to_str().unwrap(),
+            pusher.to_str().unwrap(),
+        ])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(pusher.join(".gitignore"), "__pycache__/\n").unwrap();
+    for (path, body) in [
+        ("test/a_test.py", "def test_a():\n    pass\n"),
+        ("src/b.py", "B = 1\n"),
+        ("lib/__pycache__/keep.pyc", "tracked\n"),
+    ] {
+        let path = pusher.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+    git(&pusher, &["add", "-f", ".gitignore", "test", "src", "lib"]);
+    git(&pusher, &["commit", "-m", "tests and sources"]);
+    git(&pusher, &["push", "origin", "main"]);
+}
+
+/// A host binding whose tree holds, as earlier runs left it, an ignored
+/// `test/__pycache__/x.pyc` and an untracked `test/old.py`, prepared with
+/// `tree_reset` and `purge` and the Forge's default test globs. Answers the
+/// tree, the prepared entry and what the preparation did.
+async fn host_prepared_after_earlier_runs(
+    fx: &Fixture,
+    tree_reset: TreeReset,
+    purge: &[&str],
+) -> (PathBuf, RunRepository, PreparedRepository) {
+    push_tests_and_sources(fx);
+    let (id, tree) = fx.host_binding("app", OWNER).await;
+    std::fs::create_dir_all(tree.join("test/__pycache__")).unwrap();
+    std::fs::write(tree.join("test/__pycache__/x.pyc"), "compiled\n").unwrap();
+    std::fs::write(tree.join("test/old.py"), "an earlier run's test\n").unwrap();
+    let run = uuid::Uuid::new_v4();
+    let globs = [
+        "**/test/**",
+        "**/tests/**",
+        "**/__tests__/**",
+        "**/test_*",
+        "**/*_test.*",
+        "**/*.test.*",
+    ];
+    let given = RunRepository {
+        tree_reset: Some(tree_reset),
+        purge: Some(purge.iter().map(|p| p.to_string()).collect()),
+        test_globs: Some(globs.iter().map(|g| g.to_string()).collect()),
+        ..entry(id, None)
+    };
+    let mut prepared = fx
+        .service
+        .prepare_for_run(&fx.tenant, Some(OWNER), run, &[given])
+        .await
+        .unwrap_or_else(|e| panic!("the run was not prepared: {e}"));
+    let mut preparations = fx.service.take_prepared(run);
+    assert_eq!(preparations.len(), 1);
+    (tree, prepared.remove(0), preparations.remove(0))
+}
+
+#[tokio::test]
+async fn a_hard_tree_reset_on_a_host_directory_removes_ignored_and_untracked_paths() {
+    let fx = fixture().await;
+    let (tree, entry, prepared) = host_prepared_after_earlier_runs(&fx, TreeReset::Hard, &[]).await;
+    assert!(
+        !tree.join("test/__pycache__/x.pyc").exists(),
+        "an ignored file of an earlier run survived the hard reset"
+    );
+    assert!(!tree.join("test/old.py").exists());
+    assert!(tree.join("lib/__pycache__/keep.pyc").exists());
+    assert_eq!(prepared.tree_reset, TreeReset::Hard);
+    assert_eq!(
+        prepared.removed,
+        vec!["test/__pycache__/".to_string(), "test/old.py".to_string()]
+    );
+    // R5: the tracked files the Forge's test globs match.
+    assert_eq!(entry.tests, Some(vec!["test/a_test.py".to_string()]));
+    assert_eq!(prepared.tests, entry.tests);
+}
+
+#[tokio::test]
+async fn a_list_tree_reset_on_a_host_directory_removes_what_the_purge_patterns_match() {
+    let fx = fixture().await;
+    let (tree, _, prepared) =
+        host_prepared_after_earlier_runs(&fx, TreeReset::List, &["**/__pycache__/"]).await;
+    assert!(
+        !tree.join("test/__pycache__/x.pyc").exists(),
+        "the purge pattern did not remove the ignored directory"
+    );
+    assert!(!tree.join("test/old.py").exists());
+    assert!(
+        tree.join("lib/__pycache__/keep.pyc").exists(),
+        "a tracked file matching a purge pattern was removed"
+    );
+    assert_eq!(
+        prepared.removed,
+        vec!["test/old.py".to_string(), "test/__pycache__/".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn no_tree_reset_on_a_host_directory_keeps_ignored_paths() {
+    let fx = fixture().await;
+    let (tree, _, prepared) = host_prepared_after_earlier_runs(&fx, TreeReset::None, &[]).await;
+    assert!(
+        tree.join("test/__pycache__/x.pyc").exists(),
+        "today's step removed an ignored file"
+    );
+    assert!(!tree.join("test/old.py").exists());
+    assert_eq!(prepared.removed, vec!["test/old.py".to_string()]);
+}
+
+#[tokio::test]
+async fn an_unknown_tree_reset_is_refused_with_the_sentence() {
+    for input in [
+        serde_json::json!({"tree_reset": "soft"}),
+        serde_json::json!({"tree_reset": "SOFT"}),
+    ] {
+        let named = input["tree_reset"].as_str().unwrap().to_string();
+        assert_eq!(
+            RunTreePreparation::from_input(&input, None),
+            Err(format!(
+                "tree_reset must be one of hard, list or none; this run names '{named}'"
+            ))
+        );
+    }
+    // A run naming none takes the workflow's default, else `none`.
+    let schema = serde_json::json!({"properties": {"tree_reset": {"default": "hard"}}});
+    assert_eq!(
+        RunTreePreparation::from_input(&serde_json::json!({}), Some(&schema))
+            .map(|tree| tree.tree_reset),
+        Ok(TreeReset::Hard)
+    );
+    assert_eq!(
+        RunTreePreparation::from_input(&serde_json::json!({}), None),
+        Ok(RunTreePreparation::default())
+    );
+}
+
+#[tokio::test]
+async fn a_purge_pattern_outside_the_repository_is_refused_before_anything_is_held() {
+    for pattern in ["/etc/passwd", "../other", "test/../../x"] {
+        assert_eq!(
+            RunTreePreparation::from_input(&serde_json::json!({"purge": [pattern]}), None),
+            Err(format!(
+                "a purge pattern names a path inside the repository; '{pattern}' does not"
+            ))
+        );
+        let fx = fixture().await;
+        let (id, _) = fx.host_binding("app", OWNER).await;
+        let given = RunRepository {
+            tree_reset: Some(TreeReset::List),
+            purge: Some(vec![pattern.to_string()]),
+            ..entry(id, None)
+        };
+        let result = fx
+            .service
+            .prepare_for_run(&fx.tenant, Some(OWNER), uuid::Uuid::new_v4(), &[given])
+            .await;
+        assert_eq!(
+            refusal(result),
+            format!("a purge pattern names a path inside the repository; '{pattern}' does not")
+        );
+        assert_eq!(
+            fx.service.run_holding(&id),
+            None,
+            "a refused run holds the binding"
+        );
     }
 }

@@ -250,18 +250,25 @@ impl StandardStartWorkflowExecutionUseCase {
     /// AEGIS ADR-136 G3 to G5: a workflow execution is its run. Before
     /// anything is recorded or started, its repositories are checked, held
     /// and their work branches checked out, and each entry's branch is
-    /// written back into `input` for the agent states to inherit. Answers
-    /// the guard that releases them should the start not complete.
+    /// written back into `input` for the agent states to inherit. Each
+    /// entry also carries how its tree is reset and which test files it
+    /// lists, from the run's `tree_reset`, `purge` and `test_globs` or the
+    /// workflow's `input_schema` defaults for them (AEGIS ADR-141's Update
+    /// of 2026-10-14, R1 and R5). Answers the guard that releases them
+    /// should the start not complete.
     async fn prepare_repositories(
         &self,
         tenant_id: &TenantId,
         identity: Option<&UserIdentity>,
         run: ExecutionId,
         input: &mut serde_json::Value,
+        input_schema: Option<&serde_json::Value>,
     ) -> Result<crate::application::git_repo_service::RunHoldGuard> {
         use crate::application::git_repo_service::{RunHoldGuard, RunRepositoryError};
         use crate::domain::execution::ExecutionError;
-        use crate::domain::git_repo::{parse_requested_repositories, REPOSITORIES_INPUT_KEY};
+        use crate::domain::git_repo::{
+            parse_requested_repositories, RunTreePreparation, REPOSITORIES_INPUT_KEY,
+        };
         let requested = match input.get(REPOSITORIES_INPUT_KEY) {
             None => return Ok(RunHoldGuard::new(None, run.0)),
             Some(value) => parse_requested_repositories(value).map_err(|sentence| {
@@ -271,6 +278,9 @@ impl StandardStartWorkflowExecutionUseCase {
         if requested.is_empty() {
             return Ok(RunHoldGuard::new(None, run.0));
         }
+        // Refused before anything is held.
+        let tree = RunTreePreparation::from_input(input, input_schema)
+            .map_err(|sentence| anyhow::Error::new(ExecutionError::Refused(sentence)))?;
         let Some(repositories) = self.run_repositories.get() else {
             return Err(ExecutionError::Refused(
                 "this node has no git repository service, so a run cannot be given repositories"
@@ -289,7 +299,7 @@ impl StandardStartWorkflowExecutionUseCase {
         };
         // AEGIS ADR-141 F2a: a repository named by its URL becomes a binding
         // of the person's before anything is held.
-        let entries = repositories
+        let mut entries = repositories
             .resolve_requested(
                 tenant_id,
                 person.as_deref(),
@@ -298,6 +308,9 @@ impl StandardStartWorkflowExecutionUseCase {
             )
             .await
             .map_err(refused)?;
+        for entry in &mut entries {
+            tree.apply_to(entry);
+        }
         let filled = repositories
             .prepare_for_run(tenant_id, person.as_deref(), run.0, &entries)
             .await
@@ -570,7 +583,13 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
         self.resolve_profile(tenant_id, identity, &mut persisted_input)
             .await?;
         let hold = self
-            .prepare_repositories(tenant_id, identity, execution_id, &mut persisted_input)
+            .prepare_repositories(
+                tenant_id,
+                identity,
+                execution_id,
+                &mut persisted_input,
+                workflow.metadata.input_schema.as_ref(),
+            )
             .await?;
         let mut workflow_execution =
             WorkflowExecution::new(&workflow, execution_id, persisted_input);

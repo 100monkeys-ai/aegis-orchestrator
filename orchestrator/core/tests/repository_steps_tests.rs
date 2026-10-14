@@ -642,6 +642,10 @@ impl Fixture {
                     label: None,
                     git_ref: None,
                     started_from: None,
+                    tree_reset: None,
+                    purge: None,
+                    test_globs: None,
+                    tests: None,
                 }],
             )
             .await

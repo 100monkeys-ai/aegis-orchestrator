@@ -49,7 +49,7 @@ use chrono::Utc;
 use crate::application::credential_service::{CredentialError, CredentialManagementService};
 use crate::application::git_clone_executor::{
     clone_credential, credential_secrets, redact_git_output, strip_remote_user_info, CloneError,
-    GitCloneExecutor, ResolvedCredential, PUSH_FROM_A_VOLUME_GOES_TO_ORIGIN,
+    GitCloneExecutor, ResolvedCredential, WorkBranchCheckout, PUSH_FROM_A_VOLUME_GOES_TO_ORIGIN,
 };
 use crate::application::git_ssh_key::{attach_ssh_credentials, check_ssh_host_key};
 use crate::application::user_volume_service::{
@@ -62,9 +62,10 @@ use crate::domain::credential::{
 };
 use crate::domain::git_host_keys::{host_keys_for, ssh_remote, SshHostKey};
 use crate::domain::git_repo::{
-    default_work_branch, is_mountable_label, repository_name, same_repository, validate_repo_url,
-    CloneStrategy, GitRef, GitRepoBinding, GitRepoBindingId, GitRepoBindingRepository,
-    GitRepoEvent, GitRepoStatus, RepositoryByUrl, RequestedRepository, RunAuthor, RunRepository,
+    check_purge_pattern, default_work_branch, is_mountable_label, repository_name, same_repository,
+    validate_repo_url, CloneStrategy, GitRef, GitRepoBinding, GitRepoBindingId,
+    GitRepoBindingRepository, GitRepoEvent, GitRepoStatus, RepositoryByUrl, RequestedRepository,
+    RunAuthor, RunRepository, RunTreePreparation, TreeReset,
 };
 use crate::domain::git_repo_tier_limits::GitRepoTierLimits;
 use crate::domain::iam::{IdentityKind, UserIdentity, ZaruTier};
@@ -775,6 +776,10 @@ impl GitRepoService {
             label: None,
             git_ref: None,
             started_from: None,
+            tree_reset: None,
+            purge: None,
+            test_globs: None,
+            tests: None,
         };
         let Some(owner) = person else {
             return Err(RunRepositoryError::Refused(
@@ -1757,14 +1762,16 @@ impl GitRepoService {
 
     /// Fetch the binding's ref and check out `branch` in its tree (G5,
     /// G5a): the remote's copy when the remote has the branch, else the
-    /// branch created from the ref. Answers the commit the run starts from
-    /// and whether the branch was created.
+    /// branch created from the ref; then the tree reset and its test files
+    /// listed as `tree` says (AEGIS ADR-141's Update of 2026-10-14, R1 and
+    /// R5), in the same git step or libgit2 pass.
     async fn check_out_work_branch(
         &self,
         binding: &GitRepoBinding,
         owner: &str,
         branch: &str,
-    ) -> Result<(String, bool), GitRepoError> {
+        tree: &RunTreePreparation,
+    ) -> Result<WorkBranchCheckout, GitRepoError> {
         let credential = self.resolve_credential(binding, Some(owner)).await?;
         match self.resolve_tree(binding).await? {
             Tree::Host(target_dir) => {
@@ -1772,12 +1779,14 @@ impl GitRepoService {
                 let git_ref = binding.git_ref.clone();
                 let ssh_host_keys = binding.ssh_host_keys.clone();
                 let branch = branch.to_string();
+                let tree = tree.clone();
                 tokio::task::spawn_blocking(move || {
                     work_branch_in_dir(
                         &target_dir,
                         &repo_url,
                         &git_ref,
                         &branch,
+                        &tree,
                         credential,
                         &ssh_host_keys,
                     )
@@ -1787,7 +1796,7 @@ impl GitRepoService {
             }
             Tree::Volume(volume) => self
                 .clone_executor
-                .work_branch_ephemeral(binding, &volume, branch, credential)
+                .work_branch_ephemeral(binding, &volume, branch, tree, credential)
                 .await
                 .map_err(step_error),
         }
@@ -1978,7 +1987,12 @@ pub enum RunRepositoryError {
     Failed(#[from] GitRepoError),
 }
 
-/// What a run's preparation did for one repository (AEGIS ADR-136 G5b).
+/// The most removed paths a run's preparation keeps for its narrative row
+/// (AEGIS ADR-141's Update of 2026-10-14, R1).
+pub const REMOVED_PATHS_KEPT: usize = 200;
+
+/// What a run's preparation did for one repository (AEGIS ADR-136 G5b;
+/// ADR-141's Update of 2026-10-14, R1 and R5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedRepository {
     pub label: String,
@@ -1987,6 +2001,16 @@ pub struct PreparedRepository {
     pub started_from: String,
     /// Whether the branch was created from the binding's ref.
     pub created: bool,
+    /// How the tree was reset.
+    pub tree_reset: TreeReset,
+    /// The paths the reset removed, as `git clean` prints them, at most
+    /// [`REMOVED_PATHS_KEPT`].
+    pub removed: Vec<String>,
+    /// How many paths were removed, when more than `removed` keeps.
+    pub removed_count: Option<usize>,
+    /// The tracked files matching the run's test globs; `None` when it
+    /// names none.
+    pub tests: Option<Vec<String>>,
     pub prepared_at: chrono::DateTime<Utc>,
 }
 
@@ -2237,6 +2261,11 @@ impl RunRepositories for GitRepoService {
         run: uuid::Uuid,
         entries: &[RunRepository],
     ) -> Result<Vec<RunRepository>, RunRepositoryError> {
+        // A purge pattern naming a path outside the repository is refused
+        // before anything is held (AEGIS ADR-141's Update of 2026-10-14, R1).
+        for pattern in entries.iter().flat_map(|e| e.purge.iter().flatten()) {
+            check_purge_pattern(pattern).map_err(RunRepositoryError::Refused)?;
+        }
         let checked = self
             .checked_entries(tenant_id, person, run, entries)
             .await?;
@@ -2257,25 +2286,47 @@ impl RunRepositories for GitRepoService {
         let author = self.run_author(person).await;
         let mut prepared = Vec::with_capacity(checked.len());
         let mut preparations = Vec::with_capacity(checked.len());
-        for (binding, branch) in checked {
-            match self.check_out_work_branch(&binding, owner, &branch).await {
-                Ok((started_from, created)) => {
-                    preparations.push(PreparedRepository {
-                        label: binding.label.clone(),
-                        branch: branch.clone(),
-                        started_from: started_from.clone(),
-                        created,
-                        prepared_at: Utc::now(),
-                    });
-                    // The narrative row is G5b's; until then the preparation is logged.
+        for ((binding, branch), entry) in checked.into_iter().zip(entries) {
+            let tree = RunTreePreparation {
+                tree_reset: entry.tree_reset.unwrap_or_default(),
+                purge: entry.purge.clone().unwrap_or_default(),
+                test_globs: entry.test_globs.clone(),
+            };
+            match self
+                .check_out_work_branch(&binding, owner, &branch, &tree)
+                .await
+            {
+                Ok(WorkBranchCheckout {
+                    started_from,
+                    created,
+                    removed,
+                    tests,
+                }) => {
                     info!(
                         run = %run,
                         repository = %binding.label,
                         branch = %branch,
                         started_from = %started_from,
                         created,
+                        tree_reset = tree.tree_reset.as_str(),
+                        removed = ?removed,
                         "a run's repository is prepared"
                     );
+                    let removed_count =
+                        (removed.len() > REMOVED_PATHS_KEPT).then_some(removed.len());
+                    let mut kept = removed;
+                    kept.truncate(REMOVED_PATHS_KEPT);
+                    preparations.push(PreparedRepository {
+                        label: binding.label.clone(),
+                        branch: branch.clone(),
+                        started_from: started_from.clone(),
+                        created,
+                        tree_reset: tree.tree_reset,
+                        removed: kept,
+                        removed_count,
+                        tests: tests.clone(),
+                        prepared_at: Utc::now(),
+                    });
                     let git_ref = match &binding.git_ref {
                         GitRef::Branch(name) | GitRef::Tag(name) | GitRef::Commit(name) => {
                             name.clone()
@@ -2288,6 +2339,10 @@ impl RunRepositories for GitRepoService {
                         label: Some(binding.label.clone()),
                         git_ref: Some(git_ref),
                         started_from: Some(started_from),
+                        tree_reset: entry.tree_reset,
+                        purge: entry.purge.clone(),
+                        test_globs: entry.test_globs.clone(),
+                        tests,
                     });
                 }
                 Err(e) => {
@@ -2433,16 +2488,19 @@ fn attach_credential(
 /// The work-branch checkout on a host directory, by libgit2 (AEGIS ADR-136
 /// G5a): `origin` pointed at the binding's URL, the ref fetched; the
 /// remote's copy of `branch` checked out when the remote lists it, else
-/// `branch` created from the ref; untracked files that are not ignored
-/// removed. An error's text holds no part of the credential.
+/// `branch` created from the ref; then, in the same pass, the tree reset as
+/// `tree` says and its tracked test files listed, as the volume's git step
+/// does (AEGIS ADR-141's Update of 2026-10-14, R1 and R5). An error's text
+/// holds no part of the credential.
 fn work_branch_in_dir(
     target_dir: &std::path::Path,
     repo_url: &SensitiveUrl,
     git_ref: &GitRef,
     branch: &str,
+    tree: &RunTreePreparation,
     credential: Option<ResolvedCredential>,
     ssh_host_keys: &[crate::domain::git_host_keys::SshHostKey],
-) -> Result<(String, bool), GitRepoError> {
+) -> Result<WorkBranchCheckout, GitRepoError> {
     let (url, credential) = clone_credential(repo_url.expose(), credential);
     let secrets = credential_secrets(credential.as_ref());
     let git = |e: git2::Error| GitRepoError::GitFailed(redact_git_output(e.message(), &secrets));
@@ -2521,29 +2579,310 @@ fn work_branch_in_dir(
     repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
         .map_err(git)?;
 
-    // `clean -ffd`: untracked files and directories that are not ignored.
-    let mut options = git2::StatusOptions::new();
-    options
-        .include_untracked(true)
-        .recurse_untracked_dirs(false)
-        .include_ignored(false);
-    let untracked: Vec<PathBuf> = repo
-        .statuses(Some(&mut options))
-        .map_err(git)?
-        .iter()
-        .filter(|entry| entry.status().contains(git2::Status::WT_NEW))
-        .filter_map(|entry| entry.path().ok().map(|p| target_dir.join(p)))
-        .collect();
-    for path in untracked {
-        let removed = if path.is_dir() {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
-        };
-        removed.map_err(|e| GitRepoError::GitFailed(format!("clean: {e}")))?;
+    let mut removed = Vec::new();
+    match tree.tree_reset {
+        TreeReset::None => {
+            clean_in_dir(&repo, target_dir, false, &[], &mut removed)?;
+        }
+        TreeReset::Hard => {
+            // `reset --hard <start>`, then `clean -ffdx`.
+            repo.reset(
+                start.as_object(),
+                git2::ResetType::Hard,
+                Some(git2::build::CheckoutBuilder::new().force()),
+            )
+            .map_err(git)?;
+            clean_in_dir(&repo, target_dir, true, &[], &mut removed)?;
+        }
+        TreeReset::List => {
+            // `clean -ffd`, then `clean -ffdx -- ':(glob)<pattern>'` each.
+            clean_in_dir(&repo, target_dir, false, &[], &mut removed)?;
+            for pattern in &tree.purge {
+                clean_in_dir(
+                    &repo,
+                    target_dir,
+                    true,
+                    std::slice::from_ref(pattern),
+                    &mut removed,
+                )?;
+            }
+        }
     }
 
-    Ok((start.id().to_string(), !on_remote))
+    // `ls-files -- ':(glob)<glob>'…`: the tracked files the globs match.
+    let tests = match &tree.test_globs {
+        None => None,
+        Some(globs) if globs.is_empty() => Some(Vec::new()),
+        Some(globs) => {
+            let index = repo.index().map_err(git)?;
+            Some(
+                index
+                    .iter()
+                    .filter_map(|entry| String::from_utf8(entry.path).ok())
+                    .filter(|path| globs.iter().any(|glob| pathspec_matches(glob, path)))
+                    .collect(),
+            )
+        }
+    };
+
+    Ok(WorkBranchCheckout {
+        started_from: start.id().to_string(),
+        created: !on_remote,
+        removed,
+        tests,
+    })
+}
+
+/// `git clean -ffd` on a host directory by libgit2, or `-ffdx` when
+/// `ignored`, limited to `patterns` when there are any: each removed path
+/// pushed onto `removed` as git prints it, a directory removed whole with
+/// its trailing `/`. A directory no pattern matches is walked for paths
+/// inside it that one does, as git does.
+fn clean_in_dir(
+    repo: &git2::Repository,
+    target_dir: &std::path::Path,
+    ignored: bool,
+    patterns: &[String],
+    removed: &mut Vec<String>,
+) -> Result<(), GitRepoError> {
+    let candidates = if ignored {
+        // `-x`: every path that is not tracked, a directory holding no
+        // tracked file taken whole, as git takes it. libgit2's status
+        // leaves out an ignored file in an ignored directory that also
+        // holds a tracked one, which git cleans.
+        let tracked: std::collections::BTreeSet<String> = repo
+            .index()
+            .map_err(|e| GitRepoError::GitFailed(format!("clean: {}", e.message())))?
+            .iter()
+            .filter_map(|entry| String::from_utf8(entry.path).ok())
+            .collect();
+        let mut candidates = Vec::new();
+        untracked_paths(target_dir, "", &tracked, &mut candidates)
+            .map_err(|e| GitRepoError::GitFailed(format!("clean: {e}")))?;
+        candidates
+    } else {
+        let mut options = git2::StatusOptions::new();
+        options
+            .include_untracked(true)
+            .recurse_untracked_dirs(false)
+            .include_ignored(false);
+        repo.statuses(Some(&mut options))
+            .map_err(|e| GitRepoError::GitFailed(format!("clean: {}", e.message())))?
+            .iter()
+            .filter(|entry| entry.status().contains(git2::Status::WT_NEW))
+            .filter_map(|entry| entry.path().ok().map(str::to_string))
+            .collect()
+    };
+    for candidate in candidates {
+        clean_candidate(target_dir, &candidate, patterns, removed)?;
+    }
+    Ok(())
+}
+
+/// The paths under `prefix` (relative, empty or ending in `/`) that no
+/// `tracked` path is or lies under, in name order: a file by its path, a
+/// directory holding no tracked file by its path and a trailing `/`. The
+/// repository's own `.git` is left out.
+fn untracked_paths(
+    target_dir: &std::path::Path,
+    prefix: &str,
+    tracked: &std::collections::BTreeSet<String>,
+    out: &mut Vec<String>,
+) -> std::io::Result<()> {
+    let mut names: Vec<String> = std::fs::read_dir(target_dir.join(prefix))?
+        .filter_map(|child| child.ok())
+        .filter_map(|child| child.file_name().into_string().ok())
+        .filter(|name| !(prefix.is_empty() && name == ".git"))
+        .collect();
+    names.sort();
+    for name in names {
+        let path = format!("{prefix}{name}");
+        let full = target_dir.join(&path);
+        if full.is_dir() && !full.is_symlink() {
+            let dir = format!("{path}/");
+            let holds_tracked = tracked
+                .range(dir.clone()..)
+                .next()
+                .is_some_and(|first| first.starts_with(&dir));
+            if holds_tracked {
+                untracked_paths(target_dir, &dir, tracked, out)?;
+            } else {
+                out.push(dir);
+            }
+        } else if !tracked.contains(&path) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Remove `candidate` (relative to `target_dir`, a directory ending in `/`)
+/// when no `patterns` are given or one matches it; else walk into a
+/// directory for what one matches.
+fn clean_candidate(
+    target_dir: &std::path::Path,
+    candidate: &str,
+    patterns: &[String],
+    removed: &mut Vec<String>,
+) -> Result<(), GitRepoError> {
+    let path = target_dir.join(candidate.trim_end_matches('/'));
+    let is_dir = path.is_dir() && !path.is_symlink();
+    let candidate = if is_dir && !candidate.ends_with('/') {
+        format!("{candidate}/")
+    } else {
+        candidate.to_string()
+    };
+    let clean = |e: std::io::Error| GitRepoError::GitFailed(format!("clean: {e}"));
+    if patterns.is_empty() || patterns.iter().any(|p| pathspec_matches(p, &candidate)) {
+        if is_dir {
+            std::fs::remove_dir_all(&path).map_err(clean)?;
+        } else {
+            std::fs::remove_file(&path).map_err(clean)?;
+        }
+        removed.push(candidate);
+        return Ok(());
+    }
+    if is_dir
+        && patterns
+            .iter()
+            .any(|p| pathspec_may_match_inside(p, &candidate))
+    {
+        let mut children: Vec<String> = std::fs::read_dir(&path)
+            .map_err(clean)?
+            .filter_map(|child| child.ok())
+            .filter_map(|child| child.file_name().into_string().ok())
+            .collect();
+        children.sort();
+        for child in children {
+            clean_candidate(
+                target_dir,
+                &format!("{candidate}{child}"),
+                patterns,
+                removed,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether a `:(glob)` pathspec `pattern` matches `path` as git matches it:
+/// a pattern with no wildcard matches the path itself or any path inside
+/// it; one with a wildcard matches the whole path by `wildmatch` with
+/// `WM_PATHNAME` (`*` and `?` stop at `/`, `**/` spans directories, a
+/// trailing `/**` everything inside). A directory's path ends in `/`, so
+/// a wildcard pattern matches a directory only when written `dir/` or
+/// `dir/**`.
+fn pathspec_matches(pattern: &str, path: &str) -> bool {
+    if has_wildcard(pattern) {
+        return wildmatch(pattern.as_bytes(), path.as_bytes(), true);
+    }
+    let literal = pattern.trim_end_matches('/');
+    if pattern.ends_with('/') && !path.ends_with('/') && path == literal {
+        return false;
+    }
+    let bare = path.trim_end_matches('/');
+    bare == literal || path.starts_with(&format!("{literal}/"))
+}
+
+/// Whether a path inside the directory `dir` (ending in `/`) could match
+/// `pattern`: its part before the first wildcard and `dir` agree.
+fn pathspec_may_match_inside(pattern: &str, dir: &str) -> bool {
+    let fixed = match pattern.find(['*', '?', '[', '\\']) {
+        Some(at) => &pattern[..at],
+        None => pattern,
+    };
+    fixed.starts_with(dir) || dir.starts_with(fixed)
+}
+
+fn has_wildcard(pattern: &str) -> bool {
+    pattern.contains(['*', '?', '[', '\\'])
+}
+
+/// git's `wildmatch` with `WM_PATHNAME`: `text` matched whole by `pattern`.
+/// `segment_start` says the pattern stands at the start of a path segment,
+/// where `**` followed by `/` or the end spans directories.
+fn wildmatch(pattern: &[u8], text: &[u8], segment_start: bool) -> bool {
+    match pattern.first() {
+        None => text.is_empty(),
+        Some(b'*') => {
+            if pattern.get(1) == Some(&b'*')
+                && segment_start
+                && matches!(pattern.get(2), None | Some(b'/'))
+            {
+                if pattern.len() == 2 {
+                    return true;
+                }
+                let rest = &pattern[3..];
+                if wildmatch(rest, text, true) {
+                    return true;
+                }
+                return text
+                    .iter()
+                    .enumerate()
+                    .any(|(at, &c)| c == b'/' && wildmatch(rest, &text[at + 1..], true));
+            }
+            let rest = {
+                let stars = pattern.iter().take_while(|&&c| c == b'*').count();
+                &pattern[stars..]
+            };
+            for at in 0..=text.len() {
+                if wildmatch(rest, &text[at..], false) {
+                    return true;
+                }
+                if text.get(at) == Some(&b'/') {
+                    return false;
+                }
+            }
+            false
+        }
+        Some(b'?') => match text.first() {
+            Some(&c) if c != b'/' => wildmatch(&pattern[1..], &text[1..], false),
+            _ => false,
+        },
+        Some(b'[') => {
+            let Some(&c) = text.first() else {
+                return false;
+            };
+            if c == b'/' {
+                return false;
+            }
+            let mut at = 1;
+            let negated = matches!(pattern.get(at), Some(b'!') | Some(b'^'));
+            if negated {
+                at += 1;
+            }
+            let mut matched = false;
+            let mut first = true;
+            loop {
+                match pattern.get(at) {
+                    None => return false,
+                    Some(b']') if !first => break,
+                    Some(&low) => {
+                        if pattern.get(at + 1) == Some(&b'-')
+                            && pattern.get(at + 2).is_some_and(|&h| h != b']')
+                        {
+                            let high = pattern[at + 2];
+                            matched |= low <= c && c <= high;
+                            at += 3;
+                        } else {
+                            matched |= low == c;
+                            at += 1;
+                        }
+                    }
+                }
+                first = false;
+            }
+            matched != negated && wildmatch(&pattern[at + 1..], &text[1..], false)
+        }
+        Some(b'\\') => match (pattern.get(1), text.first()) {
+            (Some(p), Some(t)) if p == t => wildmatch(&pattern[2..], &text[1..], *t == b'/'),
+            _ => false,
+        },
+        Some(&p) => match text.first() {
+            Some(&t) if t == p => wildmatch(&pattern[1..], &text[1..], t == b'/'),
+            _ => false,
+        },
+    }
 }
 
 /// A git step's failure as the commit, push and diff calls answer it.
@@ -3410,5 +3749,126 @@ mod tests {
             "x".repeat(COMMIT_SUBJECT_LIMIT),
             "a subject with no word boundary is cut at the limit"
         );
+    }
+
+    /// Run `git` in `dir` with no configuration of the machine's.
+    fn probe_git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Probe")
+            .env("GIT_AUTHOR_EMAIL", "probe@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Probe")
+            .env("GIT_COMMITTER_EMAIL", "probe@example.invalid")
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// The probe repository of the arc `forge-tree-reset`: tracked
+    /// `.gitignore` (`__pycache__/`, `*.log`), `test/a_test.py`,
+    /// `test/keep.pyc`, `src/b.py` and `lib/__pycache__/keep.pyc`; left
+    /// untracked or ignored beside them as earlier runs leave files.
+    fn probe_repository(root: &std::path::Path) {
+        probe_git(root, &["init", "--quiet", "."]);
+        let write = |path: &str| {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "x\n").unwrap();
+        };
+        std::fs::write(root.join(".gitignore"), "__pycache__/\n*.log\n").unwrap();
+        for path in [
+            "test/a_test.py",
+            "test/keep.pyc",
+            "src/b.py",
+            "lib/__pycache__/keep.pyc",
+        ] {
+            write(path);
+        }
+        probe_git(root, &["add", "-f", "."]);
+        probe_git(root, &["commit", "--quiet", "-m", "probe"]);
+        for path in [
+            "test/__pycache__/x.pyc",
+            "__pycache__/top.pyc",
+            "test/old.py",
+            "newdir/sub/n.pyc",
+            "a.log",
+            "src/__pycache__/y.pyc",
+            "lib/__pycache__/junk.pyc",
+            "deep/a/__pycache__/z.pyc",
+            "deep/a/keep.txt",
+        ] {
+            write(path);
+        }
+    }
+
+    /// AEGIS ADR-141's Update of 2026-10-14, R1: on a host directory a purge
+    /// pattern removes what `git clean -ffdx -- ':(glob)<pattern>'` removes
+    /// on the same tree, named as git names it, so the two kinds of volume
+    /// answer alike. Among them: `**/__pycache__` removes nothing, since a
+    /// wildcard reaches an untracked directory only when written `dir/` or
+    /// `dir/**`.
+    #[test]
+    fn a_purge_pattern_on_a_host_directory_removes_what_git_clean_removes() {
+        for pattern in [
+            "**/__pycache__",
+            "**/__pycache__/",
+            "**/__pycache__/**",
+            "**/*.pyc",
+            "*.pyc",
+            "*.log",
+            "lib",
+            "test",
+            "deep/a/",
+            "deep/a/__pycache__/z.pyc",
+            "**/a",
+            "newdir/**",
+        ] {
+            let by_git = tempfile::tempdir().unwrap();
+            probe_repository(by_git.path());
+            let mut want: Vec<String> = probe_git(
+                by_git.path(),
+                &[
+                    "-c",
+                    "core.quotepath=off",
+                    "clean",
+                    "-ffdx",
+                    "--",
+                    &format!(":(glob){pattern}"),
+                ],
+            )
+            .lines()
+            .filter_map(|line| line.strip_prefix("Removing ").map(str::to_string))
+            .collect();
+            want.sort();
+
+            let by_us = tempfile::tempdir().unwrap();
+            probe_repository(by_us.path());
+            let repo = git2::Repository::open(by_us.path()).unwrap();
+            let mut removed = Vec::new();
+            clean_in_dir(
+                &repo,
+                by_us.path(),
+                true,
+                &[pattern.to_string()],
+                &mut removed,
+            )
+            .unwrap();
+            removed.sort();
+            assert_eq!(removed, want, "pattern {pattern}");
+            for path in &removed {
+                assert!(
+                    !by_us.path().join(path.trim_end_matches('/')).exists(),
+                    "{path} named but not removed"
+                );
+            }
+        }
     }
 }

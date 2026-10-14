@@ -543,7 +543,10 @@ pub const REPOSITORIES_SHAPE: &str =
 /// when the run's repositories are prepared and never taken from a caller
 /// (AEGIS ADR-136 G5d); so are `label`, `ref` (the binding's) and
 /// `started_from` (the commit the work branch started from), which the
-/// workflow's repository entry reads (AEGIS ADR-141 F3).
+/// workflow's repository entry reads (AEGIS ADR-141 F3), and `tree_reset`,
+/// `purge`, `test_globs` and `tests`: how the preparation leaves the tree
+/// and the tracked test files it found (AEGIS ADR-141's Update of
+/// 2026-10-14, R1 and R5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunRepository {
     pub binding_id: GitRepoBindingId,
@@ -557,6 +560,173 @@ pub struct RunRepository {
     pub git_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_from: Option<String>,
+    /// How the preparation resets the tree; none given is [`TreeReset::None`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_reset: Option<TreeReset>,
+    /// The glob patterns [`TreeReset::List`] removes untracked and ignored
+    /// paths by, as git's pathspec matches them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purge: Option<Vec<String>>,
+    /// The glob patterns the preparation lists [`Self::tests`] by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_globs: Option<Vec<String>>,
+    /// The tracked files matching `test_globs` once the tree is prepared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests: Option<Vec<String>>,
+}
+
+impl RunRepository {
+    /// Whether the entry names a field only the platform writes: `author`
+    /// (AEGIS ADR-136 G5d), `label`, `ref`, `started_from` (AEGIS ADR-141
+    /// F3), `tree_reset`, `purge`, `test_globs` or `tests` (its Update of
+    /// 2026-10-14, R1 and R5). A starting tool's caller and a schedule never
+    /// name one.
+    pub fn names_a_platform_field(&self) -> bool {
+        self.author.is_some()
+            || self.label.is_some()
+            || self.git_ref.is_some()
+            || self.started_from.is_some()
+            || self.tree_reset.is_some()
+            || self.purge.is_some()
+            || self.test_globs.is_some()
+            || self.tests.is_some()
+    }
+}
+
+/// How a run's preparation leaves its repository's tree after the work
+/// branch is checked out (AEGIS ADR-141's Update of 2026-10-14, R1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TreeReset {
+    /// `git reset --hard` to the start, then `git clean -ffdx`: every
+    /// untracked and ignored path removed.
+    Hard,
+    /// `git clean -ffd`, then `git clean -ffdx` limited to each `purge`
+    /// pattern.
+    List,
+    /// `git clean -ffd`: untracked paths that are not ignored removed.
+    #[default]
+    None,
+}
+
+impl TreeReset {
+    /// The input key a run names it by.
+    pub const INPUT_KEY: &'static str = "tree_reset";
+
+    /// Read a run's `tree_reset`, refused in the Update's words when it is
+    /// not one of the three.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "hard" => Ok(Self::Hard),
+            "list" => Ok(Self::List),
+            "none" => Ok(Self::None),
+            other => Err(tree_reset_refusal(other)),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hard => "hard",
+            Self::List => "list",
+            Self::None => "none",
+        }
+    }
+}
+
+/// The input key a run names its purge patterns by.
+pub const PURGE_INPUT_KEY: &str = "purge";
+
+/// The input key a run names its test globs by.
+pub const TEST_GLOBS_INPUT_KEY: &str = "test_globs";
+
+fn tree_reset_refusal(value: &str) -> String {
+    format!("tree_reset must be one of hard, list or none; this run names '{value}'")
+}
+
+/// Refuse a purge pattern that names a path outside the repository: an
+/// absolute one, one holding a `..` component, or an empty one.
+pub fn check_purge_pattern(pattern: &str) -> Result<(), String> {
+    if pattern.is_empty() || pattern.starts_with('/') || pattern.split('/').any(|part| part == "..")
+    {
+        return Err(format!(
+            "a purge pattern names a path inside the repository; '{pattern}' does not"
+        ));
+    }
+    Ok(())
+}
+
+/// What a run's preparation does to its repositories' trees, read from the
+/// run's input before anything is held (AEGIS ADR-141's Update of
+/// 2026-10-14, R1 and R5).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RunTreePreparation {
+    pub tree_reset: TreeReset,
+    pub purge: Vec<String>,
+    /// `None` when neither the run nor its workflow names test globs: no
+    /// test files are listed.
+    pub test_globs: Option<Vec<String>>,
+}
+
+impl RunTreePreparation {
+    /// Read `tree_reset`, `purge` and `test_globs` from the run's `input`,
+    /// each falling back to the default `input_schema` declares for its key,
+    /// then to `none`, no patterns and no test globs. An unknown
+    /// `tree_reset`, or a pattern naming a path outside the repository, is
+    /// refused with its sentence.
+    pub fn from_input(
+        input: &serde_json::Value,
+        input_schema: Option<&serde_json::Value>,
+    ) -> Result<Self, String> {
+        let value = |key: &str| {
+            input.get(key).cloned().or_else(|| {
+                input_schema
+                    .and_then(|schema| schema.get("properties"))
+                    .and_then(|properties| properties.get(key))
+                    .and_then(|property| property.get("default"))
+                    .cloned()
+            })
+        };
+        let tree_reset = match value(TreeReset::INPUT_KEY) {
+            None | Some(serde_json::Value::Null) => TreeReset::None,
+            Some(serde_json::Value::String(name)) => TreeReset::parse(&name)?,
+            Some(other) => return Err(tree_reset_refusal(&other.to_string())),
+        };
+        let patterns = |key: &str, noun: &str| -> Result<Option<Vec<String>>, String> {
+            let outside = |pattern: &str| {
+                format!("{noun} names a path inside the repository; '{pattern}' does not")
+            };
+            match value(key) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(serde_json::Value::Array(items)) => items
+                    .into_iter()
+                    .map(|item| match item {
+                        serde_json::Value::String(pattern) => check_purge_pattern(&pattern)
+                            .map(|()| pattern.clone())
+                            .map_err(|_| outside(&pattern)),
+                        other => Err(outside(&other.to_string())),
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(Some),
+                Some(other) => Err(outside(&other.to_string())),
+            }
+        };
+        Ok(Self {
+            tree_reset,
+            purge: patterns(PURGE_INPUT_KEY, "a purge pattern")?.unwrap_or_default(),
+            test_globs: patterns(TEST_GLOBS_INPUT_KEY, "a test glob")?,
+        })
+    }
+
+    /// Write this preparation onto a run's entry, replacing whatever it
+    /// carried; `tests` is left to the preparation. Today's step (`none`,
+    /// no patterns, no test globs) leaves the entry as it was before these
+    /// fields existed.
+    pub fn apply_to(&self, entry: &mut RunRepository) {
+        entry.tree_reset = (self.tree_reset != TreeReset::None).then_some(self.tree_reset);
+        entry.purge = (!self.purge.is_empty()).then(|| self.purge.clone());
+        entry.test_globs = self.test_globs.clone();
+        entry.tests = None;
+    }
 }
 
 /// The person a run's commits are authored as: `name <email>` (AEGIS
@@ -586,8 +756,10 @@ fn is_author_part(part: &str) -> bool {
 /// keys are `binding_id` (a UUID), optionally `branch` (a name git accepts
 /// for a branch) and, as the platform stores them, `author` (an object of
 /// exactly `name` and `email`, each fit for a commit, G5d) and `label`,
-/// `ref` and `started_from` (strings, AEGIS ADR-141 F3). Anything else
-/// answers [`REPOSITORIES_SHAPE`].
+/// `ref` and `started_from` (strings, AEGIS ADR-141 F3), `tree_reset` (one
+/// of `hard`, `list` or `none`) and `purge`, `test_globs` and `tests` (lists
+/// of strings, its Update of 2026-10-14). Anything else answers
+/// [`REPOSITORIES_SHAPE`].
 pub fn parse_run_repositories(
     value: &serde_json::Value,
 ) -> Result<Vec<RunRepository>, &'static str> {
@@ -602,7 +774,16 @@ pub fn parse_run_repositories(
         if map.keys().any(|key| {
             !matches!(
                 key.as_str(),
-                "binding_id" | "branch" | "author" | "label" | "ref" | "started_from"
+                "binding_id"
+                    | "branch"
+                    | "author"
+                    | "label"
+                    | "ref"
+                    | "started_from"
+                    | "tree_reset"
+                    | "purge"
+                    | "test_globs"
+                    | "tests"
             )
         }) {
             return Err(REPOSITORIES_SHAPE);
@@ -644,6 +825,18 @@ pub fn parse_run_repositories(
             Some(serde_json::Value::String(value)) => Ok(Some(value.clone())),
             Some(_) => Err(REPOSITORIES_SHAPE),
         };
+        let texts = |key: &str| match map.get(key) {
+            None => Ok(None),
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .map(|item| match item {
+                    serde_json::Value::String(value) => Ok(value.clone()),
+                    _ => Err(REPOSITORIES_SHAPE),
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Some),
+            Some(_) => Err(REPOSITORIES_SHAPE),
+        };
         entries.push(RunRepository {
             binding_id: GitRepoBindingId(binding_id),
             branch,
@@ -651,6 +844,16 @@ pub fn parse_run_repositories(
             label: text("label")?,
             git_ref: text("ref")?,
             started_from: text("started_from")?,
+            tree_reset: match map.get(TreeReset::INPUT_KEY) {
+                None => None,
+                Some(serde_json::Value::String(name)) => {
+                    Some(TreeReset::parse(name).map_err(|_| REPOSITORIES_SHAPE)?)
+                }
+                Some(_) => return Err(REPOSITORIES_SHAPE),
+            },
+            purge: texts(PURGE_INPUT_KEY)?,
+            test_globs: texts(TEST_GLOBS_INPUT_KEY)?,
+            tests: texts("tests")?,
         });
     }
     Ok(entries)

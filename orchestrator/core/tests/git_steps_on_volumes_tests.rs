@@ -19,6 +19,9 @@
 //! | Diff, unstaged and staged | `diff_on_a_seaweedfs_volume_shows_unstaged_and_staged_changes` |
 //! | Diff at the output cap | `diff_on_a_seaweedfs_volume_at_the_output_cap_is_refused` |
 //! | Refresh | `refresh_on_a_seaweedfs_volume_fetches_and_checks_out` |
+//! | A run's tree reset `hard` (ADR-141 R1) | `a_hard_tree_reset_on_a_volume_removes_ignored_and_untracked_paths` |
+//! | A run's tree reset `list` (ADR-141 R1) | `a_list_tree_reset_on_a_volume_removes_what_the_purge_patterns_match` |
+//! | A run's tree reset `none` (ADR-141 R1) | `no_tree_reset_on_a_volume_keeps_ignored_paths` |
 //! | The step's network | `every_git_step_runs_on_the_configured_step_network` |
 //! | The start-up line | `an_absent_step_network_logs_the_start_up_line` |
 //! | The node configuration key | `the_step_network_is_read_from_spec_storage_git` |
@@ -34,14 +37,16 @@ use async_trait::async_trait;
 use aegis_orchestrator_core::application::git_clone_executor::{
     EphemeralCliEngine, EphemeralCliPaths, GitCloneExecutor,
 };
-use aegis_orchestrator_core::application::git_repo_service::{GitRepoError, GitRepoService};
+use aegis_orchestrator_core::application::git_repo_service::{
+    GitRepoError, GitRepoService, PreparedRepository, RunRepositories,
+};
 use aegis_orchestrator_core::application::nfs_gateway::NfsVolumeRegistry;
 use aegis_orchestrator_core::application::user_volume_service::UserVolumeService;
 use aegis_orchestrator_core::application::volume_manager::VolumeService;
 use aegis_orchestrator_core::domain::fsal::{AegisFSAL, EventPublisher};
 use aegis_orchestrator_core::domain::git_repo::{
     CloneStrategy, GitRef, GitRepoBinding, GitRepoBindingId, GitRepoBindingRepository,
-    GitRepoStatus,
+    GitRepoStatus, RunRepository, TreeReset,
 };
 use aegis_orchestrator_core::domain::repository::{RepositoryError, VolumeRepository};
 use aegis_orchestrator_core::domain::runtime::{
@@ -726,6 +731,117 @@ async fn refresh_on_a_seaweedfs_volume_fetches_and_checks_out() {
     // Every step that ran had a configuration; none of them is the old
     // refusal's path.
     assert!(fx.runner.seen.lock().unwrap().len() >= 2);
+}
+
+// ===========================================================================
+// A run's tree reset (AEGIS ADR-141's Update of 2026-10-14, R1 and R5)
+// ===========================================================================
+
+/// Push a commit to the remote's `main` tracking `.gitignore`
+/// (`__pycache__/`), `test/a_test.py`, `src/b.py` and, forced past the
+/// ignore rule, `lib/__pycache__/keep.pyc`; leave in the volume's tree an
+/// ignored `test/__pycache__/x.pyc` and an untracked `test/old.py`, as
+/// earlier runs did; then prepare a run with `tree_reset` and `purge`,
+/// listing tests by `**/test/**`. Answers the prepared entry and what the
+/// preparation did.
+async fn prepared_after_earlier_runs(
+    fx: &Fixture,
+    tree_reset: TreeReset,
+    purge: &[&str],
+) -> (RunRepository, PreparedRepository) {
+    std::fs::write(fx.seed.join(".gitignore"), "__pycache__/\n").unwrap();
+    for (path, body) in [
+        ("test/a_test.py", "def test_a():\n    pass\n"),
+        ("src/b.py", "B = 1\n"),
+        ("lib/__pycache__/keep.pyc", "tracked\n"),
+    ] {
+        let path = fx.seed.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+    git(&fx.seed, &["add", "-f", "."]);
+    git(&fx.seed, &["commit", "-m", "tests and sources"]);
+    git(&fx.seed, &["push", "origin", "main"]);
+    std::fs::create_dir_all(fx.tree().join("test/__pycache__")).unwrap();
+    std::fs::write(fx.tree().join("test/__pycache__/x.pyc"), "compiled\n").unwrap();
+    std::fs::write(fx.tree().join("test/old.py"), "an earlier run's test\n").unwrap();
+
+    let run = uuid::Uuid::new_v4();
+    let entry = RunRepository {
+        binding_id: fx.binding_id,
+        branch: None,
+        author: None,
+        label: None,
+        git_ref: None,
+        started_from: None,
+        tree_reset: Some(tree_reset),
+        purge: Some(purge.iter().map(|p| p.to_string()).collect()),
+        test_globs: Some(vec!["**/test/**".to_string()]),
+        tests: None,
+    };
+    let mut prepared = fx
+        .service
+        .prepare_for_run(&fx.tenant, Some(OWNER), run, &[entry])
+        .await
+        .unwrap_or_else(|e| panic!("the run was not prepared: {e}"));
+    let mut preparations = fx.service.take_prepared(run);
+    assert_eq!(preparations.len(), 1);
+    (prepared.remove(0), preparations.remove(0))
+}
+
+#[tokio::test]
+async fn a_hard_tree_reset_on_a_volume_removes_ignored_and_untracked_paths() {
+    let fx = cloned_fixture().await;
+    let (entry, prepared) = prepared_after_earlier_runs(&fx, TreeReset::Hard, &[]).await;
+    assert!(
+        !fx.tree().join("test/__pycache__/x.pyc").exists(),
+        "an ignored file of an earlier run survived the hard reset"
+    );
+    assert!(!fx.tree().join("test/old.py").exists());
+    assert!(fx.tree().join("lib/__pycache__/keep.pyc").exists());
+    assert_eq!(prepared.tree_reset, TreeReset::Hard);
+    for path in ["test/__pycache__/", "test/old.py"] {
+        assert!(
+            prepared.removed.iter().any(|r| r == path),
+            "removed does not name {path}: {:?}",
+            prepared.removed
+        );
+    }
+    // R5: the tracked files the test globs match, on the entry and the row.
+    assert_eq!(entry.tests, Some(vec!["test/a_test.py".to_string()]));
+    assert_eq!(prepared.tests, entry.tests);
+}
+
+#[tokio::test]
+async fn a_list_tree_reset_on_a_volume_removes_what_the_purge_patterns_match() {
+    let fx = cloned_fixture().await;
+    let (_, prepared) =
+        prepared_after_earlier_runs(&fx, TreeReset::List, &["**/__pycache__/"]).await;
+    assert!(
+        !fx.tree().join("test/__pycache__/x.pyc").exists(),
+        "the purge pattern did not remove the ignored directory"
+    );
+    assert!(!fx.tree().join("test/old.py").exists());
+    assert!(
+        fx.tree().join("lib/__pycache__/keep.pyc").exists(),
+        "a tracked file matching a purge pattern was removed"
+    );
+    assert_eq!(
+        prepared.removed,
+        vec!["test/old.py".to_string(), "test/__pycache__/".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn no_tree_reset_on_a_volume_keeps_ignored_paths() {
+    let fx = cloned_fixture().await;
+    let (_, prepared) = prepared_after_earlier_runs(&fx, TreeReset::None, &[]).await;
+    assert!(
+        fx.tree().join("test/__pycache__/x.pyc").exists(),
+        "today's step removed an ignored file"
+    );
+    assert!(!fx.tree().join("test/old.py").exists());
+    assert!(prepared.removed.is_empty(), "{:?}", prepared.removed);
 }
 
 // ===========================================================================

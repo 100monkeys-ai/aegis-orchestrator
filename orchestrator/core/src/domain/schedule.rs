@@ -706,15 +706,11 @@ fn check_repositories(raw: Option<Value>) -> Result<Option<Value>, String> {
         None | Some(Value::Null) => Ok(None),
         Some(value) => {
             let entries = parse_run_repositories(&value).map_err(str::to_string)?;
-            // The author, label, ref and started_from are the platform's,
-            // written when the run's repositories are prepared (AEGIS
-            // ADR-136 G5d, ADR-141 F3).
-            if entries.iter().any(|entry| {
-                entry.author.is_some()
-                    || entry.label.is_some()
-                    || entry.git_ref.is_some()
-                    || entry.started_from.is_some()
-            }) {
+            // The author, label, ref and started_from, and the tree_reset,
+            // purge, test_globs and tests, are the platform's, written when
+            // the run's repositories are prepared (AEGIS ADR-136 G5d,
+            // ADR-141 F3).
+            if entries.iter().any(|entry| entry.names_a_platform_field()) {
                 return Err(REPOSITORIES_SHAPE.to_string());
             }
             Ok(Some(value))
@@ -1188,6 +1184,7 @@ mod tests {
             ("ref", "main"),
             ("label", "app"),
             ("started_from", "0123456789abcdef0123456789abcdef01234567"),
+            ("tree_reset", "hard"),
         ] {
             let created = Schedule::create(
                 ScheduleDraft {

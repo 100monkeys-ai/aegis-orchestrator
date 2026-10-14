@@ -56,6 +56,23 @@ metadata:
         type: boolean
         default: true
         description: "True (the default) ends the run with the commit on the work branch and nothing pushed; false lands it on the repository's branch after your approval."
+      tree_reset:
+        type: string
+        enum: ["hard", "list", "none"]
+        default: "hard"
+        description: "How the repository's tree is left before the first state: hard (the default) resets it to the commit the run starts from and removes every untracked and ignored path; list removes untracked paths and the ignored paths the purge patterns match; none removes untracked paths that are not ignored."
+      purge:
+        type: array
+        items:
+          type: string
+        default: []
+        description: "With tree_reset list, the glob patterns of untracked or ignored paths to remove, as git's pathspec matches them: a directory is matched as dir/ or dir/**. A tracked file is never removed."
+      test_globs:
+        type: array
+        items:
+          type: string
+        default: ["**/test/**", "**/tests/**", "**/__tests__/**", "**/test_*", "**/*_test.*", "**/*.test.*"]
+        description: "The glob patterns the repository's tracked test files are listed by, for the tester."
     required:
       - task
       - test_command
@@ -188,7 +205,10 @@ spec:
         # The repository
         The repository is at {{repository.path}}, on the work branch {{repository.branch}}. The suite will be run in its root with: {{{input.test_command}}}
 
-        Write the tests that show each acceptance criterion met, in the repository's own test layout and style, under {{repository.path}}. Write tests only: change no implementation file. Against the unchanged tree the new tests fail; say which they are and why each fails.
+        # The test files it tracks
+        {{#if repository.tests}}{{{json repository.tests}}}{{else}}None: it tracks no test file.{{/if}}
+
+        Write the tests that show each acceptance criterion met, in the repository's own test layout and style, under {{repository.path}}. Write tests only: change no implementation file.
       transitions:
         - condition: on_success
           target: CODE

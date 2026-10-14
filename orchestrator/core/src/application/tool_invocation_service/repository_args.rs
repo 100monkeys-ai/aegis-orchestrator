@@ -29,16 +29,12 @@ pub(super) fn parse_repositories(args: &Value) -> Result<Option<Value>, SealSess
     };
     let entries = parse_requested_repositories(raw)
         .map_err(|sentence| SealSessionError::InvalidArguments(sentence.to_string()))?;
-    // A binding entry's author, label, ref and started_from are the
-    // platform's, written when the run's repositories are prepared: a
-    // caller never names one (AEGIS ADR-136 G5d, ADR-141 F3).
+    // A binding entry's author, label, ref and started_from, and its
+    // tree_reset, purge, test_globs and tests, are the platform's, written
+    // when the run's repositories are prepared: a caller never names one
+    // (AEGIS ADR-136 G5d, ADR-141 F3).
     if entries.iter().any(|entry| match entry {
-        RequestedRepository::Binding(entry) => {
-            entry.author.is_some()
-                || entry.label.is_some()
-                || entry.git_ref.is_some()
-                || entry.started_from.is_some()
-        }
+        RequestedRepository::Binding(entry) => entry.names_a_platform_field(),
         RequestedRepository::Url(_) => false,
     }) {
         return Err(SealSessionError::InvalidArguments(
@@ -130,6 +126,7 @@ mod tests {
             json!({ "repositories": [{ "binding_id": BINDING, "branch": 7 }] }),
             json!({ "repositories": [{ "binding_id": BINDING, "branch": "a..b" }] }),
             json!({ "repositories": [{ "binding_id": BINDING, "ref": "main" }] }),
+            json!({ "repositories": [{ "binding_id": BINDING, "tree_reset": "hard" }] }),
             json!({ "repositories": [{ "binding_id": BINDING, "url": "https://github.com/o/r.git" }] }),
             json!({ "repositories": [{}] }),
             json!({ "repositories": null }),
