@@ -83,6 +83,7 @@ spec:
   tools:
     - fs.read
     - fs.list
+    - fs.search
     - fs.grep
     - fs.glob
     - fs.write

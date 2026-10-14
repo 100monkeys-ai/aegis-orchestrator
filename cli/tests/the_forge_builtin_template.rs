@@ -38,7 +38,7 @@ const FORGE_AGENTS: [&str; 7] = [
 
 /// The reading `fs.*` tools (`infrastructure/tool_router.rs`, the builtin
 /// definitions marked `skip_judge`).
-const READING_FS: [&str; 4] = ["fs.read", "fs.list", "fs.grep", "fs.glob"];
+const READING_FS: [&str; 5] = ["fs.read", "fs.list", "fs.search", "fs.grep", "fs.glob"];
 
 /// The writing `fs.*` tools (`domain/tool_requirement.rs` `WRITING_FS_TOOLS`).
 const WRITING_FS: [&str; 5] = [
@@ -570,7 +570,7 @@ fn the_forges_states_are_f4s_table() {
 }
 
 /// F10: the five that only read list the reading `fs.*` tools and the two git
-/// reading tools; `tester-agent` and `coder-agent` add the writing `fs.*`
+/// reading tools, `fs.search` immediately before `fs.grep`; `tester-agent` and `coder-agent` add the writing `fs.*`
 /// tools and `cmd.run`; none lists a git write tool; each is validated by the
 /// built-in `code-quality-judge`; each judge answers `{score, confidence,
 /// reasoning, suggestions}`.
@@ -598,6 +598,13 @@ fn the_forges_agents_carry_f10s_tools() {
             }
         };
         let mut tools: Vec<&str> = manifest.spec.tools.iter().map(String::as_str).collect();
+        let search_at = tools.iter().position(|t| *t == "fs.search");
+        let grep_at = tools.iter().position(|t| *t == "fs.grep");
+        if search_at.is_none() || search_at.map(|i| i + 1) != grep_at {
+            complaints.push(format!(
+                "{name} does not list fs.search immediately before fs.grep: {tools:?}"
+            ));
+        }
         tools.sort_unstable();
         let expected = if matches!(name, "tester-agent" | "coder-agent") {
             &writer

@@ -30,8 +30,8 @@ spec:
 
       1. Read the repository before you write a word: list its layout with
          fs.list and fs.glob, read the files the task touches and their tests
-         with fs.read and fs.grep, and see the working tree with
-         aegis.git.status.
+         with fs.read, fs.search, which finds where something is, and fs.grep,
+         and see the working tree with aegis.git.status.
       2. Answer with:
          - the functional requirements, numbered, each one atomic;
          - the non-functional requirements (performance, security,
@@ -86,6 +86,7 @@ spec:
   tools:
     - fs.read
     - fs.list
+    - fs.search
     - fs.grep
     - fs.glob
     - aegis.git.status
