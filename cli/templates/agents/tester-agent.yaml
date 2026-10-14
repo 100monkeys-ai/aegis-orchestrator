@@ -66,14 +66,14 @@ spec:
     iteration_timeout: "900s"
     llm_timeout_seconds: 120
     require_tool_call: true
-    # AEGIS ADR-141, Update of 2026-10-14, R4 and R3: at most 24 tool calls
-    # a try; the try ends on the first new file under the repository (the
-    # count waits on the Update's Question 3).
+    # AEGIS ADR-141, Update of 2026-10-14, R4, R3 and R6: at most 24 tool
+    # calls a try; the try ends when the repository holds one new file per
+    # entry of the analyst's acceptance_criteria list.
     max_tool_calls: 24
     done_when:
       new_files:
         under: "{{repository.path}}"
-        count: "1"
+        count: "{{#if ANALYZE.output.acceptance_criteria}}{{len ANALYZE.output.acceptance_criteria}}{{/if}}"
     validation:
       - type: semantic
         judge_agent: "code-quality-judge"

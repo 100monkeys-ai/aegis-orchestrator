@@ -850,11 +850,11 @@ input names, and the list of test files the repository tracks.
    path and its content.
 "#;
 
-/// AEGIS ADR-141, Update of 2026-10-14, R5 (the tester's half), R3 and R4:
-/// the tester's instruction is the Update's text whole; its try ends by
-/// `done_when` on one new file under the repository (the count waits on the
-/// Update's Question 3), within a budget of 24 tool calls; its judge's
-/// criteria end naming each test file and its criterion.
+/// AEGIS ADR-141, Update of 2026-10-14, R5 (the tester's half), R3, R4 and
+/// R6: the tester's instruction is the Update's text whole; its try ends by
+/// `done_when` when the repository holds as many new files as the analyst's
+/// `acceptance_criteria` list has entries, within a budget of 24 tool calls;
+/// its judge's criteria end naming each test file and its criterion.
 #[test]
 fn the_testers_instruction_budget_and_done_when_are_the_updates() {
     use aegis_orchestrator_core::domain::agent::{DoneWhen, NewFilesDone};
@@ -882,7 +882,7 @@ fn the_testers_instruction_budget_and_done_when_are_the_updates() {
     let expected = DoneWhen {
         new_files: NewFilesDone {
             under: "{{repository.path}}".to_string(),
-            count: "1".to_string(),
+            count: TESTER_COUNT.to_string(),
         },
     };
     if execution.done_when.as_ref() != Some(&expected) {
@@ -902,6 +902,143 @@ fn the_testers_instruction_budget_and_done_when_are_the_updates() {
         .ends_with("The answer names each test file and the criterion each test shows.")
     {
         complaints.push(format!("the judge's criteria are {criteria:?}"));
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// The tester's `done_when.new_files.count` (R6): the number of entries in the
+/// analyst's `acceptance_criteria` list on the blackboard, through the
+/// template engine's `len` helper; empty, so the try ends as without
+/// `done_when`, when the list is absent or empty.
+const TESTER_COUNT: &str =
+    "{{#if ANALYZE.output.acceptance_criteria}}{{len ANALYZE.output.acceptance_criteria}}{{/if}}";
+
+/// An analyst's answer in the shape R6 gives it: the requirements' prose and
+/// the acceptance criteria as a list, one sentence each.
+const ANALYST_ANSWER: &str = r#"{"requirements": "Functional requirements:\n1. README.md is not empty.\n\nNon-functional requirements:\n1. No file but README.md changes.", "acceptance_criteria": ["README.md has a size greater than zero.", "README.md ends with a newline."]}"#;
+
+/// AEGIS ADR-141, Update of 2026-10-14, R6 (the ruling on its Question 3):
+/// the analyst answers one JSON object whose `acceptance_criteria` is a list
+/// of strings, declared as a `json_schema` step that runs before its judge;
+/// through the orchestrator's own output validator that shape takes a list of
+/// strings and refuses prose in that field, and the tester's count template
+/// renders the list's length from the blackboard the worker writes.
+#[tokio::test]
+async fn the_analysts_acceptance_criteria_are_a_list_the_testers_count_reads() {
+    use aegis_orchestrator_core::domain::validation::{
+        GradientValidator, OutputGradientValidator, ValidationContext,
+    };
+    use aegis_orchestrator_core::infrastructure::prompt_template_engine::{
+        PromptContext, PromptTemplateEngine,
+    };
+    let yaml = listed(BUILTIN_AGENTS, "requirements-analyst")
+        .expect("requirements-analyst is in BUILTIN_AGENTS");
+    let manifest = AgentManifestParser::parse_yaml(yaml)
+        .unwrap_or_else(|e| panic!("the orchestrator's parser refuses requirements-analyst: {e}"));
+    let validation = manifest
+        .spec
+        .execution
+        .clone()
+        .expect("requirements-analyst declares spec.execution")
+        .validation
+        .unwrap_or_default();
+    let Some(ValidatorSpec::JsonSchema { schema, min_score }) = validation.first().cloned() else {
+        panic!("requirements-analyst's first validation step is no json_schema: {validation:?}");
+    };
+    let mut complaints = Vec::new();
+    if min_score != 1.0 {
+        complaints.push(format!("the shape's min_score is {min_score}"));
+    }
+    if !matches!(validation.get(1), Some(ValidatorSpec::Semantic { .. })) {
+        complaints.push(format!(
+            "the judge does not follow the shape: {validation:?}"
+        ));
+    }
+    let criteria = &schema["properties"]["acceptance_criteria"];
+    if criteria["type"] != "array" || criteria["items"]["type"] != "string" {
+        complaints.push(format!("acceptance_criteria is declared {criteria}"));
+    }
+
+    let shape = OutputGradientValidator::new("json".to_string(), Some(schema.clone()), None);
+    let score = |answer: &str| {
+        let context = ValidationContext {
+            task: "README.md must not be empty".to_string(),
+            output: answer.to_string(),
+            exit_code: 0,
+            stderr: String::new(),
+            worker_mounts: Vec::new(),
+            policy_violations: Vec::new(),
+            tool_trajectory: Vec::new(),
+        };
+        let shape = &shape;
+        async move { shape.validate(&context).await.map(|r| r.score) }
+    };
+    let fenced = format!("```json\n{ANALYST_ANSWER}\n```");
+    for (answer, expected) in [
+        (ANALYST_ANSWER, 1.0),
+        (fenced.as_str(), 1.0),
+        (
+            r#"{"requirements": "1. README.md is not empty.", "acceptance_criteria": "1. README.md has a size greater than zero.\n2. README.md ends with a newline."}"#,
+            0.0,
+        ),
+        (
+            r#"{"requirements": "1. README.md is not empty.", "acceptance_criteria": [1, 2]}"#,
+            0.0,
+        ),
+        (
+            r#"{"requirements": "1. README.md is not empty.", "acceptance_criteria": []}"#,
+            0.0,
+        ),
+        (
+            "Acceptance Criteria:\n1. README.md has a size greater than zero.",
+            0.0,
+        ),
+    ] {
+        match score(answer).await {
+            Ok(s) if s == expected => {}
+            other => complaints.push(format!(
+                "the shape scores {answer:?} {other:?}, not {expected}"
+            )),
+        }
+    }
+
+    let tester = AgentManifestParser::parse_yaml(
+        listed(BUILTIN_AGENTS, "tester-agent").expect("tester-agent is in BUILTIN_AGENTS"),
+    )
+    .unwrap_or_else(|e| panic!("the orchestrator's parser refuses tester-agent: {e}"));
+    let count = tester
+        .spec
+        .execution
+        .and_then(|execution| execution.done_when)
+        .map(|done_when| done_when.new_files.count)
+        .unwrap_or_default();
+    if count != TESTER_COUNT {
+        complaints.push(format!("the tester's count is {count:?}"));
+    }
+    // The worker stores a JSON answer parsed, as `ANALYZE.output`, and sends
+    // the blackboard as the tester's `context_overrides`, which `done_when`
+    // is rendered against by the same template engine.
+    let engine = PromptTemplateEngine::new();
+    let answer: serde_json::Value =
+        serde_json::from_str(ANALYST_ANSWER).expect("the answer is JSON");
+    for (analyze, expected) in [
+        (serde_json::json!({ "output": answer }), "2"),
+        (
+            serde_json::json!({ "output": "1. README.md is not empty." }),
+            "",
+        ),
+        (
+            serde_json::json!({ "output": { "acceptance_criteria": [] } }),
+            "",
+        ),
+    ] {
+        let context = PromptContext::new().extra("ANALYZE", analyze.clone());
+        match engine.render(&count, &context) {
+            Ok(rendered) if rendered == expected => {}
+            other => complaints.push(format!(
+                "the count renders {other:?} against ANALYZE {analyze}, not {expected:?}"
+            )),
+        }
     }
     assert!(complaints.is_empty(), "{}", complaints.join("\n"));
 }

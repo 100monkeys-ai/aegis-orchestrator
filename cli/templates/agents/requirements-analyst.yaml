@@ -40,6 +40,9 @@ spec:
            the repository's own test layout;
          - the edge cases and the failure modes the change must handle;
          - every ambiguity in the task, with the reading you chose.
+      The answer is one JSON object and nothing else: "acceptance_criteria",
+      a list of strings, each one criterion in one sentence, and
+      "requirements", a string holding everything else above.
       Name files by their paths in the repository. Be thorough and concise.
     prompt_template: |
       {{instruction}}
@@ -52,6 +55,23 @@ spec:
     llm_timeout_seconds: 300
     require_tool_call: true
     validation:
+      # AEGIS ADR-141, Update of 2026-10-14, R6: the answer's shape, checked
+      # before the judge; the tester's done_when counts acceptance_criteria.
+      - type: json_schema
+        schema:
+          type: object
+          required: [requirements, acceptance_criteria]
+          additionalProperties: false
+          properties:
+            requirements:
+              type: string
+              minLength: 1
+            acceptance_criteria:
+              type: array
+              minItems: 1
+              items:
+                type: string
+                minLength: 1
       - type: semantic
         judge_agent: "code-quality-judge"
         criteria: |
