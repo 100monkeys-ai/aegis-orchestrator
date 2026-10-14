@@ -1719,7 +1719,7 @@ const REFINEMENT_AFTER_120_5_S: &str = "Your previous answer exceeded the model 
      the computed result in your text.";
 
 /// The header paragraph of the previous-tries section, as it ends.
-const SECTION_HEADER_END: &str = "do not repeat what failed in the same way.\n\n";
+const SECTION_HEADER_END: &str = "Each result is shown as the model saw it then.\n\n";
 
 /// The reproduction of execution eea195cd: the provider ends try 1's model
 /// call at its time limit; the next try is not sent the same request with
@@ -2475,7 +2475,8 @@ async fn the_try_after_an_exhausted_one_opens_from_a_constructed_history() {
 
 /// R2, a guard: a try that ended another way (here its model call failed)
 /// keeps today's opening for the next try, the replay of what it did, and
-/// is not recorded exhausted.
+/// is not recorded exhausted; the replay carries no imperative sentence
+/// (correction C2, the Update's Question 4).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_try_after_one_that_failed_otherwise_keeps_the_replay() {
     let w = world(
@@ -2495,6 +2496,13 @@ async fn the_try_after_one_that_failed_otherwise_keeps_the_replay() {
     let told = first_user_message(&w.model.conversation(2));
     if !told.contains("What the previous tries did") || told.contains("# This task so far") {
         complaints.push(format!("try 2 was told {told:?}"));
+    }
+    // Correction C2 (Question 4): the replay carries facts only, no
+    // imperative sentence.
+    if told.contains("Build on what worked") || told.contains("do not repeat what failed") {
+        complaints.push(format!(
+            "the replay carries the imperative sentence: {told:?}"
+        ));
     }
     if w.records.get(w.execution_id).iterations[0]
         .exhausted

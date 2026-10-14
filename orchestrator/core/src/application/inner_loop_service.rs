@@ -2499,8 +2499,7 @@ pub(crate) fn previous_tries_section(
     let left_out = parts.len() - kept.len();
     let mut section = String::from(
         "# What the previous tries did\n\nThe orchestrator kept each step of the earlier tries \
-         of this task. Each result is shown as the model saw it then. Build on what worked and \
-         do not repeat what failed in the same way.\n\n",
+         of this task. Each result is shown as the model saw it then.\n\n",
     );
     // The refinement the latest earlier try left (its `code_changes`), as
     // its own paragraph before the tries, where no cut reaches it.
