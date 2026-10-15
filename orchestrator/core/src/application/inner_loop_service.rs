@@ -512,6 +512,60 @@ fn is_under(path: &str, under: &str) -> bool {
     path == under || path.starts_with(&format!("{under}/"))
 }
 
+/// The files this execution wrote: each path a tool of any of its tries
+/// (`earlier`, then this try's `current`) created or changed, by `fs.write`,
+/// `fs.edit` or `fs.multi_edit`, in the order each was first written, not
+/// deleted since.
+fn files_written(earlier: &[Iteration], current: &[TrajectoryStep]) -> Vec<String> {
+    let mut written: Vec<String> = Vec::new();
+    let steps = earlier
+        .iter()
+        .flat_map(|i| i.trajectory.as_deref().unwrap_or_default())
+        .chain(current.iter());
+    for step in steps.filter(|s| s.status == "succeeded") {
+        let Some(path) = serde_json::from_str::<Value>(&step.arguments_json)
+            .ok()
+            .and_then(|a| a["path"].as_str().map(str::to_string))
+        else {
+            continue;
+        };
+        match step.tool_name.as_str() {
+            "fs.write" | "fs.edit" | "fs.multi_edit" => {
+                if !written.contains(&path) {
+                    written.push(path);
+                }
+            }
+            "fs.delete" => {
+                let under = format!("{}/", path.trim_end_matches('/'));
+                written.retain(|kept| *kept != path && !kept.starts_with(&under));
+            }
+            _ => {}
+        }
+    }
+    written
+}
+
+/// The answer of a try that wrote no file, written by the loop.
+const NO_FILE_WRITTEN: &str = "No file was written or changed in this try.";
+
+/// The answer the loop writes from a try's facts, in one fixed form (AEGIS
+/// ADR-141, Update of 2026-10-14, R3, and Update of 2026-10-15
+/// `try-end-answers-from-facts`): "Files written:" then each file's path,
+/// bytes and content; or, with no file, [`NO_FILE_WRITTEN`].
+fn facts_answer(files: &[(String, u64, String)]) -> String {
+    if files.is_empty() {
+        return NO_FILE_WRITTEN.to_string();
+    }
+    format!(
+        "Files written:\n{}",
+        files
+            .iter()
+            .map(|(path, bytes, content)| format!("{path} ({bytes} bytes)\n```\n{content}\n```"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
 /// A dispatched command: the timeout the model asked for, the one it was
 /// given, and its output cap.
 #[derive(Debug, Clone)]
@@ -1284,67 +1338,98 @@ impl InnerLoopService {
                             }
                         };
                         match not_run {
+                            // The call budget's and the deadline's end of a
+                            // try: the call is not run, the try is recorded
+                            // exhausted by its end (R2), and the loop answers
+                            // from the try's facts (AEGIS ADR-141, Update of
+                            // 2026-10-15, `try-end-answers-from-facts`).
                             Some(CallNotRun::PastTheBudget(budget)) => {
                                 let sentence = past_the_budget_sentence(&tool_call.name, budget);
-                                if let Some(mut ended_ctx) = self
+                                let mut ended_ctx = self
                                     .active_executions
                                     .write()
                                     .await
                                     .remove(execution_id_str)
-                                {
-                                    let call_index = ended_ctx.trajectory.len();
-                                    let mut step = step;
-                                    step.status = "refused".to_string();
-                                    step.error = Some(sentence.clone());
-                                    ended_ctx.trajectory.push(step);
-                                    self.publish_dispatch(
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "execution context for '{execution_id_str}' not found in active_executions"
+                                        )
+                                    })?;
+                                let call_index = ended_ctx.trajectory.len();
+                                let mut step = step;
+                                step.status = "refused".to_string();
+                                step.error = Some(sentence.clone());
+                                ended_ctx.trajectory.push(step);
+                                self.publish_dispatch(
+                                    execution_id_str,
+                                    &ended_ctx,
+                                    call_index,
+                                    &tool_call,
+                                    "refused",
+                                    Some(sentence.clone()),
+                                    Some(RefusalLayer::CallBudget),
+                                    None,
+                                )
+                                .await;
+                                self.persist_trajectory(execution_id_str, &ended_ctx).await;
+                                self.record_exhausted(
+                                    execution_id_str,
+                                    ended_ctx.iteration_number,
+                                    ExhaustedBy::CallBudget,
+                                )
+                                .await;
+                                return Ok(self
+                                    .loop_end_answer(
                                         execution_id_str,
-                                        &ended_ctx,
-                                        call_index,
-                                        &tool_call,
-                                        "refused",
-                                        Some(sentence.clone()),
-                                        Some(RefusalLayer::CallBudget),
-                                        None,
+                                        &mut ended_ctx,
+                                        &tool_call.id,
+                                        &sentence,
                                     )
-                                    .await;
-                                    self.persist_trajectory(execution_id_str, &ended_ctx).await;
-                                    self.record_exhausted(
-                                        execution_id_str,
-                                        ended_ctx.iteration_number,
-                                        ExhaustedBy::CallBudget,
-                                    )
-                                    .await;
-                                }
-                                anyhow::bail!(sentence);
+                                    .await);
                             }
                             Some(CallNotRun::PastDeadline) => {
                                 let sentence = past_deadline_sentence(&tool_call.name);
-                                if let Some(mut ended_ctx) = self
+                                let mut ended_ctx = self
                                     .active_executions
                                     .write()
                                     .await
                                     .remove(execution_id_str)
-                                {
-                                    let call_index = ended_ctx.trajectory.len();
-                                    let mut step = step;
-                                    step.status = "refused".to_string();
-                                    step.error = Some(sentence.clone());
-                                    ended_ctx.trajectory.push(step);
-                                    self.publish_dispatch(
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "execution context for '{execution_id_str}' not found in active_executions"
+                                        )
+                                    })?;
+                                let call_index = ended_ctx.trajectory.len();
+                                let mut step = step;
+                                step.status = "refused".to_string();
+                                step.error = Some(sentence.clone());
+                                ended_ctx.trajectory.push(step);
+                                self.publish_dispatch(
+                                    execution_id_str,
+                                    &ended_ctx,
+                                    call_index,
+                                    &tool_call,
+                                    "refused",
+                                    Some(sentence.clone()),
+                                    Some(RefusalLayer::Deadline),
+                                    None,
+                                )
+                                .await;
+                                self.persist_trajectory(execution_id_str, &ended_ctx).await;
+                                self.record_exhausted(
+                                    execution_id_str,
+                                    ended_ctx.iteration_number,
+                                    ExhaustedBy::Clock,
+                                )
+                                .await;
+                                return Ok(self
+                                    .loop_end_answer(
                                         execution_id_str,
-                                        &ended_ctx,
-                                        call_index,
-                                        &tool_call,
-                                        "refused",
-                                        Some(sentence.clone()),
-                                        Some(RefusalLayer::Deadline),
-                                        None,
+                                        &mut ended_ctx,
+                                        &tool_call.id,
+                                        &sentence,
                                     )
-                                    .await;
-                                    self.persist_trajectory(execution_id_str, &ended_ctx).await;
-                                }
-                                anyhow::bail!(sentence);
+                                    .await);
                             }
                             Some(CallNotRun::Repeated(runs)) => {
                                 let sentence = repeated_call_sentence(runs);
@@ -1516,9 +1601,12 @@ impl InnerLoopService {
                                     Err(refusal) => {
                                         // AEGIS ADR-141, Update of 2026-10-14,
                                         // Question 2's default (U37's
-                                        // amendment of 2026-10-13 reversed):
-                                        // the try clock's refusal ends the
-                                        // try, exhausted, with its sentence.
+                                        // amendment of 2026-10-13 reversed),
+                                        // as the Update of 2026-10-15
+                                        // (`try-end-answers-from-facts`)
+                                        // amends it: the try clock's refusal
+                                        // ends the try, exhausted, and the
+                                        // loop answers from the try's facts.
                                         let call_index = next_ctx.trajectory.len();
                                         let mut step = step;
                                         step.status = "refused".to_string();
@@ -1543,7 +1631,14 @@ impl InnerLoopService {
                                             ExhaustedBy::TryClock,
                                         )
                                         .await;
-                                        anyhow::bail!(refusal);
+                                        return Ok(self
+                                            .loop_end_answer(
+                                                execution_id_str,
+                                                &mut next_ctx,
+                                                &tool_call.id,
+                                                &refusal,
+                                            )
+                                            .await);
                                     }
                                 };
 
@@ -1754,18 +1849,9 @@ impl InnerLoopService {
     ) -> Option<OrchestratorMessage> {
         let done = ctx.done_when.clone()?;
         let execution_id = ExecutionId(uuid::Uuid::parse_str(execution_id_str).ok()?);
-        let earlier: Vec<Iteration> = match self
-            .execution_service
-            .get_execution_unscoped(execution_id)
-            .await
-        {
-            Ok(e) => e
-                .iterations
-                .into_iter()
-                .filter(|i| i.number < ctx.iteration_number)
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+        let earlier = self
+            .earlier_iterations(execution_id, ctx.iteration_number)
+            .await;
         let candidates: Vec<String> = files_created(&earlier, &ctx.trajectory)
             .into_iter()
             .filter(|path| is_under(path, &done.under))
@@ -1773,8 +1859,62 @@ impl InnerLoopService {
         if candidates.len() < done.count {
             return None;
         }
+        let files = self.read_files(ctx, execution_id, candidates).await;
+        if files.len() < done.count {
+            return None;
+        }
+        let answer = facts_answer(&files);
+        tracing::debug!(
+            execution_id = %execution_id_str,
+            files = files.len(),
+            "done_when holds: the try ends with the files written"
+        );
+        ctx.conversation.push(ConversationMessage {
+            role: "assistant".to_string(),
+            content: answer.clone(),
+            tool_call_id: None,
+            tool_calls: None,
+        });
+        self.persist_trajectory(execution_id_str, ctx).await;
+        Some(OrchestratorMessage::Final {
+            content: answer,
+            tool_calls_executed: ctx.iterations as u32,
+            conversation: ctx.conversation.clone(),
+            trajectory: ctx.trajectory.clone(),
+        })
+    }
+
+    /// The execution's tries before try `iteration_number`, as the record
+    /// keeps them; none when the record is not read.
+    async fn earlier_iterations(
+        &self,
+        execution_id: ExecutionId,
+        iteration_number: u8,
+    ) -> Vec<Iteration> {
+        match self
+            .execution_service
+            .get_execution_unscoped(execution_id)
+            .await
+        {
+            Ok(e) => e
+                .iterations
+                .into_iter()
+                .filter(|i| i.number < iteration_number)
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Each of `paths` as it is now, read through the tools' own path: its
+    /// path, bytes and content. A file that cannot be read is left out.
+    async fn read_files(
+        &self,
+        ctx: &ExecutionContext,
+        execution_id: ExecutionId,
+        paths: Vec<String>,
+    ) -> Vec<(String, u64, String)> {
         let mut files: Vec<(String, u64, String)> = Vec::new();
-        for path in candidates {
+        for path in paths {
             let read = self
                 .constructed_call(
                     ctx.agent_id,
@@ -1794,24 +1934,49 @@ impl InnerLoopService {
                 ));
             }
         }
-        if files.len() < done.count {
-            return None;
-        }
-        let answer = format!(
-            "Files written:\n{}",
-            files
-                .iter()
-                .map(|(path, bytes, content)| format!(
-                    "{path} ({bytes} bytes)\n```\n{content}\n```"
-                ))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-        tracing::debug!(
+        files
+    }
+
+    /// When the try clock, the call budget or the deadline ends a try (AEGIS
+    /// ADR-141, Update of 2026-10-15, `try-end-answers-from-facts`), the
+    /// try's end: the answer the loop writes itself from the try's facts, in
+    /// R3's form, each file the execution created or changed with its bytes
+    /// and content, or that no file was written. It goes back to the agent's
+    /// container as any answer does, so the container ends normally and the
+    /// answer goes to the agent's validation judge. The refusal's sentence,
+    /// already on the refused step and its event, is the tool result of the
+    /// call it refused and is logged here.
+    async fn loop_end_answer(
+        &self,
+        execution_id_str: &str,
+        ctx: &mut ExecutionContext,
+        tool_call_id: &str,
+        sentence: &str,
+    ) -> OrchestratorMessage {
+        tracing::info!(
             execution_id = %execution_id_str,
-            files = files.len(),
-            "done_when holds: the try ends with the files written"
+            iteration = ctx.iteration_number,
+            sentence = %sentence,
+            "The loop ended the try: it answers from the try's facts"
         );
+        let files = match uuid::Uuid::parse_str(execution_id_str) {
+            Ok(id) => {
+                let execution_id = ExecutionId(id);
+                let earlier = self
+                    .earlier_iterations(execution_id, ctx.iteration_number)
+                    .await;
+                let paths = files_written(&earlier, &ctx.trajectory);
+                self.read_files(ctx, execution_id, paths).await
+            }
+            Err(_) => Vec::new(),
+        };
+        let answer = facts_answer(&files);
+        ctx.conversation.push(ConversationMessage {
+            role: "tool".to_string(),
+            content: sentence.to_string(),
+            tool_call_id: Some(tool_call_id.to_string()),
+            tool_calls: None,
+        });
         ctx.conversation.push(ConversationMessage {
             role: "assistant".to_string(),
             content: answer.clone(),
@@ -1819,12 +1984,12 @@ impl InnerLoopService {
             tool_calls: None,
         });
         self.persist_trajectory(execution_id_str, ctx).await;
-        Some(OrchestratorMessage::Final {
+        OrchestratorMessage::Final {
             content: answer,
             tool_calls_executed: ctx.iterations as u32,
             conversation: ctx.conversation.clone(),
             trajectory: ctx.trajectory.clone(),
-        })
+        }
     }
 
     /// The constructed turns of an opening after an exhausted try (R2): an
@@ -1942,10 +2107,11 @@ impl InnerLoopService {
         }
     }
 
-    /// Record on the iteration that its call budget or the try clock ended
-    /// it (AEGIS ADR-141, Update of 2026-10-14, R2), with the history the
-    /// next try is opened from, built from the record as it stands, the
-    /// try's trajectory stored, before the gateway answers and the try fails.
+    /// Record on the iteration that its call budget, the try clock or its
+    /// deadline ended it (AEGIS ADR-141, Update of 2026-10-14, R2), with the
+    /// history the next try is opened from, built from the record as it
+    /// stands, the try's trajectory stored, before the loop answers from the
+    /// try's facts.
     async fn record_exhausted(&self, execution_id_str: &str, iteration: u8, by: ExhaustedBy) {
         let Ok(id) = uuid::Uuid::parse_str(execution_id_str) else {
             return;

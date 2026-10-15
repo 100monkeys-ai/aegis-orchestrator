@@ -119,10 +119,11 @@ pub(crate) async fn dispatch_gateway_handler(
         Err(_) => tracing::info!(outcome = "error", elapsed_ms, "dispatch_gateway returning"),
     }
 
-    match result {
+    // What the call leaves on the record: the final interaction and the
+    // try's trajectory, or the typed model-call failure's event.
+    match &result {
         Ok(OrchestratorMessage::Final {
             content,
-            tool_calls_executed,
             trajectory,
             ..
         }) => {
@@ -158,48 +159,23 @@ pub(crate) async fn dispatch_gateway_handler(
                             .store_iteration_trajectory(
                                 aegis_orchestrator_core::domain::execution::ExecutionId(exec_id),
                                 iteration_number,
-                                trajectory,
+                                trajectory.clone(),
                             )
                             .await;
                     }
                 }
             }
-
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "content": content,
-                    "tool_calls_executed": tool_calls_executed,
-                })),
-            )
         }
-        Ok(OrchestratorMessage::Dispatch {
-            dispatch_id,
-            action,
-        }) => {
-            // Respond with the dispatch action so bootstrap.py can execute it
-            (
-                StatusCode::OK,
-                Json(
-                    serde_json::to_value(OrchestratorMessage::Dispatch {
-                        dispatch_id,
-                        action,
-                    })
-                    .unwrap_or_else(
-                        |_| serde_json::json!({"error": "dispatch serialization failed"}),
-                    ),
-                ),
-            )
-        }
+        Ok(OrchestratorMessage::Dispatch { .. }) => {}
         Err(e) => {
             tracing::error!("Inner loop generation failed: {}", e);
 
             // If the underlying error is a typed `LLMError`, surface its
-            // class as both the HTTP status (so bootstrap.py / SDK callers
-            // can react) and a structured `LlmCallFailed` execution event
-            // (so parent agents reading the execution stream see the
-            // upstream failure class without parsing strings).
-            if let Some(failure) = llm_call_failure_parts(&e) {
+            // class as a structured `LlmCallFailed` execution event (so
+            // parent agents reading the execution stream see the upstream
+            // failure class without parsing strings); `gateway_answer`
+            // surfaces it as the HTTP status.
+            if let Some(failure) = llm_call_failure_parts(e) {
                 let llm_err = failure.error;
                 if agent_id.0 != Uuid::nil() {
                     if let (Some(exec_id), Some(model_alias)) = (exec_id_opt, model_opt.as_ref()) {
@@ -226,26 +202,62 @@ pub(crate) async fn dispatch_gateway_handler(
                         state.event_bus.publish_execution_event(event);
                     }
                 }
-
-                let (status, tag) = llm_error_to_status(llm_err);
-                return (
-                    status,
-                    Json(serde_json::json!({
-                        "error": format!("{tag}: {}", failure.sentence)
-                    })),
-                );
             }
-
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
         }
     }
+
+    let (status, body) = gateway_answer(&result);
+    (status, Json(body))
 
     }
     .instrument(span)
     .await
+}
+
+/// The gateway's answer to the agent's bootstrap for the inner loop's
+/// result: a final answer, including one the loop wrote itself when it ended
+/// the try (AEGIS ADR-141, Update of 2026-10-15,
+/// `try-end-answers-from-facts`), is 200 with its content; a dispatch is 200
+/// with the action; a typed model-call failure carries its class as the
+/// status; any other error is 500.
+fn gateway_answer(
+    result: &anyhow::Result<aegis_orchestrator_core::domain::dispatch::OrchestratorMessage>,
+) -> (StatusCode, serde_json::Value) {
+    use aegis_orchestrator_core::domain::dispatch::OrchestratorMessage;
+    match result {
+        Ok(OrchestratorMessage::Final {
+            content,
+            tool_calls_executed,
+            ..
+        }) => (
+            StatusCode::OK,
+            serde_json::json!({
+                "content": content,
+                "tool_calls_executed": tool_calls_executed,
+            }),
+        ),
+        // Respond with the dispatch action so bootstrap.py can execute it
+        Ok(dispatch @ OrchestratorMessage::Dispatch { .. }) => (
+            StatusCode::OK,
+            serde_json::to_value(dispatch)
+                .unwrap_or_else(|_| serde_json::json!({"error": "dispatch serialization failed"})),
+        ),
+        Err(e) => match llm_call_failure_parts(e) {
+            Some(failure) => {
+                let (status, tag) = llm_error_to_status(failure.error);
+                (
+                    status,
+                    serde_json::json!({
+                        "error": format!("{tag}: {}", failure.sentence)
+                    }),
+                )
+            }
+            None => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"error": e.to_string()}),
+            ),
+        },
+    }
 }
 
 /// What the gateway reports of a failed model call: the typed error (its raw
@@ -492,6 +504,38 @@ mod tests {
         assert_eq!(
             parts.sentence,
             "Network error: model call on alias 'smart' gave no answer within the agent's llm_timeout_seconds (120 s)"
+        );
+    }
+
+    /// AEGIS ADR-141, Update of 2026-10-15 (`try-end-answers-from-facts`),
+    /// clause 2, a guard: the answer the inner loop writes when it ends a try
+    /// is a final answer, and the gateway answers it 200 with its content,
+    /// never 500; an untyped error, the form that end took before, is 500.
+    #[test]
+    fn a_loop_ended_try_answers_200_with_its_content() {
+        use aegis_orchestrator_core::domain::dispatch::OrchestratorMessage;
+        let ended: anyhow::Result<OrchestratorMessage> = Ok(OrchestratorMessage::Final {
+            content: "No file was written or changed in this try.".to_string(),
+            tool_calls_executed: 3,
+            conversation: Vec::new(),
+            trajectory: Vec::new(),
+        });
+        assert_eq!(
+            gateway_answer(&ended),
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "content": "No file was written or changed in this try.",
+                    "tool_calls_executed": 3,
+                })
+            )
+        );
+        let untyped: anyhow::Result<OrchestratorMessage> = Err(anyhow::anyhow!(
+            "[AEGIS] cmd.run was not run: this try's time is up. The try ends here."
+        ));
+        assert_eq!(
+            gateway_answer(&untyped).0,
+            StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 }

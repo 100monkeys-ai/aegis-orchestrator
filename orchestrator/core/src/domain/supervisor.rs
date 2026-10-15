@@ -998,14 +998,27 @@ impl Supervisor {
                         last_end = Some(AttemptEnd::Cause(format!(
                             "the last attempt's output was rejected: {blocking_reason}"
                         )));
-                        iteration_history.push(serde_json::json!({
-                            "iteration": attempts,
-                            "output": stdout,
-                            "exit_code": output.exit_code,
-                            "validation_failed": true,
-                            "validation_reason": blocking_reason,
-                            "feedback": feedback
-                        }));
+                        // An exhausted try the loop answered for is not an item of the
+                        // history: the next try opens from its constructed history.
+                        // (AEGIS ADR-141, Update of 2026-10-15,
+                        // `try-end-answers-from-facts`, clause 3; R2.)
+                        if recorded_exhausted(
+                            execution_repository.as_ref(),
+                            execution_id_for_trajectory,
+                            attempts as u8,
+                        )
+                        .await
+                        .is_none()
+                        {
+                            iteration_history.push(serde_json::json!({
+                                "iteration": attempts,
+                                "output": stdout,
+                                "exit_code": output.exit_code,
+                                "validation_failed": true,
+                                "validation_reason": blocking_reason,
+                                "feedback": feedback
+                            }));
+                        }
                         continue;
                     }
                     Err(e)
@@ -3000,6 +3013,80 @@ mod tests {
                 times[1] - times[0],
                 failed_execution_backoff(1)
             ));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// AEGIS ADR-141, Update of 2026-10-15 (`try-end-answers-from-facts`),
+    /// clause 3: a try the loop ended exhausted answers, and its judge
+    /// rejects the answer; the next try is handed no history item for it, so
+    /// it opens from the constructed history alone (R2), and goes on to
+    /// answer.
+    #[tokio::test]
+    async fn a_judged_failure_of_an_exhausted_try_leaves_the_history_unset() {
+        let repository =
+            Arc::new(crate::infrastructure::repositories::InMemoryExecutionRepository::new());
+        let mut execution = crate::domain::execution::Execution::new(
+            crate::domain::agent::AgentId::new(),
+            create_test_input(),
+            5,
+            "test-context".to_string(),
+        );
+        execution.start_iteration("Test task".to_string()).unwrap();
+        execution
+            .store_constructed_history(
+                1,
+                crate::domain::execution::Exhaustion {
+                    by: crate::domain::execution::ExhaustedBy::TryClock,
+                    constructed: None,
+                },
+            )
+            .unwrap();
+        let tenant = execution.tenant_id.clone();
+        repository
+            .save_for_tenant(&tenant, &execution)
+            .await
+            .unwrap();
+        let runtime = Arc::new(
+            TestRuntime::new()
+                .with_spawn_success(2)
+                .with_execute_success(vec![
+                    "No file was written or changed in this try.".to_string(),
+                    "second".to_string(),
+                ]),
+        );
+        let observer = Arc::new(TestObserver::default());
+        let mut config = create_test_config();
+        config
+            .env
+            .insert("AEGIS_EXECUTION_ID".to_string(), execution.id.to_string());
+        let result = Supervisor::new(runtime.clone())
+            .with_execution_repository(repository)
+            .run_loop(
+                config,
+                create_test_input(),
+                2,
+                observer,
+                CancellationToken::new(),
+                Some(semantic_pipeline(vec![
+                    Ok(verdict(0.1, "the tests are missing")),
+                    Ok(verdict(0.9, "fine")),
+                ])),
+            )
+            .await;
+        let mut complaints = Vec::new();
+        if result.as_deref().ok() != Some("second") {
+            complaints.push(format!("the execution ended {result:?}"));
+        }
+        let handed = runtime
+            .spawn_envs
+            .lock()
+            .await
+            .iter()
+            .filter(|env| env.contains_key("AEGIS_ITERATION_HISTORY"))
+            .count();
+        if handed != 0 {
+            complaints.push(format!("{handed} tries were handed a history item"));
         }
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }

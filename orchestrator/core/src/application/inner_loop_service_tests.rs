@@ -1148,59 +1148,86 @@ impl World {
     }
 }
 
-/// AEGIS ADR-141, Update of 2026-10-14, Question 2's default (U37's
-/// amendment of 2026-10-13 reversed): the first command the try clock
-/// refuses is not run, and the try ends there, exhausted by the try clock,
-/// with its refusal's sentence and no order to answer; the model is not
-/// called again. The iteration records the end and the history the next try
-/// is opened from.
+/// AEGIS ADR-141, Update of 2026-10-15 (`try-end-answers-from-facts`),
+/// amending Question 2's ruling of the Update of 2026-10-14: the first
+/// command the try clock refuses is not run, and the try ends there,
+/// exhausted by the try clock, with the loop's own answer written from the
+/// try's facts in R3's form: "Files written:" and each file the execution
+/// created or changed, with its bytes and content. The model is not called
+/// again; the refusal's sentence stays in the step's record and its event.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_try_clock_refusal_ends_the_try_exhausted() {
+async fn a_try_clock_refusal_ends_the_try_with_the_loops_answer() {
+    let w = a_try_with_no_time_left(vec![
+        call_tool(
+            "fs.write",
+            json!({"path": "/workspace/r/a.py", "content": LEFT_CONTENT}),
+        ),
+        run_command(json!({"command": "echo never", "cwd": "/tmp"})),
+        answer("as far as I got"),
+    ])
+    .await
+    .with_a_writable_workspace()
+    .await;
+    let outcome = w.generate().await;
+    let mut complaints = Vec::new();
+    let expected = format!(
+        "Files written:\n/workspace/r/a.py ({} bytes)\n```\n{LEFT_CONTENT}\n```",
+        LEFT_CONTENT.len()
+    );
+    match &outcome {
+        Ok(OrchestratorMessage::Final { content, .. }) if *content == expected => {}
+        other => complaints.push(format!(
+            "the try did not end with the loop's answer {expected:?}: {other:?}"
+        )),
+    }
+    let calls = w.model.calls.lock().unwrap().len();
+    if calls != 2 {
+        complaints.push(format!(
+            "the model was called after the try clock refused its command: {calls} calls"
+        ));
+    }
+    let statuses = w.dispatch_statuses();
+    if statuses != ["succeeded", "refused try_time_limit"] {
+        complaints.push(format!("the calls were {statuses:?}"));
+    }
+    let record = w.records.get(w.execution_id);
+    let steps = record.iterations[0].trajectory.clone().unwrap_or_default();
+    match steps.as_slice() {
+        [written, refused]
+            if written.status == "succeeded"
+                && refused.status == "refused"
+                && refused.error.as_deref().is_some_and(|e| {
+                    e.starts_with("[AEGIS] cmd.run was not run: this try has")
+                        && e.ends_with("The try ends here.")
+                }) => {}
+        other => complaints.push(format!("the try's trajectory is {other:?}")),
+    }
+    match &record.iterations[0].exhausted {
+        Some(crate::domain::execution::Exhaustion {
+            by: crate::domain::execution::ExhaustedBy::TryClock,
+            constructed: Some(history),
+        }) if history.files == ["/workspace/r/a.py"] => {}
+        other => complaints.push(format!("the iteration's end is {other:?}")),
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// The Update of 2026-10-15 (`try-end-answers-from-facts`), clause 1: a try
+/// that wrote nothing and that the try clock ends answers so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_try_clock_refusal_after_no_write_answers_that_no_file_was_written() {
     let w = a_try_with_no_time_left(vec![
         run_command(json!({"command": "echo never", "cwd": "/tmp"})),
         answer("as far as I got"),
     ])
     .await;
     let outcome = w.generate().await;
-    let mut complaints = Vec::new();
     match &outcome {
-        Err(e)
-            if e.to_string()
-                .starts_with("[AEGIS] cmd.run was not run: this try has")
-                && e.to_string().ends_with("The try ends here.") => {}
-        other => complaints.push(format!(
-            "the try did not end with the refusal's sentence: {other:?}"
-        )),
+        Ok(OrchestratorMessage::Final { content, .. })
+            if content == "No file was written or changed in this try." => {}
+        other => panic!("the try did not end with the loop's answer: {other:?}"),
     }
-    let calls = w.model.calls.lock().unwrap().len();
-    if calls != 1 {
-        complaints.push(format!(
-            "the model was called after the try clock refused its command: {calls} calls"
-        ));
-    }
-    let record = w.records.get(w.execution_id);
-    let steps = record.iterations[0].trajectory.clone().unwrap_or_default();
-    if steps.len() != 1 || steps[0].status != "refused" {
-        complaints.push(format!("the try's trajectory is {steps:?}"));
-    }
-    let dispatched = w.records.events_named("ToolDispatched");
-    if dispatched.len() != 1
-        || dispatched[0]["status"] != "refused"
-        || dispatched[0]["refused_by"] != "try_time_limit"
-    {
-        complaints.push(format!("the dispatch events are {dispatched:?}"));
-    }
-    match &record.iterations[0].exhausted {
-        Some(crate::domain::execution::Exhaustion {
-            by: crate::domain::execution::ExhaustedBy::TryClock,
-            constructed: Some(history),
-        }) if history
-            .facts
-            .starts_with("# This task so far\nTry 1 ran 1 tool calls in ")
-            && history.facts.ends_with(": cmd.run 1. Files it left: none.") => {}
-        other => complaints.push(format!("the iteration's end is {other:?}")),
-    }
-    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    assert_eq!(w.model.calls.lock().unwrap().len(), 1);
 }
 
 /// A try of 900 s whose model calls are bounded at 120 s keeps 130 s after a
@@ -2046,9 +2073,10 @@ async fn a_call_asked_for_after_the_executions_time_is_up_is_not_run() {
     let outcome = w.generate().await;
     let mut complaints = Vec::new();
     match &outcome {
-        Err(e) if e.to_string().contains("fs.grep was not run") => {}
+        Ok(OrchestratorMessage::Final { content, .. })
+            if content == "No file was written or changed in this try." => {}
         other => complaints.push(format!(
-            "the try did not end with the deadline's sentence: {other:?}"
+            "the try did not end with the loop's answer: {other:?}"
         )),
     }
     let statuses = w.dispatch_statuses();
@@ -2063,8 +2091,21 @@ async fn a_call_asked_for_after_the_executions_time_is_up_is_not_run() {
     }
     let record = w.records.get(w.execution_id);
     let steps = record.iterations[0].trajectory.clone().unwrap_or_default();
-    if steps.len() != 1 || steps[0].status != "refused" {
+    if steps.len() != 1
+        || steps[0].status != "refused"
+        || !steps[0]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("fs.grep was not run"))
+    {
         complaints.push(format!("the try's trajectory is {steps:?}"));
+    }
+    match &record.iterations[0].exhausted {
+        Some(crate::domain::execution::Exhaustion {
+            by: crate::domain::execution::ExhaustedBy::Clock,
+            ..
+        }) => {}
+        other => complaints.push(format!("the iteration's end is {other:?}")),
     }
     assert!(complaints.is_empty(), "{}", complaints.join("\n"));
 }
@@ -2254,9 +2295,10 @@ async fn a_call_past_the_budget_is_refused_not_run_and_ends_the_try() {
     let mut complaints = Vec::new();
     let sentence = past_the_budget("fs.grep", 3);
     match &outcome {
-        Err(e) if e.to_string() == sentence => {}
+        Ok(OrchestratorMessage::Final { content, .. })
+            if content == "No file was written or changed in this try." => {}
         other => complaints.push(format!(
-            "the try did not end with the budget's sentence: {other:?}"
+            "the try did not end with the loop's answer: {other:?}"
         )),
     }
     let calls = w.model.calls.lock().unwrap().len();
@@ -2312,7 +2354,7 @@ async fn two_calls_in_one_turn_count_two_against_the_budget() {
     .with_the_first_try_started();
     let outcome = w.generate().await;
     let mut complaints = Vec::new();
-    if !matches!(&outcome, Err(e) if e.to_string() == past_the_budget("fs.grep", 3)) {
+    if !matches!(&outcome, Ok(OrchestratorMessage::Final { .. })) {
         complaints.push(format!("the try ended {outcome:?}"));
     }
     let statuses = w.dispatch_statuses();
@@ -2343,7 +2385,7 @@ async fn an_unset_budget_runs_fifty_calls_and_refuses_the_fifty_first() {
         .with_the_first_try_started();
     let outcome = w.generate().await;
     let mut complaints = Vec::new();
-    if !matches!(&outcome, Err(e) if e.to_string() == past_the_budget("fs.grep", 50)) {
+    if !matches!(&outcome, Ok(OrchestratorMessage::Final { .. })) {
         complaints.push(format!("the try ended {outcome:?}"));
     }
     let statuses = w.dispatch_statuses();
@@ -2636,7 +2678,7 @@ async fn a_try_its_call_budget_ends_is_recorded_exhausted() {
     .with_the_first_try_started();
     let outcome = w.generate().await;
     let mut complaints = Vec::new();
-    if outcome.is_ok() {
+    if !matches!(&outcome, Ok(OrchestratorMessage::Final { .. })) {
         complaints.push(format!("the try ended {outcome:?}"));
     }
     match &w.records.get(w.execution_id).iterations[0].exhausted {
@@ -2649,6 +2691,123 @@ async fn a_try_its_call_budget_ends_is_recorded_exhausted() {
                 .facts
                 .ends_with(": fs.grep 2, fs.write 1. Files it left: /workspace/t/a.py.") => {}
         other => complaints.push(format!("the iteration's end is {other:?}")),
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// AEGIS ADR-141, Update of 2026-10-15 (`try-end-answers-from-facts`): a try
+// the loop ends answers from its facts, and the run goes on to its judge
+// ---------------------------------------------------------------------------
+
+/// The try's world for the call budget's end: `max_tool_calls: 2`, a try
+/// that writes `/workspace/r/a.py`, searches once, and asks for a third call.
+async fn a_try_that_writes_then_spends_its_budget() -> World {
+    world(
+        agent_executing("    max_tool_calls: 2"),
+        vec![
+            call_tool(
+                "fs.write",
+                json!({"path": "/workspace/r/a.py", "content": LEFT_CONTENT}),
+            ),
+            call_tool("fs.grep", grep_args("one")),
+            call_tool("fs.grep", grep_args("two")),
+            answer("never reached"),
+        ],
+    )
+    .await
+    .with_a_writable_workspace()
+    .await
+}
+
+/// The loop's answer for a try that left `/workspace/r/a.py` holding
+/// `LEFT_CONTENT`.
+fn the_answer_naming_a_py() -> String {
+    format!(
+        "Files written:\n/workspace/r/a.py ({} bytes)\n```\n{LEFT_CONTENT}\n```",
+        LEFT_CONTENT.len()
+    )
+}
+
+/// Clause 1 for the call budget: the call past the budget is not run, the
+/// try ends exhausted by the call budget, and the loop answers from the
+/// try's facts; the model is not called again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_past_the_budget_ends_the_try_with_the_loops_answer() {
+    let w = a_try_that_writes_then_spends_its_budget()
+        .await
+        .with_the_first_try_started();
+    let outcome = w.generate().await;
+    let mut complaints = Vec::new();
+    let expected = the_answer_naming_a_py();
+    match &outcome {
+        Ok(OrchestratorMessage::Final { content, .. }) if *content == expected => {}
+        other => complaints.push(format!(
+            "the try did not end with the loop's answer {expected:?}: {other:?}"
+        )),
+    }
+    let calls = w.model.calls.lock().unwrap().len();
+    if calls != 3 {
+        complaints.push(format!("the model was called {calls} times, not 3"));
+    }
+    let statuses = w.dispatch_statuses();
+    if statuses != ["succeeded", "succeeded", "refused call_budget"] {
+        complaints.push(format!("the calls were {statuses:?}"));
+    }
+    let record = w.records.get(w.execution_id);
+    let last = record.iterations[0]
+        .trajectory
+        .clone()
+        .unwrap_or_default()
+        .last()
+        .cloned();
+    if last.as_ref().and_then(|s| s.error.clone()) != Some(past_the_budget("fs.grep", 2)) {
+        complaints.push(format!("the refused step is {last:?}"));
+    }
+    match &record.iterations[0].exhausted {
+        Some(crate::domain::execution::Exhaustion {
+            by: crate::domain::execution::ExhaustedBy::CallBudget,
+            ..
+        }) => {}
+        other => complaints.push(format!("the iteration's end is {other:?}")),
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// Clauses 2 and 3: on the agent's last try (`max_retries: 1`), a try its
+/// call budget ends completes: the container ends normally on the loop's
+/// answer, the validation judge is given that answer, and the execution ends
+/// with it, never "Max retries exceeded".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_last_try_its_call_budget_ends_is_judged_on_the_loops_answer() {
+    let w = a_try_that_writes_then_spends_its_budget().await;
+    let judge = RecordingJudge::default();
+    let given = judge.given.clone();
+    let pipeline = Arc::new(ValidationPipeline::new(vec![ValidatorEntry {
+        kind: ValidatorKind::Semantic,
+        validator: Box::new(judge),
+        min_score: 0.5,
+        min_confidence: 0.0,
+    }]));
+    let started = std::time::Instant::now();
+    let outcome = w.run(Some(pipeline)).await;
+    let mut complaints = Vec::new();
+    let expected = the_answer_naming_a_py();
+    if outcome.as_deref().ok() != Some(expected.as_str()) {
+        complaints.push(format!("the execution ended {outcome:?}"));
+    }
+    let given = given.lock().unwrap();
+    if given.iter().map(|c| c.output.as_str()).collect::<Vec<_>>() != [expected.as_str()] {
+        complaints.push(format!(
+            "the judge was given {:?}",
+            given.iter().map(|c| &c.output).collect::<Vec<_>>()
+        ));
+    }
+    if started.elapsed() >= std::time::Duration::from_secs(15) {
+        complaints.push(format!(
+            "the try waited as a failed execution does: {:?}",
+            started.elapsed()
+        ));
     }
     assert!(complaints.is_empty(), "{}", complaints.join("\n"));
 }
