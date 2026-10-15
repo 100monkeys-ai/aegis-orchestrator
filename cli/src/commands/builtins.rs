@@ -771,7 +771,8 @@ mod tests {
 
     /// The Forge's tester: each try is 900 s and each model call is bounded
     /// at 120 s, so a try keeps 130 s after a command and a command may start
-    /// until 770 s into it; the execution's 1800 s and its five tries stay.
+    /// until 770 s into it; its five tries stay, under an execution bound of
+    /// 1815 s that fits two of them (AEGIS ADR-141, Update of 2026-10-15).
     /// On run `dcf60c18` its 600 s tries kept 300 s and four of five ended at
     /// the try clock's refusal without an answer.
     #[test]
@@ -794,7 +795,7 @@ mod tests {
         );
         assert_eq!(execution.llm_timeout_seconds, 120);
         assert_eq!(execution.max_retries, 5);
-        assert_eq!(resources.parse_timeout_seconds(), Some(1800));
+        assert_eq!(resources.parse_timeout_seconds(), Some(1815));
     }
 
     /// Every `timeout_seconds` a validator of `execution` carries, after the
@@ -975,6 +976,147 @@ mod tests {
             code_validator_llm_timeout >= PRODUCTION_LLM_OVERALL_TIMEOUT_SECS,
             "{AEGIS_CODE_VALIDATOR_AGENT_NAME}: llm_timeout_seconds {code_validator_llm_timeout} s is below the registry's overall budget {PRODUCTION_LLM_OVERALL_TIMEOUT_SECS} s, so smart's fallback alias is unreachable"
         );
+    }
+
+    /// Built-in agents whose clocks a record decides, exempt from the
+    /// two-tries rule below, each with the record that sets its clock. A
+    /// clock here moves only by an Update of its record.
+    const TWO_TRIES_EXEMPT: &[(&str, &str)] = &[
+        (
+            AEGIS_CODE_VALIDATOR_AGENT_NAME,
+            "AEGIS ADR-124, Update of 2026-10-04: llm_timeout_seconds 300, resources.timeout 300s",
+        ),
+        (GOAL_JUDGE_NAME, "AEGIS ADR-131 D3: resources.timeout 300s"),
+        (
+            "code-quality-judge",
+            "AEGIS ADR-052, Update of 2026-10-04 (the judges keep 300 s) and ADR-124",
+        ),
+        (
+            "tool-call-policy-judge",
+            "AEGIS ADR-052, Update of 2026-10-04 (the judges keep 300 s) and ADR-124",
+        ),
+        (
+            AGENT_GENERATOR_JUDGE_NAME,
+            "AEGIS ADR-052, Update of 2026-10-04 (the judges keep 300 s) and ADR-124",
+        ),
+        (
+            WORKFLOW_GENERATOR_JUDGE_NAME,
+            "AEGIS ADR-052, Update of 2026-10-04 (the judges keep 300 s) and ADR-124",
+        ),
+        (
+            AEGIS_PYTHON_EXECUTOR_AGENT_NAME,
+            "AEGIS ADR-087: the intent-to-execution pipeline's executors",
+        ),
+        (
+            AEGIS_JAVASCRIPT_EXECUTOR_AGENT_NAME,
+            "AEGIS ADR-087: the intent-to-execution pipeline's executors",
+        ),
+        (
+            AEGIS_BASH_EXECUTOR_AGENT_NAME,
+            "AEGIS ADR-087: the intent-to-execution pipeline's executors",
+        ),
+        (
+            AEGIS_OUTPUT_FORMATTER_AGENT_NAME,
+            "AEGIS ADR-103: the output handler",
+        ),
+        (
+            AEGIS_DOCUMENT_RENDERER_AGENT_NAME,
+            "AEGIS ADR-135 D1: one fixed program, max_iterations 1",
+        ),
+        (
+            AGENT_GENERATOR_AGENT_NAME,
+            "AEGIS ADR-052, Update of 2026-10-04: resources.timeout 600s",
+        ),
+        (
+            WORKFLOW_CREATOR_AGENT_NAME,
+            "AEGIS ADR-052, Update of 2026-10-04: resources.timeout 600s",
+        ),
+        (
+            WORKFLOW_GENERATOR_PLANNER_AGENT_NAME,
+            "AEGIS ADR-052, Update of 2026-10-04: resources.timeout 600s",
+        ),
+    ];
+
+    /// The seven agents of the Forge.
+    const FORGE_AGENTS: &[&str] = &[
+        "requirements-analyst",
+        "architect-agent",
+        "coder-agent",
+        "tester-agent",
+        "code-reviewer-agent",
+        "critic-agent",
+        "security-auditor-agent",
+    ];
+
+    /// Regression test for Forge run `40e66741` (AEGIS known-defects row
+    /// `forge-architect-tries-exceed-state-bound-2026-10-15`): ARCHITECT's
+    /// first try ended at the default 600 s iteration timeout and the second
+    /// was cut by the execution's 900 s bound. AEGIS ADR-141, Update of
+    /// 2026-10-15, clause (2): every built-in agent that may make two tries
+    /// fits two of them under its execution bound, with the wait the
+    /// supervisor makes after a failed try between them
+    /// (`resources.timeout >= 2 x iteration_timeout + failed_execution_backoff(1)`),
+    /// outside the exemptions above; the Forge's seven agents take
+    /// `iteration_timeout: "900s"` and `resources.timeout: "1815s"`.
+    #[test]
+    fn builtin_agent_execution_bound_fits_two_tries() {
+        use aegis_orchestrator_core::domain::agent::{ExecutionStrategy, ResourceLimits};
+        use aegis_orchestrator_core::domain::supervisor::{
+            failed_execution_backoff, iteration_timeout, DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+        };
+
+        let names: Vec<&str> = BUILTIN_AGENTS.iter().map(|(name, _)| *name).collect();
+        let mut complaints = Vec::new();
+        for (exempt, record) in TWO_TRIES_EXEMPT {
+            if !names.contains(exempt) {
+                complaints.push(format!(
+                    "{exempt} is exempt ({record}) but is not a built-in agent"
+                ));
+            }
+        }
+        let backoff = failed_execution_backoff(1).as_secs();
+        for (name, yaml) in BUILTIN_AGENTS {
+            let doc: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+            let spec = &doc["spec"];
+            let execution: ExecutionStrategy = serde_yaml::from_value(spec["execution"].clone())
+                .unwrap_or_else(|e| {
+                    panic!("builtin agent '{name}': execution does not parse: {e}")
+                });
+            let resources: ResourceLimits =
+                serde_yaml::from_value(spec["security"]["resources"].clone()).unwrap_or_else(|e| {
+                    panic!("builtin agent '{name}': resources do not parse: {e}")
+                });
+            let bound = resources
+                .parse_timeout_seconds()
+                .unwrap_or(DEFAULT_EXECUTION_TIMEOUT_SECONDS);
+            let iteration = iteration_timeout(&execution).as_secs();
+
+            if FORGE_AGENTS.contains(name)
+                && (execution.iteration_timeout.as_deref() != Some("900s")
+                    || spec["security"]["resources"]["timeout"].as_str() != Some("1815s"))
+            {
+                complaints.push(format!(
+                    "{name}: a Forge agent takes iteration_timeout \"900s\" and resources.timeout \"1815s\", it has {:?} and {:?}",
+                    execution.iteration_timeout,
+                    spec["security"]["resources"]["timeout"].as_str()
+                ));
+            }
+            if execution.max_retries < 2 || TWO_TRIES_EXEMPT.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            let needed = 2 * iteration + backoff;
+            if bound < needed {
+                complaints.push(format!(
+                    "{name}: resources.timeout {bound} s is under two tries of {iteration} s and the {backoff} s wait between them ({needed} s)"
+                ));
+            }
+        }
+        for name in FORGE_AGENTS {
+            if !names.contains(name) {
+                complaints.push(format!("{name} is a Forge agent but not a built-in agent"));
+            }
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
 
     /// The coder edits an existing file and never rewrites it: on run

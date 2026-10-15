@@ -111,4 +111,4 @@ spec:
     resources:
       cpu: 1000
       memory: "1Gi"
-      timeout: "1800s"
+      timeout: "1815s"

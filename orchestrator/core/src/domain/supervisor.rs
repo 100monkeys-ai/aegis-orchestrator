@@ -148,6 +148,34 @@ pub fn failed_execution_backoff(failed: u32) -> Duration {
     Duration::from_secs((15u64 << failed.saturating_sub(1).min(3)).min(120))
 }
 
+/// The execution's overall bound, as the loop sees it before each try.
+#[derive(Debug, Clone, Copy)]
+struct TryBound {
+    /// When the bound runs out.
+    deadline: tokio::time::Instant,
+    /// The bound, in seconds.
+    seconds: u64,
+}
+
+impl TryBound {
+    /// The sentence the execution ends with when the time left under the
+    /// bound is less than a try needs (AEGIS ADR-141, Update of 2026-10-15,
+    /// clause (1)); `None` when a try fits.
+    fn refuses_a_try(&self, try_needs: Duration) -> Option<String> {
+        let left = self
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        (left < try_needs).then(|| {
+            format!(
+                "Execution ended: {} s left under the {} s bound, under the {} s a try needs",
+                left.as_secs(),
+                self.seconds,
+                try_needs.as_secs()
+            )
+        })
+    }
+}
+
 /// Whether iteration `iteration` of the execution is recorded exhausted
 /// (AEGIS ADR-141, Update of 2026-10-14, R2): the inner loop records it when
 /// the try's call budget or the try clock ends the try.
@@ -483,6 +511,10 @@ impl Supervisor {
         );
 
         let current_instance = Arc::new(Mutex::new(None));
+        let bound = TryBound {
+            deadline: tokio::time::Instant::now() + overall_timeout,
+            seconds: overall_timeout_secs,
+        };
 
         // Wrap the entire loop in an overall deadline
         match tokio::time::timeout(
@@ -497,6 +529,7 @@ impl Supervisor {
                 validation_pipeline,
                 current_instance.clone(),
                 self.execution_repository.clone(),
+                bound,
             ),
         )
         .await
@@ -535,6 +568,7 @@ impl Supervisor {
         validation_pipeline: Option<Arc<ValidationPipeline>>,
         current_instance: Arc<Mutex<Option<InstanceId>>>,
         execution_repository: Option<Arc<dyn ExecutionRepository>>,
+        bound: TryBound,
     ) -> Result<String, RuntimeError> {
         let mut attempts = 0;
         let original_intent = input.intent.clone().unwrap_or_default();
@@ -560,6 +594,18 @@ impl Supervisor {
             if cancellation_token.is_cancelled() {
                 info!("Execution cancelled before iteration {}", attempts + 1);
                 return Err(RuntimeError::Cancelled);
+            }
+
+            // The first try always starts; a later try starts only when it
+            // fits under the execution's bound, and otherwise the execution
+            // ends now rather than inside the try (AEGIS ADR-141, Update of
+            // 2026-10-15, clause (1)). The last try was recorded exhausted
+            // where it ended (R2).
+            if attempts > 0 {
+                if let Some(ended) = bound.refuses_a_try(per_iteration_timeout) {
+                    warn!(iteration = attempts + 1, "{}", ended);
+                    return Err(RuntimeError::ExecutionFailed(ended));
+                }
             }
 
             attempts += 1;

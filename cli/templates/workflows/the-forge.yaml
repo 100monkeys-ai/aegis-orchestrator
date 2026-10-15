@@ -309,7 +309,7 @@ spec:
       agents:
         - agent: "code-reviewer-agent"
           weight: 1.0
-          timeout_seconds: 900
+          timeout_seconds: 1815
           input: |-
             Review this change for correctness, completeness and the repository's own conventions.
 
@@ -329,7 +329,7 @@ spec:
             The repository is at {{repository.path}}. Answer only with the JSON object {"score", "confidence", "reasoning", "suggestions"}.
         - agent: "critic-agent"
           weight: 1.5
-          timeout_seconds: 900
+          timeout_seconds: 1815
           input: |-
             Find every flaw in this change: what it gets wrong, what it misses, what it makes worse.
 
@@ -349,7 +349,7 @@ spec:
             The repository is at {{repository.path}}. Answer only with the JSON object {"score", "confidence", "reasoning", "suggestions"}.
         - agent: "security-auditor-agent"
           weight: 2.0
-          timeout_seconds: 900
+          timeout_seconds: 1815
           input: |-
             Audit this change for security: injection, unchecked input, exposed secrets, unsafe defaults, risky dependencies.
 

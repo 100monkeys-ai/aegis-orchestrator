@@ -53,6 +53,7 @@ spec:
     mode: "iterative"
     max_iterations: 5
     llm_timeout_seconds: 300
+    iteration_timeout: "900s"
     require_tool_call: true
     validation:
       # AEGIS ADR-141, Update of 2026-10-14, R6: the answer's shape, checked
@@ -102,4 +103,4 @@ spec:
     resources:
       cpu: 1000
       memory: "1Gi"
-      timeout: "900s"
+      timeout: "1815s"
