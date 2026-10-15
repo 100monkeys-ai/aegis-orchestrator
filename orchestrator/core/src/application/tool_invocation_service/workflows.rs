@@ -1,5 +1,63 @@
 use super::*;
 
+use crate::domain::execution::AttachmentRef;
+
+/// The mark a workflow's `input_schema` sets on an input that names one of
+/// the run's attached files (AEGIS ADR-143 S7b): `x-aegis-attachment-name:
+/// true` on the input's property. An extension keyword, so the schema's
+/// validation ignores it.
+pub(super) const ATTACHMENT_NAME_MARK: &str = "x-aegis-attachment-name";
+
+/// Fill and check each input `input_schema` marks as naming an attached
+/// file, before the run starts (AEGIS ADR-143 S7a, S7b). Left out with
+/// exactly one attachment, the input is that attachment's name; left out
+/// with several, or naming no attached file, the run is refused with the
+/// sentence returned. A run carrying no attachment is left to the step's
+/// own refusal (S4), and an input of another type to the schema's.
+fn fill_attachment_names(
+    input_schema: Option<&Value>,
+    input: &mut Value,
+    attachments: &[AttachmentRef],
+) -> Result<(), String> {
+    let Some(properties) = input_schema
+        .and_then(|schema| schema.get("properties"))
+        .and_then(Value::as_object)
+    else {
+        return Ok(());
+    };
+    if attachments.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<&str> = attachments.iter().map(|a| a.name.as_str()).collect();
+    let listed = names.join(", ");
+    for (key, property) in properties {
+        if property.get(ATTACHMENT_NAME_MARK) != Some(&Value::Bool(true)) {
+            continue;
+        }
+        match input.get(key) {
+            Some(Value::String(named)) => {
+                if !names.contains(&named.as_str()) {
+                    return Err(format!(
+                        "No attached file is named '{named}'; the attached files are: {listed}."
+                    ));
+                }
+            }
+            None | Some(Value::Null) => {
+                if names.len() > 1 {
+                    return Err(format!(
+                        "This run reads one recording and several files are attached ({listed}); name the one to transcribe in {key}."
+                    ));
+                }
+                if let Some(obj) = input.as_object_mut() {
+                    obj.insert(key.clone(), Value::String(names[0].to_string()));
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
 impl ToolInvocationService {
     /// Build a [`crate::application::workflow_scope::ScopeChangeRequester`] from tool args and the active security context.
     ///
@@ -202,6 +260,25 @@ impl ToolInvocationService {
             .and_then(|v| v.as_str())
             .map(String::from);
 
+        // AEGIS ADR-143 S7a, S7b: an input naming an attached file is
+        // filled from the run's only attachment, or the run is refused here,
+        // before any execution or container exists.
+        if let Some(workflow) = self
+            .workflow_for_run(&tenant_id, name, version.as_deref())
+            .await
+        {
+            if let Err(sentence) = fill_attachment_names(
+                workflow.metadata.input_schema.as_ref(),
+                &mut input,
+                &attachments,
+            ) {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.run",
+                    "error": sentence
+                })));
+            }
+        }
+
         let start_use_case = match &self.start_workflow_execution_use_case {
             Some(uc) => uc,
             None => {
@@ -251,6 +328,38 @@ impl ToolInvocationService {
                 "tool": "aegis.workflow.run",
                 "error": format!("Failed to start workflow: {e}")
             }))),
+        }
+    }
+
+    /// The workflow `aegis.workflow.run` would start, resolved as the start
+    /// resolves it: by id, by name and version, or by name. `None` when no
+    /// repository is configured or none is found; the start then answers
+    /// for itself.
+    async fn workflow_for_run(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+        version: Option<&str>,
+    ) -> Option<Workflow> {
+        let repo = self.workflow_repository.as_ref()?;
+        let found = if let Ok(uuid) = uuid::Uuid::parse_str(name) {
+            repo.find_by_id_for_tenant(
+                tenant_id,
+                crate::domain::workflow::WorkflowId::from_uuid(uuid),
+            )
+            .await
+        } else if let Some(version) = version {
+            repo.resolve_by_name_and_version(tenant_id, name, version)
+                .await
+        } else {
+            repo.resolve_by_name(tenant_id, name).await
+        };
+        match found {
+            Ok(workflow) => workflow,
+            Err(e) => {
+                tracing::warn!(workflow = name, error = %e, "The workflow to run could not be read before its start");
+                None
+            }
         }
     }
 
@@ -2133,7 +2242,9 @@ fn signal_answerer(identity: Option<&crate::domain::iam::UserIdentity>) -> Optio
 }
 
 /// `aegis.workflow.run`'s start: its run bound to the goal it is started
-/// for (Zaru ADR-0028 W49b (3)).
+/// for (Zaru ADR-0028 W49b (3)), and an input naming an attached file
+/// filled from the run's only attachment, or the run refused before any
+/// execution exists (AEGIS ADR-143 S7a, S7b).
 #[cfg(test)]
 mod workflow_run_tests {
     use super::*;
@@ -2148,6 +2259,7 @@ mod workflow_run_tests {
     use crate::domain::iam::{IdentityKind, TenantScope, UserIdentity, ZaruTier};
     use crate::domain::node_config::GoalsConfig;
     use crate::domain::security_context::SecurityContext;
+    use crate::domain::workflow::StateKind;
     use crate::infrastructure::event_bus::DomainEvent;
     use crate::infrastructure::repositories::postgres_goal::InMemoryGoalRepository;
     use crate::infrastructure::repositories::{
@@ -2162,6 +2274,19 @@ mod workflow_run_tests {
     use std::sync::Mutex as StdMutex;
 
     const OWNER: &str = "1a2b0000-workflow-run-owner";
+
+    const TRANSCRIBE_AUDIO: &str =
+        include_str!("../../../../../cli/templates/workflows/transcribe-audio.yaml");
+
+    fn attachment(name: &str, mime_type: &str) -> Value {
+        json!({
+            "volume_id": uuid::Uuid::new_v4().to_string(),
+            "path": format!("uploads/{name}"),
+            "name": name,
+            "mime_type": mime_type,
+            "size": 2_525_169,
+        })
+    }
 
     fn identity(sub: &str) -> UserIdentity {
         UserIdentity {
@@ -2376,6 +2501,7 @@ mod workflow_run_tests {
         workflows: Arc<WorkflowControl>,
         starts: Arc<Starts>,
         goals: Arc<InMemoryGoalRepository>,
+        workflow_repository: Arc<InMemoryWorkflowRepository>,
     }
 
     fn harness() -> Harness {
@@ -2416,12 +2542,13 @@ mod workflow_run_tests {
         .with_goals(goal_service)
         .with_workflow_execution_control(workflows.clone())
         .with_workflow_execution(starts.clone())
-        .with_workflow_repository(workflow_repository);
+        .with_workflow_repository(workflow_repository.clone());
         Harness {
             service,
             workflows,
             starts,
             goals,
+            workflow_repository,
         }
     }
 
@@ -2463,6 +2590,25 @@ mod workflow_run_tests {
                     .await
                     .unwrap(),
             )
+        }
+
+        fn created(&self) -> usize {
+            self.starts.requests.lock().unwrap().len()
+        }
+
+        /// The built-in `transcribe-audio`, as its template reads, visible
+        /// to the caller.
+        async fn with_transcribe_audio(&self) -> Workflow {
+            let workflow =
+                WorkflowParser::parse_yaml(TRANSCRIBE_AUDIO).expect("the template parses");
+            crate::domain::repository::WorkflowRepository::save_for_tenant(
+                self.workflow_repository.as_ref(),
+                &TenantId::for_consumer_user(OWNER).unwrap(),
+                &workflow,
+            )
+            .await
+            .unwrap();
+            workflow
         }
 
         async fn goal_cancel(&self, goal_id: GoalId) -> Value {
@@ -2517,5 +2663,99 @@ mod workflow_run_tests {
         );
         let goal_row = h.goals.find_goal(goal).await.unwrap().unwrap();
         assert_eq!(goal_row.state, GoalState::Cancelled);
+    }
+
+    /// S7a: `audio_path` left out, with exactly one attachment, names that
+    /// attachment, so the step's command reads `/input/<its name>`.
+    #[tokio::test]
+    async fn transcribe_audio_with_one_attachment_and_no_audio_path_renders_input_that_name() {
+        let h = harness();
+        let workflow = h.with_transcribe_audio().await;
+
+        let started = h
+            .workflow_run(json!({
+                "name": "transcribe-audio",
+                "input": {},
+                "attachments": [attachment("DIALOGUE.ogg", "audio/ogg")],
+            }))
+            .await;
+        assert_eq!(started["status"], "started", "{started}");
+        assert_eq!(h.created(), 1);
+
+        let input = h.starts.requests.lock().unwrap()[0].input.clone();
+        let command = workflow
+            .spec
+            .states
+            .values()
+            .find_map(|state| match &state.kind {
+                StateKind::ContainerRun { command, .. } => Some(command.clone()),
+                _ => None,
+            })
+            .expect("transcribe-audio has its model step");
+        let rendered: Vec<String> = command
+            .iter()
+            .map(|arg| {
+                handlebars::Handlebars::new()
+                    .render_template(arg, &json!({ "input": input }))
+                    .unwrap()
+            })
+            .collect();
+        println!("the step's command renders as {rendered:?}");
+        assert_eq!(
+            rendered[1], "/input/DIALOGUE.ogg",
+            "the run's only attachment is not the file the step reads: {input}"
+        );
+    }
+
+    /// S7b: several attachments and no `audio_path` is refused at the
+    /// start, before any execution, with one sentence naming the files.
+    #[tokio::test]
+    async fn transcribe_audio_with_two_attachments_and_no_audio_path_is_refused_before_any_execution(
+    ) {
+        let h = harness();
+        h.with_transcribe_audio().await;
+
+        let answer = h
+            .workflow_run(json!({
+                "name": "transcribe-audio",
+                "input": {},
+                "attachments": [
+                    attachment("DIALOGUE.ogg", "audio/ogg"),
+                    attachment("notes.wav", "audio/wav"),
+                ],
+            }))
+            .await;
+        println!("aegis.workflow.run answered: {answer}");
+        assert_eq!(
+            answer["error"],
+            "This run reads one recording and several files are attached (DIALOGUE.ogg, notes.wav); name the one to transcribe in audio_path.",
+            "{answer}"
+        );
+        assert!(answer.get("execution_id").is_none(), "{answer}");
+        assert_eq!(h.created(), 0, "an execution was created for a refused run");
+    }
+
+    /// S7b: an `audio_path` naming no attached file is refused at the
+    /// start, before any execution, with one sentence naming the files.
+    #[tokio::test]
+    async fn transcribe_audio_naming_no_attached_file_is_refused_before_any_execution() {
+        let h = harness();
+        h.with_transcribe_audio().await;
+
+        let answer = h
+            .workflow_run(json!({
+                "name": "transcribe-audio",
+                "input": {"audio_path": "recording.ogg"},
+                "attachments": [attachment("DIALOGUE.ogg", "audio/ogg")],
+            }))
+            .await;
+        println!("aegis.workflow.run answered: {answer}");
+        assert_eq!(
+            answer["error"],
+            "No attached file is named 'recording.ogg'; the attached files are: DIALOGUE.ogg.",
+            "{answer}"
+        );
+        assert!(answer.get("execution_id").is_none(), "{answer}");
+        assert_eq!(h.created(), 0, "an execution was created for a refused run");
     }
 }

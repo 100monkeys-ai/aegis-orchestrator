@@ -19,13 +19,16 @@ metadata:
       audio_path:
         type: string
         description: >-
-          The name of the audio file attached to the run: letters, digits and
-          - . _ only, not containing "..". Any container ffmpeg decodes (wav,
-          mp3, m4a, ogg, flac, webm).
+          The name of the audio file attached to the run, exactly as it was
+          attached: letters, digits and - . _ only, not containing "..". Any
+          container ffmpeg decodes (wav, mp3, m4a, ogg, flac, webm). Leave it
+          out when one file is attached: the run reads that file.
         maxLength: 512
         pattern: "^(?!.*\\.\\.)[A-Za-z0-9._-]+$"
-    required:
-      - audio_path
+        # The input names one of the run's attached files: filled from the
+        # run's only attachment when left out, and checked against the
+        # attached names before the run starts.
+        x-aegis-attachment-name: true
   output_schema:
     type: object
     properties:
