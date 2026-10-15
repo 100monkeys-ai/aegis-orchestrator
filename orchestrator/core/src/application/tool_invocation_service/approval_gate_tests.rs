@@ -1581,6 +1581,13 @@ mod profiles {
             Ok(ToolInvocationResult::Direct(v)) => format!("{}", v["status"]),
             Ok(other) => format!("{other:?}"),
             Err(SealSessionError::InvalidArguments(sentence)) => sentence.clone(),
+            // Zaru ADR-0070 D1 (d): the profile refusals are answered with
+            // their own code and `needs`; the inner loop is shown the
+            // sentence as before.
+            Err(SealSessionError::Answered { shown, .. }) => match shown.as_ref() {
+                SealSessionError::InvalidArguments(sentence) => sentence.clone(),
+                other => format!("{other:?}"),
+            },
             Err(e) => format!("{e:?}"),
         }
     }

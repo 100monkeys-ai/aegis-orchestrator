@@ -53,10 +53,19 @@ pub(crate) const CONTEXT_ARGUMENT: &str = "_context";
 const CONTEXT_SHOWN_MAX_CHARS: usize = 64;
 
 /// The refusal `CREDENTIAL_BINDING_REQUIRED` with `message` (AEGIS ADR-132
-/// H3, Zaru ADR-0055 D15, ADR-132 Update (13) S11e).
-pub(super) fn binding_required(message: String) -> SealSessionError {
-    SealSessionError::NotFound(message.clone())
-        .answered(CallerAnswer::CredentialBindingRequired { message })
+/// H3, Zaru ADR-0055 D15, ADR-132 Update (13) S11e). `family` is the binding
+/// key of a family its person has not connected, and only then given: the
+/// refusal then carries that family's `needs` (Zaru ADR-0070 D1 (b)).
+pub(super) fn binding_required(message: String, family: Option<&str>) -> SealSessionError {
+    let answer = CallerAnswer::CredentialBindingRequired {
+        message: message.clone(),
+    };
+    SealSessionError::NotFound(message).answered(match family {
+        Some(key) => answer.needing(crate::application::credential_service::connection_needs(
+            key,
+        )),
+        None => answer,
+    })
 }
 
 /// Connect timeout for SEAL Tooling Gateway gRPC connections.
@@ -1351,7 +1360,7 @@ impl ToolInvocationService {
         let Some(user_id) = acting.user_id.as_deref() else {
             return Err(binding_required(format!(
                 "This tool needs your own credential for '{server}', and no person is recorded for this run."
-            )));
+            ), None));
         };
         let source = self.tool_credentials.as_ref().ok_or_else(|| {
             SealSessionError::InternalError(format!(
@@ -1372,6 +1381,7 @@ impl ToolInvocationService {
                     Ok(Some(credential)) => Ok(credential),
                     Ok(None) => Err(binding_required(
                         crate::application::credential_service::not_connected_sentence(server),
+                        Some(server),
                     )),
                     Err(e) => Err(SealSessionError::InternalError(format!(
                         "resolving the credential for the remote tool server '{server}' failed: {e}"
@@ -1394,7 +1404,8 @@ impl ToolInvocationService {
         };
         match source.tool_server_credential(&actor, server).await {
             Ok(Some(credential)) => Ok(credential),
-            Ok(None) => Err(binding_required(match context {
+            Ok(None) => Err(binding_required(
+                match context {
                 ContextChoice::None => format!(
                     "This tool needs your own credential for '{server}', and none was chosen for this run."
                 ),
@@ -1404,7 +1415,9 @@ impl ToolInvocationService {
                 ContextChoice::NotGiven => format!(
                     "This tool needs your own credential for '{server}', granted to this agent."
                 ),
-            })),
+                },
+                None,
+            )),
             Err(e) => Err(SealSessionError::InternalError(format!(
                 "resolving the credential for the remote tool server '{server}' failed: {e}"
             ))),
@@ -1457,7 +1470,7 @@ impl ToolInvocationService {
         let Some(given) = context_argument else {
             return Err(binding_required(format!(
                 "This tool reaches several of your '{server}' contexts; say which in '{CONTEXT_ARGUMENT}': {listed}."
-            )));
+            ), None));
         };
         let given = match given {
             Value::String(text) => text.clone(),
@@ -1473,7 +1486,7 @@ impl ToolInvocationService {
                     .collect();
                 Err(binding_required(format!(
                     "'{shown}' is not one of the '{server}' contexts chosen for this run; choose one of: {listed}."
-                )))
+                ), None))
             }
         }
     }

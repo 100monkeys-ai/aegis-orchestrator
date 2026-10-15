@@ -1,5 +1,6 @@
 use super::*;
 use crate::domain::iam::TenantScope;
+use crate::domain::seal_session::{CallerAnswer, RefusalNeeds};
 
 /// The tools that start an execution from a call (AEGIS ADR-126, Update of
 /// 2026-10-07 (2), clause 3).
@@ -24,6 +25,56 @@ struct CallConversation {
 /// `approval_pending` (Zaru ADR-0069 D5).
 pub(super) const APPROVAL_WAITS_IN_ZARU_WEB: &str =
     "This waits for your answer in Zaru Web, under Approvals.";
+
+/// Why a run's or a conversation's profile refused a governed tool (AEGIS
+/// ADR-140 D7; Zaru ADR-0070 D1 (d)).
+enum ProfileRefusal {
+    /// The profile's list does not admit the tool.
+    NotAdmitted,
+    /// The profile is not the person's or was deleted.
+    Gone,
+    /// The profile could not be read; the sentence says why.
+    Other(String),
+}
+
+impl ProfileRefusal {
+    /// The refusal's sentence, a run's or a conversation's.
+    fn sentence(&self, in_run: bool) -> String {
+        match self {
+            Self::NotAdmitted if in_run => crate::domain::execution::PROFILE_NOT_ADMITTED,
+            Self::NotAdmitted => crate::domain::execution::PROFILE_NOT_ADMITTED_IN_CONVERSATION,
+            Self::Gone => crate::domain::execution::PROFILE_GONE,
+            Self::Other(sentence) => sentence,
+        }
+        .to_string()
+    }
+
+    /// What the call is refused with: a tool narrowed away by `profile` is
+    /// answered 403 `TOOL_NOT_IN_PROFILE` with the sentence alone and needs
+    /// that profile; a gone profile keeps its answer and needs the Profiles
+    /// page. The inner loop is shown the refusal as before.
+    fn into_error(self, profile: uuid::Uuid, in_run: bool) -> SealSessionError {
+        let sentence = self.sentence(in_run);
+        match self {
+            Self::NotAdmitted => SealSessionError::InvalidArguments(sentence.clone()).answered(
+                CallerAnswer::ToolNotInProfile(sentence)
+                    .needing(RefusalNeeds::profile(Some(profile))),
+            ),
+            Self::Gone => profile_gone(),
+            Self::Other(_) => SealSessionError::InvalidArguments(sentence),
+        }
+    }
+}
+
+/// The refusal of a profile that is not the person's or was deleted, at a
+/// call: its sentence and code as before, needing the Profiles page (Zaru
+/// ADR-0070 D1 (d)).
+fn profile_gone() -> SealSessionError {
+    let shown =
+        SealSessionError::InvalidArguments(crate::domain::execution::PROFILE_GONE.to_string());
+    let answer = CallerAnswer::InvalidArguments(shown.to_string());
+    shown.answered(answer.needing(RefusalNeeds::profile(None)))
+}
 
 #[allow(clippy::too_many_arguments)]
 impl ToolInvocationService {
@@ -808,9 +859,10 @@ impl ToolInvocationService {
             return Ok(None);
         };
         if bindings.is_empty() {
-            return Err(super::gateway::binding_required(not_connected_sentence(
-                key,
-            )));
+            return Err(super::gateway::binding_required(
+                not_connected_sentence(key),
+                Some(key),
+            ));
         }
         let (argument, field, resolve): (_, _, fn(_, &_) -> _) = match key {
             CredentialProvider::IMAP => (
@@ -1166,8 +1218,8 @@ impl ToolInvocationService {
         let run_profile = self
             .profile_of_call(execution_id, call_profile, caller_identity)
             .await;
-        if let Some((profile, person)) = &run_profile {
-            if let Err(refusal) = self
+        if let Some((profile, person, in_run)) = &run_profile {
+            if let Err(refused) = self
                 .admit_by_profile(
                     tenant_id,
                     person.as_deref(),
@@ -1178,6 +1230,7 @@ impl ToolInvocationService {
                 )
                 .await
             {
+                let refusal = refused.sentence(*in_run);
                 self.event_bus
                     .publish_mcp_event(MCPToolEvent::PolicyViolation {
                         execution_id,
@@ -1204,10 +1257,10 @@ impl ToolInvocationService {
                     *agent_id,
                     format!("Policy violation: {refusal}"),
                 );
-                return Err(SealSessionError::InvalidArguments(refusal));
+                return Err(refused.into_error(*profile, *in_run));
             }
         }
-        let run_profile = run_profile.map(|(profile, _)| profile);
+        let run_profile = run_profile.map(|(profile, _, _)| profile);
 
         // --- A gated mail tool's mailbox, admitted before the gate (AEGIS
         // ADR-125's Update of 2026-10-07 (3) clause 11) ---
@@ -2030,7 +2083,7 @@ impl ToolInvocationService {
         execution_id: crate::domain::execution::ExecutionId,
         call_profile: Option<uuid::Uuid>,
         caller_identity: Option<&crate::domain::iam::UserIdentity>,
-    ) -> Option<(uuid::Uuid, Option<String>)> {
+    ) -> Option<(uuid::Uuid, Option<String>, bool)> {
         match self
             .execution_service
             .get_execution_unscoped(execution_id)
@@ -2039,11 +2092,12 @@ impl ToolInvocationService {
             Ok(execution) => execution
                 .input
                 .profile()
-                .map(|profile| (profile, execution.initiating_user_sub.clone())),
+                .map(|profile| (profile, execution.initiating_user_sub.clone(), true)),
             Err(_) => call_profile.map(|profile| {
                 (
                     profile,
                     crate::application::execution::person_sub(caller_identity),
+                    false,
                 )
             }),
         }
@@ -2067,9 +2121,7 @@ impl ToolInvocationService {
             Ok(map) => Ok(crate::domain::execution::ExecutionContexts::from_value(
                 Some(&Value::Object(map)),
             )),
-            Err(ProfileError::NotFound) => Err(SealSessionError::InvalidArguments(
-                crate::domain::execution::PROFILE_GONE.to_string(),
-            )),
+            Err(ProfileError::NotFound) => Err(profile_gone()),
             Err(e) => Err(SealSessionError::InternalError(format!(
                 "reading the call's profile failed: {e}"
             ))),
@@ -2077,7 +2129,7 @@ impl ToolInvocationService {
     }
 
     /// AEGIS ADR-140 D2, D7: whether the run's profile lets `tool_name`
-    /// through, read now; `Err` carries the refusal's sentence. A profile
+    /// through, read now; `Err` carries the refusal. A profile
     /// that can no longer be read (deleted, or not the person's) refuses
     /// every tool of `mail`, `calendar` and of each server the run chose
     /// bindings for (the reading R2).
@@ -2089,7 +2141,7 @@ impl ToolInvocationService {
         tool_name: &str,
         execution_id: crate::domain::execution::ExecutionId,
         call_contexts: Option<&crate::domain::execution::ExecutionContexts>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ProfileRefusal> {
         use crate::application::profile_service::ProfileError;
         let read = match self.run_profiles.as_ref() {
             Some(profiles) => profiles.admission_of(tenant_id, person, profile).await,
@@ -2099,10 +2151,10 @@ impl ToolInvocationService {
         };
         let unreadable = match read {
             Ok(admission) if admission.admits(tool_name) => return Ok(()),
-            Ok(_) => return Err(crate::domain::execution::PROFILE_NOT_ADMITTED.to_string()),
-            Err(ProfileError::NotFound) => crate::domain::execution::PROFILE_GONE.to_string(),
-            Err(ProfileError::Refused(sentence)) => sentence,
-            Err(e) => format!("reading the run's profile failed: {e}"),
+            Ok(_) => return Err(ProfileRefusal::NotAdmitted),
+            Err(ProfileError::NotFound) => ProfileRefusal::Gone,
+            Err(ProfileError::Refused(sentence)) => ProfileRefusal::Other(sentence),
+            Err(e) => ProfileRefusal::Other(format!("reading the run's profile failed: {e}")),
         };
         let family = tool_name.split('.').next().unwrap_or(tool_name);
         let contexts = match self

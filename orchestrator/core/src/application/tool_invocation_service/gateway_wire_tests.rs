@@ -1278,8 +1278,8 @@ async fn a_grant_to_all_agents_or_to_the_runs_workflow_opens_the_call() {
 
 /// H1, H3: an agent the binding is not granted to, a user with no binding,
 /// and a run with no person recorded are each refused
-/// `CREDENTIAL_BINDING_REQUIRED` in ADR-035's shape, and nothing reaches the
-/// gateway: no other credential path is tried.
+/// `CREDENTIAL_BINDING_REQUIRED` in ADR-035's shape with no `needs`, and
+/// nothing reaches the gateway: no other credential path is tried.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_grant_no_binding_or_no_person_is_refused_and_nothing_is_sent() {
     let tool = format!("{SERVER}.pages.read");
@@ -1348,6 +1348,10 @@ async fn no_grant_no_binding_or_no_person_is_refused_and_nothing_is_sent() {
             format!("This tool needs your own credential for '{SERVER}', granted to this agent.")
         };
         assert_eq!(refusal.message, expected, "{case}");
+        // Zaru ADR-0070 D1 (b), Trigger 1 (d): none of these is a missing
+        // connection (a run with no person, a grant, another server's
+        // binding), so none carries `needs`.
+        assert_eq!(refusal.needs, None, "{case}: carries needs");
         assert!(
             matches!(shown(&err), SealSessionError::NotFound(_)),
             "{case}: the inner loop is shown {:?}",

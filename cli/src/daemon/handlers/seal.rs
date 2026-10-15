@@ -734,6 +734,7 @@ const UPSTREAM_RETRY_AFTER_SECONDS: u64 = 5;
 /// The answer of `POST /v1/seal/invoke` to a refusal (AEGIS ADR-035, Update
 /// of 2026-10-04, R1 to R4): ADR-035's own error shape,
 /// `{"protocol","request_id","status","error":{"code","message","context","tool"}}`,
+/// with `error.needs` beside them on a refusal that carries one,
 /// with the status and stable code of [`SealSessionError::refusal`]. The
 /// route has no request id for a call, so one is minted here and is the
 /// correlation id: the log line carries it. An internal failure's detail is
@@ -775,7 +776,7 @@ pub(crate) fn invoke_refusal_response(
     }
     let status =
         StatusCode::from_u16(refusal.http_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let body = Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "protocol": "seal/v1",
         "request_id": request_id,
         "status": refusal.status,
@@ -785,7 +786,14 @@ pub(crate) fn invoke_refusal_response(
             "context": serde_json::Value::Null,
             "tool": tool,
         },
-    }));
+    });
+    // Zaru ADR-0070 D1 (a), D5: a refusal for a missing connection or
+    // profile says beside its sentence what is missing and where it is
+    // resolved; every other refusal carries no `needs`.
+    if let Some(needs) = &refusal.needs {
+        body["error"]["needs"] = serde_json::json!(needs);
+    }
+    let body = Json(body);
     let mut headers = HeaderMap::new();
     if refusal.code == "UPSTREAM_UNAVAILABLE" {
         // AEGIS ADR-035, Update of 2026-10-08 (U1): an upstream failure is
@@ -1451,5 +1459,92 @@ mod listing_person_tests {
         assert!(person.escalated);
         assert_eq!(person.user_id, "7c3d0000-person");
         assert_eq!(person.tier, None);
+    }
+}
+
+#[cfg(test)]
+mod refusal_needs_tests {
+    //! Zaru ADR-0070 D1 (a), D5; AEGIS ADR-035's Update
+    //! `error-needs-2026-10-15`: the invoke route's body carries `error.needs`
+    //! beside `code` and `message` when the refusal has one, and no `needs`
+    //! otherwise.
+    use super::*;
+    use aegis_orchestrator_core::domain::seal_session::RefusalNeeds;
+
+    async fn body_of(e: &SealSessionError, tool: &str) -> (u16, serde_json::Value) {
+        let payload = serde_json::json!({"params": {"name": tool}});
+        let response = invoke_refusal_response(e, &payload);
+        let status = response.status().as_u16();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// (a) A calendar the person has not connected: 403, the code, the
+    /// sentence, and `needs` naming the calendar and the Connections page.
+    #[tokio::test]
+    async fn a_missing_calendar_is_answered_with_its_needs() {
+        let sentence = "You have not connected a calendar to Zaru. Connect it on the Connections page in Zaru Web (ask.myzaru.com/vault/connections), then try again.";
+        let e = SealSessionError::NotFound(sentence.to_string()).answered(
+            CallerAnswer::CredentialBindingRequired {
+                message: sentence.to_string(),
+            }
+            .needing(RefusalNeeds::connection("calendar")),
+        );
+        let (status, body) = body_of(&e, "calendar.list").await;
+        println!("(a) {body}");
+        assert_eq!(status, 403);
+        assert_eq!(body["status"], "policy_violation");
+        assert_eq!(
+            body["error"],
+            serde_json::json!({
+                "code": "CREDENTIAL_BINDING_REQUIRED",
+                "message": sentence,
+                "context": null,
+                "tool": "calendar.list",
+                "needs": {"family": "calendar", "page": "/vault/connections"},
+            })
+        );
+    }
+
+    /// (c) A tool the conversation's profile does not admit: 403
+    /// `TOOL_NOT_IN_PROFILE`, the sentence alone, `needs` naming the profile.
+    #[tokio::test]
+    async fn c_a_tool_not_in_the_profile_is_answered_with_its_needs() {
+        let sentence = "This tool is not in the profile chosen for this conversation.";
+        let id = uuid::Uuid::parse_str("5b0c1d2e-3f40-4152-8364-758697a8b9ca").unwrap();
+        let e = SealSessionError::InvalidArguments(sentence.to_string()).answered(
+            CallerAnswer::ToolNotInProfile(sentence.to_string())
+                .needing(RefusalNeeds::profile(Some(id))),
+        );
+        let (status, body) = body_of(&e, "mail.send").await;
+        println!("(c) {body}");
+        assert_eq!(status, 403);
+        assert_eq!(body["status"], "policy_violation");
+        assert_eq!(
+            body["error"],
+            serde_json::json!({
+                "code": "TOOL_NOT_IN_PROFILE",
+                "message": sentence,
+                "context": null,
+                "tool": "mail.send",
+                "needs": {"family": "profile", "page": format!("/vault/profiles/{id}")},
+            })
+        );
+    }
+
+    /// (d) A refusal with no `needs` keeps ADR-035's shape with no `needs`
+    /// member.
+    #[tokio::test]
+    async fn d_a_refusal_without_needs_has_no_needs_member() {
+        let sentence = "This tool needs your own credential for 'github', and no person is recorded for this run.";
+        let e = SealSessionError::NotFound(sentence.to_string()).answered(
+            CallerAnswer::CredentialBindingRequired {
+                message: sentence.to_string(),
+            },
+        );
+        let (_, body) = body_of(&e, "github.list_issues").await;
+        assert!(body["error"].get("needs").is_none(), "{body}");
     }
 }

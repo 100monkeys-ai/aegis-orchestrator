@@ -189,7 +189,12 @@ async fn f_every_not_connected_sentence_names_the_connections_page_and_no_record
             wrong.push(format!("{tool} names a record: {said}"));
         }
         if let Err(SealSessionError::Answered { answer, .. }) = &result {
-            if !matches!(answer, CallerAnswer::CredentialBindingRequired { .. }) {
+            // Zaru ADR-0070 D1: the refusal carries its family's `needs`.
+            let bare = match answer {
+                CallerAnswer::Needs { answer, .. } => answer.as_ref(),
+                other => other,
+            };
+            if !matches!(bare, CallerAnswer::CredentialBindingRequired { .. }) {
                 wrong.push(format!("{tool} answered {answer:?}"));
             }
         }

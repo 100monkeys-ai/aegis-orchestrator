@@ -281,6 +281,10 @@ pub const PROFILE_GONE: &str = "The profile chosen for this run no longer exists
 /// admit (AEGIS ADR-140 D7).
 pub const PROFILE_NOT_ADMITTED: &str = "This tool is not in the profile chosen for this run.";
 
+/// [`PROFILE_NOT_ADMITTED`] for a conversation's call (Zaru ADR-0070 D1 (d)).
+pub const PROFILE_NOT_ADMITTED_IN_CONVERSATION: &str =
+    "This tool is not in the profile chosen for this conversation.";
+
 /// Read a `profile` value (AEGIS ADR-140 D6): a string holding a UUID is
 /// that profile; anything else is refused with [`PROFILE_SHAPE`].
 pub fn read_profile_value(value: &serde_json::Value) -> Result<uuid::Uuid, &'static str> {

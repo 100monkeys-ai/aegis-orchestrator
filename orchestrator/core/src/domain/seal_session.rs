@@ -224,6 +224,16 @@ pub enum CallerAnswer {
     /// listing its own tools (403 `EXECUTION_BOUND_SESSION`, AEGIS ADR-132
     /// S8). The message is fixed.
     ExecutionBoundSession,
+    /// A tool the chosen profile does not admit (403 `TOOL_NOT_IN_PROFILE`,
+    /// AEGIS ADR-140 D7; Zaru ADR-0070 D1 (d)): the sentence alone.
+    ToolNotInProfile(String),
+    /// `answer`, with what the person lacks and where it is resolved
+    /// (`error.needs`, Zaru ADR-0070 D1): the refusal keeps `answer`'s
+    /// status, code and message.
+    Needs {
+        answer: Box<CallerAnswer>,
+        needs: RefusalNeeds,
+    },
 }
 
 /// The class of an internal failure, which alone reaches the caller
@@ -267,6 +277,51 @@ pub struct SealRefusal {
     pub internal: bool,
     /// The rate limit, on a 429.
     pub rate_limit: Option<RateLimitHint>,
+    /// `error.needs`: what the person lacks and the page that resolves it,
+    /// on a refusal for a missing connection or profile (Zaru ADR-0070 D1).
+    pub needs: Option<RefusalNeeds>,
+}
+
+/// What a refusal for a missing connection or profile says is missing and
+/// where it is resolved (Zaru ADR-0070 D1 (a), AEGIS ADR-035's Update
+/// `error-needs-2026-10-15`), set where the refusal is raised, never read
+/// from its sentence. `family` is `mailbox`, `calendar`, a remote server's
+/// own name or `profile`; `page` is a path of Zaru Web.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusalNeeds {
+    pub family: String,
+    pub page: String,
+}
+
+/// The Zaru Web page where every connection family is connected (Zaru
+/// ADR-0070 D1 (c)).
+pub const CONNECTIONS_PAGE: &str = "/vault/connections";
+/// The Zaru Web page listing the person's profiles (Zaru ADR-0070 D1 (c)).
+pub const PROFILES_PAGE: &str = "/vault/profiles";
+/// The `family` of a refusal a profile resolves.
+pub const PROFILE_FAMILY: &str = "profile";
+
+impl RefusalNeeds {
+    /// A connection of `family` (`mailbox`, `calendar` or a server's name),
+    /// connected on the Connections page.
+    pub fn connection(family: &str) -> Self {
+        Self {
+            family: family.to_string(),
+            page: CONNECTIONS_PAGE.to_string(),
+        }
+    }
+
+    /// The profile `id`, on its own page; a profile that no longer exists
+    /// (`None`), on the Profiles page.
+    pub fn profile(id: Option<Uuid>) -> Self {
+        Self {
+            family: PROFILE_FAMILY.to_string(),
+            page: match id {
+                Some(id) => format!("{PROFILES_PAGE}/{id}"),
+                None => PROFILES_PAGE.to_string(),
+            },
+        }
+    }
 }
 
 /// The fixed message of an attestation refused for a context the caller's
@@ -295,6 +350,7 @@ impl SealRefusal {
             message,
             internal: false,
             rate_limit: None,
+            needs: None,
         }
     }
 
@@ -322,6 +378,7 @@ impl SealRefusal {
             message: message.to_string(),
             internal: true,
             rate_limit: None,
+            needs: None,
         }
     }
 }
@@ -414,54 +471,59 @@ impl SealSessionError {
             }
             Self::ConfigurationError(_) => SealRefusal::internal(InternalFailure::Unavailable),
             Self::UpstreamUnavailable(_) => SealRefusal::internal(InternalFailure::Upstream),
-            Self::Answered { answer, .. } => match answer {
-                CallerAnswer::InvalidArguments(m) => {
-                    SealRefusal::caller(422, "INVALID_ARGUMENTS", m.clone())
-                }
-                CallerAnswer::NotFound(m) => SealRefusal::caller(404, "NOT_FOUND", m.clone()),
-                CallerAnswer::Conflict(m) => SealRefusal::caller(409, "CONFLICT", m.clone()),
-                CallerAnswer::QuotaExceeded(m) => {
-                    SealRefusal::caller(422, "QUOTA_EXCEEDED", m.clone())
-                }
-                CallerAnswer::JudgeRejected(m) => {
-                    SealRefusal::policy(403, "JUDGE_REJECTED", m.clone())
-                }
-                CallerAnswer::PathNotAllowed(m) => {
-                    SealRefusal::policy(403, "PATH_NOT_ALLOWED", m.clone())
-                }
-                CallerAnswer::TenantMismatch(m) => {
-                    SealRefusal::caller(403, "TENANT_MISMATCH", m.clone())
-                }
-                CallerAnswer::ContextNotAllowed => SealRefusal::policy(
-                    403,
-                    "CONTEXT_NOT_ALLOWED",
-                    CONTEXT_NOT_ALLOWED_MESSAGE.to_string(),
-                ),
-                CallerAnswer::NotImplemented(m) => {
-                    SealRefusal::caller(501, "NOT_IMPLEMENTED", m.clone())
-                }
-                CallerAnswer::EdgeUnavailable(m) => {
-                    SealRefusal::caller(503, "EDGE_UNAVAILABLE", m.clone())
-                }
-                CallerAnswer::Internal(class) => SealRefusal::internal(*class),
-                CallerAnswer::CredentialBindingRequired { message } => {
-                    SealRefusal::policy(403, "CREDENTIAL_BINDING_REQUIRED", message.clone())
-                }
-                CallerAnswer::CredentialRejected { message } => {
-                    SealRefusal::caller(403, "CREDENTIAL_REJECTED", message.clone())
-                }
-                CallerAnswer::RemoteToolError(m) => {
-                    SealRefusal::caller(422, "REMOTE_TOOL_ERROR", m.clone())
-                }
-                CallerAnswer::CredentialChannelNotConfidential => SealRefusal {
-                    code: "CREDENTIAL_CHANNEL_NOT_CONFIDENTIAL",
-                    ..SealRefusal::internal(InternalFailure::Unavailable)
-                },
-                CallerAnswer::ExecutionBoundSession => SealRefusal::policy(
-                    403,
-                    "EXECUTION_BOUND_SESSION",
-                    EXECUTION_BOUND_SESSION_MESSAGE.to_string(),
-                ),
+            Self::Answered { answer, .. } => answer.refusal(),
+        }
+    }
+}
+
+impl CallerAnswer {
+    /// This answer carrying `needs`.
+    pub fn needing(self, needs: RefusalNeeds) -> Self {
+        Self::Needs {
+            answer: Box::new(self),
+            needs,
+        }
+    }
+
+    /// What the tool invoke route answers for this (AEGIS ADR-035, Update of
+    /// 2026-10-04, R5). One exhaustive match.
+    pub fn refusal(&self) -> SealRefusal {
+        match self {
+            Self::InvalidArguments(m) => SealRefusal::caller(422, "INVALID_ARGUMENTS", m.clone()),
+            Self::NotFound(m) => SealRefusal::caller(404, "NOT_FOUND", m.clone()),
+            Self::Conflict(m) => SealRefusal::caller(409, "CONFLICT", m.clone()),
+            Self::QuotaExceeded(m) => SealRefusal::caller(422, "QUOTA_EXCEEDED", m.clone()),
+            Self::JudgeRejected(m) => SealRefusal::policy(403, "JUDGE_REJECTED", m.clone()),
+            Self::PathNotAllowed(m) => SealRefusal::policy(403, "PATH_NOT_ALLOWED", m.clone()),
+            Self::TenantMismatch(m) => SealRefusal::caller(403, "TENANT_MISMATCH", m.clone()),
+            Self::ContextNotAllowed => SealRefusal::policy(
+                403,
+                "CONTEXT_NOT_ALLOWED",
+                CONTEXT_NOT_ALLOWED_MESSAGE.to_string(),
+            ),
+            Self::NotImplemented(m) => SealRefusal::caller(501, "NOT_IMPLEMENTED", m.clone()),
+            Self::EdgeUnavailable(m) => SealRefusal::caller(503, "EDGE_UNAVAILABLE", m.clone()),
+            Self::Internal(class) => SealRefusal::internal(*class),
+            Self::CredentialBindingRequired { message } => {
+                SealRefusal::policy(403, "CREDENTIAL_BINDING_REQUIRED", message.clone())
+            }
+            Self::CredentialRejected { message } => {
+                SealRefusal::caller(403, "CREDENTIAL_REJECTED", message.clone())
+            }
+            Self::RemoteToolError(m) => SealRefusal::caller(422, "REMOTE_TOOL_ERROR", m.clone()),
+            Self::CredentialChannelNotConfidential => SealRefusal {
+                code: "CREDENTIAL_CHANNEL_NOT_CONFIDENTIAL",
+                ..SealRefusal::internal(InternalFailure::Unavailable)
+            },
+            Self::ExecutionBoundSession => SealRefusal::policy(
+                403,
+                "EXECUTION_BOUND_SESSION",
+                EXECUTION_BOUND_SESSION_MESSAGE.to_string(),
+            ),
+            Self::ToolNotInProfile(m) => SealRefusal::policy(403, "TOOL_NOT_IN_PROFILE", m.clone()),
+            Self::Needs { answer, needs } => SealRefusal {
+                needs: Some(needs.clone()),
+                ..answer.refusal()
             },
         }
     }

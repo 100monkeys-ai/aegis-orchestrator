@@ -860,6 +860,20 @@ pub fn not_connected_sentence(key: &str) -> String {
     )
 }
 
+/// What a refusal for a family its person has not connected needs (Zaru
+/// ADR-0070 D1 (a) to (c)), from the same binding key as
+/// [`not_connected_sentence`]: `imap` is a mailbox, `caldav` a calendar, a
+/// server's key its own name; every family is connected on the Connections
+/// page.
+pub fn connection_needs(key: &str) -> crate::domain::seal_session::RefusalNeeds {
+    let family = match key {
+        CredentialProvider::IMAP => "mailbox",
+        CALENDAR_CHOICE_KEY => "calendar",
+        server => server,
+    };
+    crate::domain::seal_session::RefusalNeeds::connection(family)
+}
+
 /// A mail tool's mailbox (AEGIS ADR-125 D4 and its Update of 2026-10-07
 /// clauses 7, 8 and 10): a mailbox binding of the acting person, its
 /// settings and how its sessions authenticate (an `imap` binding's
