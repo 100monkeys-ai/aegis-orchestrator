@@ -4,8 +4,9 @@
 //! calls (Zaru ADR-0055 D2, D9, D15): a chosen binding is the credential, no
 //! grant needed, only when it is the acting person's own active binding for
 //! that server in their tenant; a choice of none gives no credential
-//! whatever is granted; with no choice the per-agent grant path (AEGIS
-//! ADR-132 S6) stands. The real `StandardCredentialManagementService` over
+//! whatever is granted; and a choice of nothing gives none either (Zaru
+//! ADR-0071 D1 (b): the per-agent grant path of AEGIS ADR-132 S6 is
+//! closed). The real `StandardCredentialManagementService` over
 //! in-memory bindings and secrets.
 
 use aegis_orchestrator_core::application::credential_service::{
@@ -177,7 +178,8 @@ impl Vault {
 }
 
 /// D15: an id selects that binding though it is neither the newest nor
-/// granted, where no choice keeps the newest granted one.
+/// granted; with no choice the newest granted one is not the credential
+/// either (Zaru ADR-0071 D1 (b)).
 #[tokio::test]
 async fn a_chosen_binding_is_the_credential_though_older_and_ungranted() {
     let v = vault();
@@ -199,8 +201,8 @@ async fn a_chosen_binding_is_the_credential_though_older_and_ungranted() {
         v.alices_credential(ContextChoice::NotGiven)
             .await
             .as_deref(),
-        Some("newest-granted"),
-        "with no choice the newest granted binding is no longer the credential"
+        None,
+        "with no choice the newest granted binding was the credential"
     );
 }
 
@@ -242,7 +244,8 @@ async fn a_chosen_binding_that_is_not_alices_active_one_for_the_server_answers_n
     assert!(carried.is_empty(), "a chosen binding that is not Alice's own active one for the server was the credential: {carried:?}");
 }
 
-/// D2, D15: `null` chose no credential, even under an all-agents grant.
+/// D2, D15: `null` chose no credential, even under an all-agents grant;
+/// and no choice chose none (Zaru ADR-0071 D1 (b)).
 #[tokio::test]
 async fn a_choice_of_none_answers_nothing_under_an_all_agents_grant() {
     let v = vault();
@@ -261,7 +264,7 @@ async fn a_choice_of_none_answers_nothing_under_an_all_agents_grant() {
         v.alices_credential(ContextChoice::NotGiven)
             .await
             .as_deref(),
-        Some("granted-to-all-agents"),
-        "the grant path no longer answers with no choice"
+        None,
+        "with no choice the all-agents grant's credential was carried"
     );
 }

@@ -68,6 +68,18 @@ pub(super) fn binding_required(message: String, family: Option<&str>) -> SealSes
     })
 }
 
+/// The refusal `CREDENTIAL_BINDING_REQUIRED` with `message` and the
+/// `needs` that resolves it, for a refusal whose `needs` is not a family
+/// its person has not connected: a run that names nothing for the family
+/// needs a profile (Zaru ADR-0071 D1 (e)).
+pub(super) fn binding_required_needing(
+    message: String,
+    needs: crate::domain::seal_session::RefusalNeeds,
+) -> SealSessionError {
+    SealSessionError::NotFound(message.clone())
+        .answered(CallerAnswer::CredentialBindingRequired { message }.needing(needs))
+}
+
 /// Connect timeout for SEAL Tooling Gateway gRPC connections.
 ///
 /// Built-in tool dispatch must not hang waiting for the SEAL Tooling Gateway
@@ -1344,8 +1356,10 @@ impl ToolInvocationService {
 
     /// The acting user's credential for `server` (AEGIS ADR-132 H1, H3,
     /// H6), or the refusal `CREDENTIAL_BINDING_REQUIRED`: for a run with no
-    /// recorded person, saying so; for a user with no binding to the server
-    /// granted to this agent or its workflow; for an execution whose dispatch
+    /// recorded person, saying so; for a run that named nothing for the
+    /// server, with the sentence and `needs` of Zaru ADR-0071 D1 (e), since
+    /// a run reaches a connection only when its profile or its chosen
+    /// bindings name it, whatever is granted; for an execution whose dispatch
     /// chose none for the server, or chose a binding that is not the user's
     /// own active one for it (Zaru ADR-0055 D15). With a chosen set, the
     /// call's `_context` picks the binding (ADR-132 Update (13) S11e). No
@@ -1388,7 +1402,14 @@ impl ToolInvocationService {
                     ))),
                 };
             }
-            ServerChoice::NotGiven => ContextChoice::NotGiven,
+            // Zaru ADR-0071 D1 (a), (b), (e): a run that named nothing for
+            // the server reaches none of its person's bindings.
+            ServerChoice::NotGiven => {
+                return Err(binding_required_needing(
+                    crate::application::credential_service::no_profile_names_sentence(server),
+                    crate::domain::seal_session::RefusalNeeds::profile(None),
+                ));
+            }
             ServerChoice::None => ContextChoice::None,
             ServerChoice::Bindings(chosen) => {
                 self.pick_binding(tenant_id, user_id, server, &chosen, context_argument)
@@ -1406,14 +1427,11 @@ impl ToolInvocationService {
             Ok(Some(credential)) => Ok(credential),
             Ok(None) => Err(binding_required(
                 match context {
-                ContextChoice::None => format!(
-                    "This tool needs your own credential for '{server}', and none was chosen for this run."
-                ),
                 ContextChoice::Binding(_) => format!(
                     "This tool needs your own credential for '{server}', and the one chosen for this run is not an active credential of yours for it."
                 ),
-                ContextChoice::NotGiven => format!(
-                    "This tool needs your own credential for '{server}', granted to this agent."
+                ContextChoice::None | ContextChoice::NotGiven => format!(
+                    "This tool needs your own credential for '{server}', and none was chosen for this run."
                 ),
                 },
                 None,

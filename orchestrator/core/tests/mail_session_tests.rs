@@ -45,7 +45,7 @@ use aegis_orchestrator_core::application::credential_service::{
     ToolCallActor, ToolMailbox, ToolMailboxSource,
 };
 use aegis_orchestrator_core::application::tools::builtin_mail::{
-    MailActing, MailTools, CHOSEN_DIFFERENT, NONE_CHOSEN, NOT_GRANTED, NO_PERSON,
+    MailActing, MailTools, CHOSEN_DIFFERENT, NONE_CHOSEN, NO_PERSON,
 };
 use aegis_orchestrator_core::domain::agent::AgentId;
 use aegis_orchestrator_core::domain::credential::{
@@ -77,7 +77,6 @@ struct OneMailbox {
     id: CredentialBindingId,
     port: u16,
     host: String,
-    granted: bool,
 }
 
 #[async_trait]
@@ -104,7 +103,6 @@ impl ToolMailboxSource for OneMailbox {
                 username: LOGIN.to_string(),
             },
             auth: MailAuth::Password(SensitiveString::new(PASSWORD)),
-            granted: self.granted,
         }))
     }
 }
@@ -175,14 +173,13 @@ struct Fixture {
     id: CredentialBindingId,
 }
 
-async fn fixture(permanent_flags: &str, granted: bool) -> Fixture {
+async fn fixture(permanent_flags: &str) -> Fixture {
     let mailbox = imap_mailbox_standin(LOGIN, PASSWORD, inbox(), permanent_flags).await;
     let id = CredentialBindingId::new();
     let source = Arc::new(OneMailbox {
         id,
         port: mailbox.port(),
         host: "127.0.0.1".to_string(),
-        granted,
     });
     Fixture {
         tools: MailTools::with_connector(source, Arc::new(PlainConnector)),
@@ -252,7 +249,7 @@ async fn call(
 
 #[tokio::test]
 async fn mail_list_answers_the_inbox_grouped_into_threads_newest_first() {
-    let f = fixture("\\Seen \\Flagged \\*", false).await;
+    let f = fixture("\\Seen \\Flagged \\*").await;
     let answer = call(&f, "mail.list", json!({}), &conversation())
         .await
         .unwrap();
@@ -290,7 +287,7 @@ async fn mail_list_answers_the_inbox_grouped_into_threads_newest_first() {
 
 #[tokio::test]
 async fn mail_list_searches_with_the_query_and_reports_truncation() {
-    let f = fixture("\\Seen \\Flagged \\*", false).await;
+    let f = fixture("\\Seen \\Flagged \\*").await;
     let answer = call(
         &f,
         "mail.list",
@@ -313,7 +310,7 @@ async fn mail_list_searches_with_the_query_and_reports_truncation() {
 
 #[tokio::test]
 async fn mail_read_answers_a_threads_messages_oldest_first_and_marks_nothing_read() {
-    let f = fixture("\\Seen \\Flagged \\*", false).await;
+    let f = fixture("\\Seen \\Flagged \\*").await;
     let answer = call(
         &f,
         "mail.read",
@@ -379,7 +376,7 @@ async fn mail_read_answers_a_threads_messages_oldest_first_and_marks_nothing_rea
 
 #[tokio::test]
 async fn mail_read_of_a_message_with_no_message_id_reads_it_by_uid() {
-    let f = fixture("\\Seen \\Flagged \\*", false).await;
+    let f = fixture("\\Seen \\Flagged \\*").await;
     let answer = call(
         &f,
         "mail.read",
@@ -394,7 +391,7 @@ async fn mail_read_of_a_message_with_no_message_id_reads_it_by_uid() {
 
 #[tokio::test]
 async fn mail_label_stores_the_keywords_and_the_flag_and_takes_them_off_again() {
-    let f = fixture("\\Seen \\Flagged \\*", false).await;
+    let f = fixture("\\Seen \\Flagged \\*").await;
     let answer = call(
         &f,
         "mail.label",
@@ -450,7 +447,7 @@ async fn mail_label_stores_the_keywords_and_the_flag_and_takes_them_off_again() 
 
 #[tokio::test]
 async fn mail_label_refuses_a_keyword_the_server_will_not_keep_before_any_store() {
-    let f = fixture("\\Seen \\Flagged", false).await;
+    let f = fixture("\\Seen \\Flagged").await;
     let error = call(
         &f,
         "mail.label",
@@ -472,7 +469,7 @@ async fn mail_label_refuses_a_keyword_the_server_will_not_keep_before_any_store(
 
 #[tokio::test]
 async fn a_call_with_no_person_is_refused_before_any_connection() {
-    let f = fixture("\\*", true).await;
+    let f = fixture("\\*").await;
     let acting = MailActing {
         user_id: None,
         ..agent_run()
@@ -485,7 +482,7 @@ async fn a_call_with_no_person_is_refused_before_any_connection() {
 
 #[tokio::test]
 async fn a_mailbox_that_is_not_the_persons_own_is_refused() {
-    let f = fixture("\\*", true).await;
+    let f = fixture("\\*").await;
     let other = CredentialBindingId::new();
     let error = f
         .tools
@@ -533,7 +530,7 @@ async fn a_mailbox_that_is_not_the_persons_own_is_refused() {
 
 #[tokio::test]
 async fn a_chosen_mailbox_other_than_the_argument_or_none_is_refused() {
-    let f = fixture("\\*", true).await;
+    let f = fixture("\\*").await;
     let chosen_other = MailActing {
         choice: ServerChoice::Bindings(vec![CredentialBindingId::new()]),
         ..conversation()
@@ -557,7 +554,7 @@ async fn a_chosen_mailbox_other_than_the_argument_or_none_is_refused() {
         choice: ServerChoice::Bindings(vec![f.id]),
         ..agent_run()
     };
-    let f = fixture("\\*", false).await;
+    let f = fixture("\\*").await;
     let chosen = MailActing {
         choice: ServerChoice::Bindings(vec![f.id]),
         ..chosen
@@ -565,24 +562,25 @@ async fn a_chosen_mailbox_other_than_the_argument_or_none_is_refused() {
     call(&f, "mail.list", json!({}), &chosen).await.unwrap();
 }
 
+/// Zaru ADR-0071 D1 (a), (b), (e): an agent's run that chose nothing
+/// reaches no mailbox, whatever is granted, and no connection is made.
 #[tokio::test]
-async fn an_agents_run_with_nothing_chosen_needs_the_grant() {
-    let ungranted = fixture("\\*", false).await;
-    let error = call(&ungranted, "mail.list", json!({}), &agent_run())
+async fn an_agents_run_with_nothing_chosen_reaches_no_mailbox() {
+    let f = fixture("\\*").await;
+    let error = call(&f, "mail.list", json!({}), &agent_run())
         .await
         .unwrap_err();
-    assert_eq!(sentence(&error), NOT_GRANTED, "{error:?}");
-    assert_eq!(ungranted.mailbox.connections(), 0);
-
-    let granted = fixture("\\*", true).await;
-    call(&granted, "mail.list", json!({}), &agent_run())
-        .await
-        .unwrap();
+    assert_eq!(
+        error.refusal().message,
+        aegis_orchestrator_core::application::credential_service::no_profile_names_sentence("imap"),
+        "{error:?}"
+    );
+    assert_eq!(f.mailbox.connections(), 0);
 }
 
 #[tokio::test]
 async fn a_conversation_with_nothing_chosen_is_admitted_on_ownership_alone() {
-    let f = fixture("\\*", false).await;
+    let f = fixture("\\*").await;
     let answer = call(&f, "mail.list", json!({}), &conversation())
         .await
         .unwrap();
@@ -597,7 +595,6 @@ async fn the_production_connector_refuses_a_loopback_mail_server() {
         id,
         port: 993,
         host: "127.0.0.1".to_string(),
-        granted: true,
     }));
     let error = tools
         .invoke(
@@ -656,7 +653,6 @@ impl ToolMailboxSource for OAuthMailbox {
                 username: OAUTH_ADDRESS.to_string(),
             },
             auth: MailAuth::XOAuth2(SensitiveString::new(self.token.clone())),
-            granted: false,
         }))
     }
 }
@@ -790,7 +786,6 @@ impl ToolMailboxSource for SendMailbox {
                 username: self.address.clone(),
             },
             auth: self.auth.clone(),
-            granted: false,
         }))
     }
 }
@@ -1325,7 +1320,6 @@ async fn delete_fixture(
         id,
         port: mailbox.port(),
         host: "127.0.0.1".to_string(),
-        granted: false,
     });
     Fixture {
         tools: MailTools::with_connector(source, Arc::new(PlainConnector)),

@@ -764,7 +764,8 @@ pub struct ToolCallActor<'a> {
     pub agent_id: AgentId,
     pub workflow_id: Option<uuid::Uuid>,
     /// What the execution's dispatch chose for this server (Zaru ADR-0055
-    /// D15): a binding, none, or nothing, which leaves the grant path.
+    /// D15): a binding, none, or nothing, which reaches no binding (Zaru
+    /// ADR-0071 D1 (b)).
     pub context: crate::domain::execution::ContextChoice,
 }
 
@@ -773,21 +774,18 @@ pub struct ToolCallActor<'a> {
 /// checked against the binding's grants where the secret is read.
 #[async_trait]
 pub trait ToolCredentialSource: Send + Sync {
-    /// The acting user's credential for the tool server `server`: the secret
-    /// of their active binding whose provider is the server's name, granted
-    /// to the calling agent, to its workflow, or to all their agents (the
-    /// grant model of ADR-078 and ADR-125). `Ok(None)` when no such binding
-    /// is granted, or when its OAuth token can no longer be refreshed: the
-    /// call is then refused, and no other credential path is tried. An
-    /// `OAuth2` binding answers its access token, refreshed when it is
-    /// within 60 seconds of `expires_at` (`access_token_for`); any other
-    /// answers its `token` or `value` field.
-    ///
-    /// The execution's choice for the server comes first (Zaru ADR-0055
-    /// D15): a chosen binding is the credential, no grant needed, when it is
+    /// The acting user's credential for the tool server `server`, as the
+    /// execution's choice for the server names it (Zaru ADR-0055 D15, Zaru
+    /// ADR-0071 D1 (a), (b)): a chosen binding is the credential when it is
     /// the acting user's own active binding for the server in the tenant,
-    /// and `Ok(None)` otherwise; a choice of none answers `Ok(None)` whatever
-    /// is granted; with no choice the grant path above stands.
+    /// and `Ok(None)` otherwise; a choice of none, and a choice of nothing,
+    /// answer `Ok(None)` whatever is granted, since a grant names no binding
+    /// for a run (the grant path of AEGIS ADR-132 S6 is closed). `Ok(None)`
+    /// also when the chosen binding's OAuth token can no longer be
+    /// refreshed: the call is then refused, and no other credential path is
+    /// tried. An `OAuth2` binding answers its access token, refreshed when
+    /// it is within 60 seconds of `expires_at` (`access_token_for`); any
+    /// other answers its `token` or `value` field.
     async fn tool_server_credential(
         &self,
         actor: &ToolCallActor<'_>,
@@ -860,6 +858,35 @@ pub fn not_connected_sentence(key: &str) -> String {
     )
 }
 
+/// A family as a person reads it after "your" (Zaru ADR-0071 D1 (e)):
+/// `imap` is a mailbox, `caldav` a calendar, a remote server its product's
+/// name, and a person's own server its own name.
+fn your_family(key: &str) -> &str {
+    match key {
+        CredentialProvider::IMAP => "mailbox",
+        CALENDAR_CHOICE_KEY => "calendar",
+        "github" => "GitHub",
+        "nuclear-notes" => "Nuclear Notes",
+        server => server,
+    }
+}
+
+/// The sentence a run's or a schedule's call is refused with when nothing
+/// the run carries names a binding of the family `key` (Zaru ADR-0071 D1
+/// (a), (b), (e)): a run reaches a connection only when its profile, or the
+/// bindings chosen one by one, name it.
+pub fn no_profile_names_sentence(key: &str) -> String {
+    format!(
+        "This run has no profile that names your {}. Choose a profile that names it, then start the run again.",
+        your_family(key)
+    )
+}
+
+/// The sentence a call on an API key is refused with when neither the
+/// key's profile nor the request names a binding of the call's family
+/// (Zaru ADR-0071 D1 (e), D3).
+pub const KEY_REACHES_NONE: &str = "This key reaches none of your connections. Choose a profile for it on the API keys page in Zaru Web, or name one in the request.";
+
 /// What a refusal for a family its person has not connected needs (Zaru
 /// ADR-0070 D1 (a) to (c)), from the same binding key as
 /// [`not_connected_sentence`]: `imap` is a mailbox, `caldav` a calendar, a
@@ -877,14 +904,11 @@ pub fn connection_needs(key: &str) -> crate::domain::seal_session::RefusalNeeds 
 /// A mail tool's mailbox (AEGIS ADR-125 D4 and its Update of 2026-10-07
 /// clauses 7, 8 and 10): a mailbox binding of the acting person, its
 /// settings and how its sessions authenticate (an `imap` binding's
-/// password, or an OAuth binding's access token for XOAUTH2), and whether
-/// it is granted to the calling agent, its workflow or all the person's
-/// agents.
+/// password, or an OAuth binding's access token for XOAUTH2).
 pub struct ToolMailbox {
     pub binding_id: CredentialBindingId,
     pub settings: crate::domain::credential::MailboxSettings,
     pub auth: MailAuth,
-    pub granted: bool,
 }
 
 /// Whether `binding` is a mailbox (AEGIS ADR-125's Update of 2026-10-07
@@ -921,14 +945,11 @@ pub const CALENDAR_CHOICE_KEY: &str = "caldav";
 /// the acting person ([`is_calendar_binding`]), its CalDAV settings, how its
 /// requests authenticate (the OAuth access token as a bearer, or the user
 /// name and password of a binding connected by password by HTTP Basic,
-/// K10), and whether
-/// it is granted to the calling agent, its workflow or all the person's
-/// agents.
+/// K10).
 pub struct ToolCalendar {
     pub binding_id: CredentialBindingId,
     pub settings: crate::domain::credential::CalendarSettings,
     pub auth: CalDavAuth,
-    pub granted: bool,
 }
 
 /// Answers the calendar account a calendar tool's `account` argument names
@@ -940,8 +961,7 @@ pub trait ToolCalendarSource: Send + Sync {
     /// answers (refreshed within 60 seconds of expiry); `Ok(None)` for
     /// anything else, another person's binding and a binding whose token can
     /// no longer be refreshed included. Whether the call may use it (the
-    /// choice and the grant) is the calendar tools' decision, from
-    /// [`ToolCalendar::granted`].
+    /// run's choice) is the calendar tools' decision.
     async fn tool_calendar(
         &self,
         actor: &ToolCallActor<'_>,
@@ -970,8 +990,7 @@ pub trait ToolMailboxSource: Send + Sync {
     /// `access_token_for` answers, refreshed within 60 seconds of expiry);
     /// `Ok(None)` for anything else, another person's binding and an OAuth
     /// binding whose token can no longer be refreshed included. Whether the
-    /// call may use it (the choice and the grant) is the mail tools'
-    /// decision, from [`ToolMailbox::granted`].
+    /// call may use it (the run's choice) is the mail tools' decision.
     async fn tool_mailbox(
         &self,
         actor: &ToolCallActor<'_>,
@@ -1060,24 +1079,6 @@ pub fn context_names(bindings: &[(CredentialBindingId, &str)]) -> Vec<String> {
         .collect()
 }
 
-/// Whether `binding` is granted to `actor`'s agent, its workflow, or all the
-/// owner's agents. `active_grants_for` answers nothing for a binding that is
-/// not active.
-fn granted_to(binding: &UserCredentialBinding, actor: &ToolCallActor<'_>) -> bool {
-    let agent = GrantTarget::Agent {
-        agent_id: actor.agent_id,
-    };
-    !binding.active_grants_for(&agent).is_empty()
-        || actor.workflow_id.is_some_and(|workflow_id| {
-            !binding
-                .active_grants_for(&GrantTarget::Workflow { workflow_id })
-                .is_empty()
-        })
-        || !binding
-            .active_grants_for(&GrantTarget::AllAgents)
-            .is_empty()
-}
-
 #[async_trait]
 impl ToolCredentialSource for StandardCredentialManagementService {
     async fn tool_server_credential(
@@ -1106,12 +1107,9 @@ impl ToolCredentialSource for StandardCredentialManagementService {
                     _ => return Ok(None),
                 }
             }
-            crate::domain::execution::ContextChoice::NotGiven => {
-                match self.newest_granted(actor, &provider).await? {
-                    Some(binding) => binding,
-                    None => return Ok(None),
-                }
-            }
+            // Zaru ADR-0071 D1 (b): a run that named nothing for the server
+            // reaches none of its person's bindings, whatever is granted.
+            crate::domain::execution::ContextChoice::NotGiven => return Ok(None),
         };
         self.binding_secret(binding).await
     }
@@ -1186,7 +1184,6 @@ impl ToolMailboxSource for StandardCredentialManagementService {
             }
             _ => return Ok(None),
         };
-        let granted = granted_to(&binding, actor);
         if binding.credential_type == CredentialType::OAuth2 {
             // XOAUTH2 with the access token (clause 10, 8b): read from
             // `access_token`, refreshed inside the margin; never `value`. A
@@ -1200,7 +1197,6 @@ impl ToolMailboxSource for StandardCredentialManagementService {
                     binding_id,
                     settings,
                     auth: MailAuth::XOAuth2(token),
-                    granted,
                 }));
         }
         let stored = self
@@ -1219,7 +1215,6 @@ impl ToolMailboxSource for StandardCredentialManagementService {
             binding_id: binding.id,
             settings,
             auth: MailAuth::Password(password),
-            granted,
         }))
     }
 
@@ -1253,7 +1248,6 @@ impl ToolCalendarSource for StandardCredentialManagementService {
             }
             _ => return Ok(None),
         };
-        let granted = granted_to(&binding, actor);
         let binding_id = binding.id;
         if binding.credential_type == CredentialType::Calendar {
             // Connected by password (K10): HTTP Basic with the user name and
@@ -1278,7 +1272,6 @@ impl ToolCalendarSource for StandardCredentialManagementService {
                 binding_id,
                 settings,
                 auth: CalDavAuth::Basic { username, password },
-                granted,
             }));
         }
         // The access token, read from `access_token` and refreshed inside the
@@ -1291,7 +1284,6 @@ impl ToolCalendarSource for StandardCredentialManagementService {
                 binding_id,
                 settings,
                 auth: CalDavAuth::Bearer(token),
-                granted,
             }))
     }
 
@@ -1397,31 +1389,6 @@ impl StandardCredentialManagementService {
             })
             .collect();
         Ok(Self::named_contexts(&mut active))
-    }
-
-    /// The acting person's newest active binding for `provider` granted to
-    /// the calling agent, its workflow or all their agents (AEGIS ADR-132
-    /// H1, S6).
-    async fn newest_granted(
-        &self,
-        actor: &ToolCallActor<'_>,
-        provider: &CredentialProvider,
-    ) -> anyhow::Result<Option<UserCredentialBinding>> {
-        // The newest granted binding, when a user holds several.
-        let mut granted: Vec<UserCredentialBinding> = self
-            .repo
-            .find_by_owner(actor.tenant_id, actor.user_id)
-            .await?
-            .into_iter()
-            .filter(|binding| {
-                &binding.provider == provider
-                    && binding.owner_user_id == actor.user_id
-                    && &binding.tenant_id == actor.tenant_id
-                    && granted_to(binding, actor)
-            })
-            .collect();
-        granted.sort_by_key(|binding| std::cmp::Reverse(binding.created_at));
-        Ok(granted.into_iter().next())
     }
 
     /// The secret a remote tool server's call carries from `binding`: an

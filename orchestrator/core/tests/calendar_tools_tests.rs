@@ -994,8 +994,8 @@ mod read_tools {
         ToolInvocationResult, ToolInvocationService,
     };
     use aegis_orchestrator_core::application::tools::builtin_calendar::{
-        BAD_LIMIT, CHOSEN_DIFFERENT, END_NOT_AFTER_START, NONE_CHOSEN, NOT_AMONG_CHOSEN,
-        NOT_GRANTED, NO_PERSON, WINDOW_TOO_WIDE,
+        BAD_LIMIT, CHOSEN_DIFFERENT, END_NOT_AFTER_START, NONE_CHOSEN, NOT_AMONG_CHOSEN, NO_PERSON,
+        WINDOW_TOO_WIDE,
     };
     use aegis_orchestrator_core::domain::agent::{Agent, AgentId, AgentManifest, AgentStatus};
     use aegis_orchestrator_core::domain::events::ExecutionEvent;
@@ -1084,15 +1084,13 @@ spec:
     struct Account {
         id: CredentialBindingId,
         name: String,
-        granted: bool,
     }
 
     impl Account {
-        fn new(name: &str, granted: bool) -> Self {
+        fn new(name: &str) -> Self {
             Self {
                 id: CredentialBindingId::new(),
                 name: name.to_string(),
-                granted,
             }
         }
     }
@@ -1119,7 +1117,6 @@ spec:
                     binding_id: a.id,
                     settings: client_settings(),
                     auth: CalDavAuth::Bearer(SensitiveString::new(TOKEN)),
-                    granted: a.granted,
                 }))
         }
 
@@ -1184,6 +1181,12 @@ spec:
             person: Some(PERSON),
             contexts,
         }
+    }
+
+    /// A run of the person that chose `account`: a run reaches only the
+    /// accounts it names, whatever is granted (Zaru ADR-0071 D1).
+    fn run_choosing(account: &Account) -> Run {
+        run_of(Some(json!({"caldav": [account.id.0.to_string()]})))
     }
 
     struct Harness {
@@ -1307,6 +1310,13 @@ spec:
                 answer: CallerAnswer::CredentialBindingRequired { message },
                 ..
             }) => message.clone(),
+            // A refusal carrying `needs` (Zaru ADR-0070 D1) tells its sentence.
+            Err(
+                e @ SealSessionError::Answered {
+                    answer: CallerAnswer::Needs { .. },
+                    ..
+                },
+            ) => e.refusal().message,
             Err(SealSessionError::InvalidArguments(message))
             | Err(SealSessionError::UpstreamUnavailable(message)) => message.clone(),
             Err(other) => format!("{other:?}"),
@@ -1415,7 +1425,7 @@ spec:
     async fn calendar_calendars_answers_each_calendar_with_its_name_colour_and_whether_it_is_writable(
     ) {
         let standin = CalDavStandIn::start(client_config()).await;
-        let work = Account::new("Work account", false);
+        let work = Account::new("Work account");
         let h = harness(
             vec![work.clone()],
             &standin,
@@ -1463,8 +1473,8 @@ spec:
     async fn calendar_list_queries_the_window_and_answers_its_events_by_start_utc_as_the_server_gave_it(
     ) {
         let standin = CalDavStandIn::start(tools_config()).await;
-        let work = Account::new("Work account", true);
-        let h = harness(vec![work.clone()], &standin, vec![run_of(None)]).await;
+        let work = Account::new("Work account");
+        let h = harness(vec![work.clone()], &standin, vec![run_choosing(&work)]).await;
         let result = h
             .call(
                 0,
@@ -1561,8 +1571,8 @@ spec:
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn calendar_list_matches_its_query_and_says_truncated_past_its_limit() {
         let standin = CalDavStandIn::start(tools_config()).await;
-        let work = Account::new("Work account", true);
-        let h = harness(vec![work.clone()], &standin, vec![run_of(None)]).await;
+        let work = Account::new("Work account");
+        let h = harness(vec![work.clone()], &standin, vec![run_choosing(&work)]).await;
         let base = with(
             week(),
             json!({"account": work.id.0.to_string(), "calendar_id": WORK}),
@@ -1622,8 +1632,8 @@ spec:
     async fn calendar_list_refuses_a_window_over_92_days_an_end_not_after_start_and_a_bad_limit_sending_nothing(
     ) {
         let standin = CalDavStandIn::start(tools_config()).await;
-        let work = Account::new("Work account", true);
-        let h = harness(vec![work.clone()], &standin, vec![run_of(None)]).await;
+        let work = Account::new("Work account");
+        let h = harness(vec![work.clone()], &standin, vec![run_choosing(&work)]).await;
         let base = json!({"account": work.id.0.to_string(), "calendar_id": WORK});
         let mut wrong = Vec::new();
         for (more, expected) in [
@@ -1663,8 +1673,8 @@ spec:
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn calendar_read_answers_the_event_with_its_description_tzid_and_etag() {
         let standin = CalDavStandIn::start(read_config()).await;
-        let work = Account::new("Work account", true);
-        let h = harness(vec![work.clone()], &standin, vec![run_of(None)]).await;
+        let work = Account::new("Work account");
+        let h = harness(vec![work.clone()], &standin, vec![run_choosing(&work)]).await;
         let read = |event: &str| json!({"account": work.id.0.to_string(), "calendar_id": WORK, "event_id": event});
         let planning = answered(&h.call(0, "calendar.read", read("planning.ics")).await);
         assert_eq!(
@@ -1727,8 +1737,8 @@ spec:
     async fn a_calendar_off_the_accounts_server_or_an_event_id_of_two_segments_is_refused_before_any_request(
     ) {
         let standin = CalDavStandIn::start(client_config()).await;
-        let work = Account::new("Work account", true);
-        let h = harness(vec![work.clone()], &standin, vec![run_of(None)]).await;
+        let work = Account::new("Work account");
+        let h = harness(vec![work.clone()], &standin, vec![run_choosing(&work)]).await;
         let account = work.id.0.to_string();
         let mut wrong = Vec::new();
         for (tool, args, expected) in [
@@ -1762,8 +1772,8 @@ spec:
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_account_is_refused_with_k5a_sentences_and_a_chosen_one_is_used_by_its_name() {
         let standin = CalDavStandIn::start(client_config()).await;
-        let work = Account::new("Work account", false);
-        let home = Account::new("Home account", true);
+        let work = Account::new("Work account");
+        let home = Account::new("Home account");
         let other = CredentialBindingId::new();
         let h = harness(
             vec![work.clone(), home.clone()],
@@ -1788,7 +1798,7 @@ spec:
             ("no person", 0, calls(&work.id), NO_PERSON.to_string()),
             (
                 "not the person's",
-                1,
+                4,
                 calls(&other),
                 format!(
                     "'{}' is not an active calendar connection of yours.",
@@ -1812,10 +1822,14 @@ spec:
                 ),
             ),
             (
-                "nothing chosen, not granted",
+                // Zaru ADR-0071 D1 (e): a run that named no account is
+                // refused with the run sentence, whatever is granted.
+                "nothing chosen",
                 1,
                 calls(&work.id),
-                NOT_GRANTED.to_string(),
+                aegis_orchestrator_core::application::credential_service::no_profile_names_sentence(
+                    "caldav",
+                ),
             ),
             (
                 "a name not chosen",
@@ -1825,7 +1839,7 @@ spec:
             ),
             (
                 "not a string",
-                1,
+                4,
                 json!({"account": 7}),
                 "'account' must be the id of one of your calendar accounts.".to_string(),
             ),
@@ -1837,7 +1851,7 @@ spec:
         }
         // Several chosen, one of the person's own not among them: K5a's
         // fifth sentence. The person's third account is not in the set.
-        let third = Account::new("Third account", true);
+        let third = Account::new("Third account");
         let h3 = harness(
             vec![work.clone(), home.clone(), third.clone()],
             &standin,
@@ -1870,8 +1884,8 @@ spec:
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_run_with_chosen_calendar_accounts_lists_account_as_their_names() {
         let standin = CalDavStandIn::start(client_config()).await;
-        let work = Account::new("Work", true);
-        let home = Account::new("Home", true);
+        let work = Account::new("Work");
+        let home = Account::new("Home");
         let h = harness(
             vec![work.clone(), home.clone()],
             &standin,
@@ -2282,8 +2296,8 @@ spec:
         /// stand-in serving `config`: what it answered and what it sent.
         async fn list_with(config: StandInConfig, calendar_id: &str) -> (Value, Vec<String>) {
             let standin = CalDavStandIn::start(config).await;
-            let work = Account::new("Work account", true);
-            let h = harness(vec![work.clone()], &standin, vec![run_of(None)]).await;
+            let work = Account::new("Work account");
+            let h = harness(vec![work.clone()], &standin, vec![run_choosing(&work)]).await;
             let result = h
                 .call(
                     0,
@@ -2349,8 +2363,8 @@ spec:
         async fn a_calendar_id_calendar_calendars_answered_is_used_as_it_is_with_no_further_propfind(
         ) {
             let standin = CalDavStandIn::start(google_shaped()).await;
-            let work = Account::new("Work account", true);
-            let h = harness(vec![work.clone()], &standin, vec![run_of(None)]).await;
+            let work = Account::new("Work account");
+            let h = harness(vec![work.clone()], &standin, vec![run_choosing(&work)]).await;
             let account = work.id.0.to_string();
             let listed = answered(
                 &h.call(0, "calendar.calendars", json!({"account": account}))
@@ -2388,8 +2402,8 @@ spec:
         async fn any_other_calendar_id_is_refused_as_invalid_arguments_before_any_request_on_a_calendar(
         ) {
             let standin = CalDavStandIn::start(google_shaped()).await;
-            let work = Account::new("Work account", true);
-            let h = harness(vec![work.clone()], &standin, vec![run_of(None)]).await;
+            let work = Account::new("Work account");
+            let h = harness(vec![work.clone()], &standin, vec![run_choosing(&work)]).await;
             let tools = tools(&work, &standin);
             let account = work.id.0.to_string();
             let mut wrong = Vec::new();
@@ -2459,8 +2473,8 @@ spec:
             let mut wrong = Vec::new();
             for status in [405u16, 404] {
                 let standin = CalDavStandIn::start(google_shaped()).await;
-                let work = Account::new("Work account", true);
-                let h = harness(vec![work.clone()], &standin, vec![run_of(None)]).await;
+                let work = Account::new("Work account");
+                let h = harness(vec![work.clone()], &standin, vec![run_choosing(&work)]).await;
                 let tools = tools(&work, &standin);
                 let account = work.id.0.to_string();
                 answered(
@@ -2645,7 +2659,7 @@ spec:
         async fn calendar_create_puts_a_new_resource_with_if_none_match_its_times_in_utc_and_its_invitations(
         ) {
             let standin = CalDavStandIn::start(write_config()).await;
-            let account = Account::new("Work account", true);
+            let account = Account::new("Work account");
             let tools = tools(&account, &standin);
             let mut wrong = Vec::new();
             let result = tools
@@ -2771,7 +2785,7 @@ spec:
         async fn calendar_update_reads_then_puts_with_if_match_changing_only_the_named_properties_and_counting_sequence(
         ) {
             let standin = CalDavStandIn::start(write_config()).await;
-            let account = Account::new("Work account", true);
+            let account = Account::new("Work account");
             let tools = tools(&account, &standin);
             let mut wrong = Vec::new();
             let before = lines(MINE);
@@ -2889,7 +2903,7 @@ spec:
         #[tokio::test]
         async fn calendar_delete_reads_then_deletes_with_if_match() {
             let standin = CalDavStandIn::start(write_config()).await;
-            let account = Account::new("Work account", true);
+            let account = Account::new("Work account");
             let result = tools(&account, &standin)
                 .invoke(
                     "calendar.delete",
@@ -2939,7 +2953,7 @@ spec:
         #[tokio::test]
         async fn calendar_respond_sets_the_accounts_partstat_and_puts_with_if_match() {
             let standin = CalDavStandIn::start(write_config()).await;
-            let account = Account::new("Work account", true);
+            let account = Account::new("Work account");
             let result = tools(&account, &standin)
                 .invoke(
                     "calendar.respond",
@@ -2999,7 +3013,7 @@ spec:
         #[tokio::test]
         async fn a_412_on_any_write_is_answered_with_its_sentence_and_nothing_changes() {
             let standin = CalDavStandIn::start(write_config()).await;
-            let account = Account::new("Work account", true);
+            let account = Account::new("Work account");
             let tools = tools(&account, &standin);
             let id = account.id.0.to_string();
             let mut wrong = Vec::new();
@@ -3057,7 +3071,7 @@ spec:
         #[tokio::test]
         async fn every_k6a_refusal_comes_before_any_change() {
             let standin = CalDavStandIn::start(write_config()).await;
-            let account = Account::new("Work account", true);
+            let account = Account::new("Work account");
             let tools = tools(&account, &standin);
             let id = account.id.0.to_string();
             let create = |extra: Value| {
@@ -3418,7 +3432,7 @@ spec:
         async fn the_admission_names_the_account_by_id_and_writes_the_events_values_over_the_models(
         ) {
             let standin = CalDavStandIn::start(write_config()).await;
-            let work = Account::new("Work account", false);
+            let work = Account::new("Work account");
             let id = work.id.0.to_string();
             let h = gated(
                 vec![work.clone()],
@@ -3498,8 +3512,8 @@ spec:
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_call_its_admission_refuses_writes_no_row_and_asks_no_one() {
             let standin = CalDavStandIn::start(write_config()).await;
-            let work = Account::new("Work account", true);
-            let home = Account::new("Home account", true);
+            let work = Account::new("Work account");
+            let home = Account::new("Home account");
             let id = work.id.0.to_string();
             let h = gated(
                 vec![work.clone(), home.clone()],
@@ -3582,7 +3596,7 @@ spec:
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn an_approved_update_reads_the_event_again_and_writes_with_the_etag_it_then_reads() {
             let standin = CalDavStandIn::start(write_config()).await;
-            let work = Account::new("Work account", false);
+            let work = Account::new("Work account");
             let id = work.id.0.to_string();
             let h = gated(
                 vec![work.clone()],

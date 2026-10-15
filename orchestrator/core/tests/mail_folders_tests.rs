@@ -96,7 +96,6 @@ impl ToolMailboxSource for OneMailbox {
                 username: LOGIN.to_string(),
             },
             auth: MailAuth::Password(SensitiveString::new(PASSWORD)),
-            granted: true,
         }))
     }
 }

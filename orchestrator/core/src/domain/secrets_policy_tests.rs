@@ -312,12 +312,6 @@ fn person(sub: &str) -> TenantId {
     TenantId::for_consumer_user(sub).expect("a person's tenant")
 }
 
-async fn grant_all_agents(h: &Harness, id: CredentialBindingId) {
-    let mut binding = h.repo.find_by_id(&id).await.unwrap().unwrap();
-    binding.add_grant(GrantTarget::AllAgents, ALICE.to_string());
-    h.repo.save(&binding).await.unwrap();
-}
-
 async fn store(h: &Harness, sub: &str, provider: &str, ty: CredentialType) -> CredentialBindingId {
     h.service
         .store_api_key(StoreApiKeyCommand {
@@ -333,13 +327,15 @@ async fn store(h: &Harness, sub: &str, provider: &str, ty: CredentialType) -> Cr
         .unwrap_or_else(|e| panic!("store {provider}: {e:#}"))
 }
 
-fn actor<'a>(tenant: &'a TenantId, sub: &'a str) -> ToolCallActor<'a> {
+/// `sub` in `tenant`, its run having chosen the binding `id` (a run reaches
+/// only the bindings it names, Zaru ADR-0071 D1).
+fn actor<'a>(tenant: &'a TenantId, sub: &'a str, id: CredentialBindingId) -> ToolCallActor<'a> {
     ToolCallActor {
         tenant_id: tenant,
         user_id: sub,
         agent_id: AgentId::new(),
         workflow_id: None,
-        context: crate::domain::execution::ContextChoice::NotGiven,
+        context: crate::domain::execution::ContextChoice::Binding(id),
     }
 }
 
@@ -368,7 +364,6 @@ async fn person_credentials_are_kept_in_the_realm_mount_under_the_deployed_polic
         ("gcp", CredentialType::ServiceAccount),
     ] {
         let id = store(&h, ALICE, provider, ty).await;
-        grant_all_agents(&h, id).await;
         let binding = h.repo.find_by_id(&id).await.unwrap().unwrap();
         assert_eq!(
             binding.secret_path.effective_mount(),
@@ -380,7 +375,7 @@ async fn person_credentials_are_kept_in_the_realm_mount_under_the_deployed_polic
         );
         let read = h
             .service
-            .tool_server_credential(&actor(&tenant, ALICE), provider)
+            .tool_server_credential(&actor(&tenant, ALICE, id), provider)
             .await
             .unwrap_or_else(|e| panic!("read {provider}: {e:#}"))
             .expect("the credential");
@@ -447,12 +442,11 @@ async fn person_credentials_are_kept_in_the_realm_mount_under_the_deployed_polic
 async fn another_person_cannot_read_a_persons_credential() {
     let h = harness();
     let id = store(&h, ALICE, "openai", CredentialType::Secret).await;
-    grant_all_agents(&h, id).await;
 
     let bob = person(BOB);
     let read = h
         .service
-        .tool_server_credential(&actor(&bob, BOB), "openai")
+        .tool_server_credential(&actor(&bob, BOB, id), "openai")
         .await
         .expect("no error");
     assert!(read.is_none(), "Bob read Alice's credential");

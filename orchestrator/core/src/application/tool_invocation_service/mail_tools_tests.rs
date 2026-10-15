@@ -11,7 +11,7 @@ use super::*;
 use crate::application::credential_service::{
     StandardCredentialManagementService, ToolCallActor, ToolMailbox, ToolMailboxSource,
 };
-use crate::application::tools::builtin_mail::{CHOSEN_DIFFERENT, NOT_GRANTED, NO_PERSON};
+use crate::application::tools::builtin_mail::{CHOSEN_DIFFERENT, NO_PERSON};
 use crate::domain::agent::{Agent, AgentManifest, AgentStatus};
 use crate::domain::credential::{
     CredentialBindingId, CredentialBindingRepository, CredentialGrant, CredentialMetadata,
@@ -390,11 +390,11 @@ async fn the_credential_service_answers_only_the_persons_own_active_mailbox() {
         matches!(&mailbox.auth, MailAuth::Password(p) if p.expose() == "Mk5-mail-password"),
         "the mailbox's password was not answered"
     );
-    assert!(mailbox.granted, "a grant to the calling agent was not seen");
-    let ungranted = answer(own_ungranted)
+    // Zaru ADR-0071 D1 (b): whether the mailbox is granted is not read; an
+    // ungranted own mailbox is answered as a granted one is.
+    answer(own_ungranted)
         .await
         .expect("an ungranted own mailbox is answered");
-    assert!(!ungranted.granted, "an ungranted mailbox read as granted");
     let mut refused = Vec::new();
     for (what, id) in [
         ("another person's mailbox", others),
@@ -439,7 +439,6 @@ impl ToolMailboxSource for RecordingMailbox {
             binding_id: self.id,
             settings: settings(),
             auth: MailAuth::Password(SensitiveString::new("Mk5-mail-password")),
-            granted: false,
         }))
     }
 }
@@ -616,6 +615,13 @@ fn told(result: &Result<ToolInvocationResult, SealSessionError>) -> String {
             answer: CallerAnswer::CredentialBindingRequired { message },
             ..
         }) => message.clone(),
+        // A refusal carrying `needs` (Zaru ADR-0070 D1) tells its sentence.
+        Err(
+            e @ SealSessionError::Answered {
+                answer: CallerAnswer::Needs { .. },
+                ..
+            },
+        ) => e.refusal().message,
         Err(SealSessionError::InvalidArguments(message)) => message.clone(),
         Err(other) => format!("{other:?}"),
     }
@@ -655,9 +661,13 @@ async fn the_dispatch_hands_a_mail_tool_the_runs_person_and_its_choice() {
         ));
     }
     let nothing_chosen = list_on(&service, agent_id, runs[2], id).await;
-    if told(&nothing_chosen) != NOT_GRANTED {
+    // Zaru ADR-0071 D1 (e): a run that named no mailbox is refused with the
+    // run sentence, whatever is granted.
+    if told(&nothing_chosen)
+        != crate::application::credential_service::no_profile_names_sentence("imap")
+    {
         wrong.push(format!(
-            "an agent's run with nothing chosen and no grant was not refused: {}",
+            "an agent's run with nothing chosen was not refused: {}",
             told(&nothing_chosen)
         ));
     }

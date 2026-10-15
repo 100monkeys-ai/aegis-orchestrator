@@ -8,8 +8,8 @@
 //!   declare the approval contract, `mail.draft` is not gated;
 //! - a gated call answers `approval_pending` with the declared summary and
 //!   reaches no mail server, while `mail.draft` runs;
-//! - the mailbox is admitted before the gate: an ungranted mailbox is
-//!   refused with its sentence and no approval row is written, and a
+//! - the mailbox is admitted before the gate: a run that names no mailbox
+//!   is refused with its sentence and no approval row is written, and a
 //!   mailbox named by its context name is stored by its binding id;
 //! - a send approved once runs over XOAUTH2, and its token appears in no
 //!   result, event or log line;
@@ -44,9 +44,7 @@ use aegis_orchestrator_core::application::tool_approval_service::ToolApprovalSer
 use aegis_orchestrator_core::application::tool_invocation_service::{
     ToolInvocationResult, ToolInvocationService,
 };
-use aegis_orchestrator_core::application::tools::builtin_mail::{
-    MailActing, MailFiles, MailTools, NOT_GRANTED,
-};
+use aegis_orchestrator_core::application::tools::builtin_mail::{MailActing, MailFiles, MailTools};
 use aegis_orchestrator_core::domain::agent::{Agent, AgentId, AgentManifest, AgentStatus};
 use aegis_orchestrator_core::domain::credential::{
     CredentialBindingId, MailSecurity, MailboxSettings,
@@ -90,6 +88,10 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+
+/// The refusal of a run's mail call when the run named no mailbox, whatever
+/// is granted (Zaru ADR-0071 D1 (e)).
+const NOTHING_CHOSEN: &str = "This run has no profile that names your mailbox. Choose a profile that names it, then start the run again.";
 
 const CONTEXT: &str = "mail-send-test-context";
 const USER: &str = "mail-send-user";
@@ -303,7 +305,6 @@ async fn mail_attachment_is_listed_ungated_skipping_the_judge_and_mail_read_name
 struct Owned {
     id: CredentialBindingId,
     name: String,
-    granted: bool,
     imap_port: u16,
     smtp_port: u16,
     auth: MailAuth,
@@ -341,7 +342,6 @@ impl ToolMailboxSource for Mailboxes {
                     username: ADDRESS.to_string(),
                 },
                 auth: m.auth.clone(),
-                granted: m.granted,
             }))
     }
 
@@ -596,13 +596,20 @@ fn told(result: &Result<ToolInvocationResult, SealSessionError>) -> String {
             answer: CallerAnswer::CredentialBindingRequired { message },
             ..
         }) => message.clone(),
+        // A refusal carrying `needs` (Zaru ADR-0070 D1) tells its sentence.
+        Err(
+            e @ SealSessionError::Answered {
+                answer: CallerAnswer::Needs { .. },
+                ..
+            },
+        ) => e.refusal().message,
         Err(SealSessionError::InvalidArguments(message))
         | Err(SealSessionError::UpstreamUnavailable(message)) => message.clone(),
         Err(other) => format!("{other:?}"),
     }
 }
 
-async fn password_mailbox(name: &str, granted: bool) -> (MailboxStandIn, SmtpSubmission, Owned) {
+async fn password_mailbox(name: &str) -> (MailboxStandIn, SmtpSubmission, Owned) {
     let mailbox = imap_mailbox_standin_with_folders(ADDRESS, PASSWORD, inbox(), folders()).await;
     let smtp = smtp_submission_standin(
         SubmitAuth::Plain {
@@ -615,7 +622,6 @@ async fn password_mailbox(name: &str, granted: bool) -> (MailboxStandIn, SmtpSub
     let owned = Owned {
         id: CredentialBindingId::new(),
         name: name.to_string(),
-        granted,
         imap_port: mailbox.port(),
         smtp_port: smtp.port(),
         auth: MailAuth::Password(SensitiveString::new(PASSWORD)),
@@ -625,7 +631,7 @@ async fn password_mailbox(name: &str, granted: bool) -> (MailboxStandIn, SmtpSub
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn send_and_reply_answer_approval_pending_with_the_declared_summary_and_draft_does_not() {
-    let (mailbox, smtp, owned) = password_mailbox("Inbox", false).await;
+    let (mailbox, smtp, owned) = password_mailbox("Inbox").await;
     let id = owned.id.0.to_string();
     let h = harness(vec![owned], &[Some(json!({ "imap": [id.clone()] }))]).await;
     let mut wrong = Vec::new();
@@ -685,8 +691,8 @@ async fn send_and_reply_answer_approval_pending_with_the_declared_summary_and_dr
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_ungranted_mailbox_is_refused_before_the_gate_and_no_row_is_written() {
-    let (_mailbox, smtp, owned) = password_mailbox("Inbox", false).await;
+async fn a_run_that_names_no_mailbox_is_refused_before_the_gate_and_no_row_is_written() {
+    let (_mailbox, smtp, owned) = password_mailbox("Inbox").await;
     let id = owned.id.0.to_string();
     let h = harness(vec![owned], &[None]).await;
     let mut events = h.event_bus.subscribe();
@@ -698,9 +704,9 @@ async fn an_ungranted_mailbox_is_refused_before_the_gate_and_no_row_is_written()
         )
         .await;
     let mut wrong = Vec::new();
-    if told(&result) != NOT_GRANTED {
+    if told(&result) != NOTHING_CHOSEN {
         wrong.push(format!(
-            "an ungranted mailbox was not refused before the gate: {}",
+            "a run that names no mailbox was not refused before the gate: {}",
             told(&result)
         ));
     }
@@ -727,9 +733,11 @@ async fn an_ungranted_mailbox_is_refused_before_the_gate_and_no_row_is_written()
 /// services refuses it before any mail server is reached.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mail_attachment_reaches_the_mail_tools_ungated_and_needs_their_file_services() {
-    let (mailbox, _smtp, owned) = password_mailbox("Inbox", true).await;
+    let (mailbox, _smtp, owned) = password_mailbox("Inbox").await;
     let id = owned.id.0.to_string();
-    let h = harness(vec![owned], &[None]).await;
+    // Zaru ADR-0071 D1: the run names its mailbox; a grant reaches none.
+    let chosen = Some(json!({ "imap": [owned.id.0.to_string()] }));
+    let h = harness(vec![owned], &[chosen]).await;
     let mut events = h.event_bus.subscribe();
     let result = h
         .call(
@@ -767,7 +775,7 @@ async fn mail_attachment_reaches_the_mail_tools_ungated_and_needs_their_file_ser
 async fn an_inbox_tool_naming_another_folder_is_refused_before_the_gate_and_no_row_is_written() {
     const INBOX_ONLY: &str =
         "This tool works on threads in the inbox only; leave out 'folder' or set it to inbox.";
-    let (mailbox, smtp, owned) = password_mailbox("Inbox", false).await;
+    let (mailbox, smtp, owned) = password_mailbox("Inbox").await;
     let id = owned.id.0.to_string();
     let h = harness(vec![owned], &[Some(json!({ "imap": [id.clone()] }))]).await;
     let mut events = h.event_bus.subscribe();
@@ -835,8 +843,8 @@ async fn an_inbox_tool_naming_another_folder_is_refused_before_the_gate_and_no_r
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_mailbox_named_by_its_context_name_is_stored_with_its_binding_id() {
-    let (_m1, _s1, inbox_box) = password_mailbox("Inbox", false).await;
-    let (_m2, _s2, sales) = password_mailbox("Sales", false).await;
+    let (_m1, _s1, inbox_box) = password_mailbox("Inbox").await;
+    let (_m2, _s2, sales) = password_mailbox("Sales").await;
     let (inbox_id, sales_id) = (inbox_box.id.0.to_string(), sales.id.0.to_string());
     let h = harness(
         vec![inbox_box, sales],
@@ -933,13 +941,14 @@ async fn an_approved_send_runs_over_xoauth2_and_its_token_reaches_no_result_even
     let owned = Owned {
         id: CredentialBindingId::new(),
         name: ADDRESS.to_string(),
-        granted: true,
         imap_port: mailbox.port(),
         smtp_port: smtp.port(),
         auth: MailAuth::XOAuth2(SensitiveString::new(TOKEN)),
     };
     let id = owned.id.0.to_string();
-    let h = harness(vec![owned], &[None]).await;
+    // Zaru ADR-0071 D1: the run names its mailbox; a grant reaches none.
+    let chosen = Some(json!({ "imap": [owned.id.0.to_string()] }));
+    let h = harness(vec![owned], &[chosen]).await;
     let mut events = h.event_bus.subscribe();
     let pending = h
         .call(
@@ -1060,7 +1069,7 @@ fn trash() -> Vec<StandInFolder> {
     vec![StandInFolder::new("Trash", "\\Trash")]
 }
 
-async fn delete_mailbox(folders: Vec<StandInFolder>, granted: bool) -> (MailboxStandIn, Owned) {
+async fn delete_mailbox(folders: Vec<StandInFolder>) -> (MailboxStandIn, Owned) {
     let mailbox = imap_mailbox_standin_with_capabilities(
         ADDRESS,
         PASSWORD,
@@ -1072,7 +1081,6 @@ async fn delete_mailbox(folders: Vec<StandInFolder>, granted: bool) -> (MailboxS
     let owned = Owned {
         id: CredentialBindingId::new(),
         name: "Inbox".to_string(),
-        granted,
         imap_port: mailbox.port(),
         smtp_port: 465,
         auth: MailAuth::Password(SensitiveString::new(PASSWORD)),
@@ -1096,7 +1104,7 @@ fn moved_anything(mailbox: &MailboxStandIn) -> Vec<String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_delete_waits_with_the_threads_subject_and_senders_and_moves_nothing_before_approval() {
-    let (mailbox, owned) = delete_mailbox(trash(), false).await;
+    let (mailbox, owned) = delete_mailbox(trash()).await;
     let id = owned.id.0.to_string();
     let h = harness(vec![owned], &[Some(json!({ "imap": [id.clone()] }))]).await;
     let result = h
@@ -1146,19 +1154,17 @@ async fn a_delete_waits_with_the_threads_subject_and_senders_and_moves_nothing_b
 async fn a_delete_its_mailbox_thread_or_trash_would_refuse_is_refused_before_the_gate_with_no_row()
 {
     let mut wrong = Vec::new();
-    for (case, folders, granted, chosen, thread, expected) in [
+    for (case, folders, chosen, thread, expected) in [
         (
-            "an ungranted mailbox",
+            "nothing chosen, the mailbox granted or not",
             trash(),
             false,
-            false,
             "<a1@x>",
-            NOT_GRANTED.to_string(),
+            NOTHING_CHOSEN.to_string(),
         ),
         (
             "a thread not in the inbox",
             trash(),
-            false,
             true,
             "<nope@x>",
             "There is no thread '<nope@x>' in this mailbox's inbox.".to_string(),
@@ -1166,13 +1172,12 @@ async fn a_delete_its_mailbox_thread_or_trash_would_refuse_is_refused_before_the
         (
             "a mailbox with no Trash folder",
             vec![StandInFolder::new("Sent", "\\Sent")],
-            false,
             true,
             "<a1@x>",
             NO_TRASH_SENTENCE.to_string(),
         ),
     ] {
-        let (mailbox, owned) = delete_mailbox(folders, granted).await;
+        let (mailbox, owned) = delete_mailbox(folders).await;
         let id = owned.id.0.to_string();
         let contexts = chosen.then(|| json!({ "imap": [id.clone()] }));
         let h = harness(vec![owned], &[contexts]).await;
@@ -1224,13 +1229,14 @@ async fn an_approved_delete_runs_over_xoauth2_and_its_token_reaches_no_result_ev
     let owned = Owned {
         id: CredentialBindingId::new(),
         name: ADDRESS.to_string(),
-        granted: true,
         imap_port: mailbox.port(),
         smtp_port: 465,
         auth: MailAuth::XOAuth2(SensitiveString::new(TOKEN)),
     };
     let id = owned.id.0.to_string();
-    let h = harness(vec![owned], &[None]).await;
+    // Zaru ADR-0071 D1: the run names its mailbox; a grant reaches none.
+    let chosen = Some(json!({ "imap": [owned.id.0.to_string()] }));
+    let h = harness(vec![owned], &[chosen]).await;
     let mut events = h.event_bus.subscribe();
     let pending = h
         .call(
@@ -1488,7 +1494,6 @@ async fn archive_mailbox(
     folders: Vec<StandInFolder>,
     capabilities: &str,
     inbox: Vec<StoredMessage>,
-    granted: bool,
 ) -> (MailboxStandIn, Owned) {
     let mailbox =
         imap_mailbox_standin_with_capabilities(ADDRESS, PASSWORD, inbox, folders, capabilities)
@@ -1496,7 +1501,6 @@ async fn archive_mailbox(
     let owned = Owned {
         id: CredentialBindingId::new(),
         name: "Inbox".to_string(),
-        granted,
         imap_port: mailbox.port(),
         smtp_port: 465,
         auth: MailAuth::Password(SensitiveString::new(PASSWORD)),
@@ -1622,8 +1626,7 @@ async fn mail_archive_moves_exactly_the_threads_inbox_messages_into_the_archive_
             // Another client marked message 3 deleted: a plain EXPUNGE
             // would remove it, UID EXPUNGE of the thread's uids does not.
             inbox[2].flags.push("\\Deleted".to_string());
-            let (mailbox, owned) =
-                archive_mailbox(folders.clone(), capabilities, inbox, false).await;
+            let (mailbox, owned) = archive_mailbox(folders.clone(), capabilities, inbox).await;
             let at = format!("{case} with {capabilities}");
             match archive_directly(&owned, json!({"thread_id": "<a1@x>"})).await {
                 Ok(result) => {
@@ -1720,7 +1723,7 @@ async fn mail_archive_refuses_with_no_archive_folder_or_no_safe_move_and_changes
             NO_SAFE_ARCHIVE_SENTENCE,
         ),
     ] {
-        let (mailbox, owned) = archive_mailbox(folders, capabilities, delete_inbox(), false).await;
+        let (mailbox, owned) = archive_mailbox(folders, capabilities, delete_inbox()).await;
         let result = archive_directly(&owned, json!({"thread_id": "<a1@x>"})).await;
         if refused_with(&result) != expected {
             wrong.push(format!("{case}: {}", refused_with(&result)));
@@ -1746,7 +1749,6 @@ async fn an_archive_waits_with_the_threads_subject_and_senders_and_moves_only_on
         vec![StandInFolder::new("Archive", "\\Archive")],
         "IMAP4rev1 MOVE",
         delete_inbox(),
-        false,
     )
     .await;
     let id = owned.id.0.to_string();
@@ -1841,21 +1843,19 @@ async fn an_archive_its_admission_would_refuse_is_refused_before_the_gate_with_n
         "This tool works on threads in the inbox only; leave out 'folder' or set it to inbox.";
     let archive = || vec![StandInFolder::new("Archive", "\\Archive")];
     let mut wrong = Vec::new();
-    for (case, folders, capabilities, granted, chosen, args, expected) in [
+    for (case, folders, capabilities, chosen, args, expected) in [
         (
-            "an ungranted mailbox",
+            "nothing chosen, the mailbox granted or not",
             archive(),
             "IMAP4rev1 MOVE",
             false,
-            false,
             json!({"thread_id": "<a1@x>"}),
-            NOT_GRANTED,
+            NOTHING_CHOSEN,
         ),
         (
             "a folder other than the inbox",
             archive(),
             "IMAP4rev1 MOVE",
-            false,
             true,
             json!({"thread_id": "<a1@x>", "folder": "sent"}),
             INBOX_ONLY,
@@ -1864,7 +1864,6 @@ async fn an_archive_its_admission_would_refuse_is_refused_before_the_gate_with_n
             "a thread not in the inbox",
             archive(),
             "IMAP4rev1 MOVE",
-            false,
             true,
             json!({"thread_id": "<nope@x>"}),
             "There is no thread '<nope@x>' in this mailbox's inbox.",
@@ -1873,7 +1872,6 @@ async fn an_archive_its_admission_would_refuse_is_refused_before_the_gate_with_n
             "a mailbox with no Archive folder",
             vec![StandInFolder::new("Trash", "\\Trash")],
             "IMAP4rev1 MOVE",
-            false,
             true,
             json!({"thread_id": "<a1@x>"}),
             NO_ARCHIVE_SENTENCE,
@@ -1882,14 +1880,12 @@ async fn an_archive_its_admission_would_refuse_is_refused_before_the_gate_with_n
             "a server that cannot move safely",
             archive(),
             "IMAP4rev1",
-            false,
             true,
             json!({"thread_id": "<a1@x>"}),
             NO_SAFE_ARCHIVE_SENTENCE,
         ),
     ] {
-        let (mailbox, owned) =
-            archive_mailbox(folders, capabilities, delete_inbox(), granted).await;
+        let (mailbox, owned) = archive_mailbox(folders, capabilities, delete_inbox()).await;
         let id = owned.id.0.to_string();
         let contexts = chosen.then(|| json!({ "imap": [id.clone()] }));
         let h = harness(vec![owned], &[contexts]).await;
@@ -2239,9 +2235,11 @@ mod attachments_out {
         let f = files().await;
         f.put(f.own, USER, "report.pdf", PDF).await;
         f.put(f.own, USER, "notes été.txt", NOTES).await;
-        let (mailbox, smtp, owned) = password_mailbox("Inbox", true).await;
+        let (mailbox, smtp, owned) = password_mailbox("Inbox").await;
         let id = owned.id.0.to_string();
-        let h = harness_over(vec![owned], &[None], Some(f.files.clone())).await;
+        // Zaru ADR-0071 D1: the run names its mailbox; a grant reaches none.
+        let chosen = Some(json!({ "imap": [owned.id.0.to_string()] }));
+        let h = harness_over(vec![owned], &[chosen], Some(f.files.clone())).await;
         let pending = h
             .call(
                 0,
@@ -2345,9 +2343,11 @@ mod attachments_out {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_send_attaching_nothing_shows_no_names_the_model_wrote_and_stays_plain_text() {
         let f = files().await;
-        let (_mailbox, smtp, owned) = password_mailbox("Inbox", true).await;
+        let (_mailbox, smtp, owned) = password_mailbox("Inbox").await;
         let id = owned.id.0.to_string();
-        let h = harness_over(vec![owned], &[None], Some(f.files.clone())).await;
+        // Zaru ADR-0071 D1: the run names its mailbox; a grant reaches none.
+        let chosen = Some(json!({ "imap": [owned.id.0.to_string()] }));
+        let h = harness_over(vec![owned], &[chosen], Some(f.files.clone())).await;
         let pending = h
             .call(
                 0,
@@ -2395,9 +2395,11 @@ mod attachments_out {
         for gone in [false, true] {
             let f = files().await;
             f.put(f.own, USER, "report.pdf", PDF).await;
-            let (mailbox, smtp, owned) = password_mailbox("Inbox", true).await;
+            let (mailbox, smtp, owned) = password_mailbox("Inbox").await;
             let id = owned.id.0.to_string();
-            let h = harness_over(vec![owned], &[None], Some(f.files.clone())).await;
+            // Zaru ADR-0071 D1: the run names its mailbox; a grant reaches none.
+            let chosen = Some(json!({ "imap": [owned.id.0.to_string()] }));
+            let h = harness_over(vec![owned], &[chosen], Some(f.files.clone())).await;
             let pending = h
                 .call(
                     0,
@@ -2452,9 +2454,11 @@ mod attachments_out {
         let half = vec![b'x'; 10 * 1024 * 1024 + 512 * 1024];
         f.put(f.own, USER, "big-one.bin", &half).await;
         f.put(f.own, USER, "big-two.bin", &half).await;
-        let (mailbox, smtp, owned) = password_mailbox("Inbox", true).await;
+        let (mailbox, smtp, owned) = password_mailbox("Inbox").await;
         let id = owned.id.0.to_string();
-        let h = harness_over(vec![owned], &[None], Some(f.files.clone())).await;
+        // Zaru ADR-0071 D1: the run names its mailbox; a grant reaches none.
+        let chosen = Some(json!({ "imap": [owned.id.0.to_string()] }));
+        let h = harness_over(vec![owned], &[chosen], Some(f.files.clone())).await;
         let eleven: Vec<Value> = (0..11).map(|_| f.file(f.own, "report.pdf")).collect();
         let mut wrong = Vec::new();
         for (case, tool, attachments, expected) in [
@@ -2605,7 +2609,6 @@ mod attachments_out {
             let owned = Owned {
                 id: CredentialBindingId::new(),
                 name: "Inbox".to_string(),
-                granted: true,
                 imap_port: mailbox.port(),
                 smtp_port: smtp.port(),
                 auth: MailAuth::Password(SensitiveString::new(PASSWORD)),
@@ -2657,7 +2660,9 @@ mod attachments_out {
             f.put(f.own, USER, "report.pdf", PDF).await;
             let (mailbox, smtp, owned) = forward_mailbox(plans_inbox(), Vec::new()).await;
             let id = owned.id.0.to_string();
-            let h = harness_over(vec![owned], &[None], Some(f.files.clone())).await;
+            // Zaru ADR-0071 D1: the run names its mailbox; a grant reaches none.
+            let chosen = Some(json!({ "imap": [owned.id.0.to_string()] }));
+            let h = harness_over(vec![owned], &[chosen], Some(f.files.clone())).await;
             let originals: Vec<String> = mailbox
                 .folder_messages("INBOX")
                 .iter()
@@ -2810,7 +2815,9 @@ mod attachments_out {
             let (mailbox, smtp, owned) = forward_mailbox(plans_inbox(), sent).await;
             let original = mailbox.folder_messages("Sent")[1].raw.clone();
             let id = owned.id.0.to_string();
-            let h = harness_over(vec![owned], &[None], Some(f.files.clone())).await;
+            // Zaru ADR-0071 D1: the run names its mailbox; a grant reaches none.
+            let chosen = Some(json!({ "imap": [owned.id.0.to_string()] }));
+            let h = harness_over(vec![owned], &[chosen], Some(f.files.clone())).await;
             let pending = h
                 .call(
                     0,
@@ -2873,7 +2880,9 @@ mod attachments_out {
             let f = files().await;
             let (mailbox, smtp, owned) = forward_mailbox(plans_inbox(), Vec::new()).await;
             let id = owned.id.0.to_string();
-            let h = harness_over(vec![owned], &[None], Some(f.files.clone())).await;
+            // Zaru ADR-0071 D1: the run names its mailbox; a grant reaches none.
+            let chosen = Some(json!({ "imap": [owned.id.0.to_string()] }));
+            let h = harness_over(vec![owned], &[chosen], Some(f.files.clone())).await;
             let pending = h
                 .call(
                     0,
@@ -2965,7 +2974,9 @@ mod attachments_out {
             }
             let (mailbox, smtp, owned) = forward_mailbox(inbox, Vec::new()).await;
             let id = owned.id.0.to_string();
-            let h = harness_over(vec![owned], &[None], Some(f.files.clone())).await;
+            // Zaru ADR-0071 D1: the run names its mailbox; a grant reaches none.
+            let chosen = Some(json!({ "imap": [owned.id.0.to_string()] }));
+            let h = harness_over(vec![owned], &[chosen], Some(f.files.clone())).await;
             let mut wrong = Vec::new();
             for (case, args, expected) in [
                 (
@@ -3016,7 +3027,9 @@ mod attachments_out {
             let f = files().await;
             let (mailbox, smtp, owned) = forward_mailbox(plans_inbox(), Vec::new()).await;
             let id = owned.id.0.to_string();
-            let h = harness_over(vec![owned], &[None], Some(f.files.clone())).await;
+            // Zaru ADR-0071 D1: the run names its mailbox; a grant reaches none.
+            let chosen = Some(json!({ "imap": [owned.id.0.to_string()] }));
+            let h = harness_over(vec![owned], &[chosen], Some(f.files.clone())).await;
             let pending = h
                 .call(
                     0,

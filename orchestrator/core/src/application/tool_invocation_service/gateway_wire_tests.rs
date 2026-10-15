@@ -322,7 +322,7 @@ spec:
 }
 
 /// Serves the executions that call tools.
-struct Executions(HashMap<ExecutionId, Execution>);
+struct Executions(std::sync::Mutex<HashMap<ExecutionId, Execution>>);
 
 #[async_trait]
 impl ExecutionService for Executions {
@@ -358,6 +358,8 @@ impl ExecutionService for Executions {
     }
     async fn get_execution_unscoped(&self, id: ExecutionId) -> Result<Execution> {
         self.0
+            .lock()
+            .unwrap()
             .get(&id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("execution not found"))
@@ -651,9 +653,9 @@ async fn harness(setup: Setup) -> Harness {
         Arc::new(NoOpPublisher),
     ));
     let sessions = Arc::new(InMemorySealSessionRepository::new());
-    let executions = Arc::new(Executions(
+    let executions = Arc::new(Executions(std::sync::Mutex::new(
         executions.into_iter().map(|e| (e.id, e)).collect(),
-    ));
+    )));
     let service = ToolInvocationService::new(
         sessions.clone(),
         security_context_repo,
@@ -703,6 +705,21 @@ async fn harness(setup: Setup) -> Harness {
 }
 
 impl Harness {
+    /// Each run's choice for `server`, `binding`, written into its input's
+    /// `contexts` as a start writes it: a run reaches only the bindings it
+    /// names, whatever is granted (Zaru ADR-0071 D1).
+    fn choose(&self, server: &str, binding: CredentialBindingId) {
+        let mut runs = self.executions.0.lock().unwrap();
+        for run in runs.values_mut() {
+            if let Value::Object(input) = &mut run.input.input {
+                input.insert(
+                    crate::domain::execution::CONTEXTS_INPUT_KEY.to_string(),
+                    json!({ server: binding.0.to_string() }),
+                );
+            }
+        }
+    }
+
     async fn call(&self, execution: ExecutionId, tool: &str) -> Result<Value, SealSessionError> {
         match self
             .service
@@ -1179,17 +1196,18 @@ fn remote_result() -> Answer {
     Answer::Result(r#"{"content":[{"type":"text","text":"page"}],"isError":false}"#.to_string())
 }
 
-/// H1, H4: a call of a remote server's tool by an agent its user granted
-/// the binding to reaches the gateway as `InvokeTool`, with the tenant, the
-/// acting identity, the server, the tool, the arguments as given and the
-/// user's credential, over TLS; the server's result passes unchanged.
+/// H1, H4: a call of a remote server's tool by a run that chose the user's
+/// binding (Zaru ADR-0071 D1) reaches the gateway as `InvokeTool`, with the
+/// tenant, the acting identity, the server, the tool, the arguments as given
+/// and the user's credential, over TLS; the server's result passes
+/// unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_granted_agents_call_reaches_the_gateway_with_the_credential_and_the_acting_identity() {
+async fn a_chosen_bindings_call_reaches_the_gateway_with_the_credential_and_the_acting_identity() {
     let stub = StubGateway::new(vec![], remote_result());
     let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
     let vault = Vault::new("https://token.example.test/token");
     let h = remote_harness(&url, &tls, &vault, vec!["*"]).await;
-    vault
+    let id = vault
         .bind(
             &h.tenant,
             USER,
@@ -1201,6 +1219,7 @@ async fn a_granted_agents_call_reaches_the_gateway_with_the_credential_and_the_a
             }],
         )
         .await;
+    h.choose(SERVER, id);
 
     let value = h
         .call(h.execution, &format!("{SERVER}.pages.read"))
@@ -1231,10 +1250,12 @@ async fn a_granted_agents_call_reaches_the_gateway_with_the_credential_and_the_a
     assert!(received.workflows.is_empty() && received.lists.is_empty());
 }
 
-/// H1: a grant to all the owner's agents, or to the workflow the run belongs
-/// to, also opens the call; the workflow is named on the acting identity.
+/// Zaru ADR-0071 D1 (a), (b), (e): a grant to all the owner's agents, or to
+/// the workflow the run belongs to, opens nothing for a run that named no
+/// binding: the call is refused with the run sentence and `needs` naming
+/// the Profiles page, and nothing reaches the gateway.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_grant_to_all_agents_or_to_the_runs_workflow_opens_the_call() {
+async fn a_grant_to_all_agents_or_to_the_runs_workflow_opens_nothing() {
     let workflow_id = uuid::Uuid::new_v4();
     for grant in [
         GrantTarget::AllAgents,
@@ -1262,24 +1283,35 @@ async fn a_grant_to_all_agents_or_to_the_runs_workflow_opens_the_call() {
             )
             .await;
 
-        h.call(h.execution, &format!("{SERVER}.pages.read"))
+        let refusal = h
+            .call(h.execution, &format!("{SERVER}.pages.read"))
             .await
-            .unwrap_or_else(|e| panic!("{grant:?}: {e:?}"));
-        let received = stub.received.lock().unwrap();
-        assert_eq!(received.tools.len(), 1, "{grant:?}");
-        let call = &received.tools[0];
+            .expect_err("a grant opened the call")
+            .refusal();
         assert_eq!(
-            call.acting.as_ref().unwrap().workflow_id,
-            workflow_id.to_string()
+            (refusal.code, refusal.message, refusal.needs),
+            (
+                "CREDENTIAL_BINDING_REQUIRED",
+                crate::application::credential_service::no_profile_names_sentence(SERVER),
+                Some(crate::domain::seal_session::RefusalNeeds::profile(None)),
+            ),
+            "{grant:?}"
         );
-        assert_eq!(call.credential.as_ref().unwrap().value, MARKER);
+        let received = stub.received.lock().unwrap();
+        assert!(
+            received.tools.is_empty(),
+            "{grant:?}: a call reached the gateway"
+        );
     }
 }
 
-/// H1, H3: an agent the binding is not granted to, a user with no binding,
-/// and a run with no person recorded are each refused
-/// `CREDENTIAL_BINDING_REQUIRED` in ADR-035's shape with no `needs`, and
-/// nothing reaches the gateway: no other credential path is tried.
+/// H1, H3: a run that named no binding (its person's binding granted to
+/// another agent, or only a binding to another server granted to all), and
+/// a run with no person recorded are each refused
+/// `CREDENTIAL_BINDING_REQUIRED` in ADR-035's shape, and nothing reaches the
+/// gateway: no other credential path is tried. The first two answer Zaru
+/// ADR-0071 D1 (e)'s run sentence with `needs` naming the Profiles page;
+/// the run with no person carries no `needs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_grant_no_binding_or_no_person_is_refused_and_nothing_is_sent() {
     let tool = format!("{SERVER}.pages.read");
@@ -1340,18 +1372,24 @@ async fn no_grant_no_binding_or_no_person_is_refused_and_nothing_is_sent() {
         assert_eq!(refusal.http_status, 403, "{case}");
         assert_eq!(refusal.code, "CREDENTIAL_BINDING_REQUIRED", "{case}");
         assert_eq!(refusal.status, "policy_violation", "{case}");
-        let expected = if case == "no person" {
-            format!(
-                "This tool needs your own credential for '{SERVER}', and no person is recorded for this run."
+        let (expected, needs) = if case == "no person" {
+            (
+                format!(
+                    "This tool needs your own credential for '{SERVER}', and no person is recorded for this run."
+                ),
+                None,
             )
         } else {
-            format!("This tool needs your own credential for '{SERVER}', granted to this agent.")
+            (
+                crate::application::credential_service::no_profile_names_sentence(SERVER),
+                Some(crate::domain::seal_session::RefusalNeeds::profile(None)),
+            )
         };
         assert_eq!(refusal.message, expected, "{case}");
-        // Zaru ADR-0070 D1 (b), Trigger 1 (d): none of these is a missing
-        // connection (a run with no person, a grant, another server's
-        // binding), so none carries `needs`.
-        assert_eq!(refusal.needs, None, "{case}: carries needs");
+        // Zaru ADR-0070 D1 (b), Trigger 1 (d): a run with no person is not a
+        // missing connection and carries no `needs`; a run that named
+        // nothing needs a profile (Zaru ADR-0071 D1 (e)).
+        assert_eq!(refusal.needs, needs, "{case}: its needs");
         assert!(
             matches!(shown(&err), SealSessionError::NotFound(_)),
             "{case}: the inner loop is shown {:?}",
@@ -1404,6 +1442,7 @@ async fn an_oauth_binding_near_expiry_is_refreshed_before_the_call() {
             &[GrantTarget::AllAgents],
         )
         .await;
+    h.choose(SERVER, id);
 
     h.call(h.execution, &format!("{SERVER}.pages.read"))
         .await
@@ -1435,7 +1474,7 @@ async fn a_plaintext_gateway_address_never_carries_a_credential() {
         ..Setup::gateway(&url)
     })
     .await;
-    vault
+    let id = vault
         .bind(
             &h.tenant,
             USER,
@@ -1445,6 +1484,7 @@ async fn a_plaintext_gateway_address_never_carries_a_credential() {
             &[GrantTarget::AllAgents],
         )
         .await;
+    h.choose(SERVER, id);
 
     let err = h
         .call(h.execution, &format!("{SERVER}.pages.read"))
@@ -1565,7 +1605,7 @@ fn the_credential_is_in_no_log_line_and_no_error() {
             let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
             let vault = Vault::new("https://token.example.test/token");
             let h = remote_harness(&url, &tls, &vault, vec!["*"]).await;
-            vault
+            let id = vault
                 .bind(
                     &h.tenant,
                     USER,
@@ -1575,6 +1615,7 @@ fn the_credential_is_in_no_log_line_and_no_error() {
                     &[GrantTarget::AllAgents],
                 )
                 .await;
+            h.choose(SERVER, id);
             if let Err(e) = h.call(h.execution, &format!("{SERVER}.pages.read")).await {
                 errors.push(format!("{e} {e:?} {:?}", e.refusal()));
             }
@@ -1597,7 +1638,7 @@ fn the_credential_is_in_no_log_line_and_no_error() {
             ..Setup::gateway(&url)
         })
         .await;
-        vault
+        let id = vault
             .bind(
                 &h.tenant,
                 USER,
@@ -1607,6 +1648,7 @@ fn the_credential_is_in_no_log_line_and_no_error() {
                 &[GrantTarget::AllAgents],
             )
             .await;
+        h.choose(SERVER, id);
         let e = h
             .call(h.execution, &format!("{SERVER}.pages.read"))
             .await
@@ -1636,13 +1678,13 @@ fn names(tools: &[crate::infrastructure::tool_router::ToolMetadata]) -> Vec<Stri
     names
 }
 
-/// A run's agent sees the `<server>.<tool>` tools of a server its person
-/// holds a granted binding to, listed by the gateway with that person's
+/// A run's agent sees the `<server>.<tool>` tools of a server whose binding
+/// of its person's the run chose, listed by the gateway with that person's
 /// credential; a run of another person, or of no person, does not, and
 /// nothing of the first person's reaches the gateway for it; the agent's
 /// security context still filters the list.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_users_agent_lists_the_tools_of_the_servers_its_person_granted_it() {
+async fn a_users_agent_lists_the_tools_of_the_servers_its_run_chose() {
     let stub = StubGateway::new(vec![listed("ext.lookup", "workflow")], remote_result());
     let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
     let vault = Vault::new("https://token.example.test/token");
@@ -1655,7 +1697,7 @@ async fn a_users_agent_lists_the_tools_of_the_servers_its_person_granted_it() {
         ..Setup::gateway(&url)
     })
     .await;
-    vault
+    let id = vault
         .bind(
             &h.tenant,
             USER,
@@ -1667,6 +1709,7 @@ async fn a_users_agent_lists_the_tools_of_the_servers_its_person_granted_it() {
             }],
         )
         .await;
+    h.choose(SERVER, id);
 
     let mine = h
         .service
@@ -1712,7 +1755,7 @@ async fn a_users_agent_lists_the_tools_of_the_servers_its_person_granted_it() {
         ..Setup::gateway(&url)
     })
     .await;
-    vault
+    let id = vault
         .bind(
             &narrow.tenant,
             USER,
@@ -1722,6 +1765,7 @@ async fn a_users_agent_lists_the_tools_of_the_servers_its_person_granted_it() {
             &[GrantTarget::AllAgents],
         )
         .await;
+    narrow.choose(SERVER, id);
     let filtered = narrow
         .service
         .get_available_tools_for_agent_run(
@@ -2262,13 +2306,13 @@ fn schema_names(tools: &[crate::domain::llm::ToolSchema]) -> Vec<String> {
 }
 
 /// AEGIS ADR-132 G5, H4 end to end: an agent's run is offered the
-/// `<server>.<tool>` tools of the servers its person bound and granted it,
+/// `<server>.<tool>` tools of the servers whose bindings its run chose,
 /// calls one, and the call reaches the gateway with the person's credential;
 /// the result is the tool message the model reads next. Every tool it was
 /// offered before (a builtin, a gateway workflow) is offered unchanged
 /// (ADR-035 R7).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_agents_run_lists_and_calls_its_persons_granted_remote_tool() {
+async fn an_agents_run_lists_and_calls_its_chosen_remote_tool() {
     let stub = StubGateway::new(vec![listed("ext.lookup", "workflow")], remote_result());
     let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
     let vault = Vault::new("https://token.example.test/token");
@@ -2281,7 +2325,7 @@ async fn an_agents_run_lists_and_calls_its_persons_granted_remote_tool() {
         Some(&gateway_config(&url, Some(&tls.ca_path), &[SERVER])),
         Some(vault.service.clone()),
     );
-    vault
+    let id = vault
         .bind(
             &h.tenant,
             USER,
@@ -2293,6 +2337,7 @@ async fn an_agents_run_lists_and_calls_its_persons_granted_remote_tool() {
             }],
         )
         .await;
+    h.choose(SERVER, id);
     let before = h
         .service
         .get_available_tools_for_agent_in_context(&h.tenant, h.agent_id, CONTEXT)
@@ -2338,12 +2383,13 @@ async fn an_agents_run_lists_and_calls_its_persons_granted_remote_tool() {
     );
 }
 
-/// An agent its person did not grant the binding to is not offered the
-/// server's tools, and a call of one anyway is refused before any dial:
+/// A run that named no binding (its person's binding granted to another
+/// agent) is not offered the server's tools, and a call of one anyway is
+/// refused before any dial (Zaru ADR-0071 D1):
 /// the gateway receives no InvokeTool, and the model reads that the tool
 /// was not run, with the refusal's own sentence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_ungranted_agents_run_is_not_offered_the_remote_tool_and_its_call_is_refused_before_any_dial(
+async fn a_run_naming_no_binding_is_not_offered_the_remote_tool_and_its_call_is_refused_before_any_dial(
 ) {
     let stub = StubGateway::new(vec![], remote_result());
     let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
@@ -2384,7 +2430,7 @@ async fn an_ungranted_agents_run_is_not_offered_the_remote_tool_and_its_call_is_
         .expect("the refusal is in the conversation");
     assert_eq!(
         result.content,
-        "Tool 'notes-1.lookup' was not run: Not found: This tool needs your own credential for 'notes-1', granted to this agent."
+        "Tool 'notes-1.lookup' was not run: Not found: This run has no profile that names your notes-1. Choose a profile that names it, then start the run again."
     );
 }
 

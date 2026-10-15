@@ -1017,7 +1017,6 @@ impl crate::application::credential_service::ToolMailboxSource for ConsumersMail
             auth: crate::infrastructure::mail::MailAuth::Password(SensitiveString::new(
                 "Mk23-mail-password",
             )),
-            granted: false,
         }))
     }
 

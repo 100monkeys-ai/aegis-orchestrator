@@ -30,11 +30,12 @@
 //! chosen. The choice for the key `imap` (the execution record's `contexts`
 //! when the execution has a record, else the call's `_meta.contexts`) is a
 //! set of any number of mailboxes, which must, when given, hold that
-//! binding; a choice of none refuses. With nothing chosen, an execution with a record needs
-//! the binding granted to the calling agent, its workflow or all agents; a
-//! call with no execution record (a conversation, or an MCP client acting
-//! as the person) is admitted on the ownership check alone, since its agent
-//! id is the session's own and no grant can name it.
+//! binding; a choice of none refuses. An execution with a record that chose
+//! nothing for `imap` reaches no mailbox, whatever is granted (Zaru ADR-0071
+//! D1); inside it an absent `mailbox` is the run's one chosen mailbox, else
+//! the newest of those it chose. A call with no execution record (a
+//! conversation, or an MCP client acting as the person) has its mailbox
+//! admitted by the tool service before it reaches this tool.
 //!
 //! **The outbound tools.** A message is given in full: `to` (1 to 50
 //! addresses), an optional `cc` (at most 50 recipients in all), `subject`
@@ -180,8 +181,10 @@ pub const NOT_AMONG_CHOSEN: &str =
     "This tool needs your own mailbox, and the one named is not among those chosen for this run.";
 /// The refusal for a choice of none.
 pub const NONE_CHOSEN: &str = "This tool needs your own mailbox, and none was chosen for this run.";
-/// The refusal for an agent's run whose agent holds no grant.
-pub const NOT_GRANTED: &str = "This tool needs your own mailbox, granted to this agent.";
+/// The refusal for a run's absent `mailbox` when none of the mailboxes it
+/// chose is still an active one of the person's.
+pub const NONE_CHOSEN_ACTIVE: &str =
+    "This tool needs your own mailbox, and none chosen for this run is an active mailbox of yours.";
 /// The refusal of `mail.draft` for a mailbox with no Drafts folder.
 pub const NO_DRAFTS: &str = "This mailbox has no Drafts folder; nothing was saved.";
 /// The refusal of `mail.delete` for a mailbox with no Trash folder.
@@ -555,11 +558,23 @@ impl MailTools {
         let Some(user_id) = acting.user_id.as_deref() else {
             return Err(binding_required(NO_PERSON.to_string()));
         };
-        let raw = args.get("mailbox").and_then(Value::as_str).ok_or_else(|| {
-            SealSessionError::InvalidArguments(
-                "'mailbox' must be the id of one of your mailbox connections.".to_string(),
-            )
-        })?;
+        // Zaru ADR-0071 D1 (a), (b), (e): a run that named no mailbox reaches
+        // none, whatever is granted.
+        if acting.has_execution_record && acting.choice == ServerChoice::NotGiven {
+            return Err(no_profile_names_mailbox());
+        }
+        let absent = matches!(args.get("mailbox"), None | Some(Value::Null));
+        let resolved;
+        let raw = if absent && acting.has_execution_record {
+            resolved = self.run_mailbox_for_absent(user_id, acting).await?;
+            resolved.as_str()
+        } else {
+            args.get("mailbox").and_then(Value::as_str).ok_or_else(|| {
+                SealSessionError::InvalidArguments(
+                    "'mailbox' must be the id of one of your mailbox connections.".to_string(),
+                )
+            })?
+        };
         let not_yours = || {
             let shown: String = raw.chars().filter(|c| !c.is_control()).take(64).collect();
             binding_required(format!(
@@ -617,13 +632,45 @@ impl MailTools {
                 return Err(binding_required(NOT_AMONG_CHOSEN.to_string()))
             }
             ServerChoice::None => return Err(binding_required(NONE_CHOSEN.to_string())),
-            ServerChoice::NotGiven if acting.has_execution_record && !mailbox.granted => {
-                return Err(binding_required(NOT_GRANTED.to_string()))
-            }
             ServerChoice::NotGiven => {}
         }
         Ok(mailbox)
     }
+
+    /// The mailbox an absent `mailbox` names inside a run (Zaru ADR-0071
+    /// D1 (b)): of the mailboxes the run chose, the only one, else the
+    /// newest still active, by its id; refused when the run chose none.
+    async fn run_mailbox_for_absent(
+        &self,
+        user_id: &str,
+        acting: &MailActing,
+    ) -> Result<String, SealSessionError> {
+        if !matches!(acting.choice, ServerChoice::Bindings(_)) {
+            return Err(binding_required(NONE_CHOSEN.to_string()));
+        }
+        let mailboxes = self
+            .mailboxes
+            .mailbox_contexts(&acting.tenant_id, user_id)
+            .await
+            .map_err(|e| {
+                SealSessionError::InternalError(format!("mailbox lookup failed: {e}"))
+                    .answered(CallerAnswer::Internal(InternalFailure::Server))
+            })?;
+        own_for_absent(mailboxes, &acting.choice)
+            .map(|mailbox| mailbox.id.0.to_string())
+            .ok_or_else(|| binding_required(NONE_CHOSEN_ACTIVE.to_string()))
+    }
+}
+
+/// The refusal of a run's mail call when the run named no mailbox (Zaru
+/// ADR-0071 D1 (e)), with `needs` naming the Profiles page.
+fn no_profile_names_mailbox() -> SealSessionError {
+    let message =
+        crate::application::credential_service::no_profile_names_sentence(CredentialProvider::IMAP);
+    SealSessionError::NotFound(message.clone()).answered(
+        CallerAnswer::CredentialBindingRequired { message }
+            .needing(crate::domain::seal_session::RefusalNeeds::profile(None)),
+    )
 }
 
 /// The binding an absent `mailbox` resolves to on a call that belongs to no

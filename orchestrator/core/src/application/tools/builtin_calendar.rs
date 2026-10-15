@@ -43,11 +43,13 @@
 //! chosen. The choice for the key `caldav` (the execution record's
 //! `contexts` when the execution has a record, else the call's
 //! `_meta.contexts`) is a set of any number of accounts, which must, when
-//! given, hold that binding; a choice of none refuses. With nothing chosen,
-//! an execution with a record needs the binding granted to the calling
-//! agent, its workflow or all agents; a call with no execution record (a
-//! conversation, or an MCP client acting as the person) is admitted on the
-//! ownership check alone.
+//! given, hold that binding; a choice of none refuses. An execution with a
+//! record that chose nothing for `caldav` reaches no account, whatever is
+//! granted (Zaru ADR-0071 D1); inside it an absent `account` is the run's
+//! one chosen account, else the newest of those it chose. A call with no
+//! execution record (a conversation, or an MCP client acting as the person)
+//! has its account admitted by the tool service before it reaches this
+//! tool.
 //!
 //! **Identifiers** (K6d, K6f). A calendar is named by its collection's
 //! `href` as the server gives it (`calendar_id`), refused unless it resolves
@@ -121,8 +123,10 @@ pub const CHOSEN_DIFFERENT: &str =
 /// The refusal for an account outside several chosen ones.
 pub const NOT_AMONG_CHOSEN: &str =
     "This tool needs your own calendar account, and the one named is not among those chosen for this run.";
-/// The refusal for an agent's run whose agent holds no grant.
-pub const NOT_GRANTED: &str = "This tool needs your own calendar account, granted to this agent.";
+/// The refusal for a run's absent `account` when none of the accounts it
+/// chose is still an active one of the person's.
+pub const NONE_CHOSEN_ACTIVE: &str =
+    "This tool needs your own calendar account, and none chosen for this run is an active calendar account of yours.";
 /// The refusal for a window wider than [`MAX_WINDOW_DAYS`] (K6a).
 pub const WINDOW_TOO_WIDE: &str = "'start' and 'end' must be at most 92 days apart.";
 /// The refusal for an `end` not after `start` (K6a).
@@ -364,10 +368,21 @@ impl CalendarTools {
         let Some(user_id) = acting.user_id.as_deref() else {
             return Err(binding_required(NO_PERSON.to_string()));
         };
-        let raw = args
-            .get("account")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid(BAD_ACCOUNT))?;
+        // Zaru ADR-0071 D1 (a), (b), (e): a run that named no calendar
+        // account reaches none, whatever is granted.
+        if acting.has_execution_record && acting.choice == ServerChoice::NotGiven {
+            return Err(no_profile_names_calendar());
+        }
+        let absent = matches!(args.get("account"), None | Some(Value::Null));
+        let resolved;
+        let raw = if absent && acting.has_execution_record {
+            resolved = self.run_account_for_absent(user_id, acting).await?;
+            resolved.as_str()
+        } else {
+            args.get("account")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid(BAD_ACCOUNT))?
+        };
         let id = match uuid::Uuid::parse_str(raw) {
             Ok(id) => CredentialBindingId(id),
             // A chosen account by its context name, resolved within the set.
@@ -412,13 +427,42 @@ impl CalendarTools {
                 return Err(binding_required(NOT_AMONG_CHOSEN.to_string()))
             }
             ServerChoice::None => return Err(binding_required(NONE_CHOSEN.to_string())),
-            ServerChoice::NotGiven if acting.has_execution_record && !account.granted => {
-                return Err(binding_required(NOT_GRANTED.to_string()))
-            }
             ServerChoice::NotGiven => {}
         }
         Ok(account)
     }
+
+    /// The account an absent `account` names inside a run (Zaru ADR-0071
+    /// D1 (b)): of the accounts the run chose, the only one, else the newest
+    /// still active, by its id; refused when the run chose none.
+    async fn run_account_for_absent(
+        &self,
+        user_id: &str,
+        acting: &CalendarActing,
+    ) -> Result<String, SealSessionError> {
+        if !matches!(acting.choice, ServerChoice::Bindings(_)) {
+            return Err(binding_required(NONE_CHOSEN.to_string()));
+        }
+        let accounts = self
+            .accounts
+            .calendar_contexts(&acting.tenant_id, user_id)
+            .await
+            .map_err(lookup_failed)?;
+        own_for_absent(accounts, &acting.choice)
+            .map(|account| account.id.0.to_string())
+            .ok_or_else(|| binding_required(NONE_CHOSEN_ACTIVE.to_string()))
+    }
+}
+
+/// The refusal of a run's calendar call when the run named no calendar
+/// account (Zaru ADR-0071 D1 (e)), with `needs` naming the Profiles page.
+fn no_profile_names_calendar() -> SealSessionError {
+    let message =
+        crate::application::credential_service::no_profile_names_sentence(CALENDAR_CHOICE_KEY);
+    SealSessionError::NotFound(message.clone()).answered(
+        CallerAnswer::CredentialBindingRequired { message }
+            .needing(crate::domain::seal_session::RefusalNeeds::profile(None)),
+    )
 }
 
 /// The answer for a call that is not served when the node has no calendar
