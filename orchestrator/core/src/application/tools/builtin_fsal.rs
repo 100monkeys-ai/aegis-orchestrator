@@ -11,13 +11,25 @@ use std::sync::Arc;
 
 /// An FSAL error of a `fs.*` tool, answered by its variant and the caller's
 /// own `path` (AEGIS ADR-035, Update of 2026-10-04, R5). What the inner loop
-/// and the log see is the text it always had, `"<context>: <error>"`.
+/// and the log see is the text it always had, `"<context>: <error>"`, but
+/// for a path that does not exist (AEGIS ADR-048, Update of 2026-10-15):
+/// that is one sentence with the caller's path, answered 404 to the caller
+/// and shown to the inner loop as invalid arguments, never as an internal
+/// error, so no storage path reaches the model; the storage error goes to
+/// the log only.
 pub(crate) fn fsal_refusal(context: &str, path_arg: &str, e: FsalError) -> SealSessionError {
     let answer = match &e {
         FsalError::VolumeNotFound(_)
         | FsalError::Storage(StorageError::FileNotFound(_))
         | FsalError::Storage(StorageError::NotFound(_)) => {
-            CallerAnswer::NotFound(format!("Not found: '{path_arg}'."))
+            tracing::info!(path = %path_arg, error = %e, "{context}: the path does not exist");
+            // Not `SealSessionError::NotFound`: the inner loop reads that as
+            // a tool that is not available.
+            let sentence = format!(
+                "[AEGIS] '{path_arg}' does not exist; fs.list of its parent lists what does."
+            );
+            return SealSessionError::InvalidArguments(sentence.clone())
+                .answered(CallerAnswer::NotFound(sentence));
         }
         FsalError::Storage(StorageError::AlreadyExists(_)) => {
             CallerAnswer::Conflict(format!("Conflict: '{path_arg}' already exists."))
@@ -619,31 +631,42 @@ fn locate_target<'a>(
     Err(TargetMiss::NotFound(first_differing_line(content, target)))
 }
 
+/// Why an `fs.edit` call or one `fs.multi_edit` edit was not run.
+enum EditPairRefusal {
+    /// `target_content` or `replacement_content` is missing or not a
+    /// string: the keys the edit sent.
+    Missing(String),
+    /// `target_content` is present and empty.
+    EmptyTarget,
+}
+
+const EMPTY_TARGET: &str = "`target_content` is empty, and an empty target matches everywhere; the target is the file's existing text that the replacement takes the place of.";
+
 /// The `target_content` and `replacement_content` of an `fs.edit` call or
-/// of one `fs.multi_edit` edit, or, when either is missing, not a string or
-/// empty, the keys it sent. A missing key must not read as an empty target,
-/// which matches everywhere.
-fn edit_pair(edit: &Value) -> Result<(&str, &str), String> {
+/// of one `fs.multi_edit` edit. When either is missing or not a string, the
+/// keys it sent; a missing key must not read as an empty target, which
+/// matches everywhere. An empty target is refused on its own; an empty
+/// replacement is a deletion of the target.
+fn edit_pair(edit: &Value) -> Result<(&str, &str), EditPairRefusal> {
     fn text<'v>(edit: &'v Value, key: &str) -> Option<&'v str> {
-        edit.get(key)
-            .and_then(|v| v.as_str())
-            .filter(|text| !text.is_empty())
+        edit.get(key).and_then(|v| v.as_str())
     }
     match (
         text(edit, "target_content"),
         text(edit, "replacement_content"),
     ) {
+        (Some(""), Some(_)) => Err(EditPairRefusal::EmptyTarget),
         (Some(target), Some(replacement)) => Ok((target, replacement)),
         _ => {
             let keys: Vec<String> = edit
                 .as_object()
                 .map(|object| object.keys().map(|key| format!("`{key}`")).collect())
                 .unwrap_or_default();
-            Err(if keys.is_empty() {
+            Err(EditPairRefusal::Missing(if keys.is_empty() {
                 "no keys".to_string()
             } else {
                 keys.join(", ")
-            })
+            }))
         }
     }
 }
@@ -736,10 +759,13 @@ async fn invoke_edit(
 ) -> Result<ToolInvocationResult, SealSessionError> {
     let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
     let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
-    let (target, replacement) = edit_pair(args).map_err(|sent| {
-        SealSessionError::InvalidArguments(format!(
-            "[AEGIS] fs.edit needs `target_content` and `replacement_content`; the call sent {sent}"
-        ))
+    let (target, replacement) = edit_pair(args).map_err(|refusal| {
+        SealSessionError::InvalidArguments(match refusal {
+            EditPairRefusal::Missing(sent) => format!(
+                "[AEGIS] fs.edit needs `target_content` and `replacement_content`; the call sent {sent}"
+            ),
+            EditPairRefusal::EmptyTarget => format!("[AEGIS] fs.edit was not run: {EMPTY_TARGET}"),
+        })
     })?;
 
     let handle = AegisFileHandle::new(vol_ctx.execution_id, vol_ctx.volume_id, "/");
@@ -807,12 +833,19 @@ async fn invoke_multi_edit(
         .iter()
         .enumerate()
         .map(|(i, edit)| {
-            edit_pair(edit).map_err(|sent| {
-                SealSessionError::InvalidArguments(format!(
-                    "[AEGIS] fs.multi_edit needs `target_content` and `replacement_content` in every edit; edit {} of {} sent {sent}",
-                    i + 1,
-                    edits.len()
-                ))
+            edit_pair(edit).map_err(|refusal| {
+                SealSessionError::InvalidArguments(match refusal {
+                    EditPairRefusal::Missing(sent) => format!(
+                        "[AEGIS] fs.multi_edit needs `target_content` and `replacement_content` in every edit; edit {} of {} sent {sent}",
+                        i + 1,
+                        edits.len()
+                    ),
+                    EditPairRefusal::EmptyTarget => format!(
+                        "[AEGIS] fs.multi_edit was not run: edit {} of {}: {EMPTY_TARGET}",
+                        i + 1,
+                        edits.len()
+                    ),
+                })
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1693,8 +1726,8 @@ mod tests {
         let (answer, _) = fixture.edit_answer("notes.txt", "", "1").await;
         let refusal = answer.expect_err("an empty target").to_string();
         assert!(
-            refusal.contains("[AEGIS] fs.edit needs `target_content` and `replacement_content`; the call sent `path`, `replacement_content`, `target_content`"),
-            "an empty target is refused the same way: {refusal}"
+            refusal.contains("[AEGIS] fs.edit was not run: `target_content` is empty, and an empty target matches everywhere; the target is the file's existing text that the replacement takes the place of."),
+            "an empty target is refused with its own sentence: {refusal}"
         );
 
         let refusal = invoke_multi_edit(
@@ -1716,8 +1749,127 @@ mod tests {
             refusal.contains("[AEGIS] fs.multi_edit needs `target_content` and `replacement_content` in every edit; edit 2 of 2 sent `replacement_content`, `target`"),
             "the refusal names the edit and the keys it sent: {refusal}"
         );
+
+        let refusal = invoke_multi_edit(
+            &json!({
+                "path": "/workspace/notes.txt",
+                "edits": [
+                    { "target_content": "one", "replacement_content": "1" },
+                    { "target_content": "two", "replacement_content": "2" },
+                    { "target_content": "", "replacement_content": "3" },
+                ],
+            }),
+            fixture.context.execution_id,
+            &fixture.fsal,
+            fixture.context.clone(),
+        )
+        .await
+        .expect_err("the third edit's target is empty")
+        .to_string();
+        assert!(
+            refusal.contains("[AEGIS] fs.multi_edit was not run: edit 3 of 3: `target_content` is empty, and an empty target matches everywhere; the target is the file's existing text that the replacement takes the place of."),
+            "the refusal names the edit whose target is empty: {refusal}"
+        );
         let on_disk = std::fs::read(fixture.on_disk("notes.txt")).expect("the file");
         assert_eq!(on_disk, b"one\r\ntwo\r\n");
+    }
+
+    /// An empty `replacement_content` is a deletion: the target is removed,
+    /// and the file's CRLF line endings are kept whole. `fs.multi_edit`
+    /// accepts it through the same pair. Before, it was refused as a
+    /// missing key.
+    #[tokio::test]
+    async fn fs_edit_with_an_empty_replacement_deletes_the_target_and_keeps_line_endings() {
+        let fixture = edit_fixture("notes.txt", b"one\r\ntwo\r\nthree\r\n").await;
+
+        let (answer, on_disk) = fixture.edit_answer("notes.txt", "two\n", "").await;
+        let answer = answer.expect("an empty replacement deletes the target");
+        assert_eq!(answer["message"], "File edited successfully");
+        assert_eq!(
+            on_disk, b"one\r\nthree\r\n",
+            "the line and its CRLF are gone"
+        );
+
+        let on_disk = fixture.edit("notes.txt", "one\r\n", "").await;
+        assert_eq!(on_disk, b"three\r\n");
+
+        // `fs.multi_edit` takes each edit through the same pair and lookup:
+        // an empty replacement is accepted as a deletion.
+        assert!(matches!(
+            edit_pair(&json!({ "target_content": "b\n", "replacement_content": "" })),
+            Ok(("b\n", ""))
+        ));
+    }
+
+    /// Each not-found storage error a provider answers (the filer's
+    /// `NotFound` for a directory, `FileNotFound` for a file) is the one
+    /// sentence with the caller's path: 404 to the caller, invalid arguments
+    /// to the inner loop, the storage path in neither.
+    #[test]
+    fn a_not_found_storage_error_answers_the_callers_path_and_no_storage_path() {
+        let sentence =
+            "[AEGIS] '/workspace/missing' does not exist; fs.list of its parent lists what does.";
+        for e in [
+            FsalError::Storage(StorageError::NotFound(
+                "/aegis/volumes/u-1/v-1/repo/missing".to_string(),
+            )),
+            FsalError::Storage(StorageError::FileNotFound(
+                "/aegis/volumes/u-1/v-1/repo/missing".to_string(),
+            )),
+        ] {
+            let refused = fsal_refusal("FSAL readdir error", "/workspace/missing", e);
+            let shown = refused.to_string();
+            let refusal = refused.refusal();
+            assert_eq!(shown, format!("Invalid tool arguments: {sentence}"));
+            assert_eq!(
+                (refusal.http_status, refusal.message.as_str()),
+                (404, sentence)
+            );
+            assert!(!shown.contains("/aegis/volumes") && !shown.contains("Internal error"));
+        }
+    }
+
+    /// Regression (fs-list-missing-directory-answers-internal-error-2026-10-15):
+    /// `fs.list` of a missing directory showed the model "Internal error:
+    /// FSAL readdir error: Storage error: Directory not found: <storage
+    /// path>". It answers one sentence with the caller's path, 404 to the
+    /// caller and invalid arguments to the inner loop.
+    #[tokio::test]
+    async fn fs_list_of_a_missing_directory_answers_its_path_and_no_storage_path() {
+        let (fixture, registry) = directory_fixture().await;
+
+        let refused = match invoke_fs_tool(
+            "fs.list",
+            &json!({"path": "/workspace/missing"}),
+            fixture.context.execution_id,
+            &fixture.fsal,
+            &registry,
+        )
+        .await
+        {
+            Err(refused) => refused,
+            Ok(_) => panic!("fs.list of a missing directory was answered as a listing"),
+        };
+        let sentence =
+            "[AEGIS] '/workspace/missing' does not exist; fs.list of its parent lists what does.";
+        let shown = refused.to_string();
+        let refusal = refused.refusal();
+        assert!(
+            shown.contains("[AEGIS] '/workspace/missing' does not exist"),
+            "the inner loop is not shown the caller's path: {shown}"
+        );
+        assert_eq!(shown, format!("Invalid tool arguments: {sentence}"));
+        assert_eq!(
+            (refusal.http_status, refusal.message.as_str()),
+            (404, sentence)
+        );
+        let root = fixture.root.path().display().to_string();
+        for leaked in ["Internal error", "/aegis/volumes", root.as_str(), "/hosts/"] {
+            assert!(
+                !shown.contains(leaked) && !refusal.message.contains(leaked),
+                "the refusal carries {leaked:?}: {shown}"
+            );
+        }
     }
 
     /// Run `53ae66ac`'s CODE child grepped `README.md` by its own path and

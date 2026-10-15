@@ -223,9 +223,11 @@ impl StorageProvider for LocalHostStorageProvider {
         let fs_path = self.resolve_path(path);
         let mut entries = Vec::new();
 
-        for entry in std::fs::read_dir(&fs_path)
-            .map_err(|_| StorageError::IoError("readdir failed".into()))?
-        {
+        let read_dir = std::fs::read_dir(&fs_path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => StorageError::NotFound(path.to_string()),
+            _ => StorageError::IoError("readdir failed".into()),
+        })?;
+        for entry in read_dir {
             let entry = entry.map_err(|_| StorageError::IoError("entry read failed".into()))?;
             let metadata = entry
                 .metadata()
