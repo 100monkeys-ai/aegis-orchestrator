@@ -1597,6 +1597,7 @@ spec:
                     volume_id: tester_volume.id,
                     execution_id: state.id,
                     workflow_execution_id: None,
+                    run_repository: None,
                     container_uid: 1000,
                     container_gid: 1000,
                     policy: aegis_orchestrator_core::domain::fsal::FsalAccessPolicy {

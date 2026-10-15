@@ -115,6 +115,7 @@ async fn fs_read_of_a_seaweedfs_volumes_root_is_refused_and_names_no_storage_pat
         volume_id: volume.id,
         execution_id: execution,
         workflow_execution_id: None,
+        run_repository: None,
         container_uid: 1000,
         container_gid: 1000,
         policy,

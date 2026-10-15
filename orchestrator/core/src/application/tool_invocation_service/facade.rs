@@ -2551,6 +2551,7 @@ impl ToolInvocationService {
                     execution_id: execution.id,
                     volume_id,
                     workflow_execution_id: Some(run),
+                    run_repository: None,
                     container_uid: 1000,
                     container_gid: 1000,
                     policy: crate::domain::fsal::FsalAccessPolicy {
@@ -2658,6 +2659,7 @@ impl ToolInvocationService {
             volume_id: volume.id,
             execution_id: crate::domain::execution::ExecutionId(run),
             workflow_execution_id: Some(run),
+            run_repository: None,
             container_uid: 1000,
             container_gid: 1000,
             policy: crate::domain::fsal::FsalAccessPolicy {

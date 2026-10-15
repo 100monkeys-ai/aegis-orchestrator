@@ -1981,6 +1981,7 @@ spec:
             volume_id: run_volume,
             execution_id: run.id,
             workflow_execution_id: in_workflow.then_some(workflow),
+            run_repository: None,
             container_uid: 1000,
             container_gid: 1000,
             policy: FsalAccessPolicy {
@@ -2793,6 +2794,7 @@ spec:
             volume_id: existing,
             execution_id: ExecutionId(f.workflow),
             workflow_execution_id: Some(f.workflow),
+            run_repository: None,
             container_uid: 1000,
             container_gid: 1000,
             policy: FsalAccessPolicy {

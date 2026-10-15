@@ -740,6 +740,7 @@ impl StandardExecutionService {
                 volume_id: alias_volume_id,
                 execution_id: child_execution_id,
                 workflow_execution_id: None,
+                run_repository: None,
                 container_uid: 1000,
                 container_gid: 1000,
                 policy: read_policy.clone(),
@@ -1666,6 +1667,7 @@ mod tests {
             volume_id: parent_volume.id,
             execution_id: parent_execution.id,
             workflow_execution_id: None,
+            run_repository: None,
             container_uid: 1000,
             container_gid: 1000,
             policy: FsalAccessPolicy {
@@ -2915,6 +2917,7 @@ mod tests {
             volume_id: workspace.id,
             execution_id: parent_execution.id,
             workflow_execution_id: Some(workflow_execution_id),
+            run_repository: None,
             container_uid: 1000,
             container_gid: 1000,
             policy: FsalAccessPolicy {
@@ -6138,6 +6141,123 @@ mod tests {
         }
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
+
+    /// The run's repositories of `execution` as its registrations name them:
+    /// each registered mount point with its `run_repository`, in order.
+    fn registered_run_repositories(
+        gateway: &NfsGatewayService,
+        execution: ExecutionId,
+    ) -> Vec<(PathBuf, Option<String>)> {
+        let mut registered: Vec<(PathBuf, Option<String>)> = gateway
+            .volume_registry()
+            .find_all_by_execution(execution)
+            .into_iter()
+            .map(|ctx| (ctx.mount_point, ctx.run_repository))
+            .collect();
+        registered.sort();
+        registered
+    }
+
+    /// AEGIS ADR-141, Update of 2026-10-15 (1): a workflow's agent state whose
+    /// run holds a repository registers its mount `/workspace/<label>` as the
+    /// run's repository, and its own `/workspace` as none.
+    #[tokio::test]
+    async fn a_workflow_agent_states_repository_mounts_are_registered_as_the_runs_repository() {
+        let tenant_id = CoreTenantId::consumer();
+        let agent = make_agent("coder", None, None);
+        let workflow_execution_id = uuid::Uuid::new_v4();
+        let workflows = Arc::new(
+            crate::infrastructure::repositories::InMemoryWorkflowExecutionRepository::new(),
+        );
+        let now = Utc::now();
+        crate::domain::repository::WorkflowExecutionRepository::save_for_tenant(
+            workflows.as_ref(),
+            &tenant_id,
+            &crate::domain::workflow::WorkflowExecution {
+                id: crate::domain::execution::ExecutionId(workflow_execution_id),
+                workflow_id: crate::domain::workflow::WorkflowId::new(),
+                tenant_id: tenant_id.clone(),
+                status: crate::domain::execution::ExecutionStatus::Running,
+                current_state: crate::domain::workflow::StateName::new("CODE").unwrap(),
+                blackboard: crate::domain::workflow::Blackboard::new(),
+                input: serde_json::json!({
+                    "task": "fix",
+                    "repositories": [{
+                        "binding_id": REPOSITORY_BINDING,
+                        "branch": crate::domain::git_repo::default_work_branch(workflow_execution_id),
+                    }],
+                }),
+                state_outputs: HashMap::new(),
+                final_output: None,
+                started_at: now,
+                last_transition_at: now,
+                initiating_user_sub: Some("u-starter".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        let (service, runtime, gateway) =
+            workspace_mount_service(&tenant_id, &[&agent], HashMap::new(), &[]).await;
+        let service = service.with_workflow_executions(workflows);
+        service.set_repositories(RecordingRunRepositories::new(None));
+
+        let id = service
+            .start_execution(
+                agent.id,
+                workflow_step_input(VolumeId::new(), workflow_execution_id),
+                "test-ctx".to_string(),
+                Some(&temporal_worker()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the agent state did not start: {e}"));
+        wait_for_spawn(runtime.as_ref()).await;
+
+        assert_eq!(
+            registered_run_repositories(&gateway, id),
+            vec![
+                (PathBuf::from("/workspace"), None),
+                (PathBuf::from("/workspace/app"), Some("app".to_string())),
+            ],
+            "the agent state's repository mount is not registered as the run's repository"
+        );
+        assert_eq!(
+            gateway.volume_registry().run_repository_mounts(id),
+            vec![PathBuf::from("/workspace/app")]
+        );
+    }
+
+    /// AEGIS ADR-141, Update of 2026-10-15 (4): a root agent execution given
+    /// repositories registers their mounts as none of a run's, so its
+    /// `/workspace` stays writable.
+    #[tokio::test]
+    async fn a_root_agent_execution_with_repositories_is_not_confined() {
+        let tenant_id = CoreTenantId::consumer();
+        let agent = make_agent("fixer", None, None);
+        let (service, runtime, gateway) =
+            workspace_mount_service(&tenant_id, &[&agent], HashMap::new(), &[]).await;
+        service.set_repositories(RecordingRunRepositories::new(None));
+
+        let id = service
+            .start_execution(
+                agent.id,
+                repositories_input(),
+                "test-ctx".to_string(),
+                Some(&repository_person()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the root execution did not start: {e}"));
+        wait_for_spawn(runtime.as_ref()).await;
+
+        assert_eq!(
+            registered_run_repositories(&gateway, id),
+            vec![(PathBuf::from("/workspace/app"), None)],
+            "the root execution's repository mount is registered as a run's repository"
+        );
+        assert!(gateway
+            .volume_registry()
+            .run_repository_mounts(id)
+            .is_empty());
+    }
 }
 
 struct ExecutionMonitor {
@@ -7244,7 +7364,7 @@ impl StandardExecutionService {
         run: uuid::Uuid,
         prepare: bool,
         input: &mut ExecutionInput,
-    ) -> Result<Vec<VolumeMount>> {
+    ) -> Result<Vec<crate::application::git_repo_service::RunMount>> {
         use crate::application::git_repo_service::RunRepositoryError;
         let requested = Self::requested_repositories(input)?;
         if requested.is_empty() {
@@ -7323,7 +7443,7 @@ impl StandardExecutionService {
             .mounts_for_run(tenant_id, person, run, &entries)
             .await
         {
-            Ok(mounts) => Ok(mounts.into_iter().map(|m| m.mount).collect()),
+            Ok(mounts) => Ok(mounts),
             Err(e) => {
                 if prepare {
                     repositories.release_run(run);
@@ -8049,8 +8169,20 @@ impl StandardExecutionService {
         };
 
         // AEGIS ADR-136 G4: each of the run's repositories at
-        // `/workspace/<label>`, beside the manifest's own volumes.
-        volume_mounts.extend(repository_mounts);
+        // `/workspace/<label>`, beside the manifest's own volumes. A
+        // workflow's agent state registers them as its run's repositories,
+        // under which alone it writes (AEGIS ADR-141, Update of 2026-10-15);
+        // a root execution is not confined.
+        let run_repository_labels: std::collections::HashMap<PathBuf, String> =
+            if workflow_execution_id.is_some() {
+                repository_mounts
+                    .iter()
+                    .map(|m| (m.mount.mount_point.clone(), m.label.clone()))
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            };
+        volume_mounts.extend(repository_mounts.into_iter().map(|m| m.mount));
 
         // Mount policy: all mount points must live under /workspace, and must not overlap.
         if !volume_mounts.is_empty() || workflow_workspace.is_some() {
@@ -8100,6 +8232,7 @@ impl StandardExecutionService {
                     volume_id: mount.volume_id,
                     execution_id,
                     workflow_execution_id: None,
+                    run_repository: run_repository_labels.get(&mount.mount_point).cloned(),
                     container_uid: 1000,
                     container_gid: 1000,
                     policy,
@@ -8133,6 +8266,7 @@ impl StandardExecutionService {
                     volume_id: vol_id,
                     execution_id,
                     workflow_execution_id,
+                    run_repository: None,
                     container_uid: 1000,
                     container_gid: 1000,
                     policy,
@@ -8921,7 +9055,7 @@ impl ExecutionService for StandardExecutionService {
         // checked with the child's own volumes. The mounts from
         // `declared_mounts` on are the run's, not the child's own.
         let declared_mounts = own_volume_mounts.len();
-        own_volume_mounts.extend(repository_mounts);
+        own_volume_mounts.extend(repository_mounts.into_iter().map(|m| m.mount));
 
         // Validate own volume mount paths (must be under /workspace, no overlaps with each other
         // or with inherited mounts).
@@ -8997,6 +9131,7 @@ impl ExecutionService for StandardExecutionService {
                     volume_id: mount.volume_id,
                     execution_id: child_execution_id,
                     workflow_execution_id: None,
+                    run_repository: None,
                     container_uid: 1000,
                     container_gid: 1000,
                     policy,

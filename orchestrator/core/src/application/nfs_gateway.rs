@@ -73,6 +73,11 @@ pub struct VolumeRegistration {
     pub policy: FsalAccessPolicy,
     pub mount_point: PathBuf,
     pub remote_path: String,
+    /// The label of the run's repository this mount is, when the execution is
+    /// a workflow's agent state whose run holds repositories; `None` for every
+    /// other mount. An execution with any such mount writes only under them
+    /// (AEGIS ADR-141, Update of 2026-10-15).
+    pub run_repository: Option<String>,
 }
 
 /// Volume context registry for NFS export path routing
@@ -155,6 +160,7 @@ impl NfsVolumeRegistry {
             policy: registration.policy,
             mount_point: registration.mount_point,
             remote_path: registration.remote_path,
+            run_repository: registration.run_repository,
         };
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
         let mut registrations = self.registrations.write();
@@ -340,6 +346,21 @@ impl NfsVolumeRegistry {
         }
         contexts.sort_by_key(|ctx| ctx.mount_point.as_os_str().len());
         contexts.into_iter().next()
+    }
+
+    /// The mount points of an execution's registrations that are its run's
+    /// repositories, in order: empty for an execution that is not a
+    /// workflow's agent state or whose run holds no repository.
+    pub fn run_repository_mounts(&self, execution_id: ExecutionId) -> Vec<PathBuf> {
+        let mut mounts: Vec<PathBuf> = self
+            .find_all_by_execution(execution_id)
+            .into_iter()
+            .filter(|ctx| ctx.run_repository.is_some())
+            .map(|ctx| ctx.mount_point)
+            .collect();
+        mounts.sort();
+        mounts.dedup();
+        mounts
     }
 
     /// Get count of registrations held
@@ -606,6 +627,7 @@ mod tests {
             volume_id,
             execution_id,
             workflow_execution_id: None,
+            run_repository: None,
             container_uid: 1000,
             container_gid: 1000,
             policy: FsalAccessPolicy {

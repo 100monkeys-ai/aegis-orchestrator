@@ -103,6 +103,7 @@ impl Fixture {
             volume_id: self.volume_id,
             execution_id,
             workflow_execution_id: None,
+            run_repository: None,
             container_uid: 0,
             container_gid: 0,
             policy: FsalAccessPolicy::default(),

@@ -52,6 +52,24 @@ fn directory_refusal(tool: &str, path_arg: &str) -> SealSessionError {
         .answered(CallerAnswer::InvalidArguments(sentence))
 }
 
+/// The answer of `fs.write`, `fs.edit`, `fs.multi_edit`, `fs.create_dir` and
+/// `fs.delete` to a `path_arg` outside the run's repository mounts `mounts`,
+/// for a workflow's agent state whose run holds repositories (AEGIS ADR-141,
+/// Update of 2026-10-15): the tool is not run, and the refusal names the
+/// caller's path and every mount it may write under.
+fn outside_repository_refusal(path_arg: &str, mounts: &[std::path::PathBuf]) -> SealSessionError {
+    let under = mounts
+        .iter()
+        .map(|mount| mount.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sentence = format!(
+        "'{path_arg}' is outside this run's repository; this step writes only under {under}"
+    );
+    SealSessionError::InvalidArguments(sentence.clone())
+        .answered(CallerAnswer::InvalidArguments(sentence))
+}
+
 /// [`fsal_refusal`] for the read of a file by `tool`, a directory refused by
 /// [`directory_refusal`].
 fn file_read_refusal(tool: &str, context: &str, path_arg: &str, e: FsalError) -> SealSessionError {
@@ -209,6 +227,20 @@ pub async fn invoke_fs_tool(
         .and_then(|v| v.as_str())
         .unwrap_or("/workspace");
     let vol_ctx = resolve_volume(execution_id, path_arg, volume_registry)?;
+
+    // A workflow's agent state whose run holds repositories writes only
+    // under them (AEGIS ADR-141, Update of 2026-10-15): refused before any
+    // storage call, so nothing outside is created, changed or deleted.
+    if matches!(
+        tool_name,
+        "fs.write" | "fs.edit" | "fs.multi_edit" | "fs.create_dir" | "fs.delete"
+    ) && vol_ctx.run_repository.is_none()
+    {
+        let mounts = volume_registry.run_repository_mounts(execution_id);
+        if !mounts.is_empty() {
+            return Err(outside_repository_refusal(path_arg, &mounts));
+        }
+    }
 
     let handle = AegisFileHandle::new(vol_ctx.execution_id, vol_ctx.volume_id, "/");
 
@@ -1089,6 +1121,7 @@ mod tests {
                 volume_id,
                 execution_id: coder,
                 workflow_execution_id: None,
+                run_repository: None,
                 container_uid: 1000,
                 container_gid: 1000,
                 policy: FsalAccessPolicy {
@@ -1288,6 +1321,7 @@ mod tests {
                 execution_id: execution,
                 volume_id: volume.id,
                 workflow_execution_id: None,
+                run_repository: None,
                 container_uid: 1000,
                 container_gid: 1000,
                 policy: crate::domain::fsal::FsalAccessPolicy {
@@ -1733,6 +1767,7 @@ mod tests {
             volume_id: fixture.volume,
             execution_id: fixture.context.execution_id,
             workflow_execution_id: None,
+            run_repository: None,
             container_uid: 1000,
             container_gid: 1000,
             policy: fixture.context.policy.clone(),
@@ -1836,6 +1871,285 @@ mod tests {
             std::fs::read(fixture.on_disk("sub/kept.txt")).expect("sub/kept.txt"),
             b"kept\n",
             "the file in sub/ changed"
+        );
+    }
+
+    /// A run's volumes as a workflow's agent state holds them: the agent's own
+    /// volume at `/workspace` and, when `repository` is set, the run's
+    /// repository `app` at `/workspace/app`. Each volume holds `x` ("kept\n").
+    /// A new file is written into a new directory: the local provider refuses
+    /// to create a parent directory that already exists.
+    struct RunFixture {
+        root: tempfile::TempDir,
+        execution: ExecutionId,
+        workspace: crate::domain::volume::VolumeId,
+        repository: crate::domain::volume::VolumeId,
+        fsal: Arc<AegisFSAL>,
+        registry: NfsVolumeRegistry,
+    }
+
+    impl RunFixture {
+        async fn new(repository_label: Option<&str>) -> Self {
+            use crate::domain::repository::VolumeRepository;
+            use crate::domain::volume::{StorageClass, Volume, VolumeBackend, VolumeOwnership};
+
+            let root = tempfile::tempdir().expect("scratch root");
+            let execution = ExecutionId::new();
+            let volumes =
+                Arc::new(crate::infrastructure::repositories::InMemoryVolumeRepository::new());
+            let mut ids = Vec::new();
+            for name in ["workspace", "repository"] {
+                let mut volume = Volume::new(
+                    name.to_string(),
+                    crate::domain::tenant::TenantId::consumer(),
+                    StorageClass::persistent(),
+                    VolumeBackend::HostPath {
+                        path: std::path::PathBuf::from("/placeholder"),
+                    },
+                    64 * 1024 * 1024,
+                    VolumeOwnership::execution(execution),
+                )
+                .expect("volume");
+                volume.backend = VolumeBackend::HostPath {
+                    path: std::path::PathBuf::from(format!("/hosts/{}", volume.id)),
+                };
+                volume.mark_available().expect("available");
+                volumes.save(&volume).await.expect("saved");
+                let dir = root.path().join(format!("hosts/{}", volume.id));
+                std::fs::create_dir_all(&dir).expect("dirs");
+                std::fs::write(dir.join("x"), b"kept\n").expect("x written");
+                ids.push(volume.id);
+            }
+            let fsal = Arc::new(AegisFSAL::new(
+                Arc::new(
+                    crate::infrastructure::storage::LocalHostStorageProvider::new(root.path())
+                        .expect("storage root"),
+                ),
+                volumes as Arc<dyn VolumeRepository>,
+                Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+                Arc::new(NoStorageEvents),
+            ));
+            let registry = NfsVolumeRegistry::new();
+            for (volume_id, mount_point, run_repository) in [
+                (ids[0], "/workspace", None),
+                (
+                    ids[1],
+                    "/workspace/app",
+                    repository_label.map(str::to_string),
+                ),
+            ] {
+                registry.register(crate::application::nfs_gateway::VolumeRegistration {
+                    volume_id,
+                    execution_id: execution,
+                    workflow_execution_id: Some(uuid::Uuid::new_v4()),
+                    run_repository,
+                    container_uid: 1000,
+                    container_gid: 1000,
+                    policy: crate::domain::fsal::FsalAccessPolicy {
+                        read: vec!["/**".to_string()],
+                        write: vec!["/**".to_string()],
+                    },
+                    mount_point: std::path::PathBuf::from(mount_point),
+                    remote_path: String::new(),
+                });
+            }
+            Self {
+                root,
+                execution,
+                workspace: ids[0],
+                repository: ids[1],
+                fsal,
+                registry,
+            }
+        }
+
+        fn on_disk(
+            &self,
+            volume: crate::domain::volume::VolumeId,
+            file: &str,
+        ) -> std::path::PathBuf {
+            self.root.path().join(format!("hosts/{volume}")).join(file)
+        }
+
+        async fn call(
+            &self,
+            tool: &str,
+            args: Value,
+        ) -> Result<ToolInvocationResult, SealSessionError> {
+            invoke_fs_tool(tool, &args, self.execution, &self.fsal, &self.registry).await
+        }
+    }
+
+    /// Asserts `answer` is the refusal of a write to `path` outside the run's
+    /// repository at `/workspace/app`: the caller and the inner loop are both
+    /// given the sentence naming the path and the mount.
+    fn assert_outside_repository_refusal(
+        answer: Result<ToolInvocationResult, SealSessionError>,
+        tool: &str,
+        path: &str,
+    ) {
+        let sentence = format!(
+            "'{path}' is outside this run's repository; this step writes only under /workspace/app"
+        );
+        let refused = match answer {
+            Err(refused) => refused,
+            Ok(ToolInvocationResult::Direct(ran)) => {
+                panic!("{tool} of {path}, outside the run's repository, was run: {ran}")
+            }
+            Ok(_) => panic!("{tool} of {path}, outside the run's repository, was run"),
+        };
+        assert_eq!(
+            (refused.to_string(), refused.refusal().message),
+            (format!("Invalid tool arguments: {sentence}"), sentence),
+            "{tool} of {path} was not refused as outside the run's repository"
+        );
+    }
+
+    /// Regression (forge-coder-writes-outside-repository-and-claims-pass-2026-10-14):
+    /// the Forge's coder wrote `/workspace/README.md`, outside the run's
+    /// repository at `/workspace/aegis-examples`, and the write landed in the
+    /// agent's own volume. It is refused, and nothing is written.
+    #[tokio::test]
+    async fn a_run_states_write_outside_its_repository_is_refused_and_nothing_is_written() {
+        let run = RunFixture::new(Some("app")).await;
+
+        let answer = run
+            .call(
+                "fs.write",
+                json!({"path": "/workspace/README.md", "content": "# Examples\n"}),
+            )
+            .await;
+
+        assert_outside_repository_refusal(answer, "fs.write", "/workspace/README.md");
+        assert!(
+            !run.on_disk(run.workspace, "README.md").exists(),
+            "README.md was written to the agent's own volume"
+        );
+    }
+
+    /// Every tool that writes refuses a path outside the run's repository the
+    /// same way, and a write with no `path` (the agent's `/workspace`) too;
+    /// nothing is created, changed or deleted.
+    #[tokio::test]
+    async fn each_writing_fs_tool_outside_the_repository_is_refused() {
+        let run = RunFixture::new(Some("app")).await;
+
+        for (tool, path, args) in [
+            (
+                "fs.edit",
+                "/workspace/x",
+                json!({"path": "/workspace/x", "target_content": "kept", "replacement_content": "gone"}),
+            ),
+            (
+                "fs.multi_edit",
+                "/workspace/x",
+                json!({"path": "/workspace/x", "edits": [{"target_content": "kept", "replacement_content": "gone"}]}),
+            ),
+            (
+                "fs.create_dir",
+                "/workspace/made",
+                json!({"path": "/workspace/made"}),
+            ),
+            ("fs.delete", "/workspace/x", json!({"path": "/workspace/x"})),
+            ("fs.write", "/workspace", json!({"content": "written\n"})),
+        ] {
+            let answer = run.call(tool, args).await;
+            assert_outside_repository_refusal(answer, tool, path);
+        }
+
+        assert_eq!(
+            std::fs::read(run.on_disk(run.workspace, "x")).expect("x is still there"),
+            b"kept\n",
+            "x in the agent's own volume changed"
+        );
+        assert!(
+            !run.on_disk(run.workspace, "made").exists(),
+            "made/ was created in the agent's own volume"
+        );
+        assert_eq!(
+            outside_repository_refusal(
+                "/tmp/y",
+                &[
+                    std::path::PathBuf::from("/workspace/a"),
+                    std::path::PathBuf::from("/workspace/b")
+                ]
+            )
+            .refusal()
+            .message,
+            "'/tmp/y' is outside this run's repository; this step writes only under /workspace/a, /workspace/b",
+            "several mounts are named comma-separated"
+        );
+    }
+
+    /// A write under the run's repository is written there, as before.
+    #[tokio::test]
+    async fn a_run_states_write_inside_its_repository_is_written() {
+        let run = RunFixture::new(Some("app")).await;
+
+        let answer = run
+            .call(
+                "fs.write",
+                json!({"path": "/workspace/app/docs/README.md", "content": "# Examples\n"}),
+            )
+            .await;
+
+        assert!(
+            answer.is_ok(),
+            "the write under the repository was refused: {:?}",
+            answer.err().map(|e| e.to_string())
+        );
+        assert_eq!(
+            std::fs::read(run.on_disk(run.repository, "docs/README.md"))
+                .expect("README.md in the repository"),
+            b"# Examples\n"
+        );
+    }
+
+    /// Reading outside the run's repository is unchanged.
+    #[tokio::test]
+    async fn reading_outside_the_repository_is_unchanged() {
+        let run = RunFixture::new(Some("app")).await;
+
+        let Ok(ToolInvocationResult::Direct(read)) =
+            run.call("fs.read", json!({"path": "/workspace/x"})).await
+        else {
+            panic!("fs.read of /workspace/x was not answered");
+        };
+        assert_eq!(read["content"], "kept\n", "{read}");
+
+        let Ok(ToolInvocationResult::Direct(listed)) =
+            run.call("fs.list", json!({"path": "/workspace"})).await
+        else {
+            panic!("fs.list of /workspace was not answered");
+        };
+        assert!(
+            listed.to_string().contains("\"x\""),
+            "x is not listed: {listed}"
+        );
+    }
+
+    /// An execution with no run repository registered writes its own
+    /// `/workspace` as before.
+    #[tokio::test]
+    async fn an_execution_without_run_repositories_writes_its_workspace_as_before() {
+        let run = RunFixture::new(None).await;
+
+        let answer = run
+            .call(
+                "fs.write",
+                json!({"path": "/workspace/docs/README.md", "content": "# Examples\n"}),
+            )
+            .await;
+
+        assert!(
+            answer.is_ok(),
+            "the write was refused: {:?}",
+            answer.err().map(|e| e.to_string())
+        );
+        assert_eq!(
+            std::fs::read(run.on_disk(run.workspace, "docs/README.md"))
+                .expect("README.md in /workspace"),
+            b"# Examples\n"
         );
     }
 }

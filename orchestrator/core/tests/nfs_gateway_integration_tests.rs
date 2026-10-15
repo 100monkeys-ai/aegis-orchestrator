@@ -339,6 +339,7 @@ async fn test_fsal_mode_validation() {
     gateway.register_volume(VolumeRegistration {
         volume_id,
         execution_id,
+        run_repository: None,
         container_uid: 0,
         container_gid: 0,
         policy: policy.clone(),
@@ -401,6 +402,7 @@ async fn test_fsal_path_traversal_prevention() {
     nfs_gateway.register_volume(VolumeRegistration {
         volume_id,
         execution_id,
+        run_repository: None,
         container_uid: 0,
         container_gid: 0,
         policy: policy.clone(),
@@ -678,6 +680,7 @@ async fn test_gateway_borrowed_volume_alias_allows_judge_read_only_access() {
     gateway.register_volume(VolumeRegistration {
         volume_id: borrowed_alias_id,
         execution_id: judge_execution_id,
+        run_repository: None,
         container_uid: 1000,
         container_gid: 1000,
         policy: FsalAccessPolicy {
@@ -746,6 +749,7 @@ async fn test_gateway_borrowed_volume_alias_rejects_wrong_execution() {
     gateway.register_volume(VolumeRegistration {
         volume_id: borrowed_alias_id,
         execution_id: judge_execution_id,
+        run_repository: None,
         container_uid: 1000,
         container_gid: 1000,
         policy: FsalAccessPolicy {

@@ -1971,6 +1971,7 @@ mod tests {
                 volume_id: vol.id,
                 execution_id,
                 workflow_execution_id: None,
+                run_repository: None,
                 container_uid: 1000,
                 container_gid: 1000,
                 policy: FsalAccessPolicy::default(),

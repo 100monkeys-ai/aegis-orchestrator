@@ -84,6 +84,9 @@ pub struct NfsVolumeContext {
     /// Remote path on the NFS server (e.g. `/aegis/volumes/{tenant_id}/{volume_id}`).
     /// Used by container_step_runner to build the NFS device path for Docker mounts.
     pub remote_path: String,
+    /// The label of the run's repository this mount is, for a workflow's
+    /// agent state whose run holds repositories; `None` otherwise.
+    pub run_repository: Option<String>,
 }
 
 /// NFS server errors
@@ -491,6 +494,7 @@ impl NFSFileSystem for AegisFsalAdapter {
                         execution_id: ExecutionId::new(),
                         volume_id: VolumeId::new(),
                         workflow_execution_id: None,
+                        run_repository: None,
                         container_uid: 1000,
                         container_gid: 1000,
                         policy: FsalAccessPolicy::default(),

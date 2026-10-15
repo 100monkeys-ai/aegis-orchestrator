@@ -70,6 +70,7 @@ impl Run {
                 volume_id: volume.id,
                 execution_id: execution,
                 workflow_execution_id: None,
+                run_repository: None,
                 container_uid: 1000,
                 container_gid: 1000,
                 policy: FsalAccessPolicy {

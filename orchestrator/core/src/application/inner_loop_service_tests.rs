@@ -1860,6 +1860,7 @@ impl World {
                 volume_id: crate::domain::volume::VolumeId::new(),
                 execution_id: self.execution_id,
                 workflow_execution_id: None,
+                run_repository: None,
                 container_uid: 1000,
                 container_gid: 1000,
                 policy: crate::domain::fsal::FsalAccessPolicy {
@@ -1901,6 +1902,7 @@ impl World {
                 volume_id: volume.id,
                 execution_id: self.execution_id,
                 workflow_execution_id: None,
+                run_repository: None,
                 container_uid: 1000,
                 container_gid: 1000,
                 policy: crate::domain::fsal::FsalAccessPolicy {

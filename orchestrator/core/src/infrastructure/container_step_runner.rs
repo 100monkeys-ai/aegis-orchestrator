@@ -440,6 +440,7 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                             workflow_execution_id: existing_ctx
                                 .workflow_execution_id
                                 .or(config.workflow_execution_id),
+                            run_repository: None,
                             container_uid: existing_ctx.container_uid,
                             container_gid: existing_ctx.container_gid,
                             policy,

@@ -551,6 +551,7 @@ impl RunContainerStepUseCase {
                         volume_id: staged.volume_id,
                         execution_id: input.execution_id,
                         workflow_execution_id: Some(run),
+                        run_repository: None,
                         container_uid: 1000,
                         container_gid: 1000,
                         policy: FsalAccessPolicy {
@@ -663,6 +664,7 @@ impl RunContainerStepUseCase {
                 volume_id: mount.volume_id,
                 execution_id: input.execution_id,
                 workflow_execution_id: Some(run),
+                run_repository: None,
                 container_uid: 1000,
                 container_gid: 1000,
                 policy: FsalAccessPolicy {
@@ -1116,6 +1118,7 @@ mod tests {
             volume_id,
             execution_id: agent_state,
             workflow_execution_id: None,
+            run_repository: None,
             container_uid: 1000,
             container_gid: 1000,
             policy: FsalAccessPolicy::default(),
