@@ -808,6 +808,56 @@ pub trait ToolCredentialSource: Send + Sync {
     ) -> anyhow::Result<Vec<ContextBinding>> {
         Ok(Vec::new())
     }
+
+    /// The person's own credential for `server` on a call that belongs to no
+    /// execution and chose nothing (a remote client acting as the person,
+    /// Zaru ADR-0069 D4): the secret of their newest Active binding whose
+    /// provider is the server, in the tenant, no grant needed, since no grant
+    /// can name the session's own agent. `Ok(None)` when they hold none, or
+    /// when its OAuth token can no longer be refreshed. The default answers
+    /// none.
+    async fn own_server_credential(
+        &self,
+        _tenant_id: &TenantId,
+        _user_id: &str,
+        _server: &str,
+    ) -> anyhow::Result<Option<SensitiveString>> {
+        Ok(None)
+    }
+}
+
+/// The binding key a tool's connection family is chosen and connected under
+/// (Zaru ADR-0069 D1): `imap` for a `mail.*` tool (a mailbox of either form),
+/// `caldav` for a `calendar.*` tool (a calendar account), and the server's
+/// name for a tool of a registered remote server (`<server>.<tool>`). `None`
+/// for a tool of no connection family (`web.*`, `aegis.*`, the built-ins).
+pub fn connection_key<'a>(tool_name: &'a str, remote_servers: &[String]) -> Option<&'a str> {
+    let (family, tool) = tool_name.split_once('.')?;
+    if tool.is_empty() {
+        return None;
+    }
+    match family {
+        "mail" => Some(CredentialProvider::IMAP),
+        "calendar" => Some(CALENDAR_CHOICE_KEY),
+        server if remote_servers.iter().any(|name| name == server) => Some(family),
+        _ => None,
+    }
+}
+
+/// The sentence a call for a family its person has not connected is refused
+/// with (Zaru ADR-0069 D3), naming the family as a person reads it and the
+/// page where it is connected.
+pub fn not_connected_sentence(key: &str) -> String {
+    let what = match key {
+        CredentialProvider::IMAP => "a mailbox",
+        CALENDAR_CHOICE_KEY => "a calendar",
+        "github" => "GitHub",
+        "nuclear-notes" => "Nuclear Notes",
+        server => server,
+    };
+    format!(
+        "You have not connected {what} to Zaru. Connect it on the Connections page in Zaru Web (ask.myzaru.com/vault/connections), then try again."
+    )
 }
 
 /// A mail tool's mailbox (AEGIS ADR-125 D4 and its Update of 2026-10-07
@@ -1072,6 +1122,32 @@ impl ToolCredentialSource for StandardCredentialManagementService {
         }
         self.active_context_bindings(tenant_id, user_id, &CredentialProvider::new(server))
             .await
+    }
+
+    async fn own_server_credential(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &str,
+        server: &str,
+    ) -> anyhow::Result<Option<SensitiveString>> {
+        let provider = CredentialProvider::new(server);
+        let mut own: Vec<UserCredentialBinding> = self
+            .repo
+            .find_by_owner(tenant_id, user_id)
+            .await?
+            .into_iter()
+            .filter(|binding| {
+                binding.provider == provider
+                    && binding.owner_user_id == user_id
+                    && &binding.tenant_id == tenant_id
+                    && binding.status == CredentialStatus::Active
+            })
+            .collect();
+        own.sort_by_key(|binding| std::cmp::Reverse((binding.created_at, binding.id.0)));
+        match own.into_iter().next() {
+            Some(binding) => self.binding_secret(binding).await,
+            None => Ok(None),
+        }
     }
 }
 

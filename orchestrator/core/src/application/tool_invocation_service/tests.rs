@@ -4458,6 +4458,7 @@ mod gateway_timeout_regression {
                         agent_id: AgentId::new(),
                         workflow_id: None,
                         contexts: Default::default(),
+                        has_execution_record: true,
                     },
                 )
                 .await
@@ -4544,6 +4545,7 @@ mod gateway_timeout_regression {
                     agent_id: AgentId::new(),
                     workflow_id: None,
                     contexts: Default::default(),
+                    has_execution_record: true,
                 },
             ),
         )

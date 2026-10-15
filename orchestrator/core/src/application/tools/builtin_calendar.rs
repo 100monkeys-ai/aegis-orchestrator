@@ -73,7 +73,7 @@
 //! their `tzid`.
 
 use crate::application::credential_service::{
-    ToolCalendar, ToolCalendarSource, ToolCallActor, CALENDAR_CHOICE_KEY,
+    ContextBinding, ToolCalendar, ToolCalendarSource, ToolCallActor, CALENDAR_CHOICE_KEY,
 };
 use crate::domain::agent::AgentId;
 use crate::domain::credential::CredentialBindingId;
@@ -300,6 +300,21 @@ impl CalendarTools {
         }
     }
 
+    /// The person's own active calendar accounts in the tenant, oldest
+    /// first, each with its context name: what Zaru ADR-0069 D1 reads to
+    /// tell whether the calendar family is connected, and D4 an absent
+    /// `account` by.
+    pub async fn person_accounts(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &str,
+    ) -> Result<Vec<ContextBinding>, SealSessionError> {
+        self.accounts
+            .calendar_contexts(tenant_id, user_id)
+            .await
+            .map_err(lookup_failed)
+    }
+
     /// Run `tool_name` with `args` for `acting`.
     pub async fn invoke(
         &self,
@@ -413,6 +428,24 @@ pub fn not_configured() -> SealSessionError {
         "the calendar tools are not configured on this node".to_string(),
     )
     .answered(CallerAnswer::Internal(InternalFailure::Unavailable))
+}
+
+/// The binding an absent `account` resolves to on a call that belongs to no
+/// execution (Zaru ADR-0069 D4): of the person's own active calendar accounts (oldest
+/// first, as `contexts` answers them), within the call's choice when it
+/// chose a set, the only one, else the newest. `None` when the choice is
+/// none or nothing is left.
+pub fn own_for_absent(
+    contexts: Vec<ContextBinding>,
+    choice: &ServerChoice,
+) -> Option<ContextBinding> {
+    match choice {
+        ServerChoice::None => None,
+        ServerChoice::NotGiven => contexts.into_iter().next_back(),
+        ServerChoice::Bindings(chosen) => contexts
+            .into_iter()
+            .rfind(|binding| chosen.contains(&binding.id)),
+    }
 }
 
 fn lookup_failed(e: anyhow::Error) -> SealSessionError {

@@ -186,6 +186,41 @@ impl ToolCredentialSource for Credentials {
         self.lookups.fetch_add(1, Ordering::SeqCst);
         Ok(self.answer.map(SensitiveString::new))
     }
+
+    /// The person holds one binding to `SERVER` exactly when this source
+    /// answers a credential (Zaru ADR-0069 D1 reads it before the call).
+    async fn context_bindings(
+        &self,
+        _: &aegis_orchestrator_core::domain::tenant::TenantId,
+        user_id: &str,
+        server: &str,
+    ) -> Result<Vec<aegis_orchestrator_core::application::credential_service::ContextBinding>> {
+        assert_eq!((user_id, server), (USER, SERVER));
+        Ok(self
+            .answer
+            .map(
+                |_| aegis_orchestrator_core::application::credential_service::ContextBinding {
+                    id: aegis_orchestrator_core::domain::credential::CredentialBindingId::new(),
+                    name: "wiring".to_string(),
+                    reach: None,
+                },
+            )
+            .into_iter()
+            .collect())
+    }
+
+    /// A call with no execution record and no choice reads the person's own
+    /// credential (Zaru ADR-0069 D4), counted as a lookup.
+    async fn own_server_credential(
+        &self,
+        _: &aegis_orchestrator_core::domain::tenant::TenantId,
+        user_id: &str,
+        server: &str,
+    ) -> Result<Option<SensitiveString>> {
+        assert_eq!((user_id, server), (USER, SERVER));
+        self.lookups.fetch_add(1, Ordering::SeqCst);
+        Ok(self.answer.map(SensitiveString::new))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -507,8 +542,8 @@ async fn without_seal_gateway_the_daemon_answers_an_unknown_tool_404_and_nothing
 
 /// `seal_gateway` with `remote_servers`: the daemon dials the configured
 /// gateway and wires the servers and the credential store. A user with no
-/// granted binding is refused 403 `CREDENTIAL_BINDING_REQUIRED` and the
-/// gateway receives nothing; one with a credential, over this plaintext
+/// binding is refused 403 `CREDENTIAL_BINDING_REQUIRED` before any lookup and
+/// the gateway receives nothing; one with a credential, over this plaintext
 /// address, is refused 503 `CREDENTIAL_CHANNEL_NOT_CONFIDENTIAL` and the
 /// gateway still receives nothing (H8); a tool of a server not named is
 /// looked up in the gateway's list with no credential, and answered 404.
@@ -528,7 +563,9 @@ async fn with_seal_gateway_the_daemon_wires_the_servers_the_credential_store_and
         body["error"]["code"], "CREDENTIAL_BINDING_REQUIRED",
         "{body}"
     );
-    assert_eq!(none.lookups(), 1);
+    // Zaru ADR-0069 D3: a person with no binding to the server is refused
+    // before any credential is looked up.
+    assert_eq!(none.lookups(), 0);
 
     let held = Credentials::answering(Some(MARKER));
     let daemon_with_binding = daemon(Some(&config), held.clone()).await;

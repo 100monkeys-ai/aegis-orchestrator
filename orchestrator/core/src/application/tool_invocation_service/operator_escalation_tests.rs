@@ -416,6 +416,12 @@ async fn harness_with(role_lookup: Option<Arc<StubRoleLookup>>) -> Harness {
         .save(operator_context())
         .await
         .unwrap();
+    // The consumer's plan context (Zaru ADR-0069 D7): what an escalated
+    // session adds to the operator's tools for its person.
+    let mut plan = operator_context();
+    plan.name = "zaru-free".to_string();
+    plan.capabilities[0].tool_pattern = "mail.*".to_string();
+    security_context_repo.save(plan).await.unwrap();
 
     let router = Arc::new(ToolRouter::new(dispatchers_gating("aegis.system.info")));
     let storage_root =
@@ -973,4 +979,125 @@ async fn node_without_keycloak_admin_refuses_every_escalated_call() {
     assert!(ended_rows(&h).await.is_empty());
     let plain = h.plain_session().await;
     assert!(h.call(&plain, "aegis.task.list", json!({})).await.is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// Zaru ADR-0069 D7: the escalation changes the role, not the person's reach
+// ---------------------------------------------------------------------------
+
+/// What the stopping connector answers: the call passed every check.
+const MAIL_REACHED: &str = "Mk23-the-call-reached-the-mail-server";
+
+/// The consumer's one mailbox.
+struct ConsumersMailbox(crate::domain::credential::CredentialBindingId);
+
+#[async_trait]
+impl crate::application::credential_service::ToolMailboxSource for ConsumersMailbox {
+    async fn tool_mailbox(
+        &self,
+        actor: &crate::application::credential_service::ToolCallActor<'_>,
+        binding_id: &crate::domain::credential::CredentialBindingId,
+    ) -> anyhow::Result<Option<crate::application::credential_service::ToolMailbox>> {
+        if *binding_id != self.0 || actor.user_id != CONSUMER_SUB {
+            return Ok(None);
+        }
+        Ok(Some(crate::application::credential_service::ToolMailbox {
+            binding_id: self.0,
+            settings: crate::domain::credential::MailboxSettings {
+                address: "operator@example.test".to_string(),
+                display_name: None,
+                imap_host: "imap.example.test".to_string(),
+                imap_port: 993,
+                imap_security: crate::domain::credential::MailSecurity::Tls,
+                smtp_host: "smtp.example.test".to_string(),
+                smtp_port: 465,
+                smtp_security: crate::domain::credential::MailSecurity::Tls,
+                username: "operator@example.test".to_string(),
+            },
+            auth: crate::infrastructure::mail::MailAuth::Password(SensitiveString::new(
+                "Mk23-mail-password",
+            )),
+            granted: false,
+        }))
+    }
+
+    async fn mailbox_contexts(
+        &self,
+        _: &TenantId,
+        user_id: &str,
+    ) -> anyhow::Result<Vec<crate::application::credential_service::ContextBinding>> {
+        Ok(if user_id == CONSUMER_SUB {
+            vec![crate::application::credential_service::ContextBinding {
+                id: self.0,
+                name: "Inbox".to_string(),
+                reach: None,
+            }]
+        } else {
+            Vec::new()
+        })
+    }
+}
+
+/// Stops every connection with [`MAIL_REACHED`].
+struct StopAtTheMailServer;
+
+#[async_trait]
+impl crate::infrastructure::mail::MailConnector for StopAtTheMailServer {
+    async fn admit(
+        &self,
+        _: crate::infrastructure::mail::MailTarget,
+    ) -> Result<
+        crate::infrastructure::mail::AdmittedTarget,
+        crate::infrastructure::mail::AdmissionError,
+    > {
+        Err(crate::infrastructure::mail::AdmissionError::NotAllowed {
+            field: "imap_host",
+            reason: MAIL_REACHED.to_string(),
+        })
+    }
+    async fn connect(
+        &self,
+        _: &crate::infrastructure::mail::AdmittedTarget,
+    ) -> std::io::Result<crate::infrastructure::mail::BoxedMailStream> {
+        Err(std::io::Error::other("not reached"))
+    }
+    async fn start_tls(
+        &self,
+        _: crate::infrastructure::mail::BoxedMailStream,
+        _: &str,
+    ) -> std::io::Result<crate::infrastructure::mail::BoxedMailStream> {
+        Err(std::io::Error::other("not reached"))
+    }
+}
+
+/// Trigger 1 (d): an escalated session admits the person's `mail.list` (it
+/// reaches the mail server) and the operator's `aegis.system.info` (it reaches
+/// the gate) both.
+#[tokio::test]
+async fn d_an_escalated_session_admits_the_persons_mail_list_and_the_operators_system_info() {
+    let mut h = harness().await;
+    let mailbox = crate::domain::credential::CredentialBindingId::new();
+    h.service = h.service.with_mail_tools_over(
+        Arc::new(ConsumersMailbox(mailbox)),
+        Arc::new(StopAtTheMailServer),
+    );
+    let escalation = h.escalate(AegisRole::Operator).await;
+    let token = h.escalated_session(&escalation).await;
+    let mut wrong = Vec::new();
+    match h
+        .call(
+            &token,
+            "mail.list",
+            json!({ "mailbox": mailbox.0.to_string() }),
+        )
+        .await
+    {
+        Err(e) if format!("{e:?}").contains(MAIL_REACHED) => {}
+        other => wrong.push(format!("mail.list answered {other:?}")),
+    }
+    match h.call(&token, "aegis.system.info", json!({})).await {
+        Ok(value) if value["status"] == json!("approval_pending") => {}
+        other => wrong.push(format!("aegis.system.info answered {other:?}")),
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }

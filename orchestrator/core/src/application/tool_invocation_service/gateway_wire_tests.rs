@@ -1952,11 +1952,13 @@ async fn the_configured_gateway_takes_a_granted_users_call_through_the_route() {
     assert_eq!(call.credential.as_ref().unwrap().value, MARKER);
 }
 
-/// The wiring refuses before any dial: a user with no binding to the server
-/// granted to the session's agent is answered 403
-/// `CREDENTIAL_BINDING_REQUIRED`, and the gateway receives nothing.
+/// Zaru ADR-0069 D4, Trigger 1 (c): a call through the route with no
+/// execution record and no choice (a remote client acting as its person)
+/// carries the person's newest active binding for the server, though no grant
+/// names the session's agent; an older one of theirs and another person's
+/// newer one are never carried.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_configured_gateway_refuses_an_ungranted_call_before_any_dial() {
+async fn c_a_route_call_with_no_choice_carries_the_persons_newest_binding_with_no_grant() {
     let stub = StubGateway::new(vec![], remote_result());
     let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
     let vault = Vault::new("https://token.example.test/token");
@@ -1971,32 +1973,51 @@ async fn the_configured_gateway_refuses_an_ungranted_call_before_any_dial() {
             USER,
             SERVER,
             CredentialType::Secret,
-            &[("value", MARKER)],
+            &[("value", "Mk22-older-binding")],
             &[GrantTarget::Agent {
                 agent_id: AgentId::new(),
             }],
         )
         .await;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    vault
+        .bind(
+            &h.tenant,
+            USER,
+            SERVER,
+            CredentialType::Secret,
+            &[("value", MARKER)],
+            &[],
+        )
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    vault
+        .bind(
+            &h.tenant,
+            "someone-else",
+            SERVER,
+            CredentialType::Secret,
+            &[("value", "Mk22-another-persons-binding")],
+            &[GrantTarget::AllAgents],
+        )
+        .await;
 
     let token = h.session().await;
-    let error = h
+    let value = h
         .route(&token, &format!("{SERVER}.pages.read"))
         .await
-        .expect_err("refused");
-    let refusal = error.refusal();
+        .expect("the call is made");
     assert_eq!(
-        (refusal.http_status, refusal.code),
-        (403, "CREDENTIAL_BINDING_REQUIRED"),
-        "{error:?}"
-    );
-    assert_eq!(
-        refusal.message,
-        format!("This tool needs your own credential for '{SERVER}', granted to this agent.")
+        value,
+        json!({"content":[{"type":"text","text":"page"}],"isError":false})
     );
     let received = stub.received.lock().unwrap();
-    assert!(
-        received.tools.is_empty() && received.lists.is_empty(),
-        "nothing reached the gateway"
+    assert_eq!(received.tools.len(), 1, "one InvokeTool");
+    assert_eq!(received.tools[0].acting.as_ref().unwrap().user_id, USER);
+    assert_eq!(
+        received.tools[0].credential.as_ref().unwrap().value,
+        MARKER,
+        "the call did not carry the person's newest active binding"
     );
 }
 

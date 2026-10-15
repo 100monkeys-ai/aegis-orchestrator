@@ -812,6 +812,54 @@ pub(crate) fn invoke_refusal_response(
     (status, headers, body).into_response()
 }
 
+/// Whom a listing of `GET /v1/seal/tools` is for, when the caller presents
+/// its credential (Zaru ADR-0069 D1, D7): the session's binding as
+/// `/v1/seal/attest` would make it, admitted to `security_context` by the
+/// same entitlement check, its tenant, its user, its plan tier and whether
+/// its key holds an operator escalation. Refused with the entitlement's
+/// reason when the context is not one the caller may attest.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ListingPerson {
+    pub(crate) tenant_id: TenantId,
+    pub(crate) user_id: String,
+    pub(crate) tier: Option<String>,
+    pub(crate) escalated: bool,
+}
+
+pub(crate) fn listing_person(
+    binding: &AttestBinding,
+    security_context: &str,
+) -> Result<ListingPerson, String> {
+    aegis_orchestrator_core::domain::security_context::security_context::validate_context_entitlement(
+        security_context,
+        &binding.tenant_id,
+        &binding.realm,
+        binding.zaru_tier.as_ref(),
+    )?;
+    let user_id = binding
+        .user_id
+        .clone()
+        .ok_or_else(|| "the caller has no subject".to_string())?;
+    Ok(ListingPerson {
+        tenant_id: binding.tenant_id.clone(),
+        user_id,
+        tier: binding
+            .zaru_tier
+            .as_ref()
+            .map(|tier| tier.to_claim_str().to_string()),
+        escalated: binding.escalation.is_some(),
+    })
+}
+
+/// `GET /v1/seal/tools`: the tools of the security context the request
+/// names (`X-Zaru-Security-Context`, or the `security_context` query). A
+/// request that presents its credential (`Authorization: Bearer`, an
+/// `aegis_*` key or a consumer JWT, as `/v1/seal/attest` takes it) is
+/// answered its person's callable set (Zaru ADR-0069 D1, D7): the context's
+/// tools, with the person's plan context's under an operator escalation,
+/// less every connection family the person has not connected, with the
+/// tools of each remote server they have; a credential that does not
+/// authenticate is answered 401, a context the caller may not attest 403.
 pub(crate) async fn list_seal_tools_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SealToolsQuery>,
@@ -825,13 +873,68 @@ pub(crate) async fn list_seal_tools_handler(
         .map(ToOwned::to_owned)
         .or(query.security_context);
 
-    let tools_result = if let Some(ref security_context) = security_context {
-        state
-            .tool_invocation_service
-            .get_available_tools_for_context(security_context)
-            .await
-    } else {
-        state.tool_invocation_service.get_available_tools().await
+    let tools_result = match (&security_context, headers.contains_key("authorization")) {
+        (Some(security_context), true) => {
+            let Some(caller) = authenticate_attest_request(&state, &headers).await else {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "error": "The credential presented could not be authenticated.",
+                    })),
+                )
+                    .into_response();
+            };
+            let request = HttpAttestationRequest {
+                agent_id: None,
+                execution_id: None,
+                container_id: None,
+                public_key: String::new(),
+                security_context: Some(security_context.clone()),
+                principal_subject: None,
+                workload_id: None,
+                tenant_id: None,
+                task_summary: None,
+            };
+            let no_execution = |_: ExecutionId| async { Err::<TenantId, ()>(()) };
+            let person = match attest_binding(no_execution, Some(&caller), &request).await {
+                Ok(binding) => listing_person(&binding, security_context),
+                Err(err) => Err(err.message()),
+            };
+            let person = match person {
+                Ok(person) => person,
+                Err(reason) => {
+                    tracing::info!(
+                        target: "aegis::seal::tools",
+                        reason = %reason,
+                        "tool listing refused: the context is not the caller's"
+                    );
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(serde_json::json!({
+                            "error": "This security context is not one your credential may use.",
+                        })),
+                    )
+                        .into_response();
+                }
+            };
+            state
+                .tool_invocation_service
+                .get_available_tools_for_person(
+                    security_context,
+                    &person.tenant_id,
+                    &person.user_id,
+                    person.tier.as_deref(),
+                    person.escalated,
+                )
+                .await
+        }
+        (Some(security_context), false) => {
+            state
+                .tool_invocation_service
+                .get_available_tools_for_context(security_context)
+                .await
+        }
+        (None, _) => state.tool_invocation_service.get_available_tools().await,
     };
 
     match tools_result {
@@ -1298,5 +1401,55 @@ mod envelope_wire_tests {
             complaints.push(format!("a payload with no _meta was read as {read:?}"));
         }
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+}
+
+#[cfg(test)]
+mod listing_person_tests {
+    //! Zaru ADR-0069 D1, D7: whom `GET /v1/seal/tools` lists for, from the
+    //! binding `/v1/seal/attest` would make.
+    use super::*;
+
+    fn binding(tier: Option<ZaruTier>, escalated: bool) -> AttestBinding {
+        AttestBinding {
+            tenant_id: TenantId::for_consumer_user("7c3d0000-person").unwrap(),
+            realm: if escalated {
+                RealmKind::System
+            } else {
+                RealmKind::Consumer
+            },
+            user_id: Some("7c3d0000-person".to_string()),
+            zaru_tier: tier,
+            escalation: escalated.then(|| SealOperatorEscalation {
+                escalation_id: uuid::Uuid::new_v4(),
+                aegis_role: aegis_orchestrator_core::domain::iam::AegisRole::Operator,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_consumer_is_listed_as_itself_on_its_own_tier_context_only() {
+        let consumer = binding(Some(ZaruTier::Pro), false);
+        assert_eq!(
+            listing_person(&consumer, "zaru-pro"),
+            Ok(ListingPerson {
+                tenant_id: consumer.tenant_id.clone(),
+                user_id: "7c3d0000-person".to_string(),
+                tier: Some("pro".to_string()),
+                escalated: false,
+            })
+        );
+        assert!(listing_person(&consumer, "zaru-free").is_err());
+        assert!(listing_person(&consumer, "aegis-system-operator").is_err());
+    }
+
+    #[test]
+    fn an_escalated_key_is_listed_as_its_person_on_the_operator_context() {
+        let escalated = binding(None, true);
+        let person = listing_person(&escalated, "aegis-system-operator")
+            .expect("the operator context is the escalated key's");
+        assert!(person.escalated);
+        assert_eq!(person.user_id, "7c3d0000-person");
+        assert_eq!(person.tier, None);
     }
 }

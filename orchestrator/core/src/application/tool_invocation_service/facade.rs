@@ -20,6 +20,11 @@ struct CallConversation {
     started: Option<String>,
 }
 
+/// What a gated call of a session acting as its person answers beside
+/// `approval_pending` (Zaru ADR-0069 D5).
+pub(super) const APPROVAL_WAITS_IN_ZARU_WEB: &str =
+    "This waits for your answer in Zaru Web, under Approvals.";
+
 #[allow(clippy::too_many_arguments)]
 impl ToolInvocationService {
     /// Bind the `tenant_id` argument of an `aegis.*` tool call to the
@@ -573,6 +578,35 @@ impl ToolInvocationService {
         let agent_id = session.agent_id;
         let execution_id = session.execution_id;
 
+        // 1b. Zaru ADR-0069: a session acting as its person, with no
+        // execution record (a remote MCP client on the person's key, or a
+        // conversation), calls what the person connected.
+        let acts_as_person = session.user_id.is_some()
+            && self
+                .execution_service
+                .get_execution_unscoped(execution_id)
+                .await
+                .is_err();
+        // 1c. D7: under an operator escalation the escalation changes the
+        // role, not the person's reach. A tool the operator's context does
+        // not admit is evaluated against the person's plan context, for this
+        // call only; the session's own record is unchanged.
+        if acts_as_person && session.operator_escalation.is_some() {
+            if let Some(tool) = envelope.extract_tool_name() {
+                if !session.security_context.permits_tool_name(&tool) {
+                    let plan = Self::person_plan_context(session.zaru_tier.as_deref());
+                    let plan = self
+                        .security_context_repo
+                        .find_by_name(&plan)
+                        .await
+                        .map_err(|e| SealSessionError::ConfigurationError(e.to_string()))?;
+                    if let Some(plan) = plan.filter(|plan| plan.permits_tool_name(&tool)) {
+                        session.security_context = plan;
+                    }
+                }
+            }
+        }
+
         // 2. Middleware verifies signature and evaluates against SecurityContext
         let args = self
             .seal_middleware
@@ -583,10 +617,6 @@ impl ToolInvocationService {
             .ok_or(SealSessionError::MalformedPayload(
                 "missing tool name".to_string(),
             ))?;
-
-        // 2b. Validate required arguments against the tool's input contract (ADR-055).
-        ToolInputContract::validate(&tool_name, &args)
-            .map_err(SealSessionError::InvalidArguments)?;
 
         // 2b2. AEGIS ADR-132 S7: the conversation's choices, refused before
         // anything runs when malformed.
@@ -636,6 +666,28 @@ impl ToolInvocationService {
             ),
             None => call_contexts,
         };
+
+        // 4c. Zaru ADR-0069 D1, D3, D4: a call for a family its person has
+        // not connected is refused before anything runs; an absent `mailbox`
+        // or `account` resolves to the person's own, which the answer names.
+        let mut args = args;
+        let named = match (acts_as_person, session.user_id.as_deref()) {
+            (true, Some(user_id)) => {
+                self.admit_person_connection(
+                    &tool_name,
+                    &mut args,
+                    &tenant_id,
+                    user_id,
+                    call_contexts.as_ref(),
+                )
+                .await?
+            }
+            _ => None,
+        };
+
+        // 4d. Validate required arguments against the tool's input contract (ADR-055).
+        ToolInputContract::validate(&tool_name, &args)
+            .map_err(SealSessionError::InvalidArguments)?;
 
         // 5. Build caller identity from the session's user_id, if present.
         let seal_caller_identity: Option<crate::domain::iam::UserIdentity> = session
@@ -699,12 +751,101 @@ impl ToolInvocationService {
 
         // 5. Map ToolInvocationResult to Value for SEAL return type.
         match result {
-            ToolInvocationResult::Direct(value) => Ok(value),
+            ToolInvocationResult::Direct(mut value) => {
+                if let Some(answer) = value.as_object_mut() {
+                    // Zaru ADR-0069 D4: the binding the call used, by its
+                    // context name.
+                    if let Some((field, name)) = named {
+                        answer
+                            .entry(field.to_string())
+                            .or_insert(Value::String(name));
+                    }
+                    // D5: a call with no execution record is answered in Zaru
+                    // Web, where its person reads the request.
+                    if acts_as_person
+                        && answer.get("status").and_then(Value::as_str) == Some("approval_pending")
+                    {
+                        answer.insert(
+                            "message".to_string(),
+                            Value::String(APPROVAL_WAITS_IN_ZARU_WEB.to_string()),
+                        );
+                    }
+                }
+                Ok(value)
+            }
             ToolInvocationResult::DispatchRequired(action) => Ok(serde_json::json!({
                 "status": "dispatch_required",
                 "action": format!("{:?}", action)
             })),
         }
+    }
+
+    /// Admit a call of a session acting as its person against the person's
+    /// connections (Zaru ADR-0069 D1, D3, D4). A tool of a connection family
+    /// (`connection_key`) the person holds no active binding of is refused
+    /// `CREDENTIAL_BINDING_REQUIRED` with D3's sentence. For a mail or
+    /// calendar tool, an absent `mailbox` or `account` is written as the
+    /// binding D4 resolves (the only one, else the newest, within the call's
+    /// choice); a given one is named when it is one of the person's. Answers
+    /// the answer's field and the binding's context name, when there is one
+    /// to name. A family the node does not serve is left to its own path.
+    async fn admit_person_connection(
+        &self,
+        tool_name: &str,
+        args: &mut Value,
+        tenant_id: &TenantId,
+        user_id: &str,
+        call_contexts: Option<&crate::domain::execution::ExecutionContexts>,
+    ) -> Result<Option<(&'static str, String)>, SealSessionError> {
+        use crate::application::credential_service::{
+            connection_key, not_connected_sentence, CALENDAR_CHOICE_KEY,
+        };
+        use crate::domain::credential::CredentialProvider;
+        let Some(key) = connection_key(tool_name, &self.remote_tool_servers) else {
+            return Ok(None);
+        };
+        let Some(bindings) = self.person_bindings(tenant_id, user_id, key).await? else {
+            return Ok(None);
+        };
+        if bindings.is_empty() {
+            return Err(super::gateway::binding_required(not_connected_sentence(
+                key,
+            )));
+        }
+        let (argument, field, resolve): (_, _, fn(_, &_) -> _) = match key {
+            CredentialProvider::IMAP => (
+                "mailbox",
+                "mailbox_name",
+                crate::application::tools::builtin_mail::own_for_absent,
+            ),
+            CALENDAR_CHOICE_KEY => (
+                "account",
+                "account_name",
+                crate::application::tools::builtin_calendar::own_for_absent,
+            ),
+            _ => return Ok(None),
+        };
+        if let Some(given) = args.get(argument).filter(|given| !given.is_null()) {
+            let named = given.as_str().and_then(|raw| {
+                bindings
+                    .iter()
+                    .find(|binding| binding.id.0.to_string() == raw || binding.name == raw)
+            });
+            return Ok(named.map(|binding| (field, binding.name.clone())));
+        }
+        let Some(arguments) = args.as_object_mut() else {
+            return Ok(None);
+        };
+        let choice = call_contexts
+            .map(|contexts| contexts.server(key))
+            .unwrap_or(crate::domain::execution::ServerChoice::NotGiven);
+        Ok(resolve(bindings, &choice).map(|binding| {
+            arguments.insert(
+                argument.to_string(),
+                Value::String(binding.id.0.to_string()),
+            );
+            (field, binding.name)
+        }))
     }
 
     /// The active operator escalation `session` was attested under, if any

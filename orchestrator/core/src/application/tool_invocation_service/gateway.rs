@@ -23,6 +23,10 @@ pub(crate) struct GatewayActing {
     pub(crate) agent_id: AgentId,
     pub(crate) workflow_id: Option<uuid::Uuid>,
     pub(crate) contexts: crate::domain::execution::ExecutionContexts,
+    /// Whether the call's execution has a record (an agent's run), as
+    /// opposed to a session acting as its person with none (a conversation,
+    /// or a remote MCP client; Zaru ADR-0069 D4).
+    pub(crate) has_execution_record: bool,
 }
 
 impl GatewayActing {
@@ -50,7 +54,7 @@ const CONTEXT_SHOWN_MAX_CHARS: usize = 64;
 
 /// The refusal `CREDENTIAL_BINDING_REQUIRED` with `message` (AEGIS ADR-132
 /// H3, Zaru ADR-0055 D15, ADR-132 Update (13) S11e).
-fn binding_required(message: String) -> SealSessionError {
+pub(super) fn binding_required(message: String) -> SealSessionError {
     SealSessionError::NotFound(message.clone())
         .answered(CallerAnswer::CredentialBindingRequired { message })
 }
@@ -340,6 +344,7 @@ impl ToolInvocationService {
                 agent_id,
                 workflow_id: self.workflow_of(execution_id, tenant_id).await,
                 contexts,
+                has_execution_record: execution.is_some(),
             };
             let listing = ListToolsRequest {
                 tenant_id: tenant_id.as_str().to_string(),
@@ -782,6 +787,181 @@ impl ToolInvocationService {
         Ok(filtered)
     }
 
+    /// The person's own active bindings of the family `key` chooses and
+    /// connects under (Zaru ADR-0069 D1; `connection_key`): mailboxes for
+    /// `imap`, calendar accounts for `caldav`, a remote server's bindings
+    /// for its name. `None` when the node serves no such family (no mail
+    /// tools, no calendar tools, or no credential source), so nothing is
+    /// told about a family the node cannot reach.
+    pub(super) async fn person_bindings(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &str,
+        key: &str,
+    ) -> Result<Option<Vec<ContextBinding>>, SealSessionError> {
+        match key {
+            crate::domain::credential::CredentialProvider::IMAP => match self.mail_tools.as_deref()
+            {
+                Some(tools) => tools.person_mailboxes(tenant_id, user_id).await.map(Some),
+                None => Ok(None),
+            },
+            crate::application::credential_service::CALENDAR_CHOICE_KEY => {
+                match self.calendar_tools.as_deref() {
+                    Some(tools) => tools.person_accounts(tenant_id, user_id).await.map(Some),
+                    None => Ok(None),
+                }
+            }
+            server => match self.tool_credentials.as_ref() {
+                Some(source) => source
+                    .context_bindings(tenant_id, user_id, server)
+                    .await
+                    .map(Some)
+                    .map_err(|e| {
+                        SealSessionError::InternalError(format!(
+                            "binding lookup for '{server}' failed: {e}"
+                        ))
+                        .answered(CallerAnswer::Internal(InternalFailure::Server))
+                    }),
+                None => Ok(None),
+            },
+        }
+    }
+
+    /// The person's plan context (Zaru ADR-0069 D1): `zaru-<tier>` for the
+    /// tier the session was attested with, else `zaru-free`, the lowest
+    /// plan, so an escalated session, whose tier the attestation does not
+    /// record, never reaches beyond what every plan admits.
+    pub(super) fn person_plan_context(tier: Option<&str>) -> String {
+        tier.and_then(crate::domain::iam::ZaruTier::from_claim)
+            .unwrap_or(crate::domain::iam::ZaruTier::Free)
+            .to_security_context_name()
+            .to_string()
+    }
+
+    /// The tools a session acting as its person may call, as the Zaru MCP
+    /// server lists them (Zaru ADR-0069 D1, D7): its security context's
+    /// tools (with the person's plan context's added under an operator
+    /// escalation), less every connection family the person holds no active
+    /// binding of, with the tools of each remote server they hold one of. A
+    /// session with no person answers its context's tools.
+    pub async fn get_available_tools_for_session(
+        &self,
+        session: &crate::domain::seal_session::SealSession,
+    ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SealSessionError> {
+        match session.user_id.as_deref() {
+            Some(user_id) => {
+                self.get_available_tools_for_person(
+                    &session.security_context.name,
+                    &session.tenant_id,
+                    user_id,
+                    session.zaru_tier.as_deref(),
+                    session.operator_escalation.is_some(),
+                )
+                .await
+            }
+            None => {
+                self.get_available_tools_for_context(&session.security_context.name)
+                    .await
+            }
+        }
+    }
+
+    /// [`Self::get_available_tools_for_session`] for the person `user_id` in
+    /// `tenant_id`, attested under `security_context_name` with the plan
+    /// `tier`, `escalated` when the key holds an operator escalation: what
+    /// `GET /v1/seal/tools` answers a caller that presents its credential.
+    pub async fn get_available_tools_for_person(
+        &self,
+        security_context_name: &str,
+        tenant_id: &TenantId,
+        user_id: &str,
+        tier: Option<&str>,
+        escalated: bool,
+    ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SealSessionError> {
+        let mut tools = self
+            .get_available_tools_for_context(security_context_name)
+            .await?;
+        let plan_name = Self::person_plan_context(tier);
+        if escalated && plan_name != security_context_name {
+            for tool in self.get_available_tools_for_context(&plan_name).await? {
+                if !tools.iter().any(|listed| listed.name == tool.name) {
+                    tools.push(tool);
+                }
+            }
+        }
+        let mut connected: std::collections::HashMap<String, Option<Vec<ContextBinding>>> =
+            std::collections::HashMap::new();
+        for server in self.remote_tool_servers.clone() {
+            let bindings = self.person_bindings(tenant_id, user_id, &server).await?;
+            connected.insert(server, bindings);
+        }
+        let mut kept = Vec::with_capacity(tools.len());
+        for tool in tools {
+            let key = crate::application::credential_service::connection_key(
+                &tool.name,
+                &self.remote_tool_servers,
+            )
+            .map(str::to_string);
+            let Some(key) = key else {
+                kept.push(tool);
+                continue;
+            };
+            if !connected.contains_key(&key) {
+                let bindings = self.person_bindings(tenant_id, user_id, &key).await?;
+                connected.insert(key.clone(), bindings);
+            }
+            if connected[&key]
+                .as_ref()
+                .is_none_or(|bindings| !bindings.is_empty())
+            {
+                kept.push(tool);
+            }
+        }
+        // Each remote server the person holds a binding of is listed with
+        // their newest one, as a call with no choice resolves (D4).
+        let mut choices = serde_json::Map::new();
+        for server in &self.remote_tool_servers {
+            if let Some(Some(newest)) = connected
+                .get(server)
+                .map(|b| b.as_ref().and_then(|b| b.last()))
+            {
+                choices.insert(server.clone(), Value::String(newest.id.0.to_string()));
+            }
+        }
+        if !choices.is_empty() {
+            let mut contexts = vec![self
+                .security_context_repo
+                .find_by_name(security_context_name)
+                .await
+                .map_err(|e| SealSessionError::ConfigurationError(e.to_string()))?];
+            if escalated && plan_name != security_context_name {
+                contexts.push(
+                    self.security_context_repo
+                        .find_by_name(&plan_name)
+                        .await
+                        .map_err(|e| SealSessionError::ConfigurationError(e.to_string()))?,
+                );
+            }
+            for context in contexts.into_iter().flatten() {
+                for tool in self
+                    .listed_remote_tools(
+                        tenant_id,
+                        Some(user_id.to_string()),
+                        AgentId::new(),
+                        &context,
+                        &choices,
+                    )
+                    .await?
+                {
+                    if !kept.iter().any(|listed| listed.name == tool.name) {
+                        kept.push(tool);
+                    }
+                }
+            }
+        }
+        Ok(kept)
+    }
+
     /// The SEAL gateway's node-wide tool list, best effort: a slow, failing or
     /// unreachable gateway answers an empty list, so built-in dispatch and
     /// the semantic judge's inventory never wait on it. The request names no
@@ -940,19 +1120,20 @@ impl ToolInvocationService {
         caller_identity: Option<&crate::domain::iam::UserIdentity>,
         call_contexts: Option<&crate::domain::execution::ExecutionContexts>,
     ) -> GatewayActing {
-        let contexts = match self
+        let (contexts, has_execution_record) = match self
             .execution_service
             .get_execution_unscoped(execution_id)
             .await
         {
-            Ok(execution) => execution.input.contexts(),
-            Err(_) => call_contexts.cloned().unwrap_or_default(),
+            Ok(execution) => (execution.input.contexts(), true),
+            Err(_) => (call_contexts.cloned().unwrap_or_default(), false),
         };
         GatewayActing {
             user_id: crate::application::execution::person_sub(caller_identity),
             agent_id,
             workflow_id: self.workflow_of(execution_id, tenant_id).await,
             contexts,
+            has_execution_record,
         }
     }
 
@@ -1029,6 +1210,42 @@ impl ToolInvocationService {
             }
             None => choices,
         };
+        let mut listed = self
+            .listed_remote_tools(
+                &session.tenant_id,
+                session.user_id.clone(),
+                session.agent_id,
+                &session.security_context,
+                &choices,
+            )
+            .await?;
+        // AEGIS ADR-140 D7: and only those the profile admits.
+        if let Some(profile) = profile {
+            self.narrow_by_profile(
+                &session.tenant_id,
+                session.user_id.as_deref(),
+                profile,
+                &mut listed,
+            )
+            .await;
+        }
+        Ok(listed)
+    }
+
+    /// The tools of each remote server `choices` names with a binding,
+    /// listed by the gateway with that binding's credential (Zaru ADR-0055
+    /// D15's rules: the person's own active binding for the server, no
+    /// grant), each a `<server>.<tool>` the security context permits. A
+    /// server chosen `null`, or not named, is listed with none. Nothing on a
+    /// node without a gateway.
+    async fn listed_remote_tools(
+        &self,
+        tenant_id: &TenantId,
+        user_id: Option<String>,
+        agent_id: AgentId,
+        security_context: &crate::domain::security_context::SecurityContext,
+        choices: &serde_json::Map<String, Value>,
+    ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SealSessionError> {
         // Every server the node knows: the bindings the call chose, else none.
         let mut every_server = serde_json::Map::new();
         for server in &self.remote_tool_servers {
@@ -1051,16 +1268,17 @@ impl ToolInvocationService {
             return Ok(Vec::new());
         }
         let acting = GatewayActing {
-            user_id: session.user_id.clone(),
-            agent_id: session.agent_id,
+            user_id,
+            agent_id,
             workflow_id: None,
             contexts,
+            has_execution_record: false,
         };
-        let bound_servers = self.bound_servers(&session.tenant_id, &acting).await;
+        let bound_servers = self.bound_servers(tenant_id, &acting).await;
         let mut listed = Vec::new();
         if !bound_servers.is_empty() {
             let listing = ListToolsRequest {
-                tenant_id: session.tenant_id.as_str().to_string(),
+                tenant_id: tenant_id.as_str().to_string(),
                 acting: Some(acting.to_proto()),
                 bound_servers,
             };
@@ -1071,25 +1289,15 @@ impl ToolInvocationService {
                     .map(Self::gateway_tool_metadata),
             );
         }
-        listed.extend(self.listed_per_binding(&session.tenant_id, &acting).await);
-        let mut listed: Vec<_> = listed
+        listed.extend(self.listed_per_binding(tenant_id, &acting).await);
+        let listed: Vec<_> = listed
             .into_iter()
             .filter(|tool| {
                 self.remote_tool_of(&tool.name)
                     .is_some_and(|(server, _)| chosen.contains(&server))
-                    && session.security_context.permits_tool_name(&tool.name)
+                    && security_context.permits_tool_name(&tool.name)
             })
             .collect();
-        // AEGIS ADR-140 D7: and only those the profile admits.
-        if let Some(profile) = profile {
-            self.narrow_by_profile(
-                &session.tenant_id,
-                session.user_id.as_deref(),
-                profile,
-                &mut listed,
-            )
-            .await;
-        }
         Ok(listed)
     }
 
@@ -1152,6 +1360,24 @@ impl ToolInvocationService {
             .answered(CallerAnswer::Internal(InternalFailure::Unavailable))
         })?;
         let context = match acting.contexts.server(server) {
+            // Zaru ADR-0069 D4: a call that belongs to no execution and chose
+            // nothing (a remote client acting as its person) carries the
+            // person's own newest active binding for the server, no grant
+            // needed; inside an execution D15's grant path stands.
+            ServerChoice::NotGiven if !acting.has_execution_record => {
+                return match source
+                    .own_server_credential(tenant_id, user_id, server)
+                    .await
+                {
+                    Ok(Some(credential)) => Ok(credential),
+                    Ok(None) => Err(binding_required(
+                        crate::application::credential_service::not_connected_sentence(server),
+                    )),
+                    Err(e) => Err(SealSessionError::InternalError(format!(
+                        "resolving the credential for the remote tool server '{server}' failed: {e}"
+                    ))),
+                };
+            }
             ServerChoice::NotGiven => ContextChoice::NotGiven,
             ServerChoice::None => ContextChoice::None,
             ServerChoice::Bindings(chosen) => {
