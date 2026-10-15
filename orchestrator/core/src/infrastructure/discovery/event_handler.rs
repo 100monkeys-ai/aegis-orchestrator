@@ -17,7 +17,7 @@ use chrono::Utc;
 use tokio::sync::Mutex;
 use tonic::Status;
 
-use crate::domain::agent::AgentManifest;
+use crate::domain::agent::{AgentManifest, AgentScope};
 use crate::domain::events::{AgentLifecycleEvent, WorkflowEvent};
 use crate::domain::repository::{AgentRepository, WorkflowRepository};
 use crate::domain::shared_kernel::AgentId;
@@ -159,7 +159,17 @@ impl DiscoveryIndexEventHandler {
                 manifest,
                 ..
             }) => {
-                self.handle_agent_upsert(&agent_id, &tenant_id, &manifest)
+                // The event carries no scope; the agent is stored before the
+                // event is published, so its scope is read from the store.
+                let scope = match self
+                    .agent_repo
+                    .find_by_id_for_tenant(&tenant_id, agent_id)
+                    .await
+                {
+                    Ok(Some(agent)) => agent.scope,
+                    _ => AgentScope::default(),
+                };
+                self.handle_agent_upsert(&agent_id, &tenant_id, &manifest, &scope)
                     .await;
             }
             DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentUpdated {
@@ -259,10 +269,13 @@ impl DiscoveryIndexEventHandler {
     // Agent handlers
     // ──────────────────────────────────────────────────────────────────────
 
+    /// A global agent is a platform template (ADR-075 §10): the flag lets a
+    /// search from any tenant find it.
     fn build_agent_index_request(
         agent_id: &AgentId,
         tenant_id: &TenantId,
         manifest: &AgentManifest,
+        scope: &AgentScope,
     ) -> IndexAgentRequest {
         let name = &manifest.metadata.name;
         let version = &manifest.metadata.version;
@@ -300,7 +313,7 @@ impl DiscoveryIndexEventHandler {
             task_description,
             runtime_language,
             status: "Active".to_string(),
-            is_platform_template: false,
+            is_platform_template: matches!(scope, AgentScope::Global),
             updated_at: Utc::now().to_rfc3339(),
             input_schema: manifest
                 .spec
@@ -315,8 +328,9 @@ impl DiscoveryIndexEventHandler {
         agent_id: &AgentId,
         tenant_id: &TenantId,
         manifest: &AgentManifest,
+        scope: &AgentScope,
     ) {
-        let req = Self::build_agent_index_request(agent_id, tenant_id, manifest);
+        let req = Self::build_agent_index_request(agent_id, tenant_id, manifest, scope);
         let fp = Self::fingerprint_agent(&req);
 
         if let Err(e) = self.index_agent_with_retry(req).await {
@@ -344,7 +358,7 @@ impl DiscoveryIndexEventHandler {
             }
         };
 
-        self.handle_agent_upsert(agent_id, tenant_id, &agent.manifest)
+        self.handle_agent_upsert(agent_id, tenant_id, &agent.manifest, &agent.scope)
             .await;
     }
 
@@ -429,6 +443,8 @@ impl DiscoveryIndexEventHandler {
         None
     }
 
+    /// A global workflow is a platform template (ADR-075 §10): the flag
+    /// lets a search from any tenant find it.
     fn build_workflow_index_request(
         workflow: &crate::domain::workflow::Workflow,
         name: &str,
@@ -453,7 +469,10 @@ impl DiscoveryIndexEventHandler {
             labels,
             state_names,
             agent_names,
-            is_platform_template: false,
+            is_platform_template: matches!(
+                workflow.scope,
+                crate::domain::workflow::WorkflowScope::Global
+            ),
             updated_at: Utc::now().to_rfc3339(),
             input_schema: workflow
                 .metadata
@@ -576,7 +595,7 @@ impl DiscoveryIndexEventHandler {
 
         let mut agent_count = 0usize;
         for agent in &agents {
-            self.handle_agent_upsert(&agent.id, &agent.tenant_id, &agent.manifest)
+            self.handle_agent_upsert(&agent.id, &agent.tenant_id, &agent.manifest, &agent.scope)
                 .await;
             agent_count += 1;
             if agent_count.is_multiple_of(50) {
@@ -639,7 +658,12 @@ impl DiscoveryIndexEventHandler {
 
         for agent in &agents {
             summary.agents_checked += 1;
-            let req = Self::build_agent_index_request(&agent.id, &agent.tenant_id, &agent.manifest);
+            let req = Self::build_agent_index_request(
+                &agent.id,
+                &agent.tenant_id,
+                &agent.manifest,
+                &agent.scope,
+            );
             let fp = Self::fingerprint_agent(&req);
             let cached = self.agent_index_cache.lock().await.get(&agent.id).copied();
             if cached == Some(fp) {
@@ -826,6 +850,48 @@ mod tests {
         ) -> Result<RemoveDiscoveryWorkflowResponse, Status> {
             self.remove_workflow_requests.lock().await.push(request);
             Ok(RemoveDiscoveryWorkflowResponse::default())
+        }
+    }
+
+    impl FakeCortexClient {
+        /// The names a search from `caller` finds among the indexed
+        /// workflows, by Cortex's tenant rule (`aegis-cortex` `2261b255`,
+        /// `src/infrastructure/discovery_index.rs` 436-441): with
+        /// `include_platform_templates`, `tenant_id == caller` OR
+        /// `is_platform_template == true`; without it, `tenant_id == caller`.
+        async fn search_workflows(
+            &self,
+            caller: &TenantId,
+            include_platform_templates: bool,
+        ) -> Vec<String> {
+            self.index_workflow_requests
+                .lock()
+                .await
+                .iter()
+                .filter(|r| {
+                    r.tenant_id == caller.to_string()
+                        || (include_platform_templates && r.is_platform_template)
+                })
+                .map(|r| r.name.clone())
+                .collect()
+        }
+
+        /// The same rule over the indexed agents.
+        async fn search_agents(
+            &self,
+            caller: &TenantId,
+            include_platform_templates: bool,
+        ) -> Vec<String> {
+            self.index_agent_requests
+                .lock()
+                .await
+                .iter()
+                .filter(|r| {
+                    r.tenant_id == caller.to_string()
+                        || (include_platform_templates && r.is_platform_template)
+                })
+                .map(|r| r.name.clone())
+                .collect()
         }
     }
 
@@ -1080,8 +1146,12 @@ mod tests {
         let alice =
             TenantId::for_consumer_user("alice").expect("valid per-user tenant id for alice");
 
-        let req =
-            DiscoveryIndexEventHandler::build_agent_index_request(&agent_id, &alice, &manifest);
+        let req = DiscoveryIndexEventHandler::build_agent_index_request(
+            &agent_id,
+            &alice,
+            &manifest,
+            &AgentScope::default(),
+        );
 
         assert_eq!(req.tenant_id, alice.to_string());
         assert_ne!(
@@ -1253,6 +1323,123 @@ mod tests {
                 || alice == TenantId::consumer()
                 || bob == TenantId::consumer(),
             "no per-user agent should collapse onto the consumer singleton"
+        );
+    }
+
+    // ─── Platform templates: a global record carries the flag ──────────────
+
+    /// A global workflow, stored as the startup deploy stores a built-in:
+    /// under the system tenant, scope `Global`.
+    fn global_workflow(name: &str) -> Workflow {
+        let mut wf = make_workflow(name, "Transcribes one audio file to text");
+        wf.tenant_id = TenantId::system();
+        wf.scope = crate::domain::workflow::WorkflowScope::Global;
+        wf
+    }
+
+    fn alice() -> TenantId {
+        TenantId::for_consumer_user("alice").expect("valid per-user tenant id for alice")
+    }
+
+    /// AEGIS `known-defects-24` row `workflow-search-omits-global-workflows-2026-10-15`:
+    /// a global workflow is indexed as a platform template, so a search from
+    /// a user tenant finds it; another tenant's workflow stays unfound.
+    #[tokio::test]
+    async fn a_global_workflow_is_found_by_the_search_from_a_user_tenant() {
+        let cortex = Arc::new(FakeCortexClient::default());
+        let agent_repo = Arc::new(InMemoryAgentRepository::new());
+        let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+        let global = global_workflow("transcribe-audio");
+        workflow_repo
+            .save_for_tenant(&TenantId::system(), &global)
+            .await
+            .unwrap();
+        let bob = TenantId::for_consumer_user("bob").unwrap();
+        let mut bobs = make_workflow("bobs-outreach", "Bob's own");
+        bobs.tenant_id = bob.clone();
+        workflow_repo.save_for_tenant(&bob, &bobs).await.unwrap();
+        let handler = make_handler(cortex.clone(), agent_repo, workflow_repo);
+
+        handler.backfill().await.expect("backfill ok");
+
+        let found = cortex.search_workflows(&alice(), true).await;
+        println!("a search from alice's tenant finds: {found:?}");
+        assert_eq!(
+            found,
+            vec!["transcribe-audio".to_string()],
+            "a search from a user tenant does not find the global workflow"
+        );
+        assert!(
+            cortex.search_workflows(&alice(), false).await.is_empty(),
+            "without platform templates the search finds only the caller's own"
+        );
+    }
+
+    /// A global workflow indexed before the flag was set is re-indexed by the
+    /// reconcile, its fingerprint now differing, so the search finds it.
+    #[tokio::test]
+    async fn a_global_workflow_indexed_without_the_flag_is_reindexed_by_the_reconcile() {
+        let cortex = Arc::new(FakeCortexClient::default());
+        let agent_repo = Arc::new(InMemoryAgentRepository::new());
+        let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+        let global = global_workflow("transcribe-audio");
+        workflow_repo
+            .save_for_tenant(&TenantId::system(), &global)
+            .await
+            .unwrap();
+        let handler = make_handler(cortex.clone(), agent_repo, workflow_repo);
+        // The entry as it was indexed with the flag unset.
+        let mut before = DiscoveryIndexEventHandler::build_workflow_index_request(
+            &global,
+            "transcribe-audio",
+            "1.0.0",
+        );
+        before.is_platform_template = false;
+        handler.workflow_index_cache.lock().await.insert(
+            global.id,
+            DiscoveryIndexEventHandler::fingerprint_workflow(&before),
+        );
+
+        let summary = handler.reconcile().await.expect("reconcile ok");
+
+        println!(
+            "the reconcile re-indexed {} workflow(s)",
+            summary.workflows_indexed
+        );
+        assert_eq!(
+            summary.workflows_indexed, 1,
+            "the reconcile did not re-index the global workflow indexed without the flag"
+        );
+        assert_eq!(
+            cortex.search_workflows(&alice(), true).await,
+            vec!["transcribe-audio".to_string()]
+        );
+    }
+
+    /// A global agent is indexed as a platform template, as a global
+    /// workflow is.
+    #[tokio::test]
+    async fn a_global_agent_is_found_by_the_search_from_a_user_tenant() {
+        let cortex = Arc::new(FakeCortexClient::default());
+        let agent_repo = Arc::new(InMemoryAgentRepository::new());
+        let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+        let mut global = make_agent("aegis-document-renderer-agent");
+        global.tenant_id = TenantId::system();
+        global.scope = crate::domain::agent::AgentScope::Global;
+        agent_repo
+            .save_for_tenant(&TenantId::system(), &global)
+            .await
+            .unwrap();
+        let handler = make_handler(cortex.clone(), agent_repo, workflow_repo);
+
+        handler.backfill().await.expect("backfill ok");
+
+        let found = cortex.search_agents(&alice(), true).await;
+        println!("a search from alice's tenant finds the agents: {found:?}");
+        assert_eq!(
+            found,
+            vec!["aegis-document-renderer-agent".to_string()],
+            "a search from a user tenant does not find the global agent"
         );
     }
 }
