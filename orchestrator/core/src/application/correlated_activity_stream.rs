@@ -188,7 +188,9 @@ impl CorrelatedActivityStreamService {
         if let Some(repo) = &self.workflow_execution_repository {
             let records = repo.find_events_by_execution(execution_id, 500, 0).await?;
             for record in records {
-                if let Some(event) = workflow_record_to_activity(record.payload) {
+                let event = stored_repository_row(&record.payload, None)
+                    .or_else(|| workflow_record_to_activity(record.payload));
+                if let Some(event) = event {
                     history.push(event);
                 }
             }
@@ -215,7 +217,9 @@ impl CorrelatedActivityStreamService {
             if let Some(repo) = &self.workflow_execution_repository {
                 let records = repo.find_events_by_execution(execution.id, 500, 0).await?;
                 for record in records {
-                    if let Some(event) = workflow_record_to_activity(record.payload) {
+                    let event = stored_repository_row(&record.payload, Some(agent_id))
+                        .or_else(|| workflow_record_to_activity(record.payload));
+                    if let Some(event) = event {
                         history.push(event);
                     }
                 }
@@ -497,6 +501,31 @@ fn execution_to_history(execution: &Execution) -> Vec<CorrelatedActivityEvent> {
     }
 
     history
+}
+
+/// A stored row of one of a run's repository steps, as the activity it was
+/// published as, with its line (AEGIS ADR-141's Update of 2026-10-15): the
+/// row's payload read as `RepositoryPrepared`, `RepositoryCommitted`,
+/// `RepositoryPushed` or `RepositoryLanded`. Any other row is `None`: the
+/// execution aggregate already holds the events it would replay, and they
+/// would appear twice.
+pub fn stored_repository_row(
+    payload: &Value,
+    resolved_agent_id: Option<AgentId>,
+) -> Option<CorrelatedActivityEvent> {
+    let object = payload.as_object().filter(|object| object.len() == 1)?;
+    let variant = object.keys().next()?;
+    if !matches!(
+        variant.as_str(),
+        "RepositoryPrepared" | "RepositoryCommitted" | "RepositoryPushed" | "RepositoryLanded"
+    ) {
+        return None;
+    }
+    let event = serde_json::from_value::<ExecutionEvent>(payload.clone()).ok()?;
+    Some(normalize_domain_event(
+        &DomainEvent::Execution(event),
+        resolved_agent_id,
+    ))
 }
 
 fn workflow_record_to_activity(payload: Value) -> Option<CorrelatedActivityEvent> {
@@ -841,11 +870,15 @@ mod tests {
     use std::time::Duration;
     use tokio::time::timeout;
 
+    /// A workflow-execution store holding only the event rows it is given,
+    /// each under its execution.
     #[derive(Default)]
-    struct EmptyWorkflowExecutionRepository;
+    struct StoredRowsRepository {
+        rows: Vec<(ExecutionId, WorkflowExecutionEventRecord)>,
+    }
 
     #[async_trait]
-    impl WorkflowExecutionRepository for EmptyWorkflowExecutionRepository {
+    impl WorkflowExecutionRepository for StoredRowsRepository {
         async fn find_tenant_id_by_execution(
             &self,
             _id: crate::domain::execution::ExecutionId,
@@ -934,11 +967,18 @@ mod tests {
 
         async fn find_events_by_execution(
             &self,
-            _id: ExecutionId,
-            _limit: usize,
-            _offset: usize,
+            id: ExecutionId,
+            limit: usize,
+            offset: usize,
         ) -> std::result::Result<Vec<WorkflowExecutionEventRecord>, RepositoryError> {
-            Ok(vec![])
+            Ok(self
+                .rows
+                .iter()
+                .filter(|(of, _)| *of == id)
+                .map(|(_, record)| record.clone())
+                .skip(offset)
+                .take(limit)
+                .collect())
         }
     }
 
@@ -1076,7 +1116,7 @@ mod tests {
         let service = CorrelatedActivityStreamService::new(
             event_bus.clone(),
             repository,
-            Some(Arc::new(EmptyWorkflowExecutionRepository)),
+            Some(Arc::new(StoredRowsRepository::default())),
         );
         let mut stream = service
             .stream_agent_activity(agent_a, &tenant_a, true)
@@ -1219,7 +1259,7 @@ mod tests {
         let service = CorrelatedActivityStreamService::new(
             event_bus.clone(),
             repository,
-            Some(Arc::new(EmptyWorkflowExecutionRepository)),
+            Some(Arc::new(StoredRowsRepository::default())),
         );
         let mut stream = service
             .stream_agent_activity(agent_id, &TenantId::system(), false)
@@ -1433,6 +1473,123 @@ mod tests {
 
     /// AEGIS ADR-136 G13a, G13b: the run's repository rows and every tool
     /// call each have their line, type name and stage.
+    /// AEGIS ADR-141's Update of 2026-10-15 (1): a run's repository row,
+    /// stored as the persister writes it, is replayed by the execution's
+    /// and the agent's history with the R1 line, so the agent page shows it
+    /// after a reload. A stored row of an event the aggregate already holds
+    /// (here `IterationStarted`) adds nothing: it would appear twice.
+    #[tokio::test]
+    async fn execution_history_replays_a_stored_repository_row() {
+        let agent_id = AgentId::new();
+        let mut execution = execution_for(agent_id);
+        execution.start();
+        execution.start_iteration("generate".to_string()).unwrap();
+        let execution_id = execution.id;
+        let executions = Arc::new(InMemoryExecutionRepository::new());
+        executions
+            .save_for_tenant(&TenantId::system(), &execution)
+            .await
+            .unwrap();
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let stored = |sequence, event_type: &str, event: ExecutionEvent| {
+            (
+                execution_id,
+                WorkflowExecutionEventRecord {
+                    sequence,
+                    event_type: event_type.to_string(),
+                    state_name: None,
+                    iteration_number: None,
+                    payload: serde_json::to_value(event).unwrap(),
+                    recorded_at: Utc::now(),
+                },
+            )
+        };
+        let rows = StoredRowsRepository {
+            rows: vec![
+                stored(
+                    1_000_000_000_001,
+                    "repository_prepared",
+                    ExecutionEvent::RepositoryPrepared {
+                        execution_id,
+                        agent_id,
+                        label: "app".to_string(),
+                        branch: "aegis/1234abcd".to_string(),
+                        started_from: sha.to_string(),
+                        created: true,
+                        tree_reset: crate::domain::git_repo::TreeReset::Hard,
+                        removed: vec!["test/".to_string()],
+                        removed_count: None,
+                        tests: Some(Vec::new()),
+                        prepared_at: Utc::now(),
+                    },
+                ),
+                stored(
+                    1_000_000_000_002,
+                    "IterationStarted",
+                    ExecutionEvent::IterationStarted {
+                        execution_id,
+                        agent_id,
+                        iteration_number: 1,
+                        action: "generate".to_string(),
+                        started_at: Utc::now(),
+                    },
+                ),
+            ],
+        };
+        let service = CorrelatedActivityStreamService::new(
+            Arc::new(EventBus::with_default_capacity()),
+            executions,
+            Some(Arc::new(rows)),
+        );
+        let line = format!(
+            "Prepared repository app at /workspace/app: branch aegis/1234abcd created from {sha}; removed 1 paths (test/)"
+        );
+
+        for (history, of) in [
+            (
+                service
+                    .execution_history(&TenantId::system(), execution_id, false)
+                    .await
+                    .unwrap(),
+                "execution",
+            ),
+            (
+                service
+                    .agent_history(agent_id, &TenantId::system(), false)
+                    .await
+                    .unwrap(),
+                "agent",
+            ),
+        ] {
+            let repository: Vec<(Option<String>, String, Option<ExecutionId>)> = history
+                .iter()
+                .filter(|item| item.event_type == "repository_prepared")
+                .map(|item| (item.stage.clone(), item.message.clone(), item.execution_id))
+                .collect();
+            assert_eq!(
+                repository,
+                vec![(
+                    Some("repository".to_string()),
+                    line.clone(),
+                    Some(execution_id)
+                )],
+                "the {of} history does not hold the stored repository row with its line: {:?}",
+                history
+                    .iter()
+                    .map(|item| (&item.event_type, &item.message))
+                    .collect::<Vec<_>>()
+            );
+            let started = history
+                .iter()
+                .filter(|item| item.event_type == "iteration_started")
+                .count();
+            assert_eq!(
+                started, 1,
+                "the {of} history holds the stored IterationStarted row beside the aggregate's"
+            );
+        }
+    }
+
     #[test]
     fn repository_rows_and_tool_calls_have_their_lines() {
         let execution_id = ExecutionId::new();

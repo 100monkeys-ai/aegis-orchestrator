@@ -7862,20 +7862,27 @@ impl StandardExecutionService {
         if !repository_mounts.is_empty() {
             if let Some(repositories) = self.run_repositories.get() {
                 for prepared in repositories.take_prepared(run) {
-                    self.event_bus
-                        .publish_execution_event(ExecutionEvent::RepositoryPrepared {
-                            execution_id,
-                            agent_id,
-                            label: prepared.label,
-                            branch: prepared.branch,
-                            started_from: prepared.started_from,
-                            created: prepared.created,
-                            tree_reset: prepared.tree_reset,
-                            removed: prepared.removed,
-                            removed_count: prepared.removed_count,
-                            tests: prepared.tests,
-                            prepared_at: prepared.prepared_at,
-                        });
+                    let row = |execution_id| ExecutionEvent::RepositoryPrepared {
+                        execution_id,
+                        agent_id,
+                        label: prepared.label.clone(),
+                        branch: prepared.branch.clone(),
+                        started_from: prepared.started_from.clone(),
+                        created: prepared.created,
+                        tree_reset: prepared.tree_reset,
+                        removed: prepared.removed.clone(),
+                        removed_count: prepared.removed_count,
+                        tests: prepared.tests.clone(),
+                        prepared_at: prepared.prepared_at,
+                    };
+                    self.event_bus.publish_execution_event(row(execution_id));
+                    // AEGIS ADR-141's Update of 2026-10-15 (2): a workflow's
+                    // agent state's row is also a row of the workflow run,
+                    // so the run's logs carry it.
+                    if let Some(workflow_execution_id) = workflow_execution_id {
+                        self.event_bus
+                            .publish_execution_event(row(ExecutionId(workflow_execution_id)));
+                    }
                 }
             }
         }

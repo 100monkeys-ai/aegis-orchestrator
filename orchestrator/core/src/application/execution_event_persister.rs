@@ -301,6 +301,9 @@ fn event_type_str(event: &ExecutionEvent) -> &'static str {
         ExecutionEvent::RepositoryPrepared { .. } => "repository_prepared",
         ExecutionEvent::RepositoryCommitted { .. } => "repository_committed",
         ExecutionEvent::RepositoryPushed { .. } => "repository_pushed",
+        // AEGIS ADR-141's Update of 2026-10-15: a workflow run's landing, a
+        // row of the run as its siblings are.
+        ExecutionEvent::RepositoryLanded { .. } => "repository_landed",
         _ => "ExecutionEvent",
     }
 }
@@ -812,6 +815,65 @@ mod tests {
                 (exec_id, "ToolDispatchEnded".to_string(), Some(2)),
             ],
             "the dispatch events were stored as {stored:?}"
+        );
+    }
+
+    /// AEGIS ADR-141's Update of 2026-10-15 (2): a workflow run's repository
+    /// rows are typed by name, the landing as its siblings are, so the run's
+    /// logs route answers each with its own event type.
+    #[tokio::test]
+    async fn repository_rows_are_stored_with_their_names() {
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let repo = Arc::new(RecordingRepo::new());
+        let persister = Arc::new(ExecutionEventPersister::new(
+            repo.clone(),
+            event_bus.clone(),
+        ));
+        let _h = persister.start();
+        let run = ExecutionId::new();
+        event_bus.publish_execution_event(ExecutionEvent::RepositoryPrepared {
+            execution_id: run,
+            agent_id: AgentId::new(),
+            label: "app".to_string(),
+            branch: "aegis/1234abcd".to_string(),
+            started_from: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            created: true,
+            tree_reset: crate::domain::git_repo::TreeReset::Hard,
+            removed: vec!["test/".to_string()],
+            removed_count: None,
+            tests: None,
+            prepared_at: chrono::Utc::now(),
+        });
+        event_bus.publish_execution_event(ExecutionEvent::RepositoryLanded {
+            execution_id: run,
+            label: "app".to_string(),
+            branch: "aegis/1234abcd".to_string(),
+            git_ref: "main".to_string(),
+            commit_sha: "89abcdef0123456789abcdef0123456789abcdef".to_string(),
+            branch_url: crate::domain::secrets::RedactedUrl::new(
+                "https://github.com/example/app/tree/aegis/1234abcd",
+            ),
+            landed_at: chrono::Utc::now(),
+        });
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        while repo.events.read().await.len() < 2 && tokio::time::Instant::now() < deadline {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        }
+        let stored: Vec<(ExecutionId, String)> = repo
+            .events
+            .read()
+            .await
+            .iter()
+            .map(|(id, _, event_type, ..)| (*id, event_type.clone()))
+            .collect();
+        assert_eq!(
+            stored,
+            vec![
+                (run, "repository_prepared".to_string()),
+                (run, "repository_landed".to_string()),
+            ],
+            "the repository rows were stored as {stored:?}"
         );
     }
 }

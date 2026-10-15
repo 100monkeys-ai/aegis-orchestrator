@@ -13,6 +13,7 @@ use axum::Json;
 use sqlx::Row;
 use uuid::Uuid;
 
+use aegis_orchestrator_core::application::correlated_activity_stream::stored_repository_row;
 use aegis_orchestrator_core::application::goal_service::{
     cancel_ending_its_goal, CancelPathError, GoalService,
 };
@@ -22,6 +23,7 @@ use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity};
 use aegis_orchestrator_core::domain::node_config::{resolve_env_value, NodeConfigManifest};
 use aegis_orchestrator_core::domain::repository::WorkflowExecutionRepository;
 use aegis_orchestrator_core::domain::tenant::TenantId;
+use aegis_orchestrator_core::domain::workflow::{WorkflowExecutionEventRecord, WorkflowId};
 use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
 use aegis_orchestrator_core::infrastructure::temporal_proto::temporal::api::common::v1::WorkflowExecution as TemporalWorkflowExecution;
 use aegis_orchestrator_core::infrastructure::temporal_proto::temporal::api::workflowservice::v1::DeleteWorkflowExecutionRequest;
@@ -857,6 +859,65 @@ pub(crate) struct WorkflowLogPage {
 /// The page size of the logs route when the caller names none.
 const WORKFLOW_LOG_DEFAULT_LIMIT: usize = 50;
 /// The largest page the logs route answers.
+/// One stored row of a workflow run, as its logs route answers it.
+pub(crate) fn workflow_log_event_from_record(
+    record: WorkflowExecutionEventRecord,
+    execution_id: ExecutionId,
+    workflow_id: WorkflowId,
+    workflow_name: Option<String>,
+    temporal_linkage: Option<&WorkflowExecutionTemporalLinkage>,
+) -> WorkflowLogEventView {
+    // AEGIS ADR-141's Update of 2026-10-15 (2): a run's repository row is
+    // answered with the orchestrator's own line, its details the stored row.
+    if let Some(row) = stored_repository_row(&record.payload, None) {
+        return WorkflowLogEventView {
+            execution_id: execution_id.0,
+            workflow_id: Some(workflow_id.0),
+            workflow_name,
+            event_type: row.event_type,
+            message: row.message,
+            state_name: record.state_name,
+            iteration_number: record.iteration_number,
+            timestamp: row.timestamp.to_rfc3339(),
+            details: record.payload,
+            temporal_workflow_id: temporal_linkage
+                .map(|linkage| linkage.temporal_workflow_id.clone()),
+            temporal_run_id: temporal_linkage.map(|linkage| linkage.temporal_run_id.clone()),
+        };
+    }
+    let payload = serde_json::from_value::<TemporalEventPayload>(record.payload).unwrap_or(
+        TemporalEventPayload {
+            event_type: record.event_type.clone(),
+            execution_id: execution_id.to_string(),
+            temporal_sequence_number: record.sequence,
+            workflow_id: Some(workflow_id.to_string()),
+            state_name: record.state_name.clone(),
+            output: None,
+            error: None,
+            iteration_number: record.iteration_number,
+            final_blackboard: None,
+            artifacts: None,
+            agent_id: None,
+            code_diff: None,
+            parent_execution_id: None,
+            child_execution_id: None,
+            child_workflow_id: None,
+            mode: None,
+            result_key: None,
+            parent_state_name: None,
+            timestamp: record.recorded_at.to_rfc3339(),
+            ..Default::default()
+        },
+    );
+    workflow_log_event_from_payload(
+        execution_id,
+        workflow_id.0,
+        workflow_name,
+        payload,
+        temporal_linkage,
+    )
+}
+
 const WORKFLOW_LOG_MAX_LIMIT: usize = 200;
 /// The page size the run's events are counted by.
 const WORKFLOW_LOG_COUNT_PAGE: usize = 500;
@@ -967,34 +1028,11 @@ pub(crate) async fn get_workflow_logs_handler(
             let transformed: Vec<WorkflowLogEventView> = records
                 .into_iter()
                 .map(|record| {
-                    let payload = serde_json::from_value::<TemporalEventPayload>(record.payload)
-                        .unwrap_or(TemporalEventPayload {
-                            event_type: record.event_type.clone(),
-                            execution_id: execution.id.to_string(),
-                            temporal_sequence_number: record.sequence,
-                            workflow_id: Some(execution.workflow_id.to_string()),
-                            state_name: record.state_name.clone(),
-                            output: None,
-                            error: None,
-                            iteration_number: record.iteration_number,
-                            final_blackboard: None,
-                            artifacts: None,
-                            agent_id: None,
-                            code_diff: None,
-                            parent_execution_id: None,
-                            child_execution_id: None,
-                            child_workflow_id: None,
-                            mode: None,
-                            result_key: None,
-                            parent_state_name: None,
-                            timestamp: record.recorded_at.to_rfc3339(),
-                            ..Default::default()
-                        });
-                    workflow_log_event_from_payload(
+                    workflow_log_event_from_record(
+                        record,
                         execution.id,
-                        execution.workflow_id.0,
+                        execution.workflow_id,
                         workflow_name.clone(),
-                        payload,
                         temporal_linkage.as_ref(),
                     )
                 })
@@ -1029,8 +1067,11 @@ mod workflow_log_page_tests {
     //! `limit` and `offset`, in sequence order, and answers the values it
     //! applied with the run's total and whether more follow.
 
-    use super::{read_workflow_log_page, WorkflowLogQuery};
+    use super::{read_workflow_log_page, workflow_log_event_from_record, WorkflowLogQuery};
+    use aegis_orchestrator_core::domain::agent::AgentId;
+    use aegis_orchestrator_core::domain::events::ExecutionEvent;
     use aegis_orchestrator_core::domain::execution::ExecutionId;
+    use aegis_orchestrator_core::domain::git_repo::TreeReset;
     use aegis_orchestrator_core::domain::repository::{
         RepositoryError, WorkflowExecutionRepository,
     };
@@ -1205,6 +1246,82 @@ mod workflow_log_page_tests {
         assert_eq!(page.limit, 200, "the limit is bounded at 200");
         assert_eq!(page.records.len(), 200);
         assert!(page.has_more);
+    }
+
+    /// AEGIS ADR-141's Update of 2026-10-15 (2): the run `40e66741`'s
+    /// repository line reached no surface. Its row, stored under the
+    /// workflow execution as the persister writes it, is answered by the
+    /// run's logs route as one `repository_prepared` event whose `message`
+    /// is the orchestrator's line and whose `details` are the stored row.
+    #[tokio::test]
+    async fn the_workflow_logs_carry_the_runs_repository_row() {
+        let run = ExecutionId::new();
+        let sha = "2c665dff0123456789abcdef0123456789abcdef";
+        let branch = format!("aegis/{}", &run.0.to_string()[..8]);
+        let prepared = ExecutionEvent::RepositoryPrepared {
+            execution_id: run,
+            agent_id: AgentId::new(),
+            label: "aegis-examples".to_string(),
+            branch: branch.clone(),
+            started_from: sha.to_string(),
+            created: true,
+            tree_reset: TreeReset::Hard,
+            removed: vec!["test/".to_string()],
+            removed_count: None,
+            tests: Some(Vec::new()),
+            prepared_at: chrono::Utc::now(),
+        };
+        let mut trail = Trail::of(1);
+        trail.0.push(WorkflowExecutionEventRecord {
+            sequence: 1_000_000_000_000,
+            event_type: "repository_prepared".to_string(),
+            state_name: None,
+            iteration_number: None,
+            payload: serde_json::to_value(&prepared).unwrap(),
+            recorded_at: chrono::Utc::now(),
+        });
+        let page = read_workflow_log_page(&trail, run, &query(None, None))
+            .await
+            .unwrap();
+        let events: Vec<super::WorkflowLogEventView> = page
+            .records
+            .into_iter()
+            .map(|record| {
+                workflow_log_event_from_record(
+                    record,
+                    run,
+                    WorkflowId::new(),
+                    Some("the-forge".to_string()),
+                    None,
+                )
+            })
+            .collect();
+        println!(
+            "the run's logs answered {}",
+            serde_json::to_string(&events).unwrap()
+        );
+
+        let repository: Vec<&super::WorkflowLogEventView> = events
+            .iter()
+            .filter(|event| event.event_type == "repository_prepared")
+            .collect();
+        let line = format!(
+            "Prepared repository aegis-examples at /workspace/aegis-examples: branch {branch} created from {sha}; removed 1 paths (test/)"
+        );
+        assert_eq!(
+            repository
+                .iter()
+                .map(|event| event.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![line.as_str()],
+            "the run's logs do not carry its repository row with the line"
+        );
+        assert_eq!(repository[0].execution_id, run.0);
+        assert_eq!(
+            repository[0].details["RepositoryPrepared"]["label"], "aegis-examples",
+            "the event's details are not the stored row"
+        );
+        assert_eq!(events.len(), 2, "the run's own row is answered beside it");
     }
 
     #[tokio::test]
