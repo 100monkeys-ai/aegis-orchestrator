@@ -14,7 +14,7 @@
 //!
 //! # API Endpoints
 //!
-//! - `GET /dir/status?path=/path` - Get directory info
+//! - `GET /path?limit=N&lastFileName=X` with `Accept: application/json` - List a directory, paged
 //! - `POST /dir/` - Create directory
 //! - `DELETE /dir/?path=/path` - Delete directory
 //! - `POST /quota?path=/path&bytes=1000000` - Set quota
@@ -28,6 +28,7 @@ use chrono;
 use futures::StreamExt;
 use reqwest::{multipart, Client, Response, StatusCode};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::time::Duration;
 
 /// Hard ceiling for any single response body materialised from SeaweedFS.
@@ -39,6 +40,31 @@ const SEAWEEDFS_MAX_RESPONSE_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Ceiling for an error body the filer answers, read only to name it.
 const SEAWEEDFS_MAX_ERROR_BODY_BYTES: u64 = 64 * 1024;
+
+/// The most entries, files and directories together, one usage walk lists
+/// under a volume before it stops and reports the usage unreadable.
+const USAGE_MAX_ENTRIES: usize = 100_000;
+
+/// The deepest directory, counted from the volume's own (depth 0), one usage
+/// walk lists before it stops and reports the usage unreadable.
+const USAGE_MAX_DEPTH: usize = 64;
+
+/// Entries asked of the filer per page of a listing.
+const USAGE_PAGE_LIMIT: usize = 1000;
+
+/// The bounds of one usage walk.
+#[derive(Debug, Clone, Copy)]
+struct UsageBounds {
+    max_entries: usize,
+    max_depth: usize,
+    page_limit: usize,
+}
+
+const USAGE_BOUNDS: UsageBounds = UsageBounds {
+    max_entries: USAGE_MAX_ENTRIES,
+    max_depth: USAGE_MAX_DEPTH,
+    page_limit: USAGE_PAGE_LIMIT,
+};
 
 /// Stream the response body chunk-by-chunk, enforcing a running byte cap.
 /// Returns `StorageError::Unknown` the moment the running count exceeds
@@ -106,6 +132,101 @@ impl SeaweedFSAdapter {
     /// Build full URL for API endpoint
     fn build_url(&self, path: &str) -> String {
         format!("{}{}", self.filer_url, path)
+    }
+
+    /// The sum of the file sizes under `root` by the filer's listing, or the
+    /// reason it could not be read. Directories are walked breadth first;
+    /// the walk stops at the first failure or bound.
+    async fn sum_listed_sizes(&self, root: &str, bounds: UsageBounds) -> Result<u64, String> {
+        let mut pending: VecDeque<(String, usize)> = VecDeque::from([(root.to_string(), 0)]);
+        let mut entries_seen: usize = 0;
+        let mut total: u64 = 0;
+
+        while let Some((dir, depth)) = pending.pop_front() {
+            let mut after: Option<String> = None;
+            loop {
+                let page = self
+                    .listing_page(&dir, after.as_deref(), bounds.page_limit)
+                    .await?;
+                let more = page.should_display_load_more;
+                let last = page.last_file_name.clone();
+                let entries = page.into_entries();
+                let page_was_empty = entries.is_empty();
+
+                for entry in entries {
+                    entries_seen += 1;
+                    if entries_seen > bounds.max_entries {
+                        return Err(format!(
+                            "the listing of {root} holds more than {} entries",
+                            bounds.max_entries
+                        ));
+                    }
+                    if entry.is_directory() {
+                        if depth + 1 > bounds.max_depth {
+                            return Err(format!(
+                                "{} is deeper than {} directories under {root}",
+                                entry.full_path, bounds.max_depth
+                            ));
+                        }
+                        pending.push_back((entry.full_path, depth + 1));
+                    } else {
+                        total = total.saturating_add(entry.file_size);
+                    }
+                }
+
+                if !more || page_was_empty {
+                    break;
+                }
+                if last.is_empty() || after.as_deref() == Some(last.as_str()) {
+                    return Err(format!(
+                        "the listing of {dir} asked for another page after {last:?} and named no new last entry"
+                    ));
+                }
+                after = Some(last);
+            }
+        }
+
+        Ok(total)
+    }
+
+    /// One page of the filer's listing of `dir`, the page after `after` when
+    /// given, or the reason it could not be read.
+    async fn listing_page(
+        &self,
+        dir: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<DirectoryListing, String> {
+        let mut query: Vec<(&str, String)> = vec![("limit", limit.to_string())];
+        if let Some(after) = after {
+            query.push(("lastFileName", after.to_string()));
+        }
+
+        let response = self
+            .client
+            .get(self.build_url(dir))
+            .header("Accept", "application/json")
+            .query(&query)
+            .send()
+            .await
+            .map_err(|e| format!("the listing of {dir} was not answered: {e}"))?;
+
+        let status = response.status();
+        if status != StatusCode::OK {
+            let body = read_capped_body(response, SEAWEEDFS_MAX_ERROR_BODY_BYTES)
+                .await
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default();
+            return Err(format!(
+                "the listing of {dir} answered HTTP {status}: {body}"
+            ));
+        }
+
+        let body = read_capped_body(response, SEAWEEDFS_MAX_RESPONSE_BYTES)
+            .await
+            .map_err(|e| format!("the listing of {dir} could not be read: {e}"))?;
+        serde_json::from_slice(&body)
+            .map_err(|e| format!("the listing of {dir} could not be decoded: {e}"))
     }
 
     /// The whole content of the file at `url`, for a write that splices
@@ -280,6 +401,12 @@ impl StorageProvider for SeaweedFSAdapter {
         }
     }
 
+    /// The sum of the `FileSize` of every file under `path`, as the filer
+    /// lists them: each directory listed page by page and walked in turn,
+    /// within the walk's bounds (100,000 entries, a depth of 64). A listing
+    /// that fails, a page that cannot be read, a missing directory or a
+    /// bound reached answers [`StorageError::UsageUnreadable`], never a
+    /// smaller number.
     async fn get_usage(&self, path: &str) -> Result<u64, StorageError> {
         // Validate path
         if !path.starts_with('/') {
@@ -288,38 +415,12 @@ impl StorageProvider for SeaweedFSAdapter {
             ));
         }
 
-        let url = self.build_url("/dir/status");
-
-        let response = self
-            .client
-            .get(&url)
-            .header("Accept", "application/json")
-            .query(&[("path", path)])
-            .send()
-            .await?;
-
-        match response.status() {
-            StatusCode::OK => {
-                let status: DirectoryStatus = response
-                    .json()
-                    .await
-                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
-
-                Ok(status.total_size)
-            }
-            // A 404 from /dir/status means the directory has no tracked usage yet
-            // (e.g. only contains a .keep sentinel). Treat as zero usage.
-            StatusCode::NOT_FOUND => Ok(0),
-            status => {
-                let error_msg = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| format!("HTTP {status}"));
-                Err(StorageError::Unknown(format!(
-                    "Failed to get usage for {path}: {error_msg}"
-                )))
-            }
-        }
+        self.sum_listed_sizes(path, USAGE_BOUNDS)
+            .await
+            .map_err(|cause| {
+                tracing::warn!(path, cause = %cause, "volume usage could not be read from the filer's listing");
+                StorageError::UsageUnreadable(cause)
+            })
     }
 
     async fn health_check(&self) -> Result<(), StorageError> {
@@ -729,15 +830,6 @@ fn is_missing_move_source(status: StatusCode, body: &str) -> bool {
 // SeaweedFS API Response Types
 // ============================================================================
 
-#[derive(Debug, Serialize, Deserialize)]
-struct DirectoryStatus {
-    #[serde(rename = "TotalSize")]
-    total_size: u64,
-
-    #[serde(rename = "FileCount")]
-    file_count: u64,
-}
-
 /// The filer's listing for `GET <dir>` with `Accept: application/json`
 /// (`weed/server/filer_server_handlers_read_dir.go`,
 /// `listDirectoryHandler`): `{"Version", "Path", "Entries", "Limit",
@@ -752,6 +844,15 @@ struct DirectoryListing {
 
     #[serde(rename = "Entries")]
     entries: Option<Vec<DirectoryEntry>>,
+
+    /// The name of the page's last entry, the `lastFileName` that asks for
+    /// the page after it.
+    #[serde(rename = "LastFileName")]
+    last_file_name: String,
+
+    /// Whether the filer holds entries past this page (the page was full).
+    #[serde(rename = "ShouldDisplayLoadMore")]
+    should_display_load_more: bool,
 }
 
 impl DirectoryListing {
@@ -774,6 +875,10 @@ struct DirectoryEntry {
 
     #[serde(rename = "Mode")]
     mode: u32,
+
+    /// The file's size in bytes; zero for a directory.
+    #[serde(rename = "FileSize", default)]
+    file_size: u64,
 }
 
 impl DirectoryEntry {
@@ -841,26 +946,214 @@ mod tests {
         assert!(matches!(result, Err(StorageError::InvalidPath(_))));
     }
 
-    #[tokio::test]
-    async fn test_get_usage_returns_zero_for_not_found() {
-        // Regression: SeaweedFS returns 404 for /dir/status when a directory
-        // was just created and only contains a .keep sentinel file.
-        // get_usage must return Ok(0) — not StorageError::NotFound — so that
-        // quota-guarded writes to newly created directories succeed.
-        let mut server = mockito::Server::new_async().await;
-        let _mock = server
+    /// The filer's listing of `path` as `listDirectoryHandler` writes it:
+    /// each `(name, size)` a file of `size` bytes, a `None` size a
+    /// directory (`Mode` carrying `os.ModeDir`).
+    fn usage_listing(
+        path: &str,
+        entries: &[(&str, Option<u64>)],
+        last: &str,
+        more: bool,
+    ) -> String {
+        let entries: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(name, size)| match size {
+                Some(size) => serde_json::json!({
+                    "FullPath": format!("{path}/{name}"),
+                    "Mtime": "2026-10-15T19:00:00Z",
+                    "Mode": 420,
+                    "FileSize": size,
+                }),
+                None => serde_json::json!({
+                    "FullPath": format!("{path}/{name}"),
+                    "Mtime": "2026-10-15T19:00:00Z",
+                    "Mode": 2147484141u32,
+                    "FileSize": 0,
+                }),
+            })
+            .collect();
+        serde_json::json!({
+            "Version": "30GB 3.97",
+            "Path": path,
+            "Entries": if entries.is_empty() { serde_json::Value::Null } else { serde_json::Value::Array(entries) },
+            "Limit": 1000,
+            "LastFileName": last,
+            "ShouldDisplayLoadMore": more,
+            "EmptyFolder": false,
+        })
+        .to_string()
+    }
+
+    /// The filer serves no `/dir/status` route: every probe of it answers
+    /// 404, as production's filer does.
+    async fn filer_without_dir_status(server: &mut mockito::ServerGuard) {
+        server
             .mock("GET", "/dir/status")
-            .match_query(mockito::Matcher::UrlEncoded(
-                "path".into(),
-                "/tenant/vol".into(),
-            ))
+            .match_query(mockito::Matcher::Any)
             .with_status(404)
+            .create_async()
+            .await;
+    }
+
+    /// One page of `path`'s listing: the first page (no `lastFileName`)
+    /// when `after` is `None`, else the page after `after`.
+    async fn filer_listing_page(
+        server: &mut mockito::ServerGuard,
+        path: &str,
+        after: Option<&str>,
+        body: String,
+    ) -> mockito::Mock {
+        let query = match after {
+            None => mockito::Matcher::Regex("^limit=[0-9]+$".into()),
+            Some(after) => mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("limit".into(), "1000".into()),
+                mockito::Matcher::UrlEncoded("lastFileName".into(), after.into()),
+            ]),
+        };
+        server
+            .mock("GET", path)
+            .match_header("accept", "application/json")
+            .match_query(query)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .expect(1)
+            .create_async()
+            .await
+    }
+
+    /// Regression (volume-usage-reads-zero): usage was asked of a
+    /// `/dir/status` route the filer does not serve, and its 404 read as
+    /// zero, so every volume read `0 B`. A listing with three files, one of
+    /// them in a nested directory, sums their `FileSize`.
+    #[tokio::test]
+    async fn usage_sums_the_file_sizes_of_a_listing_and_its_nested_directory() {
+        let mut server = mockito::Server::new_async().await;
+        filer_without_dir_status(&mut server).await;
+        let root = filer_listing_page(
+            &mut server,
+            "/tenant/vol",
+            None,
+            usage_listing(
+                "/tenant/vol",
+                &[
+                    (".keep", Some(0)),
+                    ("DIALOGUE.ogg", Some(2_525_169)),
+                    ("generated", None),
+                    ("notes.md", Some(1_200)),
+                ],
+                "notes.md",
+                false,
+            ),
+        )
+        .await;
+        let nested = filer_listing_page(
+            &mut server,
+            "/tenant/vol/generated",
+            None,
+            usage_listing(
+                "/tenant/vol/generated",
+                &[("image.png", Some(48_000))],
+                "image.png",
+                false,
+            ),
+        )
+        .await;
+
+        let adapter = SeaweedFSAdapter::new(server.url());
+        let result = adapter.get_usage("/tenant/vol").await;
+
+        assert_eq!(
+            result,
+            Ok(2_525_169 + 1_200 + 48_000),
+            "usage must be the sum of the listed files' FileSize, nested directory included"
+        );
+        root.assert_async().await;
+        nested.assert_async().await;
+    }
+
+    /// A listing the filer answers in two pages (`ShouldDisplayLoadMore`,
+    /// then the page after `LastFileName`) sums both pages.
+    #[tokio::test]
+    async fn usage_sums_both_pages_of_a_paged_listing() {
+        let mut server = mockito::Server::new_async().await;
+        filer_without_dir_status(&mut server).await;
+        let first = filer_listing_page(
+            &mut server,
+            "/tenant/vol",
+            None,
+            usage_listing(
+                "/tenant/vol",
+                &[("a.bin", Some(1_000)), ("b.bin", Some(2_000))],
+                "b.bin",
+                true,
+            ),
+        )
+        .await;
+        let second = filer_listing_page(
+            &mut server,
+            "/tenant/vol",
+            Some("b.bin"),
+            usage_listing("/tenant/vol", &[("c.bin", Some(4_000))], "c.bin", false),
+        )
+        .await;
+
+        let adapter = SeaweedFSAdapter::new(server.url());
+        let result = adapter.get_usage("/tenant/vol").await;
+
+        assert_eq!(
+            result,
+            Ok(7_000),
+            "usage must sum every page of the listing"
+        );
+        first.assert_async().await;
+        second.assert_async().await;
+    }
+
+    /// Replaces `test_get_usage_returns_zero_for_not_found`: a filer that
+    /// answers the listing with a 500 answers an error, never zero, and the
+    /// error's sentence is the one the write path refuses with.
+    #[tokio::test]
+    async fn usage_of_a_filer_500_is_an_error_not_zero() {
+        let mut server = mockito::Server::new_async().await;
+        filer_without_dir_status(&mut server).await;
+        server
+            .mock("GET", "/tenant/vol")
+            .match_query(mockito::Matcher::Any)
+            .with_status(500)
+            .with_body("filer: internal error")
             .create_async()
             .await;
 
         let adapter = SeaweedFSAdapter::new(server.url());
         let result = adapter.get_usage("/tenant/vol").await;
-        assert_eq!(result, Ok(0), "404 from /dir/status must yield Ok(0)");
+
+        let error = result.expect_err("a filer 500 must be an error, not a usage");
+        assert_eq!(
+            error.to_string(),
+            "The volume's usage could not be read; try again."
+        );
+    }
+
+    /// A new volume's directory holds only its `.keep` sentinel: its usage
+    /// is read from the listing and is zero, so its first write is admitted.
+    #[tokio::test]
+    async fn usage_of_a_directory_holding_only_its_keep_is_zero() {
+        let mut server = mockito::Server::new_async().await;
+        filer_without_dir_status(&mut server).await;
+        let listing = filer_listing_page(
+            &mut server,
+            "/tenant/vol",
+            None,
+            usage_listing("/tenant/vol", &[(".keep", Some(0))], ".keep", false),
+        )
+        .await;
+
+        let adapter = SeaweedFSAdapter::new(server.url());
+        let result = adapter.get_usage("/tenant/vol").await;
+
+        assert_eq!(result, Ok(0));
+        listing.assert_async().await;
     }
 
     // Regression tests for DirectoryListing deserialization
@@ -939,15 +1232,17 @@ mod tests {
     async fn test_get_usage_sends_accept_json_header() {
         let mut server = mockito::Server::new_async().await;
         let _mock = server
-            .mock("GET", "/dir/status")
+            .mock("GET", "/tenant/vol")
             .match_header("accept", "application/json")
-            .match_query(mockito::Matcher::UrlEncoded(
-                "path".into(),
-                "/tenant/vol".into(),
-            ))
+            .match_query(mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"TotalSize":4096,"FileCount":1}"#)
+            .with_body(usage_listing(
+                "/tenant/vol",
+                &[("a.bin", Some(4096))],
+                "a.bin",
+                false,
+            ))
             .create_async()
             .await;
 
@@ -956,8 +1251,76 @@ mod tests {
         assert_eq!(
             result,
             Ok(4096),
-            "get_usage must parse JSON when Accept header is present"
+            "get_usage must parse the JSON listing when Accept header is present"
         );
+    }
+
+    /// A walk past its entry bound stops and reports the usage unreadable,
+    /// never the smaller sum it had reached.
+    #[tokio::test]
+    async fn usage_past_the_entry_bound_is_unreadable_not_a_smaller_sum() {
+        let mut server = mockito::Server::new_async().await;
+        filer_listing_page(
+            &mut server,
+            "/tenant/vol",
+            None,
+            usage_listing(
+                "/tenant/vol",
+                &[("a", Some(1)), ("b", Some(1)), ("c", Some(1))],
+                "c",
+                false,
+            ),
+        )
+        .await;
+
+        let adapter = SeaweedFSAdapter::new(server.url());
+        let bounds = UsageBounds {
+            max_entries: 2,
+            ..USAGE_BOUNDS
+        };
+        let result = adapter.sum_listed_sizes("/tenant/vol", bounds).await;
+
+        let cause = result.expect_err("past the entry bound the usage is unreadable");
+        assert!(cause.contains("more than 2 entries"), "{cause}");
+    }
+
+    /// A walk that meets a directory past its depth bound stops and reports
+    /// the usage unreadable.
+    #[tokio::test]
+    async fn usage_past_the_depth_bound_is_unreadable() {
+        let mut server = mockito::Server::new_async().await;
+        filer_listing_page(
+            &mut server,
+            "/tenant/vol",
+            None,
+            usage_listing("/tenant/vol", &[("one", None)], "one", false),
+        )
+        .await;
+        filer_listing_page(
+            &mut server,
+            "/tenant/vol/one",
+            None,
+            usage_listing("/tenant/vol/one", &[("two", None)], "two", false),
+        )
+        .await;
+
+        let adapter = SeaweedFSAdapter::new(server.url());
+        let bounds = UsageBounds {
+            max_depth: 1,
+            ..USAGE_BOUNDS
+        };
+        let result = adapter.sum_listed_sizes("/tenant/vol", bounds).await;
+
+        let cause = result.expect_err("past the depth bound the usage is unreadable");
+        assert!(cause.contains("deeper than 1 directories"), "{cause}");
+    }
+
+    /// The walk's bounds are the ones the usage decision names: 100,000
+    /// entries and a depth of 64 per volume.
+    #[test]
+    fn usage_bounds_are_a_hundred_thousand_entries_and_depth_sixty_four() {
+        assert_eq!(USAGE_BOUNDS.max_entries, 100_000);
+        assert_eq!(USAGE_BOUNDS.max_depth, 64);
     }
 
     /// The filer's own answer for a directory: `GET <path>?metadata=true`
@@ -1689,9 +2052,9 @@ mod tests {
         // Delete directory
         adapter.delete_directory(path).await.unwrap();
 
-        // Verify deletion
+        // Verify deletion: the usage of a missing directory cannot be read
         let result = adapter.get_usage(path).await;
-        assert!(matches!(result, Err(StorageError::NotFound(_))));
+        assert!(matches!(result, Err(StorageError::UsageUnreadable(_))));
     }
 
     /// A filer holding `content` at `path`, answering a plain GET of it.

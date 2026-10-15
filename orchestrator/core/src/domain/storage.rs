@@ -339,7 +339,19 @@ pub enum StorageError {
 
     #[error("Unknown storage error: {0}")]
     Unknown(String),
+
+    /// A directory's usage could not be read from the backend (a backend
+    /// error, a page that could not be read, a bound of the walk reached).
+    /// Never read as zero: the caller reports the usage as unknown, and a
+    /// write held to the quota is refused with this sentence. The cause is
+    /// carried for the server's log, not the sentence.
+    #[error("{}", USAGE_UNREADABLE)]
+    UsageUnreadable(String),
 }
+
+/// The sentence a write held to its volume's quota is refused with when the
+/// volume's usage could not be read.
+pub const USAGE_UNREADABLE: &str = "The volume's usage could not be read; try again.";
 
 impl From<reqwest::Error> for StorageError {
     fn from(err: reqwest::Error) -> Self {

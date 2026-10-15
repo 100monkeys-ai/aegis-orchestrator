@@ -14,10 +14,11 @@ use uuid::Uuid;
 
 use aegis_orchestrator_core::application::file_operations_service::FileOperationsError;
 use aegis_orchestrator_core::application::user_volume_service::{
-    UserVolumeError, CHAT_ATTACHMENTS_VOLUME_NAME,
+    QuotaReading, UserVolumeError, VolumeWithUsage, CHAT_ATTACHMENTS_VOLUME_NAME,
 };
 use aegis_orchestrator_core::application::volume_manager::CreateUserVolumeCommand;
 use aegis_orchestrator_core::domain::iam::{UserIdentity, ZaruTier};
+use aegis_orchestrator_core::domain::storage::USAGE_UNREADABLE;
 use aegis_orchestrator_core::domain::volume::VolumeId;
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
@@ -89,6 +90,20 @@ fn file_ops_error_response(
         | FileOperationsError::InvalidPath(_)
         | FileOperationsError::FileTooLarge => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
         FileOperationsError::Unauthorized => (StatusCode::FORBIDDEN, e.to_string()),
+        // A write held to the quota whose volume's usage could not be read
+        // is refused, never admitted against a usage read as zero.
+        FileOperationsError::Fsal(cause) if cause.ends_with(USAGE_UNREADABLE) => {
+            tracing::warn!(
+                route,
+                volume_id = %volume_id,
+                error = %e,
+                "volume write refused: its usage could not be read"
+            );
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                USAGE_UNREADABLE.to_string(),
+            )
+        }
         FileOperationsError::Fsal(_) | FileOperationsError::Repository(_) => {
             tracing::error!(
                 route,
@@ -103,6 +118,37 @@ fn file_ops_error_response(
         }
     };
     (status, Json(serde_json::json!({"error": message})))
+}
+
+/// One volume of `GET /v1/volumes`: `used_bytes` is `null` and
+/// `usage_incomplete` true when the volume's usage could not be read.
+fn volume_list_entry(vu: VolumeWithUsage) -> serde_json::Value {
+    let usage_incomplete = vu.usage_incomplete();
+    let v = vu.volume;
+    serde_json::json!({
+        "id": v.id.to_string(),
+        "name": v.name,
+        "status": format!("{:?}", v.status),
+        "size_limit_bytes": v.size_limit_bytes,
+        "used_bytes": vu.used_bytes,
+        "usage_incomplete": usage_incomplete,
+        "created_at": v.created_at,
+    })
+}
+
+/// The body of `GET /v1/volumes/quota`: `total_bytes_used` sums the volumes
+/// whose usage could be read, and `usage_incomplete` says whether any could
+/// not.
+fn quota_body(reading: &QuotaReading) -> serde_json::Value {
+    let usage = &reading.usage;
+    serde_json::json!({
+        "volume_count": usage.volume_count,
+        "total_bytes_used": usage.total_bytes_used,
+        "usage_incomplete": reading.usage_incomplete,
+        "max_volumes": usage.tier_limit.max_volumes,
+        "total_storage_bytes": usage.tier_limit.total_storage_bytes,
+        "max_file_size_bytes": usage.tier_limit.max_file_size_bytes,
+    })
 }
 
 // ============================================================================
@@ -164,23 +210,7 @@ pub(crate) async fn list_volumes(
         .user_volume_service
         .list_volumes_with_usage(&tenant_id, &owner)
         .await
-        .map(|vols| {
-            Json(
-                vols.into_iter()
-                    .map(|vu| {
-                        let v = vu.volume;
-                        serde_json::json!({
-                            "id": v.id.to_string(),
-                            "name": v.name,
-                            "status": format!("{:?}", v.status),
-                            "size_limit_bytes": v.size_limit_bytes,
-                            "used_bytes": vu.used_bytes,
-                            "created_at": v.created_at,
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        })
+        .map(|vols| Json(vols.into_iter().map(volume_list_entry).collect::<Vec<_>>()))
         .map_err(user_volume_error_response)
 }
 
@@ -198,17 +228,9 @@ pub(crate) async fn get_quota(
 
     state
         .user_volume_service
-        .get_quota_usage(&tenant_id, &owner, &tier)
+        .get_quota_reading(&tenant_id, &owner, &tier)
         .await
-        .map(|usage| {
-            Json(serde_json::json!({
-                "volume_count": usage.volume_count,
-                "total_bytes_used": usage.total_bytes_used,
-                "max_volumes": usage.tier_limit.max_volumes,
-                "total_storage_bytes": usage.tier_limit.total_storage_bytes,
-                "max_file_size_bytes": usage.tier_limit.max_file_size_bytes,
-            }))
-        })
+        .map(|reading| Json(quota_body(&reading)))
         .map_err(user_volume_error_response)
 }
 
@@ -1373,5 +1395,90 @@ mod tests {
                 assert!(!text.contains(leak), "the 500 body names {leak}: {text}");
             }
         }
+    }
+
+    /// A user volume named `name`, as the list and quota routes read it.
+    fn listed_volume(name: &str) -> aegis_orchestrator_core::domain::volume::Volume {
+        use aegis_orchestrator_core::domain::volume::{
+            FilerEndpoint, StorageClass, Volume, VolumeBackend, VolumeOwnership, VolumeStatus,
+        };
+        Volume {
+            id: VolumeId(Uuid::nil()),
+            name: name.to_string(),
+            tenant_id: aegis_orchestrator_core::domain::volume::TenantId::consumer(),
+            storage_class: StorageClass::persistent(),
+            backend: VolumeBackend::SeaweedFS {
+                filer_endpoint: FilerEndpoint::new("http://localhost:8888").unwrap(),
+                remote_path: format!("/aegis/volumes/{name}"),
+            },
+            size_limit_bytes: 250 * 1024 * 1024,
+            status: VolumeStatus::Available,
+            ownership: VolumeOwnership::persistent("user-1".to_string()),
+            created_at: chrono::Utc::now(),
+            attached_at: None,
+            detached_at: None,
+            expires_at: None,
+            host_node_id: None,
+        }
+    }
+
+    /// Regression (volume-usage-reads-zero): a volume whose usage probe
+    /// failed was listed with `used_bytes` 0, so its card read `0 B`. The
+    /// list route answers `used_bytes: null` and `usage_incomplete: true` for
+    /// it, and the bytes with `usage_incomplete: false` for a volume read.
+    #[test]
+    fn list_route_answers_null_and_incomplete_when_the_usage_probe_fails() {
+        let failed = volume_list_entry(VolumeWithUsage {
+            volume: listed_volume("git-aegis-examples"),
+            used_bytes: None,
+        });
+        assert_eq!(failed["used_bytes"], serde_json::Value::Null);
+        assert_eq!(failed["usage_incomplete"], serde_json::json!(true));
+
+        let read = volume_list_entry(VolumeWithUsage {
+            volume: listed_volume("chat-attachments"),
+            used_bytes: Some(2_525_169),
+        });
+        assert_eq!(read["used_bytes"], serde_json::json!(2_525_169));
+        assert_eq!(read["usage_incomplete"], serde_json::json!(false));
+    }
+
+    /// Regression (volume-usage-reads-zero): the quota route answers the sum
+    /// of the volumes it could read with `usage_incomplete: true` when a
+    /// volume's usage probe failed.
+    #[test]
+    fn quota_route_answers_incomplete_when_the_usage_probe_fails() {
+        use aegis_orchestrator_core::domain::volume::{QuotaUsage, StorageTierLimits};
+        let tier_limit = StorageTierLimits::default()
+            .limits
+            .get(&ZaruTier::Free)
+            .expect("Free tier limit present")
+            .clone();
+        let body = quota_body(&QuotaReading {
+            usage: QuotaUsage {
+                volume_count: 2,
+                total_bytes_used: 2_525_169,
+                tier_limit,
+            },
+            usage_incomplete: true,
+        });
+        assert_eq!(body["usage_incomplete"], serde_json::json!(true));
+        assert_eq!(body["total_bytes_used"], serde_json::json!(2_525_169));
+        assert_eq!(body["volume_count"], serde_json::json!(2));
+    }
+
+    /// A write held to the quota whose volume's usage could not be read is
+    /// refused with the sentence, never admitted and never a bare 500.
+    #[test]
+    fn write_refused_when_the_usage_could_not_be_read_answers_the_sentence() {
+        let volume_id = VolumeId(Uuid::nil());
+        let failure = FileOperationsError::Fsal(format!("Storage error: {USAGE_UNREADABLE}"));
+        let (status, Json(body)) =
+            file_ops_error_response("POST /v1/volumes/{id}/files/upload", &volume_id, failure);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body,
+            serde_json::json!({"error": "The volume's usage could not be read; try again."})
+        );
     }
 }

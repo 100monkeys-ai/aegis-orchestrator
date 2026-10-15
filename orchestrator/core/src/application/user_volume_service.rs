@@ -61,11 +61,29 @@ impl From<RepositoryError> for UserVolumeError {
 /// Read-model DTO returned by `UserVolumeService::list_volumes_with_usage`.
 /// `used_bytes` is fetched on-demand from the storage backend (ADR-036) and
 /// deliberately lives outside the `Volume` aggregate — usage is read-model
-/// data, not a domain invariant.
+/// data, not a domain invariant. `None` when the volume's usage could not be
+/// read (ADR-079's Update of 2026-10-15): a failed probe is reported, never
+/// read as zero.
 #[derive(Debug, Clone)]
 pub struct VolumeWithUsage {
     pub volume: Volume,
-    pub used_bytes: u64,
+    pub used_bytes: Option<u64>,
+}
+
+impl VolumeWithUsage {
+    /// Whether this volume's usage could not be read.
+    pub fn usage_incomplete(&self) -> bool {
+        self.used_bytes.is_none()
+    }
+}
+
+/// The quota usage as read now, with whether any volume's usage could not
+/// be read (ADR-079's Update of 2026-10-15). When `usage_incomplete`,
+/// `usage.total_bytes_used` is the sum of the volumes that could be read.
+#[derive(Debug, Clone)]
+pub struct QuotaReading {
+    pub usage: QuotaUsage,
+    pub usage_incomplete: bool,
 }
 
 // ============================================================================
@@ -338,8 +356,9 @@ impl UserVolumeService {
     /// Read-model projection — usage is fetched via `VolumeService::get_volume_usage`
     /// (BC-7 storage abstraction, ADR-036) and is NOT stored on the `Volume`
     /// aggregate. If a per-volume usage query fails, that volume's
-    /// `used_bytes` falls back to `0` rather than failing the entire list — a
-    /// usage-query outage must not blank the user's inventory.
+    /// `used_bytes` is `None` rather than failing the entire list — a
+    /// usage-query outage must not blank the user's inventory, and must not
+    /// read as zero either.
     pub async fn list_volumes_with_usage(
         &self,
         tenant_id: &TenantId,
@@ -348,11 +367,13 @@ impl UserVolumeService {
         let volumes = self.volume_repo.find_by_owner(tenant_id, owner).await?;
         let mut out = Vec::with_capacity(volumes.len());
         for v in volumes {
-            let used_bytes = self
-                .volume_service
-                .get_volume_usage(v.id)
-                .await
-                .unwrap_or(0);
+            let used_bytes = match self.volume_service.get_volume_usage(v.id).await {
+                Ok(bytes) => Some(bytes),
+                Err(e) => {
+                    tracing::warn!(volume_id = %v.id, error = %e, "volume usage could not be read");
+                    None
+                }
+            };
             out.push(VolumeWithUsage {
                 volume: v,
                 used_bytes,
@@ -438,12 +459,28 @@ impl UserVolumeService {
         Ok(())
     }
 
+    /// The quota usage, the sum over the volumes whose usage could be read.
+    /// [`Self::get_quota_reading`] also says whether any could not.
     pub async fn get_quota_usage(
         &self,
         tenant_id: &TenantId,
         owner: &str,
         tier: &ZaruTier,
     ) -> Result<QuotaUsage, UserVolumeError> {
+        self.get_quota_reading(tenant_id, owner, tier)
+            .await
+            .map(|reading| reading.usage)
+    }
+
+    /// The quota usage and whether any volume's usage could not be read: a
+    /// volume whose probe fails adds nothing to `total_bytes_used` and marks
+    /// the reading incomplete, never zero bytes read as exact.
+    pub async fn get_quota_reading(
+        &self,
+        tenant_id: &TenantId,
+        owner: &str,
+        tier: &ZaruTier,
+    ) -> Result<QuotaReading, UserVolumeError> {
         let limit = self
             .tier_limits
             .limits
@@ -456,17 +493,19 @@ impl UserVolumeService {
         // ADR-079: `total_bytes_used` is *actual* SeaweedFS consumption, not
         // the sum of allocated `size_limit_bytes`. We aggregate per-volume
         // usage via the storage abstraction (BC-7); a single volume's usage
-        // probe failing falls back to 0 for that volume so the quota endpoint
-        // remains responsive.
+        // probe failing marks the reading incomplete and adds nothing, so the
+        // quota endpoint remains responsive without reading the failure as 0.
         let volumes = self.volume_repo.find_by_owner(tenant_id, owner).await?;
         let mut total_bytes_used: u64 = 0;
+        let mut usage_incomplete = false;
         for v in &volumes {
-            let used = self
-                .volume_service
-                .get_volume_usage(v.id)
-                .await
-                .unwrap_or(0);
-            total_bytes_used = total_bytes_used.saturating_add(used);
+            match self.volume_service.get_volume_usage(v.id).await {
+                Ok(used) => total_bytes_used = total_bytes_used.saturating_add(used),
+                Err(e) => {
+                    tracing::warn!(volume_id = %v.id, error = %e, "volume usage could not be read");
+                    usage_incomplete = true;
+                }
+            }
         }
 
         let usage = QuotaUsage {
@@ -490,7 +529,10 @@ impl UserVolumeService {
             }
         }
 
-        Ok(usage)
+        Ok(QuotaReading {
+            usage,
+            usage_incomplete,
+        })
     }
 }
 
@@ -503,6 +545,7 @@ mod tests {
     use super::*;
     use crate::application::volume_manager::VolumeService;
     use crate::domain::runtime::InstanceId;
+    use crate::domain::storage::StorageError;
     use crate::domain::volume::{AccessMode, VolumeMount};
     use crate::infrastructure::repositories::InMemoryVolumeRepository;
     use std::collections::HashMap;
@@ -514,6 +557,8 @@ mod tests {
         event_bus: Arc<EventBus>,
         /// Optional per-volume actual usage override (read-model regression coverage).
         usage_overrides: Mutex<HashMap<VolumeId, u64>>,
+        /// Volumes whose usage probe fails, as a filer error would.
+        usage_failures: Mutex<std::collections::HashSet<VolumeId>>,
     }
 
     impl MockVolumeService {
@@ -522,6 +567,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(volume_id, used_bytes);
+        }
+
+        fn fail_usage(&self, volume_id: VolumeId) {
+            self.usage_failures.lock().unwrap().insert(volume_id);
         }
     }
 
@@ -608,6 +657,9 @@ mod tests {
         }
 
         async fn get_volume_usage(&self, volume_id: VolumeId) -> anyhow::Result<u64> {
+            if self.usage_failures.lock().unwrap().contains(&volume_id) {
+                return Err(StorageError::UsageUnreadable("filer answered HTTP 500".into()).into());
+            }
             Ok(self
                 .usage_overrides
                 .lock()
@@ -660,6 +712,7 @@ mod tests {
             repo: repo.clone(),
             event_bus: event_bus.clone(),
             usage_overrides: Mutex::new(HashMap::new()),
+            usage_failures: Mutex::new(std::collections::HashSet::new()),
         });
         let svc = UserVolumeService::new(
             repo.clone() as Arc<dyn VolumeRepository>,
@@ -964,5 +1017,84 @@ mod tests {
             usage.total_bytes_used < usage.tier_limit.total_storage_bytes,
             "actual usage must be under the tier ceiling for this scenario"
         );
+    }
+
+    /// Two Available volumes for `owner`, the first with 2,525,169 bytes
+    /// read, the second's usage probe failing.
+    async fn one_volume_read_one_failing(
+        repo: &InMemoryVolumeRepository,
+        mock: &MockVolumeService,
+        tenant: &TenantId,
+        owner: &str,
+    ) -> (Volume, Volume) {
+        let mk = |name: &str| Volume {
+            id: VolumeId::new(),
+            name: name.to_string(),
+            tenant_id: tenant.clone(),
+            storage_class: StorageClass::persistent(),
+            backend: crate::domain::volume::VolumeBackend::SeaweedFS {
+                filer_endpoint: crate::domain::volume::FilerEndpoint::new("http://localhost:8888")
+                    .unwrap(),
+                remote_path: format!("/aegis/volumes/{name}"),
+            },
+            size_limit_bytes: 250 * 1024 * 1024,
+            status: VolumeStatus::Available,
+            ownership: VolumeOwnership::persistent(owner.to_string()),
+            created_at: Utc::now(),
+            attached_at: None,
+            detached_at: None,
+            expires_at: None,
+            host_node_id: None,
+        };
+        let read = mk("chat-attachments");
+        let failing = mk("git-aegis-examples");
+        repo.save(&read).await.unwrap();
+        repo.save(&failing).await.unwrap();
+        mock.set_usage(read.id, 2_525_169);
+        mock.fail_usage(failing.id);
+        (read, failing)
+    }
+
+    /// Regression (volume-usage-reads-zero): a volume whose usage probe
+    /// failed was listed with `used_bytes` 0. It is listed with no usage and
+    /// marked incomplete; the volume read beside it keeps its bytes.
+    #[tokio::test]
+    async fn list_marks_a_volume_whose_usage_could_not_be_read() {
+        let (svc, repo, mock) = make_svc_with_mock();
+        let tenant = TenantId::consumer();
+        let owner = "user-usage-unreadable";
+        let (read, failing) = one_volume_read_one_failing(&repo, &mock, &tenant, owner).await;
+
+        let listed = svc.list_volumes_with_usage(&tenant, owner).await.unwrap();
+
+        let of = |id: VolumeId| listed.iter().find(|v| v.volume.id == id).unwrap();
+        assert_eq!(of(read.id).used_bytes, Some(2_525_169));
+        assert!(!of(read.id).usage_incomplete());
+        assert_eq!(
+            of(failing.id).used_bytes,
+            None,
+            "a failed probe must not read as 0"
+        );
+        assert!(of(failing.id).usage_incomplete());
+    }
+
+    /// Regression (volume-usage-reads-zero): the quota summed a failed probe
+    /// as 0. It sums the volumes it could read and marks the reading
+    /// incomplete.
+    #[tokio::test]
+    async fn quota_reading_is_incomplete_when_a_volume_could_not_be_read() {
+        let (svc, repo, mock) = make_svc_with_mock();
+        let tenant = TenantId::consumer();
+        let owner = "user-quota-unreadable";
+        one_volume_read_one_failing(&repo, &mock, &tenant, owner).await;
+
+        let reading = svc
+            .get_quota_reading(&tenant, owner, &ZaruTier::Free)
+            .await
+            .unwrap();
+
+        assert!(reading.usage_incomplete);
+        assert_eq!(reading.usage.total_bytes_used, 2_525_169);
+        assert_eq!(reading.usage.volume_count, 2);
     }
 }
