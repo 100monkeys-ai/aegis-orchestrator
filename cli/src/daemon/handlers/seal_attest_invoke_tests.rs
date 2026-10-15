@@ -881,7 +881,13 @@ async fn a_missing_file_is_404_named_by_the_callers_path_not_the_backend_path() 
         .await;
     a.assert_shape(404, "NOT_FOUND", "error");
     assert!(a.message().contains("notes/missing.txt"), "{}", a.body);
-    a.assert_detail_only_in_log(&["Mk7-backend-volume"]);
+    // The file service's not-found carries the caller's path, not the
+    // backend's, so the backend's path is in neither the body nor the log.
+    assert!(
+        !a.body.to_string().contains("Mk7-backend-volume"),
+        "the body carried the backend's path: {}",
+        a.body
+    );
 }
 
 /// I5 and "another tenant's identifier": a volume of another tenant is not
@@ -1164,19 +1170,22 @@ async fn a_platform_state_failure_is_500_and_its_ids_are_only_in_the_log() {
 }
 
 /// I5: a storage failure the file service reports as `FileOperationsError::Fsal`
-/// is 500 and its text is only in the log.
+/// is 500 and its text is only in the log. A write under a path whose parent
+/// is a file fails in storage (a missing directory is now a not-found, no
+/// longer a storage failure).
 #[tokio::test]
 async fn a_storage_backend_failure_is_500_and_its_text_is_only_in_the_log() {
     let mut mcp = with_files().await;
     let volume = mcp.volume(&own_tenant(), SUB, BACKEND).await;
+    mcp.put_file(BACKEND, "notes.txt", "a file, not a directory");
     let a = mcp
         .refused(
-            "aegis.file.list",
-            json!({"volume_id": volume, "path": "no-such-directory"}),
+            "aegis.file.write",
+            json!({"volume_id": volume, "path": "notes.txt/child.txt", "content": "x"}),
         )
         .await;
     a.assert_shape(500, "INTERNAL_ERROR", "error");
-    a.assert_detail_only_in_log(&["readdir failed"]);
+    a.assert_detail_only_in_log(&["IO error"]);
 }
 
 // ============================================================================

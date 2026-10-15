@@ -77,6 +77,18 @@ pub enum FileOperationsError {
     FileTooLarge,
     #[error("not found: {0}")]
     NotFound(String),
+    /// The caller's path is a file where a directory was asked for: a file
+    /// listed as a directory. Carries the caller's path, never the routed one.
+    #[error("not a directory: {0}")]
+    NotADirectory(String),
+    /// The caller's path is a directory where a file was asked for: a
+    /// directory read or written as a file. Carries the caller's path, never
+    /// the routed one.
+    #[error("is a directory: {0}")]
+    IsDirectory(String),
+    /// A storage failure. Its text is the storage error's own and may name a
+    /// storage root, a routed path or a filer URL: it is for the server's log,
+    /// never an answer.
     #[error("fsal error: {0}")]
     Fsal(String),
     #[error("repository error: {0}")]
@@ -101,6 +113,23 @@ impl From<FsalError> for FileOperationsError {
 // ============================================================================
 // Service
 // ============================================================================
+
+/// What a call expected at the caller's path. It decides how a storage
+/// failure there is answered: from the kind of the entry storage holds, read
+/// by `stat`, never from the storage error's text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expected {
+    /// An existing directory: a listing.
+    Directory,
+    /// An existing file: a read.
+    File,
+    /// A file that may not exist yet: a write.
+    NewFile,
+    /// A directory that may not exist yet: a mkdir.
+    NewDirectory,
+    /// An existing entry of either kind: a delete, a move's source.
+    Existing,
+}
 
 pub struct FileOperationsService {
     fsal: Arc<AegisFSAL>,
@@ -144,6 +173,47 @@ impl FileOperationsService {
         Ok(routed_path(volume, &canonical_str))
     }
 
+    /// The answer for `error`, a storage failure at `routed`, the volume's
+    /// own path for the caller's `requested`. A missing path is
+    /// `NotFound(requested)`; a path of the wrong kind for what was
+    /// `expected` is `NotADirectory(requested)` or `IsDirectory(requested)`,
+    /// the kind read from storage's entry by `stat`; anything else is `Fsal`
+    /// with the storage error's text, for the server's log only. No answer
+    /// but `Fsal` carries a storage root, a routed path or a filer URL.
+    async fn storage_failure(
+        &self,
+        requested: &str,
+        routed: &str,
+        expected: Expected,
+        error: StorageError,
+    ) -> FileOperationsError {
+        let creates = matches!(expected, Expected::NewFile | Expected::NewDirectory);
+        match &error {
+            StorageError::FileNotFound(_) | StorageError::NotFound(_) if !creates => {
+                return FileOperationsError::NotFound(requested.to_string());
+            }
+            StorageError::IsDirectory(_) => {
+                return FileOperationsError::IsDirectory(requested.to_string());
+            }
+            _ => {}
+        }
+        match self.fsal.storage_provider().stat(routed).await {
+            Ok(attrs) => match (expected, attrs.file_type) {
+                (Expected::Directory | Expected::NewDirectory, FileType::File) => {
+                    FileOperationsError::NotADirectory(requested.to_string())
+                }
+                (Expected::File | Expected::NewFile, FileType::Directory) => {
+                    FileOperationsError::IsDirectory(requested.to_string())
+                }
+                _ => FileOperationsError::Fsal(error.to_string()),
+            },
+            Err(StorageError::FileNotFound(_) | StorageError::NotFound(_)) if !creates => {
+                FileOperationsError::NotFound(requested.to_string())
+            }
+            Err(_) => FileOperationsError::Fsal(error.to_string()),
+        }
+    }
+
     pub async fn list_directory(
         &self,
         volume_id: &VolumeId,
@@ -156,13 +226,32 @@ impl FileOperationsService {
             .authorize_for_user(tenant_id, owner, volume_id)
             .await?;
         let full_path = self.sanitize_and_resolve(path, &volume)?;
+        let storage = self.fsal.storage_provider();
 
-        let entries = self
-            .fsal
-            .storage_provider()
-            .readdir(&full_path)
-            .await
-            .map_err(|e| FileOperationsError::Fsal(e.to_string()))?;
+        // The entry's kind decides a listing of a file, before anything is
+        // listed: a provider's listing of a file fails in its own way (the
+        // SeaweedFS filer answers the file's content), or, for a file that
+        // is itself JSON, may decode as an empty listing.
+        match storage.stat(&full_path).await {
+            Ok(attrs) if attrs.file_type == FileType::File => {
+                return Err(FileOperationsError::NotADirectory(path.to_string()));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(self
+                    .storage_failure(path, &full_path, Expected::Directory, e)
+                    .await);
+            }
+        }
+
+        let entries = match storage.readdir(&full_path).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                return Err(self
+                    .storage_failure(path, &full_path, Expected::Directory, e)
+                    .await)
+            }
+        };
 
         let result = entries
             .into_iter()
@@ -189,32 +278,42 @@ impl FileOperationsService {
             .await?;
         let full_path = self.sanitize_and_resolve(path, &volume)?;
 
-        let handle = self
-            .fsal
-            .storage_provider()
-            .open_file(&full_path, OpenMode::ReadOnly)
-            .await
-            .map_err(|e| match e {
-                StorageError::FileNotFound(p) => FileOperationsError::NotFound(p),
-                StorageError::NotFound(p) => FileOperationsError::NotFound(p),
-                other => FileOperationsError::Fsal(other.to_string()),
-            })?;
+        let storage = self.fsal.storage_provider();
 
-        let attrs = self
-            .fsal
-            .storage_provider()
-            .stat(&full_path)
-            .await
-            .map_err(|e| FileOperationsError::Fsal(e.to_string()))?;
+        // The entry's kind decides a read of a directory, before it is
+        // opened: a provider may open a directory and read its listing as
+        // the file's content.
+        let attrs = match storage.stat(&full_path).await {
+            Ok(attrs) if attrs.file_type == FileType::Directory => {
+                return Err(FileOperationsError::IsDirectory(path.to_string()));
+            }
+            Ok(attrs) => attrs,
+            Err(e) => {
+                return Err(self
+                    .storage_failure(path, &full_path, Expected::File, e)
+                    .await)
+            }
+        };
 
-        let data = self
-            .fsal
-            .storage_provider()
-            .read_at(&handle, 0, attrs.size as usize)
-            .await
-            .map_err(|e| FileOperationsError::Fsal(e.to_string()))?;
+        let handle = match storage.open_file(&full_path, OpenMode::ReadOnly).await {
+            Ok(handle) => handle,
+            Err(e) => {
+                return Err(self
+                    .storage_failure(path, &full_path, Expected::File, e)
+                    .await)
+            }
+        };
 
-        let _ = self.fsal.storage_provider().close_file(&handle).await;
+        let read = storage.read_at(&handle, 0, attrs.size as usize).await;
+        let _ = storage.close_file(&handle).await;
+        let data = match read {
+            Ok(data) => data,
+            Err(e) => {
+                return Err(self
+                    .storage_failure(path, &full_path, Expected::File, e)
+                    .await)
+            }
+        };
 
         let content_type = guess_content_type(path);
         Ok(FileContent {
@@ -255,20 +354,23 @@ impl FileOperationsService {
             }
         }
 
-        let handle = self
-            .fsal
-            .storage_provider()
-            .create_file(&full_path, 0o644)
-            .await
-            .map_err(|e| FileOperationsError::Fsal(e.to_string()))?;
+        let storage = self.fsal.storage_provider();
+        let handle = match storage.create_file(&full_path, 0o644).await {
+            Ok(handle) => handle,
+            Err(e) => {
+                return Err(self
+                    .storage_failure(path, &full_path, Expected::NewFile, e)
+                    .await)
+            }
+        };
 
-        self.fsal
-            .storage_provider()
-            .write_at(&handle, 0, data)
-            .await
-            .map_err(|e| FileOperationsError::Fsal(e.to_string()))?;
-
-        let _ = self.fsal.storage_provider().close_file(&handle).await;
+        let written = storage.write_at(&handle, 0, data).await;
+        let _ = storage.close_file(&handle).await;
+        if let Err(e) = written {
+            return Err(self
+                .storage_failure(path, &full_path, Expected::NewFile, e)
+                .await);
+        }
 
         Ok(())
     }
@@ -307,21 +409,19 @@ impl FileOperationsService {
         let full_path = self.sanitize_and_resolve(path, &volume)?;
 
         // Try file first, then directory
-        let file_result = self.fsal.storage_provider().delete_file(&full_path).await;
-        if let Err(StorageError::FileNotFound(_)) | Err(StorageError::NotFound(_)) = &file_result {
-            self.fsal
-                .storage_provider()
-                .delete_directory(&full_path)
-                .await
-                .map_err(|e| match e {
-                    StorageError::NotFound(p) => FileOperationsError::NotFound(p),
-                    other => FileOperationsError::Fsal(other.to_string()),
-                })?;
-        } else {
-            file_result.map_err(|e| FileOperationsError::Fsal(e.to_string()))?;
+        let storage = self.fsal.storage_provider();
+        let deleted = match storage.delete_file(&full_path).await {
+            Err(StorageError::FileNotFound(_)) | Err(StorageError::NotFound(_)) => {
+                storage.delete_directory(&full_path).await
+            }
+            other => other,
+        };
+        match deleted {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self
+                .storage_failure(path, &full_path, Expected::Existing, e)
+                .await),
         }
-
-        Ok(())
     }
 
     pub async fn create_directory(
@@ -337,13 +437,17 @@ impl FileOperationsService {
             .await?;
         let full_path = self.sanitize_and_resolve(path, &volume)?;
 
-        self.fsal
+        match self
+            .fsal
             .storage_provider()
             .create_directory(&full_path)
             .await
-            .map_err(|e| FileOperationsError::Fsal(e.to_string()))?;
-
-        Ok(())
+        {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self
+                .storage_failure(path, &full_path, Expected::NewDirectory, e)
+                .await),
+        }
     }
 
     pub async fn move_path(
@@ -361,18 +465,17 @@ impl FileOperationsService {
         let from_full = self.sanitize_and_resolve(from, &volume)?;
         let to_full = self.sanitize_and_resolve(to, &volume)?;
 
-        self.fsal
+        match self
+            .fsal
             .storage_provider()
             .rename(&from_full, &to_full)
             .await
-            .map_err(|e| match e {
-                StorageError::FileNotFound(p) | StorageError::NotFound(p) => {
-                    FileOperationsError::NotFound(p)
-                }
-                other => FileOperationsError::Fsal(other.to_string()),
-            })?;
-
-        Ok(())
+        {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self
+                .storage_failure(from, &from_full, Expected::Existing, e)
+                .await),
+        }
     }
 
     pub async fn get_attributes(
@@ -388,17 +491,14 @@ impl FileOperationsService {
             .await?;
         let full_path = self.sanitize_and_resolve(path, &volume)?;
 
-        let attrs = self
-            .fsal
-            .storage_provider()
-            .stat(&full_path)
-            .await
-            .map_err(|e| match e {
-                StorageError::FileNotFound(p) | StorageError::NotFound(p) => {
-                    FileOperationsError::NotFound(p)
-                }
-                other => FileOperationsError::Fsal(other.to_string()),
-            })?;
+        let attrs = match self.fsal.storage_provider().stat(&full_path).await {
+            Ok(attrs) => attrs,
+            Err(e) => {
+                return Err(self
+                    .storage_failure(path, &full_path, Expected::Existing, e)
+                    .await)
+            }
+        };
 
         let name = std::path::Path::new(path)
             .file_name()

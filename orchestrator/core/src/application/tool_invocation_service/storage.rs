@@ -104,7 +104,9 @@ fn file_refusal(e: FileOperationsError, volume_id: &str, path: &str) -> SealSess
         FileOperationsError::FileTooLarge => {
             CallerAnswer::QuotaExceeded("The file is larger than your tier allows.".to_string())
         }
-        FileOperationsError::InvalidPath(_) => CallerAnswer::InvalidArguments(format!(
+        FileOperationsError::InvalidPath(_)
+        | FileOperationsError::NotADirectory(_)
+        | FileOperationsError::IsDirectory(_) => CallerAnswer::InvalidArguments(format!(
             "Invalid tool arguments: '{path}' is not a valid path in a volume."
         )),
         FileOperationsError::Fsal(_) | FileOperationsError::Repository(_) => {

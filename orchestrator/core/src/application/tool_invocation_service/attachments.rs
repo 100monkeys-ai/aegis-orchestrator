@@ -168,7 +168,11 @@ pub async fn invoke_aegis_attachment_read_tool(
                 "message": format!("volume {} not found", volume_id.0),
             })))
         }
-        Err(FileOperationsError::InvalidPath(msg)) => {
+        Err(
+            FileOperationsError::InvalidPath(msg)
+            | FileOperationsError::NotADirectory(msg)
+            | FileOperationsError::IsDirectory(msg),
+        ) => {
             warn!(%volume_id, path, %msg, "aegis.attachment.read: invalid path");
             Ok(ToolInvocationResult::Direct(json!({
                 "status": "error",

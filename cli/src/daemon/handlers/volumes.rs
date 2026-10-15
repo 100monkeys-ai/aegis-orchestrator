@@ -68,13 +68,39 @@ fn user_volume_error_response(e: UserVolumeError) -> (StatusCode, Json<serde_jso
     (status, Json(serde_json::json!({"error": message})))
 }
 
-fn file_ops_error_response(e: FileOperationsError) -> (StatusCode, Json<serde_json::Value>) {
+/// The answer of the volume file API to a storage failure: its cause is in
+/// the server's log, never the answer, which would name the storage.
+const FILE_OPERATION_FAILED: &str =
+    "[AEGIS] the file operation failed; the server logged the cause.";
+
+/// The answer of the volume file API (`route`, on `volume_id`) to `e`. A
+/// missing path is 404 and a path of the wrong kind 422, each with the
+/// caller's own path; a storage or repository failure is 500 with
+/// [`FILE_OPERATION_FAILED`] alone, its cause logged at error level.
+fn file_ops_error_response(
+    route: &'static str,
+    volume_id: &VolumeId,
+    e: FileOperationsError,
+) -> (StatusCode, Json<serde_json::Value>) {
     let (status, message) = match &e {
         FileOperationsError::NotFound(_) => (StatusCode::NOT_FOUND, e.to_string()),
+        FileOperationsError::NotADirectory(_)
+        | FileOperationsError::IsDirectory(_)
+        | FileOperationsError::InvalidPath(_)
+        | FileOperationsError::FileTooLarge => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
         FileOperationsError::Unauthorized => (StatusCode::FORBIDDEN, e.to_string()),
-        FileOperationsError::FileTooLarge => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
-        FileOperationsError::InvalidPath(_) => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        FileOperationsError::Fsal(_) | FileOperationsError::Repository(_) => {
+            tracing::error!(
+                route,
+                volume_id = %volume_id,
+                error = %e,
+                "volume file operation failed"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                FILE_OPERATION_FAILED.to_string(),
+            )
+        }
     };
     (status, Json(serde_json::json!({"error": message})))
 }
@@ -284,7 +310,7 @@ pub(crate) async fn list_files(
         .list_directory(&vol_id, &tenant_id, &owner, &params.path)
         .await
         .map(|entries| Json(serde_json::to_value(entries).unwrap_or(serde_json::json!([]))))
-        .map_err(file_ops_error_response)
+        .map_err(|e| file_ops_error_response("GET /v1/volumes/{id}/files", &vol_id, e))
 }
 
 /// GET /v1/volumes/:id/files/stat (ADR-113)
@@ -313,7 +339,7 @@ pub(crate) async fn stat_file(
         .stat_attachment_for_user(&vol_id, &tenant_id, &owner, &params.path)
         .await
         .map(|attrs| Json(serde_json::to_value(attrs).unwrap_or(serde_json::json!({}))))
-        .map_err(file_ops_error_response)
+        .map_err(|e| file_ops_error_response("GET /v1/volumes/{id}/files/stat", &vol_id, e))
 }
 
 /// GET /v1/volumes/:id/files/download
@@ -334,7 +360,7 @@ pub(crate) async fn download_file(
         .file_operations_service
         .read_file(&vol_id, &tenant_id, &owner, &params.path)
         .await
-        .map_err(file_ops_error_response)?;
+        .map_err(|e| file_ops_error_response("GET /v1/volumes/{id}/files/download", &vol_id, e))?;
 
     Ok((
         [(axum::http::header::CONTENT_TYPE, content.content_type)],
@@ -705,7 +731,7 @@ pub(crate) async fn upload_file(
             max_file_size,
         )
         .await
-        .map_err(file_ops_error_response)?;
+        .map_err(|e| file_ops_error_response("POST /v1/volumes/{id}/files/upload", &vol_id, e))?;
 
     // Validate any client-supplied filename (multipart `filename` field or
     // X-Filename header). If invalid, fall through to the path-derived name.
@@ -748,7 +774,7 @@ pub(crate) async fn delete_path(
         .delete_path(&vol_id, &tenant_id, &owner, &params.path)
         .await
         .map(|_| Json(serde_json::json!({"success": true})))
-        .map_err(file_ops_error_response)
+        .map_err(|e| file_ops_error_response("DELETE /v1/volumes/{id}/files", &vol_id, e))
 }
 
 /// POST /v1/volumes/:id/files/mkdir
@@ -770,7 +796,7 @@ pub(crate) async fn mkdir(
         .create_directory(&vol_id, &tenant_id, &owner, &params.path)
         .await
         .map(|_| Json(serde_json::json!({"success": true})))
-        .map_err(file_ops_error_response)
+        .map_err(|e| file_ops_error_response("POST /v1/volumes/{id}/files/mkdir", &vol_id, e))
 }
 
 /// POST /v1/volumes/:id/files/move
@@ -792,7 +818,7 @@ pub(crate) async fn move_path(
         .move_path(&vol_id, &tenant_id, &owner, &body.from, &body.to)
         .await
         .map(|_| Json(serde_json::json!({"success": true})))
-        .map_err(file_ops_error_response)
+        .map_err(|e| file_ops_error_response("POST /v1/volumes/{id}/files/move", &vol_id, e))
 }
 
 #[cfg(test)]
@@ -1275,6 +1301,77 @@ mod tests {
                 chat_attachments_volume_size_for_tier(&tier).is_some(),
                 "tier {tier:?} must have a chat-attachments allocation"
             );
+        }
+    }
+
+    /// Regression (volume-files-listing-500-discloses-internal-path-2026-10-15):
+    /// a storage failure was answered 500 with the storage error's own text,
+    /// which named the volume's internal path and the filer's URL. A missing
+    /// path answers 404 and a path of the wrong kind 422, each with the
+    /// caller's path only; every other failure answers 500 with one fixed
+    /// sentence, the cause going to the server's log.
+    #[test]
+    fn file_ops_errors_answer_the_callers_path_or_one_fixed_sentence() {
+        let volume_id = VolumeId(Uuid::nil());
+        let answer = |e: FileOperationsError| {
+            let (status, Json(body)) =
+                file_ops_error_response("GET /v1/volumes/{id}/files", &volume_id, e);
+            (status, body)
+        };
+
+        assert_eq!(
+            answer(FileOperationsError::NotFound("/undefined".to_string())),
+            (
+                StatusCode::NOT_FOUND,
+                serde_json::json!({"error": "not found: /undefined"})
+            ),
+            "a missing path is not 404 with the caller's path"
+        );
+        assert_eq!(
+            answer(FileOperationsError::NotADirectory(
+                "/repo/README.md".to_string()
+            )),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                serde_json::json!({"error": "not a directory: /repo/README.md"})
+            ),
+            "a file listed as a directory is not 422 with the caller's path"
+        );
+        assert_eq!(
+            answer(FileOperationsError::IsDirectory("/repo".to_string())),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                serde_json::json!({"error": "is a directory: /repo"})
+            ),
+            "a directory read as a file is not 422 with the caller's path"
+        );
+
+        let sentence = "[AEGIS] the file operation failed; the server logged the cause.";
+        for failure in [
+            FileOperationsError::Fsal(
+                "Serialization error: error decoding response body for url \
+                 (http://aegis-storage:8888/aegis/volumes/u-d7f8/12ee6d32/repo/README.md)"
+                    .to_string(),
+            ),
+            FileOperationsError::Fsal(
+                "Directory not found: /aegis/volumes/u-d7f8/12ee6d32/undefined".to_string(),
+            ),
+            FileOperationsError::Repository("connection refused".to_string()),
+        ] {
+            let shown = failure.to_string();
+            let (status, body) = answer(failure);
+            assert_eq!(
+                (status, &body),
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &serde_json::json!({"error": sentence})
+                ),
+                "the failure {shown} is not answered 500 with the fixed sentence"
+            );
+            let text = body.to_string();
+            for leak in ["http://", "/aegis/", "aegis-storage"] {
+                assert!(!text.contains(leak), "the 500 body names {leak}: {text}");
+            }
         }
     }
 }

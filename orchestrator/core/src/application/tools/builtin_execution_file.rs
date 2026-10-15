@@ -215,7 +215,11 @@ pub async fn invoke_execution_file_tool(
                 "message": message,
             })))
         }
-        Err(FileOperationsError::InvalidPath(msg)) => {
+        Err(
+            FileOperationsError::InvalidPath(msg)
+            | FileOperationsError::NotADirectory(msg)
+            | FileOperationsError::IsDirectory(msg),
+        ) => {
             warn!(execution_id = ?execution_id, volume_id = ?volume_id, path, %msg, "aegis.execution.file: invalid path");
             Ok(ToolInvocationResult::Direct(json!({
                 "status": "error",
