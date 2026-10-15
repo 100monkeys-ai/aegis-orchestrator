@@ -650,11 +650,12 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 execution_id, sequence_number, event_type, event_payload,
                 iteration_number, created_at
             FROM execution_events
-            WHERE execution_id = ANY($1)
+            WHERE execution_id = ANY($1) AND sequence_number < $2
             ORDER BY execution_id, sequence_number DESC
             "#,
         )
         .bind(&ids)
+        .bind(crate::domain::repository::LOCAL_SEQUENCE_START)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| {

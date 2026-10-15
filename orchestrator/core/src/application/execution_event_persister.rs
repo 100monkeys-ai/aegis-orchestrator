@@ -37,18 +37,13 @@
 
 use crate::domain::events::ExecutionEvent;
 use crate::domain::execution::ExecutionId;
-use crate::domain::repository::WorkflowExecutionRepository;
+use crate::domain::repository::{WorkflowExecutionRepository, LOCAL_SEQUENCE_START};
 use crate::infrastructure::event_bus::{DomainEvent, EventBus, EventBusError};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
-
-/// Sequence numbers for in-process events start far above any plausible
-/// Temporal history index so the two writers never collide on the
-/// `(execution_id, sequence_number)` UNIQUE constraint.
-const LOCAL_SEQUENCE_START: i64 = 1_000_000_000_000;
 
 // ============================================================================
 // Service

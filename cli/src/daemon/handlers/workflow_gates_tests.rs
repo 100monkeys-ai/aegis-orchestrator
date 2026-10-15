@@ -1041,6 +1041,258 @@ async fn limit_and_offset_page_the_answered_gates() {
     );
 }
 
+/// The person whose runs carry a repository row the orchestrator stored
+/// itself.
+const REPOSITORY_OWNER: &str = "repository-owner-sub";
+
+/// The first sequence number an orchestrator process gives the rows it
+/// stores itself, written out so the test pins the value the store bounds
+/// on.
+const LOCAL_ROW_SEQUENCE: i64 = 1_000_000_000_000;
+
+/// What the repository-row world holds, by run.
+struct RepositoryRowWorld {
+    base: String,
+    waiting: ExecutionId,
+    answered: ExecutionId,
+}
+
+/// A run's `repository_prepared` row as the persister stores it: the
+/// orchestrator's own event, at a local sequence above every worker event.
+fn repository_row(execution: ExecutionId) -> Value {
+    use aegis_orchestrator_core::domain::agent::AgentId;
+    use aegis_orchestrator_core::domain::events::ExecutionEvent;
+    use aegis_orchestrator_core::domain::git_repo::TreeReset;
+    serde_json::to_value(ExecutionEvent::RepositoryPrepared {
+        execution_id: execution,
+        agent_id: AgentId::new(),
+        label: "aegis-examples".to_string(),
+        branch: format!("aegis/{}", &execution.0.to_string()[..8]),
+        started_from: "2c665dff0123456789abcdef0123456789abcdef".to_string(),
+        created: true,
+        tree_reset: TreeReset::Hard,
+        removed: vec!["test/".to_string()],
+        removed_count: None,
+        tests: Some(Vec::new()),
+        prepared_at: chrono::Utc::now(),
+    })
+    .unwrap()
+}
+
+/// Two runs of one person, each with its repository row stored at the
+/// first local sequence: one waits at its requirements gate, posted after
+/// the row; the other's gate was answered after the row and the run went
+/// on.
+async fn repository_row_world(
+    executions: Arc<dyn WorkflowExecutionRepository>,
+    workflows: Arc<dyn WorkflowRepository>,
+) -> RepositoryRowWorld {
+    let tenant = TenantId::for_consumer_user(REPOSITORY_OWNER).unwrap();
+    let workflow = forge();
+    workflows.save_for_tenant(&tenant, &workflow).await.unwrap();
+    let gate = json!({
+        "state_name": "AWAIT_REQUIREMENTS_APPROVAL",
+        "prompt": "Approve the requirements?",
+        "responses": ["yes", "no"],
+        "expires_at": "2026-10-15T12:13:46.000Z",
+    });
+    let entered = json!({ "state_name": "AWAIT_REQUIREMENTS_APPROVAL" });
+    let waiting_events: Vec<(i64, &str, &str, Value)> = vec![
+        (
+            1,
+            "WorkflowExecutionStarted",
+            "2026-10-15T11:12:00.000Z",
+            json!({}),
+        ),
+        (
+            2,
+            "WorkflowStateEntered",
+            "2026-10-15T11:13:40.000Z",
+            entered.clone(),
+        ),
+        (
+            3,
+            "HumanInputRequested",
+            "2026-10-15T11:13:46.000Z",
+            gate.clone(),
+        ),
+    ];
+    let mut answered_events = waiting_events.clone();
+    answered_events.extend([
+        (
+            4,
+            "WorkflowStateExited",
+            "2026-10-15T11:20:00.000Z",
+            json!({
+                "state_name": "AWAIT_REQUIREMENTS_APPROVAL",
+                "output": {
+                    "response": "yes",
+                    "timeout": false,
+                    "answered_by": REPOSITORY_OWNER,
+                },
+            }),
+        ),
+        (
+            5,
+            "WorkflowStateEntered",
+            "2026-10-15T11:20:01.000Z",
+            json!({ "state_name": "ARCHITECT" }),
+        ),
+    ]);
+
+    let mut ids = Vec::new();
+    for events in [waiting_events, answered_events] {
+        let id = ExecutionId::new();
+        let mut execution = WorkflowExecution::new(&workflow, id, json!({}));
+        execution.tenant_id = tenant.clone();
+        execution.status = ExecutionStatus::Running;
+        execution.initiating_user_sub = Some(REPOSITORY_OWNER.to_string());
+        executions
+            .save_for_tenant(&tenant, &execution)
+            .await
+            .unwrap();
+        // The repository row is stored before the gate is posted, as the
+        // run prepares its repository first; its sequence is the
+        // orchestrator's, above every worker event.
+        executions
+            .append_event(
+                id,
+                LOCAL_ROW_SEQUENCE,
+                "repository_prepared".to_string(),
+                repository_row(id),
+                None,
+            )
+            .await
+            .unwrap();
+        for (sequence, event_type, at, extra) in events {
+            executions
+                .append_event(
+                    id,
+                    sequence,
+                    event_type.to_string(),
+                    persisted(id, &workflow, sequence, event_type, at, extra),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        ids.push(id);
+    }
+
+    let iam = identity_provider(&[("repository-owner", consumer(REPOSITORY_OWNER), READ)]);
+    let base = serve(
+        workflow_gates_router(WorkflowGatesState {
+            executions,
+            workflows,
+        }),
+        Some(iam),
+        None,
+    )
+    .await;
+    RepositoryRowWorld {
+        base,
+        waiting: ids[0],
+        answered: ids[1],
+    }
+}
+
+async fn in_memory_repository_row_world() -> RepositoryRowWorld {
+    repository_row_world(
+        Arc::new(TrailRepository {
+            executions: InMemoryWorkflowExecutionRepository::new(),
+            events: Mutex::new(HashMap::new()),
+        }),
+        Arc::new(InMemoryWorkflowRepository::new()),
+    )
+    .await
+}
+
+/// The repository-row world's gates for a query string.
+async fn repository_row_listing(world: &RepositoryRowWorld, query: &str) -> Vec<Value> {
+    let (status, answer) = send(
+        &world.base,
+        &Method::GET,
+        &format!("/v1/workflow-gates?{query}"),
+        &None,
+        Some("repository-owner"),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the gates ({query}) were not answered: {answer}"
+    );
+    answer["gates"].as_array().cloned().unwrap_or_default()
+}
+
+/// The waiting run's pending gate, as the route lists it.
+fn repository_row_pending_view(world: &RepositoryRowWorld) -> Value {
+    json!({
+        "execution_id": world.waiting.to_string(),
+        "workflow_name": "the-forge",
+        "state_name": "AWAIT_REQUIREMENTS_APPROVAL",
+        "prompt": "Approve the requirements?",
+        "responses": ["yes", "no"],
+        "default_response": null,
+        "expires_at": "2026-10-15T12:13:46+00:00",
+        "sequence": 3,
+        "requested_at": "2026-10-15T11:13:46+00:00",
+    })
+}
+
+/// The answered run's gate, as `status=answered` lists it.
+fn repository_row_answered_view(world: &RepositoryRowWorld) -> Value {
+    json!({
+        "execution_id": world.answered.to_string(),
+        "workflow_name": "the-forge",
+        "state_name": "AWAIT_REQUIREMENTS_APPROVAL",
+        "prompt": "Approve the requirements?",
+        "responses": ["yes", "no"],
+        "response": "yes",
+        "feedback": null,
+        "answered_at": "2026-10-15T11:20:00+00:00",
+        "answered_by": REPOSITORY_OWNER,
+        "sequence": 3,
+        "requested_at": "2026-10-15T11:13:46+00:00",
+        "outcome": "went_on",
+    })
+}
+
+/// AEGIS ADR-141's Update of 2026-10-15 (anchor
+/// `pending-gate-survives-local-events-2026-10-15`), clause 1: on run
+/// `527d11df` the requirements gate was posted after the run's
+/// `repository_prepared` row, stored at the first local sequence (10^12),
+/// and the pending list answered `{"count":0}`. The gate is the worker's
+/// latest event, and the row the orchestrator stored itself does not hide
+/// it.
+#[tokio::test]
+async fn a_gate_posted_after_a_repository_row_is_listed_as_pending() {
+    let world = in_memory_repository_row_world().await;
+    let pending = repository_row_listing(&world, "status=pending").await;
+    assert_eq!(
+        pending,
+        vec![repository_row_pending_view(&world)],
+        "the gate posted after the run's repository row is not listed as pending"
+    );
+}
+
+/// The same Update, clause 2: a gate answered after the run's repository
+/// row is listed as answered, and not as pending.
+#[tokio::test]
+async fn a_gate_answered_after_a_repository_row_is_listed_as_answered_not_pending() {
+    let world = in_memory_repository_row_world().await;
+    let pending = repository_row_listing(&world, "status=pending").await;
+    assert!(
+        gate_of(&pending, world.answered).is_none(),
+        "the gate answered after the run's repository row is listed as pending: {pending:?}"
+    );
+    let answered = repository_row_listing(&world, "status=answered").await;
+    assert_eq!(
+        answered,
+        vec![repository_row_answered_view(&world)],
+        "the gate answered after the run's repository row is not listed as answered"
+    );
+}
+
 /// The same world on the real PostgreSQL repositories, every migration
 /// applied: the Postgres query lists exactly what the default does. Runs
 /// when `AEGIS_TEST_POSTGRES_URL` names a server; CI sets it, and there a
@@ -1083,6 +1335,7 @@ async fn the_postgres_repository_lists_the_same_gates() {
         TenantId::for_consumer_user(OWNER).unwrap(),
         TenantId::for_consumer_user(OTHER).unwrap(),
         TenantId::from_realm_slug(TEAM).unwrap(),
+        TenantId::for_consumer_user(REPOSITORY_OWNER).unwrap(),
     ] {
         sqlx::query(
             "INSERT INTO tenants (slug, display_name, keycloak_realm, openbao_namespace) \
@@ -1114,6 +1367,16 @@ async fn the_postgres_repository_lists_the_same_gates() {
         gate_of(&answered, world.answered_no).map(|gate| gate["answered_by"].clone()),
         ids(&listing(&world, "other", "status=answered").await),
         ids(&listing(&world, "owner", "status=any").await),
+    );
+
+    let rows = repository_row_world(
+        Arc::new(PostgresWorkflowExecutionRepository::new(pool.clone())),
+        Arc::new(PostgresWorkflowRepository::new_with_pool(pool.clone())),
+    )
+    .await;
+    let repository_rows = (
+        repository_row_listing(&rows, "status=pending").await,
+        repository_row_listing(&rows, "status=answered").await,
     );
 
     pool.close().await;
@@ -1163,5 +1426,13 @@ async fn the_postgres_repository_lists_the_same_gates() {
             ],
         ),
         "the Postgres repository's answered gates differ from the trail's"
+    );
+    assert_eq!(
+        repository_rows,
+        (
+            vec![repository_row_pending_view(&rows)],
+            vec![repository_row_answered_view(&rows)],
+        ),
+        "the Postgres repository lets a run's repository row hide or reopen its gate"
     );
 }

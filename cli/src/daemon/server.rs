@@ -4683,9 +4683,7 @@ models:
         use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
         use std::sync::Arc;
 
-        /// The first sequence number an orchestrator process gives its own
-        /// events of an execution (`execution_event_persister.rs`).
-        const LOCAL_SEQUENCE_START: i64 = 1_000_000_000_000;
+        use aegis_orchestrator_core::domain::repository::LOCAL_SEQUENCE_START;
 
         fn postgres_url() -> Option<String> {
             match std::env::var("AEGIS_TEST_POSTGRES_URL") {

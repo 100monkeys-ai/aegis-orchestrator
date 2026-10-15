@@ -15,6 +15,12 @@
 //! gate posted again after a refused word is listed with the latest post. A
 //! run that went on past its gate, or ended, is not listed.
 //!
+//! A run's workflow events are the worker's, the rows below
+//! `LOCAL_SEQUENCE_START`. The rows the orchestrator stores itself in the
+//! same trail (a workflow agent state's repository rows), from
+//! `LOCAL_SEQUENCE_START` on, stay in the run's history and its logs route
+//! and neither open, hide nor close a gate.
+//!
 //! `status=answered` lists the gates of the caller's runs, running or ended,
 //! that closed: the worker leaves a Human state with `WorkflowStateExited`,
 //! whose `output` carries the person's `response`, their optional
@@ -52,7 +58,7 @@ use aegis_orchestrator_core::domain::events::WorkflowEvent;
 use aegis_orchestrator_core::domain::execution::ExecutionStatus;
 use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity};
 use aegis_orchestrator_core::domain::repository::{
-    WorkflowExecutionRepository, WorkflowRepository,
+    WorkflowExecutionRepository, WorkflowRepository, LOCAL_SEQUENCE_START,
 };
 use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::domain::workflow::{
@@ -218,14 +224,21 @@ fn posted_gate(
     })
 }
 
-/// The gate a run waits on: `None` unless the run's latest event is the
-/// worker's `HumanInputRequested`.
+/// Whether a stored row is the worker's: below `LOCAL_SEQUENCE_START`,
+/// where the orchestrator's own rows start.
+fn is_workers(record: &WorkflowExecutionEventRecord) -> bool {
+    record.sequence < LOCAL_SEQUENCE_START
+}
+
+/// The gate a run waits on: `None` unless `latest`, the worker's latest
+/// event of the run, is its `HumanInputRequested`. The store answers the
+/// worker's latest event, passing over the orchestrator's own rows.
 fn pending_gate(
     execution: &WorkflowExecution,
     latest: Option<WorkflowExecutionEventRecord>,
     workflow_name: Option<String>,
 ) -> Option<ListedGate> {
-    let latest = latest.filter(|event| event.event_type == GATE_EVENT_TYPE)?;
+    let latest = latest.filter(|event| is_workers(event) && event.event_type == GATE_EVENT_TYPE)?;
     let gate = posted_gate(execution, &latest)?;
     // Until the worker names the gate's state, the run's current state is
     // it: the listener moves `current_state` on every state entered, and the
@@ -295,16 +308,18 @@ fn run_has_ended(execution: &WorkflowExecution) -> bool {
     )
 }
 
-/// The gates of one run that closed, read from its gate trail in sequence
-/// order.
+/// The gates of one run that closed, read from the worker's events of its
+/// gate trail in sequence order.
 fn answered_gates(
     execution: &WorkflowExecution,
     trail: &[WorkflowExecutionEventRecord],
     workflow_name: &Option<String>,
 ) -> Vec<ListedGate> {
+    let trail: Vec<&WorkflowExecutionEventRecord> =
+        trail.iter().filter(|record| is_workers(record)).collect();
     let mut listed = Vec::new();
     let mut open: Option<PostedGate> = None;
-    for (index, record) in trail.iter().enumerate() {
+    for (index, &record) in trail.iter().enumerate() {
         let event_type = record.event_type.as_str();
         if event_type == GATE_EVENT_TYPE {
             // A post again after a refused word replaces the earlier one.
@@ -468,7 +483,7 @@ pub(crate) async fn list_workflow_gates_handler(
             }
             if !latest
                 .as_ref()
-                .is_some_and(|event| event.event_type == GATE_EVENT_TYPE)
+                .is_some_and(|event| is_workers(event) && event.event_type == GATE_EVENT_TYPE)
             {
                 continue;
             }

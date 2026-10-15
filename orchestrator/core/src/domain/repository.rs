@@ -491,11 +491,14 @@ pub trait WorkflowExecutionRepository: Send + Sync {
         id: ExecutionId,
     ) -> Result<Option<TenantId>, RepositoryError>;
 
-    /// The tenant's running workflow executions, each with the latest event
-    /// of its audit trail (the highest sequence number), or `None` before its
-    /// first. A workflow execution's trail holds the Temporal listener's
-    /// workflow events only, so the latest event is its latest workflow
-    /// event. Read-only.
+    /// The tenant's running workflow executions, each with the worker's
+    /// latest event of its audit trail (the highest sequence number below
+    /// [`LOCAL_SEQUENCE_START`]), or `None` before its first. A workflow
+    /// execution's trail also holds rows the orchestrator stores itself (a
+    /// workflow agent state's repository rows), from
+    /// [`LOCAL_SEQUENCE_START`] on, above every Temporal history sequence;
+    /// they are not the worker's and are passed over, so a gate posted after
+    /// one is still the run's latest workflow event. Read-only.
     ///
     /// The default implementation reads each running execution's trail page
     /// by page; the Postgres repository answers in two queries.
@@ -520,6 +523,9 @@ pub trait WorkflowExecutionRepository: Send + Sync {
                     .await?;
                 let read = page.len();
                 for event in page {
+                    if event.sequence >= LOCAL_SEQUENCE_START {
+                        continue;
+                    }
                     if latest
                         .as_ref()
                         .is_none_or(|held| event.sequence > held.sequence)
@@ -656,6 +662,13 @@ pub const GATE_TRAIL_EVENT_TYPES: [&str; 7] = [
     "WorkflowExecutionFailed",
     "WorkflowExecutionCancelled",
 ];
+
+/// The first sequence number an orchestrator process gives the events it
+/// stores itself in an execution's audit trail (`ExecutionEventPersister`),
+/// far above any Temporal history index, so the Temporal listener and the
+/// persister write into the same `(execution_id, sequence_number)` space
+/// without colliding. A workflow execution's row below it is the worker's.
+pub const LOCAL_SEQUENCE_START: i64 = 1_000_000_000_000;
 
 /// Repository interface for Volume aggregates
 /// One repository per aggregate root (Infrastructure & Hosting Context)
