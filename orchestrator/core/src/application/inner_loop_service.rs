@@ -1157,6 +1157,7 @@ impl InnerLoopService {
                 })
                 .collect();
 
+            let call_started = std::time::Instant::now();
             let llm_output = match self
                 .call_llm(
                     &ctx.model_alias,
@@ -1167,6 +1168,7 @@ impl InnerLoopService {
                     &ctx.tenant_id,
                     ctx.llm_timeout_seconds,
                     ctx.deadline,
+                    ctx.command_margin_secs,
                 )
                 .await
             {
@@ -1179,6 +1181,9 @@ impl InnerLoopService {
                     // exhausted by it, and the supervisor does not count it
                     // (AEGIS ADR-141, Update of 2026-10-15
                     // `upstream-rate-limit-spends-no-try`, clause 2).
+                    // The failure the agent's bootstrap and so the task log
+                    // read names the try ended upstream and not counted
+                    // (amendment `upstream-rate-limit-spends-no-try-amend-bound-2026-10-15`).
                     if ends_on_an_upstream_refusal(&e) {
                         self.persist_trajectory(execution_id_str, &ctx).await;
                         self.record_exhausted(
@@ -1187,6 +1192,11 @@ impl InnerLoopService {
                             ExhaustedBy::Upstream,
                         )
                         .await;
+                        return Err(ended_the_try_upstream(
+                            e,
+                            &ctx.model_alias,
+                            call_started.elapsed(),
+                        ));
                     }
                     return Err(e);
                 }
@@ -2211,6 +2221,9 @@ impl InnerLoopService {
         tenant_id: &TenantId,
         llm_timeout_seconds: u64,
         deadline: Option<chrono::DateTime<chrono::Utc>>,
+        // Kept after a command for its result (`command_margin_secs`): a
+        // provider's rate limit is retried to the try's time left less it.
+        command_margin_secs: u64,
     ) -> anyhow::Result<LlmOutput> {
         let first_user = conversation.iter().position(|m| m.role == "user");
         let chat_messages: Vec<ChatMessage> = conversation
@@ -2366,6 +2379,7 @@ impl InnerLoopService {
             &options,
             llm_timeout_seconds,
             try_time_left(deadline, chrono::Utc::now()),
+            command_margin_secs,
         )
         .await;
 
@@ -2509,6 +2523,26 @@ fn ends_on_an_upstream_refusal(e: &anyhow::Error) -> bool {
     )
 }
 
+/// A failed model call that ended its try upstream, as the gateway answers
+/// it: the same error, whose sentence names the alias, the time spent
+/// retrying and that the try is not counted.
+fn ended_the_try_upstream(
+    e: anyhow::Error,
+    alias: &str,
+    retried: std::time::Duration,
+) -> anyhow::Error {
+    use crate::domain::llm::LLMError;
+    use crate::infrastructure::llm::registry::ModelCallFailure;
+    let failure = match e.downcast::<ModelCallFailure>() {
+        Ok(failure) => failure,
+        Err(e) => match e.downcast::<LLMError>() {
+            Ok(error) => ModelCallFailure::unreported(error),
+            Err(e) => return e,
+        },
+    };
+    anyhow::Error::new(failure.ending_the_try_upstream(alias, retried))
+}
+
 /// The time left to the try's deadline, for an alias's fallback (AEGIS
 /// ADR-130, Update of 2026-10-05, D2a). No command margin is subtracted: the
 /// margin is kept so that a model call can follow a command, and the fallback
@@ -2528,6 +2562,7 @@ fn try_time_left(
 /// answered by then is ended with an error naming the field and the seconds;
 /// on an alias that names a fallback, the fallback is then tried once where
 /// `try_left` holds its bound (AEGIS ADR-130, Update of 2026-10-05, D2a).
+#[allow(clippy::too_many_arguments)]
 async fn generate_within_llm_timeout(
     registry: &ProviderRegistry,
     model_alias: &str,
@@ -2536,6 +2571,7 @@ async fn generate_within_llm_timeout(
     options: &GenerationOptions,
     llm_timeout_seconds: u64,
     try_left: Option<std::time::Duration>,
+    command_margin_secs: u64,
 ) -> Result<crate::domain::llm::ChatResponse, crate::infrastructure::llm::registry::ModelCallFailure>
 {
     registry
@@ -2546,6 +2582,7 @@ async fn generate_within_llm_timeout(
             options,
             std::time::Duration::from_secs(llm_timeout_seconds),
             try_left,
+            std::time::Duration::from_secs(command_margin_secs),
         )
         .await
 }
@@ -3062,6 +3099,7 @@ mod tests {
             &GenerationOptions::default(),
             120,
             None,
+            0,
         )
         .await;
         let waited = started.elapsed();
@@ -3093,6 +3131,7 @@ mod tests {
             &GenerationOptions::default(),
             120,
             None,
+            0,
         )
         .await;
         assert!(result.is_ok(), "{result:?}");

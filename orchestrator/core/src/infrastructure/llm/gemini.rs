@@ -381,8 +381,13 @@ impl LLMProvider for GeminiAdapter {
                 LLMError::RateLimit(retry_after)
             } else if status == 404 {
                 LLMError::ModelNotFound(self.model.clone())
-            } else if status == 503 {
-                LLMError::ServiceUnavailable(error_text)
+            } else if status.is_server_error() {
+                // A provider's 5xx other than its time limit (500, 502, 503,
+                // 504; Workers AI's 500 with code 4009 among them) is its
+                // unavailability of the moment: retried inside the try, and a
+                // try it still ends is not counted. `Provider` stays for an
+                // answer the adapter cannot read.
+                LLMError::ServiceUnavailable(format!("HTTP {status}: {error_text}"))
             } else if status == 400 {
                 // A 400 is the provider refusing this request as sent (a prompt
                 // over the model's context window, among others): no retry can

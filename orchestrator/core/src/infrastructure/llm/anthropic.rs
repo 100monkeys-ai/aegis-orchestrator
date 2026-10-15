@@ -128,8 +128,12 @@ impl AnthropicAdapter {
             } else {
                 LLMError::Provider(format!("HTTP {status}: {error_text}"))
             }
-        } else if status == StatusCode::SERVICE_UNAVAILABLE {
-            LLMError::ServiceUnavailable(error_text.to_string())
+        } else if status.is_server_error() {
+            // A provider's 5xx (500, 502, 503, 504, and Anthropic's 529
+            // "overloaded") is its unavailability of the moment: retried
+            // inside the try, and a try it still ends is not counted.
+            // `Provider` stays for an answer the adapter cannot read.
+            LLMError::ServiceUnavailable(format!("HTTP {status}: {error_text}"))
         } else if status == StatusCode::BAD_REQUEST {
             // A 400 is the provider refusing this request as sent (a prompt
             // over the model's context window, among others): no retry can

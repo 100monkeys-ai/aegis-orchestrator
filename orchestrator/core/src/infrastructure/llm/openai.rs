@@ -505,8 +505,13 @@ impl LLMProvider for OpenAIAdapter {
                 LLMError::RateLimit(retry_after)
             } else if status == 404 {
                 LLMError::ModelNotFound(self.model.clone())
-            } else if status == 503 {
-                LLMError::ServiceUnavailable(error_text)
+            } else if status.is_server_error() {
+                // A provider's 5xx other than its time limit (500, 502, 503,
+                // 504; Workers AI's 500 with code 4009 among them) is its
+                // unavailability of the moment: retried inside the try, and a
+                // try it still ends is not counted. `Provider` stays for an
+                // answer the adapter cannot read.
+                LLMError::ServiceUnavailable(format!("HTTP {status}: {error_text}"))
             } else if status == 400 {
                 // A 400 is the provider refusing this request as sent (a prompt
                 // over the model's context window, among others): no retry can
@@ -1100,6 +1105,44 @@ mod tests {
                 assert_eq!(after, std::time::Duration::from_secs(7))
             }
             other => panic!("a 429 with Retry-After: 7 must carry 7 s, got {other:?}"),
+        }
+    }
+
+    /// Workers AI's HTTP 500 with code 4009 ("An internal server error
+    /// occured"), and a provider's 502 or 504, is the provider's
+    /// unavailability of the moment, not an answer the adapter cannot read:
+    /// `ServiceUnavailable` carrying the status and the body, which the
+    /// registry retries inside the try (AEGIS ADR-141, Update of 2026-10-15
+    /// `upstream-rate-limit-spends-no-try`, amendment
+    /// `upstream-rate-limit-spends-no-try-amend-provider-5xx-2026-10-15`;
+    /// Forge proof 20, run `5c024c91`, whose CODE tries died on it).
+    #[tokio::test]
+    async fn a_workers_ai_internal_error_is_an_upstream_unavailability() {
+        const WORKERS_AI_4009_BODY: &str = r#"{"errors":[{"message":"AiError: AiError: An internal server error occured. (x)","code":4009}],"success":false,"result":{},"messages":[]}"#;
+        for (status, body) in [
+            (500, WORKERS_AI_4009_BODY),
+            (502, "Bad Gateway"),
+            (504, "Gateway Timeout"),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let _mock = server
+                .mock("POST", "/chat/completions")
+                .with_status(status)
+                .with_body(body)
+                .create_async()
+                .await;
+
+            let res = adapter_at(server.url())
+                .generate_chat(&[message("user", "hello")], &[], &no_options())
+                .await;
+
+            match res {
+                Err(LLMError::ServiceUnavailable(text)) => assert!(
+                    text.contains(&status.to_string()) && text.contains(body),
+                    "the unavailability carries the status and the body, got {text}"
+                ),
+                other => panic!("an HTTP {status} must be ServiceUnavailable, got {other:?}"),
+            }
         }
     }
 

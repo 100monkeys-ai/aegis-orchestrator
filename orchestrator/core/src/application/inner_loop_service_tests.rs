@@ -2962,3 +2962,108 @@ async fn a_try_a_rate_limit_ends_is_recorded_exhausted_by_upstream() {
     }
     assert!(complaints.is_empty(), "{}", complaints.join("\n"));
 }
+
+/// The same model error again, for a scripted model's every turn.
+fn the_same_error(e: &LLMError) -> LLMError {
+    match e {
+        LLMError::Network(s) => LLMError::Network(s.clone()),
+        LLMError::Authentication(s) => LLMError::Authentication(s.clone()),
+        LLMError::RateLimit(d) => LLMError::RateLimit(*d),
+        LLMError::ModelNotFound(s) => LLMError::ModelNotFound(s.clone()),
+        LLMError::Provider(s) => LLMError::Provider(s.clone()),
+        LLMError::InvalidInput(s) => LLMError::InvalidInput(s.clone()),
+        LLMError::ServiceUnavailable(s) => LLMError::ServiceUnavailable(s.clone()),
+    }
+}
+
+/// AEGIS ADR-141, Update of 2026-10-15 `upstream-rate-limit-spends-no-try`,
+/// amendment `upstream-rate-limit-spends-no-try-amend-provider-5xx-2026-10-15`:
+/// a try whose model call Workers AI's HTTP 500 code 4009 still ends, as the
+/// OpenAI adapter reads that answer, is recorded on its iteration exhausted
+/// upstream, so the supervisor does not count it (Forge proof 20, run
+/// `5c024c91`: CODE's tries were counted and the run failed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_try_ended_by_a_provider_internal_error_is_recorded_upstream() {
+    let mut server = mockito::Server::new_async().await;
+    let _mock = server
+        .mock("POST", "/chat/completions")
+        .with_status(500)
+        .with_body(r#"{"errors":[{"message":"AiError: AiError: An internal server error occured. (x)","code":4009}],"success":false,"result":{},"messages":[]}"#)
+        .create_async()
+        .await;
+    let adapter = crate::infrastructure::llm::openai::OpenAIAdapter::new(
+        server.url(),
+        "test-key".to_string(),
+        "test-model".to_string(),
+        reqwest::header::HeaderMap::new(),
+    );
+    let answer = LLMProvider::generate_chat(&adapter, &[], &[], &GenerationOptions::default())
+        .await
+        .expect_err("the provider answers HTTP 500");
+    let turns: Vec<Turn> = (0..60)
+        .map(|_| -> Turn {
+            let answer = the_same_error(&answer);
+            Box::new(move |_| Err(the_same_error(&answer)))
+        })
+        .collect();
+    let w = world(agent("8s", 30), turns).await;
+    w.records.update(w.execution_id, |e| {
+        e.start_iteration("count the ticks".to_string()).unwrap();
+        e.iterations[0].started_at = chrono::Utc::now() - chrono::Duration::seconds(7);
+    });
+
+    let outcome = w.generate().await;
+
+    let mut complaints = Vec::new();
+    if outcome.is_ok() {
+        complaints.push(format!(
+            "the try did not end on the provider's error: {outcome:?}"
+        ));
+    }
+    match &w.records.get(w.execution_id).iterations[0].exhausted {
+        Some(crate::domain::execution::Exhaustion {
+            by: crate::domain::execution::ExhaustedBy::Upstream,
+            ..
+        }) => {}
+        other => complaints.push(format!("the iteration's end is {other:?}")),
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// AEGIS ADR-141, Update of 2026-10-15 `upstream-rate-limit-spends-no-try`,
+/// amendment `upstream-rate-limit-spends-no-try-amend-bound-2026-10-15`: a
+/// try a rate limit ends is answered to the agent's bootstrap, and from it
+/// to the task log as the try's failure, with the sentence naming it ended
+/// upstream and not counted; the gateway still sees the rate limit (Forge
+/// proof 20, run `5c024c91`: the task log read only "upstream_rate_limit:
+/// Rate limit exceeded").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upstream_ended_try_is_on_the_task_log() {
+    let rate_limited: Vec<Turn> = (0..60)
+        .map(|_| -> Turn { Box::new(|_| Err(LLMError::RateLimit(None))) })
+        .collect();
+    let w = world(agent("8s", 30), rate_limited).await;
+    w.records.update(w.execution_id, |e| {
+        e.start_iteration("count the ticks".to_string()).unwrap();
+        e.iterations[0].started_at = chrono::Utc::now() - chrono::Duration::seconds(7);
+    });
+
+    let outcome = w.generate().await;
+
+    let e = outcome.expect_err("the try ends on the rate limit");
+    let failure = e
+        .downcast_ref::<crate::infrastructure::llm::registry::ModelCallFailure>()
+        .unwrap_or_else(|| panic!("the gateway reads a model call failure, got {e:?}"));
+    assert!(
+        matches!(failure.error, LLMError::RateLimit(_)),
+        "the gateway still sees the rate limit, got {:?}",
+        failure.error
+    );
+    let sentence = failure.client_sentence();
+    let opening = format!("The model on alias '{ALIAS}' was over its rate limit for ");
+    assert!(
+        sentence.starts_with(&opening)
+            && sentence.ends_with(" s of retries; this try ended there and is not counted."),
+        "the try's failure names it ended upstream and not counted, got {sentence:?}"
+    );
+}

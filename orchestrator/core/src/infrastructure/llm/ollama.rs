@@ -177,8 +177,12 @@ impl LLMProvider for OllamaAdapter {
             let error_text = response.text().await.unwrap_or_default();
             return Err(if status == 404 {
                 LLMError::ModelNotFound(self.model.clone())
-            } else if status == 503 {
-                LLMError::ServiceUnavailable(error_text)
+            } else if status.is_server_error() {
+                // An Ollama server's 5xx (500, 502, 503, 504) is its
+                // unavailability of the moment: retried inside the try, and a
+                // try it still ends is not counted. `Provider` stays for an
+                // answer the adapter cannot read.
+                LLMError::ServiceUnavailable(format!("HTTP {status}: {error_text}"))
             } else if status == 400 {
                 // A 400 is the provider refusing this request as sent (a prompt
                 // over the model's context window, among others): no retry can
@@ -366,5 +370,45 @@ mod tests {
         // Ensure tool call IDs are generated deterministically by index
         let id = format!("ollama-call-{}", 0);
         assert_eq!(id, "ollama-call-0");
+    }
+
+    /// An Ollama server's HTTP 500, 502 or 504 is its unavailability of the
+    /// moment, as a 503 already is: `ServiceUnavailable` carrying the status
+    /// and the body, retried inside the try (AEGIS ADR-141, Update of
+    /// 2026-10-15 `upstream-rate-limit-spends-no-try`, amendment
+    /// `upstream-rate-limit-spends-no-try-amend-provider-5xx-2026-10-15`).
+    #[tokio::test]
+    async fn an_ollama_server_error_is_an_upstream_unavailability() {
+        for status in [500, 502, 504] {
+            let mut server = mockito::Server::new_async().await;
+            let _mock = server
+                .mock("POST", "/api/chat")
+                .with_status(status)
+                .with_body("model runner has unexpectedly stopped")
+                .create_async()
+                .await;
+
+            let res = OllamaAdapter::new(server.url(), "llama3.1".to_string())
+                .generate_chat(
+                    &[ChatMessage {
+                        role: "user".to_string(),
+                        content: "hello".into(),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    }],
+                    &[],
+                    &GenerationOptions::default(),
+                )
+                .await;
+
+            match res {
+                Err(LLMError::ServiceUnavailable(text)) => assert!(
+                    text.contains(&status.to_string())
+                        && text.contains("model runner has unexpectedly stopped"),
+                    "the unavailability carries the status and the body, got {text}"
+                ),
+                other => panic!("an HTTP {status} must be ServiceUnavailable, got {other:?}"),
+            }
+        }
     }
 }
