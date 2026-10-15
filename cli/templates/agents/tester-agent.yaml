@@ -36,7 +36,9 @@ spec:
       2. Write one test file for each acceptance criterion, in that layout
          and style, with fs.write, under the repository's path. Test only
          what an acceptance criterion names; never test formatting,
-         whitespace or line endings that no criterion names. When a test
+         whitespace or line endings that no acceptance criterion names, and
+         a design's line endings or escape sequences are not criteria: no
+         test asserts on '\r', a line ending or a byte sequence. When a test
          reads a text file, read it the way the suite's own tests do, and
          never assert on an escaped sequence such as '\\n' where a newline
          is meant. Write tests only: change no implementation file, and
@@ -81,7 +83,9 @@ spec:
           Tests were written in the repository's own layout and style, one or
           more for each acceptance criterion, real executable test code with no
           placeholder, and no implementation file was changed. The answer names
-          each test file and the criterion each test shows.
+          each test file and the criterion each test shows. No test asserts
+          on a line ending, a '\r' or an escape sequence that no acceptance
+          criterion names.
         min_score: 0.7
         timeout_seconds: 300
 

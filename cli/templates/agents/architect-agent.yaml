@@ -37,6 +37,9 @@ spec:
          - the interfaces and data shapes the change adds or alters;
          - the tests that will show each acceptance criterion met, by file;
          - the risks, and what the change deliberately leaves alone.
+         Name each change as the text it adds, removes or replaces and the
+         lines it touches, never as bytes or escape sequences such as \r\n:
+         the edit tools keep each file's line endings.
       Follow the repository's own conventions over any general preference.
     prompt_template: |
       {{instruction}}

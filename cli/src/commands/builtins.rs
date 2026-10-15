@@ -1144,7 +1144,7 @@ mod tests {
     /// a final-newline test no criterion named and which cannot pass.
     #[test]
     fn the_tester_tests_only_what_a_criterion_names() {
-        const STEP: &str = "Write one test file for each acceptance criterion, in that layout and style, with fs.write, under the repository's path. Test only what an acceptance criterion names; never test formatting, whitespace or line endings that no criterion names. When a test reads a text file, read it the way the suite's own tests do, and never assert on an escaped sequence such as '\\\\n' where a newline is meant.";
+        const STEP: &str = "Write one test file for each acceptance criterion, in that layout and style, with fs.write, under the repository's path. Test only what an acceptance criterion names; never test formatting, whitespace or line endings that no acceptance criterion names, and a design's line endings or escape sequences are not criteria: no test asserts on '\\r', a line ending or a byte sequence. When a test reads a text file, read it the way the suite's own tests do, and never assert on an escaped sequence such as '\\\\n' where a newline is meant.";
         let (_, yaml) = BUILTIN_AGENTS
             .iter()
             .find(|(name, _)| *name == "tester-agent")
@@ -1309,6 +1309,57 @@ mod tests {
                 "{agent}'s step 2 must carry \"{sentence}\":\n{step}"
             );
         }
+    }
+
+    /// Run `2c113327`: the architect's design named its change as the bytes
+    /// `"\r\n\r\nThis change ..."` of a CRLF README, and the tester asserted
+    /// `endswith("\r\n\r\n" + expected)` on a text-mode read, which turns CRLF
+    /// into LF, so the test could never pass. A design names text, and no
+    /// test asserts a line ending no acceptance criterion names (AEGIS
+    /// ADR-141, Update `forge-designs-name-text-not-line-endings-2026-10-15`).
+    #[test]
+    fn the_forge_designs_name_text_and_tests_never_assert_line_endings() {
+        const ARCHITECT: &str = "Name each change as the text it adds, removes or replaces and the lines it touches, never as bytes or escape sequences such as \\r\\n: the edit tools keep each file's line endings.";
+        const TESTER: &str = "never test formatting, whitespace or line endings that no acceptance criterion names, and a design's line endings or escape sequences are not criteria: no test asserts on '\\r', a line ending or a byte sequence.";
+        const CRITERION: &str = "No test asserts on a line ending, a '\\r' or an escape sequence that no acceptance criterion names.";
+
+        for (agent, sentence) in [("architect-agent", ARCHITECT), ("tester-agent", TESTER)] {
+            let (_, yaml) = BUILTIN_AGENTS
+                .iter()
+                .find(|(name, _)| *name == agent)
+                .unwrap_or_else(|| panic!("{agent} is a built-in agent"));
+            let manifest: aegis_orchestrator_sdk::AgentManifest =
+                serde_yaml::from_str(yaml).expect("the template parses");
+            manifest.validate().expect("the template validates");
+            let instruction = folded_instruction(yaml);
+            let step_2 = instruction.find("2. ").expect("step 2");
+            let step_3 = instruction[step_2..]
+                .find(" Follow the repository's own conventions")
+                .or_else(|| instruction[step_2..].find("3. "))
+                .map(|at| step_2 + at)
+                .expect("step 2 ends");
+            let step = &instruction[step_2..step_3];
+            assert!(
+                step.contains(sentence),
+                "{agent}'s step 2 must carry \"{sentence}\":\n{step}"
+            );
+        }
+
+        let (_, yaml) = BUILTIN_AGENTS
+            .iter()
+            .find(|(name, _)| *name == "tester-agent")
+            .expect("tester-agent is a built-in agent");
+        let raw: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let criteria = raw["spec"]["execution"]["validation"][0]["criteria"]
+            .as_str()
+            .expect("the tester's judge criteria")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            criteria.contains(CRITERION),
+            "the tester's judge criteria must carry \"{CRITERION}\":\n{criteria}"
+        );
     }
 
     #[test]

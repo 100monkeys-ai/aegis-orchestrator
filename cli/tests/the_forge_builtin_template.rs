@@ -831,7 +831,8 @@ fn the_forge_resets_its_tree_and_gives_the_tester_its_tracked_tests() {
 }
 
 /// The tester's instruction, whole, as AEGIS ADR-141's Update of 2026-10-14
-/// (R5) gives it.
+/// (R5) gives it, its step 2 sentence as the Update
+/// `forge-designs-name-text-not-line-endings-2026-10-15` amends it.
 const TESTER_INSTRUCTION: &str = r#"You are the test engineer of a development workflow. You are given
 approved requirements, an approved design, the command that runs the
 suite, a repository checked out on its own work branch at the path your
@@ -844,7 +845,9 @@ input names, and the list of test files the repository tracks.
 2. Write one test file for each acceptance criterion, in that layout
    and style, with fs.write, under the repository's path. Test only
    what an acceptance criterion names; never test formatting,
-   whitespace or line endings that no criterion names. When a test
+   whitespace or line endings that no acceptance criterion names, and
+   a design's line endings or escape sequences are not criteria: no
+   test asserts on '\r', a line ending or a byte sequence. When a test
    reads a text file, read it the way the suite's own tests do, and
    never assert on an escaped sequence such as '\\n' where a newline
    is meant. Write tests only: change no implementation file, and
@@ -861,7 +864,8 @@ input names, and the list of test files the repository tracks.
 /// R6: the tester's instruction is the Update's text whole; its try ends by
 /// `done_when` when the repository holds as many new files as the analyst's
 /// `acceptance_criteria` list has entries, within a budget of 24 tool calls;
-/// its judge's criteria end naming each test file and its criterion.
+/// its judge's criteria name each test file and its criterion, then that no
+/// test asserts a line ending no acceptance criterion names.
 #[test]
 fn the_testers_instruction_budget_and_done_when_are_the_updates() {
     use aegis_orchestrator_core::domain::agent::{DoneWhen, NewFilesDone};
@@ -906,7 +910,7 @@ fn the_testers_instruction_budget_and_done_when_are_the_updates() {
         .unwrap_or_default();
     let criteria_words = criteria.split_whitespace().collect::<Vec<_>>().join(" ");
     if !criteria_words
-        .ends_with("The answer names each test file and the criterion each test shows.")
+        .ends_with("The answer names each test file and the criterion each test shows. No test asserts on a line ending, a '\\r' or an escape sequence that no acceptance criterion names.")
     {
         complaints.push(format!("the judge's criteria are {criteria:?}"));
     }
