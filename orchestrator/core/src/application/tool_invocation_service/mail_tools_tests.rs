@@ -56,9 +56,9 @@ async fn the_mail_tools_are_listed_with_contracts_declaring_mailbox_and_flagged(
     let tools = router.list_tools().await.unwrap();
     let mut problems = Vec::new();
     for (name, required, skip_judge) in [
-        ("mail.list", vec!["mailbox"], true),
-        ("mail.read", vec!["mailbox", "thread_id"], true),
-        ("mail.label", vec!["mailbox", "thread_id"], false),
+        ("mail.list", vec![], true),
+        ("mail.read", vec!["thread_id"], true),
+        ("mail.label", vec!["thread_id"], false),
     ] {
         let Some(tool) = tools.iter().find(|t| t.name == name) else {
             problems.push(format!("{name} is not listed"));

@@ -4092,7 +4092,7 @@ async fn a_run_with_chosen_mailboxes_lists_mailbox_as_their_names() {
             let expected = expected.clone().unwrap_or_else(|| {
                 json!({
                     "type": "string",
-                    "description": "The id of one of your mailbox connections."
+                    "description": "The id of one of your mailboxes; it may be left out when you have one mailbox connected."
                 })
             });
             if mailbox != &expected {

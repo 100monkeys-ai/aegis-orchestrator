@@ -431,23 +431,19 @@ impl ToolInputContract {
             "fs.search" => &["needle"],
             "web.search" => &["query"],
             "web.fetch" => &["url"],
-            "mail.list" => &["mailbox"],
-            "mail.read" | "mail.label" | "mail.delete" | "mail.archive" => {
-                &["mailbox", "thread_id"]
-            }
-            "mail.draft" => &["mailbox", "body"],
-            "mail.send" => &["mailbox", "to", "subject", "body"],
-            "mail.reply" => &["mailbox", "thread_id", "to", "subject", "body"],
-            "mail.attachment" => &["mailbox", "uid", "part"],
+            "mail.list" => &[],
+            "mail.read" | "mail.label" | "mail.delete" | "mail.archive" => &["thread_id"],
+            "mail.draft" => &["body"],
+            "mail.send" => &["to", "subject", "body"],
+            "mail.reply" => &["thread_id", "to", "subject", "body"],
+            "mail.attachment" => &["uid", "part"],
             "aegis.image.generate" => &["prompt"],
-            "mail.forward" => &["mailbox", "thread_id", "to"],
-            "calendar.calendars" => &["account"],
-            "calendar.list" => &["account", "calendar_id"],
-            "calendar.read" | "calendar.update" | "calendar.delete" => {
-                &["account", "calendar_id", "event_id"]
-            }
-            "calendar.create" => &["account", "calendar_id", "title", "start", "end"],
-            "calendar.respond" => &["account", "calendar_id", "event_id", "response"],
+            "mail.forward" => &["thread_id", "to"],
+            "calendar.calendars" => &[],
+            "calendar.list" => &["calendar_id"],
+            "calendar.read" | "calendar.update" | "calendar.delete" => &["calendar_id", "event_id"],
+            "calendar.create" => &["calendar_id", "title", "start", "end"],
+            "calendar.respond" => &["calendar_id", "event_id", "response"],
             "aegis.tools.list" | "aegis.tools.search" | "aegis.git.list" => &[],
             _ => &[],
         }

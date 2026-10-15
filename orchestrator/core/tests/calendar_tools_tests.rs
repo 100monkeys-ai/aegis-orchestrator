@@ -1375,16 +1375,16 @@ spec:
         let tools = router.list_tools().await.unwrap();
         let mut wrong = Vec::new();
         for (name, required) in [
-            ("calendar.calendars", vec!["account"]),
-            ("calendar.list", vec!["account", "calendar_id"]),
-            ("calendar.read", vec!["account", "calendar_id", "event_id"]),
+            ("calendar.calendars", vec![]),
+            ("calendar.list", vec!["calendar_id"]),
+            ("calendar.read", vec!["calendar_id", "event_id"]),
         ] {
             let Some(tool) = tools.iter().find(|t| t.name == name) else {
                 wrong.push(format!("{name} is not listed"));
                 continue;
             };
             if tool.input_schema["properties"]["account"]["description"]
-                != "The id of one of your calendar accounts."
+                != "The id of one of your calendar accounts; it may be left out when you have one calendar account connected."
             {
                 wrong.push(format!("{name}'s schema does not declare account"));
             }
@@ -1895,7 +1895,7 @@ spec:
             ),
             (
                 1,
-                json!({"type": "string", "description": "The id of one of your calendar accounts."}),
+                json!({"type": "string", "description": "The id of one of your calendar accounts; it may be left out when you have one calendar account connected."}),
             ),
         ] {
             let listed = h
@@ -3122,7 +3122,7 @@ spec:
             for (name, required, summary, says_invites) in [
                 (
                     "calendar.create",
-                    vec!["account", "calendar_id", "title", "start", "end"],
+                    vec!["calendar_id", "title", "start", "end"],
                     vec![
                         "account",
                         "calendar_id",
@@ -3136,7 +3136,7 @@ spec:
                 ),
                 (
                     "calendar.update",
-                    vec!["account", "calendar_id", "event_id"],
+                    vec!["calendar_id", "event_id"],
                     vec![
                         "account",
                         "event_id",
@@ -3151,13 +3151,13 @@ spec:
                 ),
                 (
                     "calendar.delete",
-                    vec!["account", "calendar_id", "event_id"],
+                    vec!["calendar_id", "event_id"],
                     vec!["account", "event_id", "title", "start", "end", "attendees"],
                     false,
                 ),
                 (
                     "calendar.respond",
-                    vec!["account", "calendar_id", "event_id", "response"],
+                    vec!["calendar_id", "event_id", "response"],
                     vec![
                         "account",
                         "event_id",

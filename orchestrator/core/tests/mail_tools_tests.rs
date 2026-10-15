@@ -108,19 +108,19 @@ async fn the_nine_mail_tools_list_with_contracts_declaring_mailbox_and_five_are_
     let tools = router.list_tools().await.unwrap();
     let mut wrong = Vec::new();
     for (name, required, gated) in [
-        ("mail.list", vec!["mailbox"], false),
-        ("mail.read", vec!["mailbox", "thread_id"], false),
-        ("mail.label", vec!["mailbox", "thread_id"], false),
-        ("mail.draft", vec!["mailbox", "body"], false),
-        ("mail.send", vec!["mailbox", "to", "subject", "body"], true),
+        ("mail.list", vec![], false),
+        ("mail.read", vec!["thread_id"], false),
+        ("mail.label", vec!["thread_id"], false),
+        ("mail.draft", vec!["body"], false),
+        ("mail.send", vec!["to", "subject", "body"], true),
         (
             "mail.reply",
-            vec!["mailbox", "thread_id", "to", "subject", "body"],
+            vec!["thread_id", "to", "subject", "body"],
             true,
         ),
-        ("mail.delete", vec!["mailbox", "thread_id"], true),
-        ("mail.archive", vec!["mailbox", "thread_id"], true),
-        ("mail.forward", vec!["mailbox", "thread_id", "to"], true),
+        ("mail.delete", vec!["thread_id"], true),
+        ("mail.archive", vec!["thread_id"], true),
+        ("mail.forward", vec!["thread_id", "to"], true),
     ] {
         let Some(tool) = tools.iter().find(|t| t.name == name) else {
             wrong.push(format!("{name} is not listed"));
@@ -237,7 +237,7 @@ async fn mail_attachment_is_listed_ungated_skipping_the_judge_and_mail_read_name
     let tools = router.list_tools().await.unwrap();
     let mut wrong = Vec::new();
     let name = "mail.attachment";
-    let required = ["mailbox", "uid", "part"];
+    let required = ["uid", "part"];
     match tools.iter().find(|t| t.name == name) {
         Some(tool) => {
             let schema_required: Vec<&str> = tool.input_schema["required"]
@@ -3065,7 +3065,7 @@ mod attachments_out {
                         || p["subject"]["maxLength"] != 998
                         || p["attachments"]["maxItems"] != 10
                         || p["to"]["minItems"] != 1
-                        || tool.input_schema["required"] != json!(["mailbox", "thread_id", "to"])
+                        || tool.input_schema["required"] != json!(["thread_id", "to"])
                     {
                         wrong.push(format!("mail.forward's schema is {}", tool.input_schema));
                     }
@@ -3117,8 +3117,7 @@ mod attachments_out {
                     router.approval_contract("mail.forward")
                 ));
             }
-            if ToolInputContract::required_fields("mail.forward") != ["mailbox", "thread_id", "to"]
-            {
+            if ToolInputContract::required_fields("mail.forward") != ["thread_id", "to"] {
                 wrong.push(format!(
                     "the input contract requires {:?}",
                     ToolInputContract::required_fields("mail.forward")

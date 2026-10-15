@@ -830,7 +830,7 @@ impl ToolRouter {
         let mut properties = serde_json::Map::new();
         properties.insert(
             "mailbox".to_string(),
-            json!({"type": "string", "description": "The id of one of your mailbox connections."}),
+            json!({"type": "string", "description": "The id of one of your mailboxes; it may be left out when you have one mailbox connected."}),
         );
         if shape != OutboundShape::Send {
             let description = if shape == OutboundShape::Reply {
@@ -884,9 +884,9 @@ impl ToolRouter {
             properties.insert("attachments".to_string(), Self::schema_mail_files());
         }
         let required: Vec<&str> = match shape {
-            OutboundShape::Draft => vec!["mailbox", "body"],
-            OutboundShape::Send => vec!["mailbox", "to", "subject", "body"],
-            OutboundShape::Reply => vec!["mailbox", "thread_id", "to", "subject", "body"],
+            OutboundShape::Draft => vec!["body"],
+            OutboundShape::Send => vec!["to", "subject", "body"],
+            OutboundShape::Reply => vec!["thread_id", "to", "subject", "body"],
         };
         json!({"type": "object", "properties": properties, "required": required})
     }
@@ -918,7 +918,7 @@ impl ToolRouter {
             "properties": {
                 "mailbox": {
                     "type": "string",
-                    "description": "The id of one of your mailbox connections."
+                    "description": "The id of one of your mailboxes; it may be left out when you have one mailbox connected."
                 },
                 "folder": {
                     "type": "string",
@@ -959,7 +959,7 @@ impl ToolRouter {
                 },
                 "attachments": Self::schema_mail_files()
             },
-            "required": ["mailbox", "thread_id", "to"]
+            "required": ["thread_id", "to"]
         })
     }
 
@@ -972,10 +972,10 @@ impl ToolRouter {
             "account".to_string(),
             json!({
                 "type": "string",
-                "description": "The id of one of your calendar accounts."
+                "description": "The id of one of your calendar accounts; it may be left out when you have one calendar account connected."
             }),
         );
-        let mut required = vec!["account"];
+        let mut required: Vec<&str> = Vec::new();
         if matches!(shape, CalendarShape::List | CalendarShape::Read) {
             properties.insert(
                 "calendar_id".to_string(),
@@ -1043,7 +1043,7 @@ impl ToolRouter {
             "account".to_string(),
             json!({
                 "type": "string",
-                "description": "The id of one of your calendar accounts."
+                "description": "The id of one of your calendar accounts; it may be left out when you have one calendar account connected."
             }),
         );
         properties.insert(
@@ -1053,7 +1053,7 @@ impl ToolRouter {
                 "description": "One of the calendar_id values calendar.calendars answers for this account, or primary for the account's own calendar; any other value is refused."
             }),
         );
-        let mut required = vec!["account", "calendar_id"];
+        let mut required = vec!["calendar_id"];
         if shape != CalendarShape::Create {
             properties.insert(
                 "event_id".to_string(),
@@ -1140,7 +1140,7 @@ impl ToolRouter {
             "properties": {
                 "mailbox": {
                     "type": "string",
-                    "description": "The id of one of your mailbox connections."
+                    "description": "The id of one of your mailboxes; it may be left out when you have one mailbox connected."
                 },
                 "folder": {
                     "type": "string",
@@ -1174,7 +1174,7 @@ impl ToolRouter {
                     "description": "The most threads to answer (default 20). The 200 newest matching messages are grouped into threads; truncated says when there were more."
                 }
             },
-            "required": ["mailbox"]
+            "required": []
         })
     }
 
@@ -1185,7 +1185,7 @@ impl ToolRouter {
             "properties": {
                 "mailbox": {
                     "type": "string",
-                    "description": "The id of one of your mailbox connections."
+                    "description": "The id of one of your mailboxes; it may be left out when you have one mailbox connected."
                 },
                 "folder": {
                     "type": "string",
@@ -1197,7 +1197,7 @@ impl ToolRouter {
                     "description": "A thread id mail.list answered."
                 }
             },
-            "required": ["mailbox", "thread_id"]
+            "required": ["thread_id"]
         })
     }
 
@@ -1239,7 +1239,7 @@ impl ToolRouter {
             "properties": {
                 "mailbox": {
                     "type": "string",
-                    "description": "The id of one of your mailbox connections."
+                    "description": "The id of one of your mailboxes; it may be left out when you have one mailbox connected."
                 },
                 "folder": {
                     "type": "string",
@@ -1257,7 +1257,7 @@ impl ToolRouter {
                     "description": "The attachment's part number as mail.read answered it, such as 2 or 1.2."
                 }
             },
-            "required": ["mailbox", "uid", "part"]
+            "required": ["uid", "part"]
         })
     }
 
@@ -1270,14 +1270,14 @@ impl ToolRouter {
             "properties": {
                 "mailbox": {
                     "type": "string",
-                    "description": "The id of one of your mailbox connections."
+                    "description": "The id of one of your mailboxes; it may be left out when you have one mailbox connected."
                 },
                 "thread_id": {
                     "type": "string",
                     "description": "A thread id mail.list answered; every message of it in the inbox moves to Trash."
                 }
             },
-            "required": ["mailbox", "thread_id"]
+            "required": ["thread_id"]
         })
     }
 
@@ -1290,14 +1290,14 @@ impl ToolRouter {
             "properties": {
                 "mailbox": {
                     "type": "string",
-                    "description": "The id of one of your mailbox connections."
+                    "description": "The id of one of your mailboxes; it may be left out when you have one mailbox connected."
                 },
                 "thread_id": {
                     "type": "string",
                     "description": "A thread id mail.list answered; every message of it in the inbox moves to the Archive folder."
                 }
             },
-            "required": ["mailbox", "thread_id"]
+            "required": ["thread_id"]
         })
     }
 
@@ -1308,7 +1308,7 @@ impl ToolRouter {
             "properties": {
                 "mailbox": {
                     "type": "string",
-                    "description": "The id of one of your mailbox connections."
+                    "description": "The id of one of your mailboxes; it may be left out when you have one mailbox connected."
                 },
                 "thread_id": {
                     "type": "string",
@@ -1333,7 +1333,7 @@ impl ToolRouter {
                     "description": "true marks every message of the thread read, false marks it unread; leave it out to keep it as it is."
                 }
             },
-            "required": ["mailbox", "thread_id"]
+            "required": ["thread_id"]
         })
     }
 
