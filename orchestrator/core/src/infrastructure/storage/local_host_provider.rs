@@ -93,8 +93,11 @@ impl StorageProvider for LocalHostStorageProvider {
         let fs_path = self.resolve_path(path);
         match mode {
             OpenMode::ReadOnly => {
-                std::fs::metadata(&fs_path)
+                let metadata = std::fs::metadata(&fs_path)
                     .map_err(|e| StorageError::FileNotFound(format!("{path}: {e}")))?;
+                if metadata.is_dir() {
+                    return Err(StorageError::IsDirectory(path.to_string()));
+                }
             }
             OpenMode::WriteOnly => {
                 File::options()

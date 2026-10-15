@@ -327,6 +327,10 @@ pub enum StorageError {
     #[error("File not found: {0}")]
     FileNotFound(String),
 
+    /// A path opened for reading as a file is a directory.
+    #[error("Is a directory: {0}")]
+    IsDirectory(String),
+
     #[error("IO error: {0}")]
     IoError(String),
 

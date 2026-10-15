@@ -393,15 +393,24 @@ impl StorageProvider for SeaweedFSAdapter {
     async fn open_file(&self, path: &str, mode: OpenMode) -> Result<FileHandle, StorageError> {
         // For SeaweedFS HTTP API, we don't need to actually "open" files
         // The FileHandle just stores the path for subsequent operations
-        // Real implementations would validate file exists for ReadOnly mode
 
         if matches!(mode, OpenMode::ReadOnly) {
-            // Verify file exists via HEAD request
-            let url = self.build_url(path);
-            let response = self.client.head(&url).send().await?;
-
-            if !response.status().is_success() {
-                return Err(StorageError::FileNotFound(path.to_string()));
+            // A read opens a file that exists and is not a directory. The
+            // kind is read from the filer's own entry metadata, never from a
+            // HEAD: the filer answers a HEAD of a directory 200, and a GET of
+            // one with its HTML listing, which a read would return as the
+            // file's content.
+            match self.entry_metadata(path).await {
+                Ok(entry) if entry.is_directory() => {
+                    return Err(StorageError::IsDirectory(path.to_string()));
+                }
+                Ok(_) => {}
+                // Any other answer of the filer is not found, as the HEAD's
+                // non-success answer was.
+                Err(StorageError::Unknown(_)) => {
+                    return Err(StorageError::FileNotFound(path.to_string()));
+                }
+                Err(e) => return Err(e),
             }
         }
 
@@ -1011,6 +1020,44 @@ mod tests {
             (FileType::Directory, 0o755),
             "the root of a volume was not reported as a directory"
         );
+    }
+
+    /// Regression (fs-read-of-volume-root-returns-filer-html-2026-10-14): a
+    /// read of a volume's root passed the HEAD existence check, which the
+    /// filer answers 200 for a directory, and the read then fetched the
+    /// filer's HTML listing as the file's content. Opening a directory for
+    /// reading is refused from the filer's entry metadata, and nothing is
+    /// fetched as content.
+    #[tokio::test]
+    async fn open_file_of_a_directory_for_reading_is_refused_and_fetches_no_listing() {
+        let mut server = filer_answering("/tenant/vol/", DIRECTORY_METADATA, 0).await;
+        let listing = server
+            .mock("GET", "/tenant/vol/")
+            .match_query(mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "text/html")
+            .with_body("<html>SeaweedFS Filer</html>")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let adapter = SeaweedFSAdapter::new(server.url());
+        let opened = adapter.open_file("/tenant/vol/", OpenMode::ReadOnly).await;
+        let read = match &opened {
+            Ok(handle) => Some(
+                adapter
+                    .read_at(handle, 0, 1024)
+                    .await
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+            ),
+            Err(_) => None,
+        };
+
+        assert!(
+            matches!(opened, Err(StorageError::IsDirectory(_))),
+            "opening a directory for reading was not refused as a directory: {opened:?}, then read {read:?}"
+        );
+        listing.assert_async().await;
     }
 
     /// A file stays a regular file, mode 0644, sized by its content-length.

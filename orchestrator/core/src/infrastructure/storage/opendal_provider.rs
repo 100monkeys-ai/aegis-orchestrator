@@ -103,6 +103,14 @@ impl StorageProvider for OpenDalStorageProvider {
         let path = String::from_utf8(handle.0.clone())
             .map_err(|_| StorageError::InvalidPath("Invalid handle".into()))?;
 
+        // A directory is not read as a file. Every other outcome of the stat
+        // (a missing path among them) is the read's to answer, as before.
+        if let Ok(metadata) = self.operator.stat(&path).await {
+            if metadata.is_dir() {
+                return Err(StorageError::IsDirectory(path));
+            }
+        }
+
         let data = self
             .operator
             .read_with(&path)

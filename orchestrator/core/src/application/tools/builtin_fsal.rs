@@ -39,6 +39,28 @@ pub(crate) fn fsal_refusal(context: &str, path_arg: &str, e: FsalError) -> SealS
     SealSessionError::InternalError(format!("{context}: {e}")).answered(answer)
 }
 
+/// The answer of `fs.read`, `fs.edit`, `fs.multi_edit` and `fs.write` to a
+/// `path_arg` that is a directory: the tool is not run, and the refusal names
+/// the tool that lists a directory. The caller is answered the sentence, and
+/// the inner loop sees it as an invalid-arguments refusal; it carries the
+/// caller's own path and never the storage path.
+fn directory_refusal(tool: &str, path_arg: &str) -> SealSessionError {
+    let sentence = format!(
+        "[AEGIS] {tool} was not run: {path_arg} is a directory, not a file; fs.list lists a directory."
+    );
+    SealSessionError::InvalidArguments(sentence.clone())
+        .answered(CallerAnswer::InvalidArguments(sentence))
+}
+
+/// [`fsal_refusal`] for the read of a file by `tool`, a directory refused by
+/// [`directory_refusal`].
+fn file_read_refusal(tool: &str, context: &str, path_arg: &str, e: FsalError) -> SealSessionError {
+    match e {
+        FsalError::Storage(StorageError::IsDirectory(_)) => directory_refusal(tool, path_arg),
+        e => fsal_refusal(context, path_arg, e),
+    }
+}
+
 /// Strips the volume mount-point prefix from a container-absolute path.
 ///
 /// Converts paths like `/workspace/solution.py` → `/solution.py` so they are
@@ -198,7 +220,7 @@ pub async fn invoke_fs_tool(
             let data = fsal
                 .read(&handle, &path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
                 .await
-                .map_err(|e| fsal_refusal("FSAL read error", path_arg, e))?;
+                .map_err(|e| file_read_refusal("fs.read", "FSAL read error", path_arg, e))?;
 
             read_answer(path_arg, &data, args).map(ToolInvocationResult::Direct)
         }
@@ -614,10 +636,17 @@ async fn invoke_write(
 
     let handle = AegisFileHandle::new(vol_ctx.execution_id, vol_ctx.volume_id, "/");
 
-    let existing = fsal
+    // A file that cannot be read is created; a directory is refused.
+    let existing = match fsal
         .read(&handle, &path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
         .await
-        .ok();
+    {
+        Ok(data) => Some(data),
+        Err(FsalError::Storage(StorageError::IsDirectory(_))) => {
+            return Err(directory_refusal("fs.write", path_arg));
+        }
+        Err(_) => None,
+    };
 
     let (content, crlf_kept) = match &existing {
         Some(data) => {
@@ -687,7 +716,7 @@ async fn invoke_edit(
     let data = fsal
         .read(&handle, &path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
         .await
-        .map_err(|e| fsal_refusal("Edit error (read)", path_arg, e))?;
+        .map_err(|e| file_read_refusal("fs.edit", "Edit error (read)", path_arg, e))?;
 
     let content = String::from_utf8_lossy(&data).to_string();
 
@@ -759,7 +788,7 @@ async fn invoke_multi_edit(
     let data = fsal
         .read(&handle, &path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
         .await
-        .map_err(|e| fsal_refusal("Multi-edit error (read)", path_arg, e))?;
+        .map_err(|e| file_read_refusal("fs.multi_edit", "Multi-edit error (read)", path_arg, e))?;
 
     let mut content = String::from_utf8(data)
         .map_err(|_| SealSessionError::InvalidArguments("File is not valid UTF-8".to_string()))?;
@@ -1686,5 +1715,127 @@ mod tests {
         assert_eq!(answer["count"], 1, "the file holds the text once: {answer}");
         assert_eq!(answer["matches"][0]["line_number"], 3, "{answer}");
         assert_eq!(answer["matches"][0]["file"], "/README.md", "{answer}");
+    }
+
+    /// The refusal of a `fs.*` call naming a directory: the tool called and
+    /// the `path` the agent sent, verbatim.
+    fn directory_sentence(tool: &str, path: &str) -> String {
+        format!("[AEGIS] {tool} was not run: {path} is a directory, not a file; fs.list lists a directory.")
+    }
+
+    /// A host-path volume holding a directory `sub/` (with one file in it),
+    /// registered at `/workspace` for the fixture's execution, as a run's
+    /// volume is when its tools are called.
+    async fn directory_fixture() -> (EditFixture, NfsVolumeRegistry) {
+        let fixture = edit_fixture("sub/kept.txt", b"kept\n").await;
+        let registry = NfsVolumeRegistry::new();
+        registry.register(crate::application::nfs_gateway::VolumeRegistration {
+            volume_id: fixture.volume,
+            execution_id: fixture.context.execution_id,
+            workflow_execution_id: None,
+            container_uid: 1000,
+            container_gid: 1000,
+            policy: fixture.context.policy.clone(),
+            mount_point: std::path::PathBuf::from("/workspace"),
+            remote_path: String::new(),
+        });
+        (fixture, registry)
+    }
+
+    /// Asserts `answer` is the directory refusal of `tool` for `path`: the
+    /// caller's answer is the sentence, the inner loop's text is the
+    /// sentence as an invalid-arguments refusal, and neither names the
+    /// storage root.
+    fn assert_directory_refusal(
+        answer: Result<ToolInvocationResult, SealSessionError>,
+        tool: &str,
+        path: &str,
+        storage_root: &std::path::Path,
+    ) {
+        let sentence = directory_sentence(tool, path);
+        let refused = match answer {
+            Err(refused) => refused,
+            Ok(ToolInvocationResult::Direct(ran)) => {
+                panic!("{tool} of the directory {path} was run: {ran}")
+            }
+            Ok(_) => panic!("{tool} of the directory {path} was run"),
+        };
+        let shown = refused.to_string();
+        let answered = refused.refusal().message;
+        assert_eq!(
+            (shown.as_str(), answered.as_str()),
+            (
+                format!("Invalid tool arguments: {sentence}").as_str(),
+                sentence.as_str()
+            ),
+            "{tool} of the directory {path} was not refused naming fs.list"
+        );
+        let root = storage_root.display().to_string();
+        assert!(
+            !shown.contains(&root) && !answered.contains(&root) && !shown.contains("/hosts/"),
+            "the refusal of {tool} names the storage path: {shown}"
+        );
+    }
+
+    /// Regression (fs-read-of-volume-root-returns-filer-html-2026-10-14): an
+    /// `fs.read` of a directory was answered by the provider, the local one
+    /// with its IO error and the filer with its HTML listing. It is refused
+    /// with the sentence naming `fs.list`.
+    #[tokio::test]
+    async fn fs_read_of_a_directory_is_refused_naming_fs_list() {
+        let (fixture, registry) = directory_fixture().await;
+
+        for path in ["/workspace", "/workspace/sub"] {
+            let answer = invoke_fs_tool(
+                "fs.read",
+                &json!({"path": path}),
+                fixture.context.execution_id,
+                &fixture.fsal,
+                &registry,
+            )
+            .await;
+            assert_directory_refusal(answer, "fs.read", path, fixture.root.path());
+        }
+    }
+
+    /// The tools that read a file before they change it refuse a directory
+    /// the same way, and change nothing: `fs.write` no longer takes the
+    /// failed read for a missing file and tries to create one in its place.
+    #[tokio::test]
+    async fn fs_edit_and_fs_write_of_a_directory_are_refused_and_change_nothing() {
+        let (fixture, registry) = directory_fixture().await;
+        let path = "/workspace/sub";
+
+        for (tool, args) in [
+            (
+                "fs.edit",
+                json!({"path": path, "target_content": "kept", "replacement_content": "gone"}),
+            ),
+            (
+                "fs.multi_edit",
+                json!({"path": path, "edits": [{"target_content": "kept", "replacement_content": "gone"}]}),
+            ),
+            ("fs.write", json!({"path": path, "content": "written\n"})),
+        ] {
+            let answer = invoke_fs_tool(
+                tool,
+                &args,
+                fixture.context.execution_id,
+                &fixture.fsal,
+                &registry,
+            )
+            .await;
+            assert_directory_refusal(answer, tool, path, fixture.root.path());
+        }
+
+        assert!(
+            fixture.on_disk("sub").is_dir(),
+            "sub/ is no longer a directory"
+        );
+        assert_eq!(
+            std::fs::read(fixture.on_disk("sub/kept.txt")).expect("sub/kept.txt"),
+            b"kept\n",
+            "the file in sub/ changed"
+        );
     }
 }
