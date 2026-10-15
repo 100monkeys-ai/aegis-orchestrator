@@ -588,6 +588,9 @@ pub enum ExhaustedBy {
     CallBudget,
     /// The try clock's refusal of a command with too little of the try left.
     TryClock,
+    /// The model provider's rate limit or unavailability, outlasting the
+    /// call's retries: the try is not counted against `max_iterations`.
+    Upstream,
 }
 
 /// An iteration that ran out of its budget, and the history the next try is

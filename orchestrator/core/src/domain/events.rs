@@ -678,7 +678,7 @@ impl From<&crate::domain::llm::LLMError> for LlmErrorClass {
         use crate::domain::llm::LLMError;
         match e {
             LLMError::Authentication(_) => LlmErrorClass::Authentication,
-            LLMError::RateLimit => LlmErrorClass::RateLimit,
+            LLMError::RateLimit(_) => LlmErrorClass::RateLimit,
             LLMError::ModelNotFound(_) => LlmErrorClass::ModelNotFound,
             LLMError::InvalidInput(_) => LlmErrorClass::InvalidInput,
             LLMError::ServiceUnavailable(_) => LlmErrorClass::ServiceUnavailable,

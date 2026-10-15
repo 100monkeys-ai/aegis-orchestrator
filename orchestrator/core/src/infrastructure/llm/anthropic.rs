@@ -94,7 +94,7 @@ impl AnthropicAdapter {
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
             LLMError::Authentication(error_text.to_string())
         } else if status == StatusCode::TOO_MANY_REQUESTS {
-            LLMError::RateLimit
+            LLMError::RateLimit(None)
         } else if status == StatusCode::NOT_FOUND {
             let mentions_model = serde_json::from_str::<serde_json::Value>(error_text)
                 .ok()
@@ -297,6 +297,7 @@ impl LLMProvider for AnthropicAdapter {
 
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after = super::openai::retry_after(response.headers());
             let error_text = response.text().await.unwrap_or_default();
             let excerpt: String = error_text.chars().take(512).collect();
             tracing::warn!(
@@ -306,7 +307,10 @@ impl LLMProvider for AnthropicAdapter {
                 body_excerpt = %excerpt,
                 "LLM upstream non-2xx"
             );
-            return Err(self.classify_error(status, &error_text));
+            return Err(match self.classify_error(status, &error_text) {
+                LLMError::RateLimit(_) => LLMError::RateLimit(retry_after),
+                other => other,
+            });
         }
 
         let body_bytes = response

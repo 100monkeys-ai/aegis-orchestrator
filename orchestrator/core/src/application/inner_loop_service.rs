@@ -1120,6 +1120,20 @@ impl InnerLoopService {
                 Err(e) => {
                     self.record_time_limit_refinement(execution_id_str, ctx.iteration_number, &e)
                         .await;
+                    // A try the provider's rate limit or unavailability ends,
+                    // once the call's own retries are spent, is recorded
+                    // exhausted by it, and the supervisor does not count it
+                    // (AEGIS ADR-141, Update of 2026-10-15
+                    // `upstream-rate-limit-spends-no-try`, clause 2).
+                    if ends_on_an_upstream_refusal(&e) {
+                        self.persist_trajectory(execution_id_str, &ctx).await;
+                        self.record_exhausted(
+                            execution_id_str,
+                            ctx.iteration_number,
+                            ExhaustedBy::Upstream,
+                        )
+                        .await;
+                    }
                     return Err(e);
                 }
             };
@@ -2311,6 +2325,22 @@ impl InnerLoopService {
             Err(e) => Err(anyhow::Error::new(e)),
         }
     }
+}
+
+/// Whether a failed model call ended on the provider's rate limit or
+/// unavailability (the gateway's 429 or 503), the upstream classes a try is
+/// not counted for.
+fn ends_on_an_upstream_refusal(e: &anyhow::Error) -> bool {
+    use crate::domain::llm::LLMError;
+    use crate::infrastructure::llm::registry::ModelCallFailure;
+    let error = e
+        .downcast_ref::<ModelCallFailure>()
+        .map(|f| &f.error)
+        .or_else(|| e.downcast_ref::<LLMError>());
+    matches!(
+        error,
+        Some(LLMError::RateLimit(_) | LLMError::ServiceUnavailable(_))
+    )
 }
 
 /// The time left to the try's deadline, for an alias's fallback (AEGIS

@@ -52,6 +52,12 @@ const MAX_BACKOFF_EXPONENT: u32 = 16;
 /// Matches the value produced by `retry_delay_ms = 1000` and `MAX_BACKOFF_EXPONENT = 16`.
 const MAX_BACKOFF_MS: u64 = 65_536_000; // 2^16 * 1000 ms
 
+/// The least wait between attempts while a provider's rate limit or
+/// unavailability is retried up to a call's deadline, so a configured
+/// `retry_delay_ms` of 0 never sends attempts back to back for the whole
+/// bound.
+const UPSTREAM_RETRY_FLOOR_MS: u64 = 100;
+
 /// The alias another alias falls back to, resolved at construction from the
 /// alias map: the named alias, its model and its adapter.
 struct AliasFallback {
@@ -271,7 +277,7 @@ fn plain_failure(e: &LLMError) -> &'static str {
     match e {
         LLMError::Network(_) => "could not be reached or gave no answer",
         LLMError::Authentication(_) => "refused the platform's credentials",
-        LLMError::RateLimit => "was over its rate limit",
+        LLMError::RateLimit(_) => "was over its rate limit",
         LLMError::ModelNotFound(_) => "is not available",
         LLMError::Provider(_) => "returned an error",
         LLMError::InvalidInput(_) => "refused the request as sent",
@@ -411,6 +417,15 @@ fn is_non_retryable(e: &LLMError) -> bool {
         e,
         LLMError::Authentication(_) | LLMError::InvalidInput(_) | LLMError::ModelNotFound(_)
     )
+}
+
+/// The provider's refusals of the moment, a rate limit (HTTP 429) or an
+/// unavailable model (HTTP 503): on a call with a deadline they are retried
+/// for as long as the next attempt starts before it, not `max_retries` times
+/// (AEGIS ADR-141, Update of 2026-10-15 `upstream-rate-limit-spends-no-try`,
+/// clause 1).
+fn is_upstream_refusal(e: &LLMError) -> bool {
+    matches!(e, LLMError::RateLimit(_) | LLMError::ServiceUnavailable(_))
 }
 
 /// A generation with no text and no tool call is a provider fault, not an
@@ -922,6 +937,14 @@ impl ProviderRegistry {
     /// each attempt bounded by `llm_attempt_timeout_secs`, ended at once by
     /// a non-retryable error or the provider's time limit. `sent` counts the
     /// requests sent.
+    ///
+    /// With a `deadline` (the call's `llm_timeout_seconds` or the try's time
+    /// left, whichever ends first), a provider's rate limit or unavailability
+    /// ([`is_upstream_refusal`]) is retried with the backoff for as long as
+    /// the next attempt would start before the deadline, past `max_retries`;
+    /// the call ends with the refusal when the next backoff would reach the
+    /// deadline, and never sleeps past it. Every other retryable error is
+    /// sent `max_retries` times.
     #[allow(clippy::too_many_arguments)]
     async fn primary_attempts(
         &self,
@@ -932,9 +955,13 @@ impl ProviderRegistry {
         tools: &[ToolSchema],
         effective_options: &GenerationOptions,
         sent: &std::sync::atomic::AtomicU32,
+        deadline: Option<tokio::time::Instant>,
     ) -> PrimaryEnd {
         let mut last_error: Option<LLMError> = None;
-        for attempt in 0..self.max_retries {
+        let mut attempt: u32 = 0;
+        while attempt < self.max_retries
+            || (deadline.is_some() && last_error.as_ref().is_some_and(is_upstream_refusal))
+        {
             sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let outcome = self
                 .bounded_attempt(
@@ -1003,26 +1030,59 @@ impl ProviderRegistry {
                         return PrimaryEnd::NonRetryable(e);
                     }
 
-                    if attempt == self.max_retries - 1 {
-                        return PrimaryEnd::Exhausted(e);
-                    }
-                    last_error = Some(e);
-
                     let backoff_ms = {
                         let capped_attempt = attempt.min(MAX_BACKOFF_EXPONENT);
                         self.retry_delay_ms
                             .saturating_mul(2_u64.saturating_pow(capped_attempt))
                             .min(MAX_BACKOFF_MS)
                     };
+                    // A provider's `Retry-After` is waited when it is longer
+                    // than the backoff.
+                    let backoff = match &e {
+                        LLMError::RateLimit(Some(after)) => {
+                            tokio::time::Duration::from_millis(backoff_ms).max(*after)
+                        }
+                        _ => tokio::time::Duration::from_millis(backoff_ms),
+                    };
+
+                    let deadline = deadline.filter(|_| is_upstream_refusal(&e));
+                    let backoff = if deadline.is_some() {
+                        backoff.max(tokio::time::Duration::from_millis(UPSTREAM_RETRY_FLOOR_MS))
+                    } else {
+                        backoff
+                    };
+                    let backoff_ms = backoff.as_millis() as u64;
+                    match deadline {
+                        Some(deadline) => {
+                            if tokio::time::Instant::now() + backoff >= deadline {
+                                info!(
+                                    "LLM upstream refusal outlasts the call's bound: alias='{}', model='{}', attempts={}, error={:?}",
+                                    alias,
+                                    model_name,
+                                    attempt + 1,
+                                    e
+                                );
+                                return PrimaryEnd::Exhausted(e);
+                            }
+                        }
+                        None => {
+                            if attempt + 1 >= self.max_retries {
+                                return PrimaryEnd::Exhausted(e);
+                            }
+                        }
+                    }
+                    last_error = Some(e);
+
                     debug!(
                         "LLM retry backoff: alias='{}', duration_ms={}, attempt={}",
                         alias,
                         backoff_ms,
                         attempt + 1
                     );
-                    tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                    tokio::time::sleep(backoff).await;
                 }
             }
+            attempt += 1;
         }
         PrimaryEnd::Exhausted(
             last_error.unwrap_or_else(|| LLMError::Provider("Unknown error".into())),
@@ -1041,6 +1101,21 @@ impl ProviderRegistry {
         tools: &[ToolSchema],
         options: &GenerationOptions,
     ) -> Result<ChatResponse, LLMError> {
+        self.generate_chat_until(alias, messages, tools, options, None)
+            .await
+    }
+
+    /// [`Self::generate_chat`], with the deadline a provider's rate limit or
+    /// unavailability is retried up to ([`Self::primary_attempts`]); `None`
+    /// sends every retryable error `max_retries` times.
+    async fn generate_chat_until(
+        &self,
+        alias: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolSchema],
+        options: &GenerationOptions,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<ChatResponse, LLMError> {
         let (model_name, provider) = self
             .alias_map
             .get(alias)
@@ -1051,6 +1126,7 @@ impl ProviderRegistry {
         let effective_options = self.apply_alias_options(alias, options);
 
         let overall_budget = tokio::time::Duration::from_secs(self.llm_overall_timeout_secs.max(1));
+        let deadline = deadline.map(|d| d.min(tokio::time::Instant::now() + overall_budget));
 
         let inner = async {
             let sent = std::sync::atomic::AtomicU32::new(0);
@@ -1063,6 +1139,7 @@ impl ProviderRegistry {
                     tools,
                     &effective_options,
                     &sent,
+                    deadline,
                 )
                 .await;
             // A time limit ends the primary's attempts: the fallback, a
@@ -1154,12 +1231,17 @@ impl ProviderRegistry {
         llm_timeout: std::time::Duration,
         try_left: Option<std::time::Duration>,
     ) -> Result<ChatResponse, ModelCallFailure> {
+        // The deadline a provider's rate limit or unavailability is retried
+        // up to: the call's own bound or the try's time left, whichever ends
+        // first.
+        let deadline = tokio::time::Instant::now()
+            + try_left.map_or(llm_timeout, |left| left.min(llm_timeout));
         let (Some(own), Some((model_name, provider))) =
             (self.alias_fallbacks.get(alias), self.alias_map.get(alias))
         else {
             return match tokio::time::timeout(
                 llm_timeout,
-                self.generate_chat(alias, messages, tools, options),
+                self.generate_chat_until(alias, messages, tools, options, Some(deadline)),
             )
             .await
             {
@@ -1212,6 +1294,7 @@ impl ProviderRegistry {
                 tools,
                 &effective_options,
                 &sent,
+                Some(deadline),
             ),
         )
         .await;
@@ -1728,7 +1811,7 @@ mod tests {
         match e {
             LLMError::Network(s) => LLMError::Network(s.clone()),
             LLMError::Authentication(s) => LLMError::Authentication(s.clone()),
-            LLMError::RateLimit => LLMError::RateLimit,
+            LLMError::RateLimit(d) => LLMError::RateLimit(*d),
             LLMError::ModelNotFound(s) => LLMError::ModelNotFound(s.clone()),
             LLMError::Provider(s) => LLMError::Provider(s.clone()),
             LLMError::InvalidInput(s) => LLMError::InvalidInput(s.clone()),
@@ -1980,7 +2063,7 @@ mod tests {
             LlmErrorClass::Authentication
         );
         assert_eq!(
-            LlmErrorClass::from(&LLMError::RateLimit),
+            LlmErrorClass::from(&LLMError::RateLimit(None)),
             LlmErrorClass::RateLimit
         );
         assert_eq!(
@@ -3205,6 +3288,121 @@ mod tests {
         assert_eq!(
             failure.client_sentence(),
             "Network error: model call on alias 'smart' gave no answer within the agent's llm_timeout_seconds (2 s)"
+        );
+    }
+
+    /// A provider's rate limit is retried with the backoff for as long as the
+    /// next attempt starts inside the call's `llm_timeout_seconds`, not
+    /// `max_retries` times: five 429s then an answer, with `max_retries` 3,
+    /// answer (proof 19, run `ebd5f9ae`: four tries lost to one burst).
+    #[tokio::test]
+    async fn a_rate_limit_is_retried_within_the_call_bound_not_max_retries_times() {
+        let primary = MockProvider::with_responses(vec![
+            Err(LLMError::RateLimit(None)),
+            Err(LLMError::RateLimit(None)),
+            Err(LLMError::RateLimit(None)),
+            Err(LLMError::RateLimit(None)),
+            Err(LLMError::RateLimit(None)),
+            Ok(ok_response()),
+        ]);
+        let registry = make_registry(primary.clone() as Arc<dyn LLMProvider>, None, 60);
+
+        let res = registry
+            .generate_chat_within(
+                "default",
+                &[],
+                &[],
+                &GenerationOptions::default(),
+                std::time::Duration::from_secs(60),
+                None,
+            )
+            .await;
+
+        match res {
+            Ok(ChatResponse::FinalText(r)) => assert_eq!(r.text, "ok"),
+            other => panic!("the call must ride out five rate limits inside 60 s, got {other:?}"),
+        }
+        assert_eq!(
+            primary.call_count(),
+            6,
+            "five refused attempts and the answer"
+        );
+    }
+
+    /// A rate limit that outlasts the try's time left ends the call before
+    /// the try ends: no backoff is slept past what is left of the try, and
+    /// the call fails with the provider's rate limit.
+    #[tokio::test]
+    async fn a_rate_limit_retry_stops_before_the_try_ends() {
+        let primary = MockProvider::new();
+        *primary.default_response.lock().unwrap() = Some(Err(LLMError::RateLimit(None)));
+        let primary = Arc::new(primary);
+        let registry = make_registry(primary.clone() as Arc<dyn LLMProvider>, None, 60);
+
+        let started = std::time::Instant::now();
+        let failure = registry
+            .generate_chat_within(
+                "default",
+                &[],
+                &[],
+                &GenerationOptions::default(),
+                std::time::Duration::from_secs(60),
+                Some(std::time::Duration::from_secs(2)),
+            )
+            .await
+            .expect_err("a rate limit for the whole try fails the call");
+        let waited = started.elapsed();
+
+        assert!(
+            matches!(failure.error, LLMError::RateLimit(_)),
+            "the provider's rate limit is the call's error, got {failure:?}"
+        );
+        assert!(
+            primary.call_count() > 3,
+            "the rate limit is retried past max_retries while the try has time, sent {}",
+            primary.call_count()
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(2),
+            "no backoff is slept past the try's 2 s, took {waited:?}"
+        );
+    }
+
+    /// A provider's `Retry-After` is honoured, and one longer than the try's
+    /// time left ends the call at once with the rate limit, never sleeping
+    /// past the try.
+    #[tokio::test]
+    async fn a_retry_after_past_the_try_left_ends_the_call_without_waiting() {
+        let primary = MockProvider::with_responses(vec![
+            Err(LLMError::RateLimit(Some(std::time::Duration::from_secs(
+                30,
+            )))),
+            Ok(ok_response()),
+        ]);
+        let registry = make_registry(primary.clone() as Arc<dyn LLMProvider>, None, 60);
+
+        let started = std::time::Instant::now();
+        let failure = registry
+            .generate_chat_within(
+                "default",
+                &[],
+                &[],
+                &GenerationOptions::default(),
+                std::time::Duration::from_secs(60),
+                Some(std::time::Duration::from_secs(10)),
+            )
+            .await
+            .expect_err("a 30 s Retry-After does not fit in 10 s of the try");
+
+        assert!(
+            matches!(failure.error, LLMError::RateLimit(Some(_))),
+            "{failure:?}"
+        );
+        assert_eq!(primary.call_count(), 1, "no attempt after the Retry-After");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the call ends at once, took {:?}",
+            started.elapsed()
         );
     }
 }

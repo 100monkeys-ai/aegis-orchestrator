@@ -291,7 +291,7 @@ fn llm_error_to_status(
     use aegis_orchestrator_core::domain::llm::LLMError;
     match e {
         LLMError::Authentication(_) => (StatusCode::BAD_GATEWAY, "upstream_authentication"),
-        LLMError::RateLimit => (StatusCode::TOO_MANY_REQUESTS, "upstream_rate_limit"),
+        LLMError::RateLimit(_) => (StatusCode::TOO_MANY_REQUESTS, "upstream_rate_limit"),
         LLMError::ModelNotFound(_) => (StatusCode::BAD_GATEWAY, "upstream_model_not_found"),
         LLMError::InvalidInput(_) => (StatusCode::BAD_GATEWAY, "upstream_invalid_input"),
         LLMError::ServiceUnavailable(_) => {
@@ -397,7 +397,7 @@ mod tests {
 
     #[test]
     fn llm_error_to_status_rate_limit() {
-        let (status, tag) = llm_error_to_status(&LLMError::RateLimit);
+        let (status, tag) = llm_error_to_status(&LLMError::RateLimit(None));
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(tag, "upstream_rate_limit");
     }

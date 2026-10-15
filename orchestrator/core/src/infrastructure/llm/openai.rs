@@ -88,6 +88,19 @@ pub(super) const PROVIDER_TIMEOUT_PREFIX: &str = "provider timeout: ";
 /// whether the request is streamed or not (AEGIS ADR-124, the measurements of
 /// 2026-10-03), so the identical request meets it again: in execution 18d8e0ca
 /// each of three iterations sent it twice more and ended at the 300 s budget.
+/// A provider's `Retry-After` in seconds, the form model providers send with
+/// a 429; the HTTP-date form, or an unreadable value, is read as none.
+pub(crate) fn retry_after(headers: &HeaderMap) -> Option<std::time::Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(std::time::Duration::from_secs)
+}
+
 fn is_workers_ai_time_limit(status: u16, body: &str) -> bool {
     status == 408
         && serde_json::from_str::<serde_json::Value>(body)
@@ -474,6 +487,7 @@ impl LLMProvider for OpenAIAdapter {
 
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after = retry_after(response.headers());
             let error_text = response.text().await.unwrap_or_default();
             let excerpt: String = error_text.chars().take(512).collect();
             tracing::warn!(
@@ -488,7 +502,7 @@ impl LLMProvider for OpenAIAdapter {
             } else if status == 401 || status == 403 {
                 LLMError::Authentication(error_text)
             } else if status == 429 {
-                LLMError::RateLimit
+                LLMError::RateLimit(retry_after)
             } else if status == 404 {
                 LLMError::ModelNotFound(self.model.clone())
             } else if status == 503 {
@@ -1062,6 +1076,31 @@ mod tests {
 
         mock.assert_async().await;
         assert_eq!(text, "four");
+    }
+
+    /// A provider's 429 with `Retry-After: 7` is a rate limit carrying the
+    /// 7 s, which the registry's backoff honours.
+    #[tokio::test]
+    async fn a_rate_limit_carries_the_providers_retry_after() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/chat/completions")
+            .with_status(429)
+            .with_header("retry-after", "7")
+            .with_body("Rate limit exceeded")
+            .create_async()
+            .await;
+
+        let res = adapter_at(server.url())
+            .generate_chat(&[message("user", "hello")], &[], &no_options())
+            .await;
+
+        match res {
+            Err(LLMError::RateLimit(Some(after))) => {
+                assert_eq!(after, std::time::Duration::from_secs(7))
+            }
+            other => panic!("a 429 with Retry-After: 7 must carry 7 s, got {other:?}"),
+        }
     }
 
     #[test]

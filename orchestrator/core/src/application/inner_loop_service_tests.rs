@@ -2770,3 +2770,36 @@ async fn without_done_when_the_model_answers() {
     );
     assert_eq!(w.model.calls.lock().unwrap().len(), 3);
 }
+
+/// AEGIS ADR-141, Update of 2026-10-15 `upstream-rate-limit-spends-no-try`,
+/// clause 2: a try whose model call the provider's rate limit still ends,
+/// once the call's retries inside the try's time are spent, is recorded on
+/// its iteration exhausted by it, with the history the next try is opened
+/// from, and the gateway still sees the rate limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_try_a_rate_limit_ends_is_recorded_exhausted_by_upstream() {
+    let rate_limited: Vec<Turn> = (0..60)
+        .map(|_| -> Turn { Box::new(|_| Err(LLMError::RateLimit(None))) })
+        .collect();
+    let w = world(agent("8s", 30), rate_limited).await;
+    w.records.update(w.execution_id, |e| {
+        e.start_iteration("count the ticks".to_string()).unwrap();
+        e.iterations[0].started_at = chrono::Utc::now() - chrono::Duration::seconds(7);
+    });
+
+    let outcome = w.generate().await;
+
+    let mut complaints = Vec::new();
+    match &outcome {
+        Err(e) if e.to_string() == "Rate limit exceeded" => {}
+        other => complaints.push(format!("the try did not end on the rate limit: {other:?}")),
+    }
+    match &w.records.get(w.execution_id).iterations[0].exhausted {
+        Some(crate::domain::execution::Exhaustion {
+            by: crate::domain::execution::ExhaustedBy::Upstream,
+            constructed: Some(_),
+        }) => {}
+        other => complaints.push(format!("the iteration's end is {other:?}")),
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}

@@ -364,8 +364,9 @@ pub enum LLMError {
     #[error("Authentication failed: {0}")]
     Authentication(String),
 
+    /// HTTP 429; the provider's `Retry-After`, when it sent one.
     #[error("Rate limit exceeded")]
-    RateLimit,
+    RateLimit(Option<std::time::Duration>),
 
     #[error("Model not found: {0}")]
     ModelNotFound(String),

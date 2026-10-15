@@ -183,16 +183,18 @@ async fn recorded_exhausted(
     repository: Option<&Arc<dyn ExecutionRepository>>,
     execution_id: Option<ExecutionId>,
     iteration: u8,
-) -> bool {
+) -> Option<crate::domain::execution::ExhaustedBy> {
     let (Some(repository), Some(execution_id)) = (repository, execution_id) else {
-        return false;
+        return None;
     };
     match repository.find_by_id_unscoped(execution_id).await {
         Ok(Some(execution)) => execution
             .iterations()
             .iter()
-            .any(|i| i.number == iteration && i.exhausted.is_some()),
-        _ => false,
+            .find(|i| i.number == iteration)
+            .and_then(|i| i.exhausted.as_ref())
+            .map(|e| e.by),
+        _ => None,
     }
 }
 
@@ -571,6 +573,11 @@ impl Supervisor {
         bound: TryBound,
     ) -> Result<String, RuntimeError> {
         let mut attempts = 0;
+        // The tries counted against `max_retries`: every try but one an
+        // upstream refusal ended (AEGIS ADR-141, Update of 2026-10-15
+        // `upstream-rate-limit-spends-no-try`, clause 2). `attempts` stays
+        // the iteration's number.
+        let mut counted: u32 = 0;
         let original_intent = input.intent.clone().unwrap_or_default();
         let execution_context = Self::extract_execution_context(&input.input);
 
@@ -589,7 +596,7 @@ impl Supervisor {
         // execution ends with past max retries.
         let mut last_end: Option<AttemptEnd> = None;
 
-        while attempts < max_retries {
+        while counted < max_retries {
             // Check cancellation before each iteration
             if cancellation_token.is_cancelled() {
                 info!("Execution cancelled before iteration {}", attempts + 1);
@@ -609,6 +616,7 @@ impl Supervisor {
             }
 
             attempts += 1;
+            counted += 1;
             info!("Starting iteration {}/{}", attempts, max_retries);
             observer
                 .on_iteration_start(attempts as u8, &original_intent)
@@ -749,14 +757,14 @@ impl Supervisor {
                     // A try its clock ended is exhausted (AEGIS ADR-141,
                     // Update of 2026-10-14, R2); the inner loop records the
                     // tries its call budget or the try clock ended.
-                    let exhausted = if matches!(e, RuntimeError::TimedOut(_)) {
+                    let exhausted_by = if matches!(e, RuntimeError::TimedOut(_)) {
                         observer
                             .on_iteration_exhausted(
                                 attempts as u8,
                                 crate::domain::execution::ExhaustedBy::Clock,
                             )
                             .await;
-                        true
+                        Some(crate::domain::execution::ExhaustedBy::Clock)
                     } else {
                         recorded_exhausted(
                             execution_repository.as_ref(),
@@ -765,6 +773,17 @@ impl Supervisor {
                         )
                         .await
                     };
+                    let exhausted = exhausted_by.is_some();
+                    // A try the provider's rate limit or unavailability ended
+                    // is not counted; the wait below still comes before the
+                    // next try, and the execution's bound still ends the run.
+                    if exhausted_by == Some(crate::domain::execution::ExhaustedBy::Upstream) {
+                        counted -= 1;
+                        info!(
+                            iteration = attempts,
+                            "The try ended on an upstream refusal and is not counted"
+                        );
+                    }
                     observer.on_iteration_fail(attempts as u8, &error_msg).await;
                     last_end = Some(AttemptEnd::Cause(execution_failure_cause(&e)));
 
@@ -778,7 +797,7 @@ impl Supervisor {
                         }));
                     }
 
-                    if attempts < max_retries {
+                    if counted < max_retries {
                         let wait = failed_execution_backoff(attempts);
                         info!(
                             iteration = attempts,
@@ -2840,6 +2859,147 @@ mod tests {
             .count();
         if handed != 0 {
             complaints.push(format!("{handed} tries were handed a history item"));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// A runtime whose try records itself on the stored execution, as the
+    /// inner loop does: the first try is recorded ended by an upstream rate
+    /// limit and fails with the gateway's 429, the second fails by its own
+    /// error, and the third answers.
+    struct UpstreamRefusedThenFailingRuntime {
+        repository: Arc<crate::infrastructure::repositories::InMemoryExecutionRepository>,
+        execution_id: ExecutionId,
+        spawn_times: Mutex<Vec<tokio::time::Instant>>,
+    }
+
+    #[async_trait]
+    impl AgentRuntime for UpstreamRefusedThenFailingRuntime {
+        async fn spawn(&self, _config: RuntimeConfig) -> Result<InstanceId, RuntimeError> {
+            let mut times = self.spawn_times.lock().await;
+            times.push(tokio::time::Instant::now());
+            Ok(InstanceId::new(format!("instance-{}", times.len())))
+        }
+
+        async fn execute(
+            &self,
+            _id: &InstanceId,
+            _input: TaskInput,
+        ) -> Result<TaskOutput, RuntimeError> {
+            let mut execution = self
+                .repository
+                .find_by_id_unscoped(self.execution_id)
+                .await
+                .expect("the record reads")
+                .expect("the record is stored");
+            let try_number = {
+                let iteration = execution
+                    .start_iteration("try".to_string())
+                    .expect("an iteration starts");
+                if iteration.number == 1 {
+                    iteration.exhausted = Some(crate::domain::execution::Exhaustion {
+                        by: crate::domain::execution::ExhaustedBy::Upstream,
+                        constructed: None,
+                    });
+                }
+                iteration.number
+            };
+            self.repository
+                .save_for_tenant(&crate::domain::tenant::TenantId::consumer(), &execution)
+                .await
+                .expect("the record is saved");
+            match try_number {
+                1 => Err(RuntimeError::ExecutionFailedWithLogs {
+                    error: "RuntimeError: Orchestrator returned HTTP 429: upstream_rate_limit: Rate limit exceeded".to_string(),
+                    logs: vec![],
+                    exit_code: Some(1),
+                }),
+                2 => Err(RuntimeError::ExecutionFailedWithLogs {
+                    error: "RuntimeError: the agent's own error".to_string(),
+                    logs: vec![],
+                    exit_code: Some(1),
+                }),
+                _ => Ok(TaskOutput {
+                    result: serde_json::Value::String("answered".to_string()),
+                    logs: vec![],
+                    tool_calls: vec![],
+                    exit_code: 0,
+                    trajectory: vec![],
+                }),
+            }
+        }
+
+        async fn terminate(&self, _id: &InstanceId) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn status(&self, id: &InstanceId) -> Result<InstanceStatus, RuntimeError> {
+            Ok(InstanceStatus {
+                id: id.clone(),
+                state: "running".to_string(),
+                uptime_seconds: 0,
+                memory_usage_mb: 0,
+                cpu_usage_percent: 0.0,
+            })
+        }
+    }
+
+    /// AEGIS ADR-141, Update of 2026-10-15 `upstream-rate-limit-spends-no-try`,
+    /// clause 2: a try recorded ended by an upstream rate limit is not counted
+    /// against `max_retries`. With 2, the upstream-refused try and a failed
+    /// try leave a third try, which starts after the failed-try wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_try_ended_by_an_upstream_rate_limit_is_not_counted() {
+        let repository =
+            Arc::new(crate::infrastructure::repositories::InMemoryExecutionRepository::new());
+        let execution = crate::domain::execution::Execution::new(
+            crate::domain::agent::AgentId::new(),
+            create_test_input(),
+            10,
+            "default".to_string(),
+        );
+        repository
+            .save_for_tenant(&crate::domain::tenant::TenantId::consumer(), &execution)
+            .await
+            .expect("the record is saved");
+        let runtime = Arc::new(UpstreamRefusedThenFailingRuntime {
+            repository: repository.clone(),
+            execution_id: execution.id,
+            spawn_times: Mutex::new(Vec::new()),
+        });
+        let mut config = create_test_config();
+        config
+            .env
+            .insert("AEGIS_EXECUTION_ID".to_string(), execution.id.0.to_string());
+        let observer = Arc::new(TestObserver::default());
+
+        let result = Supervisor::new(runtime.clone())
+            .with_execution_repository(repository.clone())
+            .run_loop(
+                config,
+                create_test_input(),
+                2,
+                observer.clone(),
+                CancellationToken::new(),
+                None,
+            )
+            .await;
+
+        let mut complaints = Vec::new();
+        match &result {
+            Ok(answer) if answer == "answered" => {}
+            other => complaints.push(format!("the execution ended {other:?}")),
+        }
+        let times = runtime.spawn_times.lock().await.clone();
+        if times.len() != 3 {
+            complaints.push(format!("{} tries were spawned, expected 3", times.len()));
+        }
+        if times.len() >= 2 && times[1] - times[0] < failed_execution_backoff(1) {
+            complaints.push(format!(
+                "the try after the upstream-refused one started {:?} after it, expected at least {:?}",
+                times[1] - times[0],
+                failed_execution_backoff(1)
+            ));
         }
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }

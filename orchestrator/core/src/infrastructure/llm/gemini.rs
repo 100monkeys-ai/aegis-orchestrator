@@ -365,6 +365,7 @@ impl LLMProvider for GeminiAdapter {
 
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after = super::openai::retry_after(response.headers());
             let error_text = response.text().await.unwrap_or_default();
             let excerpt: String = error_text.chars().take(512).collect();
             tracing::warn!(
@@ -377,7 +378,7 @@ impl LLMProvider for GeminiAdapter {
             return Err(if status == 401 || status == 403 {
                 LLMError::Authentication(error_text)
             } else if status == 429 {
-                LLMError::RateLimit
+                LLMError::RateLimit(retry_after)
             } else if status == 404 {
                 LLMError::ModelNotFound(self.model.clone())
             } else if status == 503 {
