@@ -9,16 +9,23 @@ use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
 
-/// An FSAL error of a `fs.*` tool, answered by its variant and the caller's
-/// own `path` (AEGIS ADR-035, Update of 2026-10-04, R5). What the inner loop
-/// and the log see is the text it always had, `"<context>: <error>"`, but
-/// for a path that does not exist (AEGIS ADR-048, Update of 2026-10-15):
-/// that is one sentence with the caller's path, answered 404 to the caller
-/// and shown to the inner loop as invalid arguments, never as an internal
-/// error, so no storage path reaches the model; the storage error goes to
-/// the log only.
-pub(crate) fn fsal_refusal(context: &str, path_arg: &str, e: FsalError) -> SealSessionError {
-    let answer = match &e {
+/// An FSAL error of the `fs.*` tool `tool`, answered by its variant and the
+/// caller's own `path` (AEGIS ADR-035, Update of 2026-10-04, R5). No storage
+/// text reaches the inner loop from any arm; the storage error goes to the
+/// log only (AEGIS ADR-048, Updates of 2026-10-15). A path that does not
+/// exist is one sentence with the caller's path, answered 404 and shown to
+/// the inner loop as invalid arguments. An existing path, an invalid path, a
+/// full volume and a refused path show the inner loop the caller's sentence.
+/// Any other failure is `"[AEGIS] <tool> of '<path>' failed; the server
+/// logged the cause."`, answered as a server failure and logged at error
+/// level with `context`.
+pub(crate) fn fsal_refusal(
+    tool: &str,
+    context: &str,
+    path_arg: &str,
+    e: FsalError,
+) -> SealSessionError {
+    let (shown, answer) = match &e {
         FsalError::VolumeNotFound(_)
         | FsalError::Storage(StorageError::FileNotFound(_))
         | FsalError::Storage(StorageError::NotFound(_)) => {
@@ -32,23 +39,39 @@ pub(crate) fn fsal_refusal(context: &str, path_arg: &str, e: FsalError) -> SealS
                 .answered(CallerAnswer::NotFound(sentence));
         }
         FsalError::Storage(StorageError::AlreadyExists(_)) => {
-            CallerAnswer::Conflict(format!("Conflict: '{path_arg}' already exists."))
+            let sentence = format!("Conflict: '{path_arg}' already exists.");
+            (sentence.clone(), CallerAnswer::Conflict(sentence))
         }
         FsalError::PathSanitization(_) | FsalError::Storage(StorageError::InvalidPath(_)) => {
-            CallerAnswer::InvalidArguments(format!(
-                "Invalid tool arguments: '{path_arg}' is not a valid path in a volume."
-            ))
+            let sentence =
+                format!("Invalid tool arguments: '{path_arg}' is not a valid path in a volume.");
+            (sentence.clone(), CallerAnswer::InvalidArguments(sentence))
         }
         FsalError::QuotaExceeded { .. }
         | FsalError::Storage(StorageError::QuotaExceeded { .. }) => {
-            CallerAnswer::QuotaExceeded("Quota exceeded: the volume is full.".to_string())
+            let sentence = "Quota exceeded: the volume is full.".to_string();
+            (sentence.clone(), CallerAnswer::QuotaExceeded(sentence))
         }
-        FsalError::PolicyViolation(_) => CallerAnswer::PathNotAllowed(format!(
-            "Policy violation: '{path_arg}' is not permitted by your filesystem policy."
-        )),
-        _ => CallerAnswer::Internal(InternalFailure::Server),
+        FsalError::PolicyViolation(_) => {
+            let sentence = format!(
+                "Policy violation: '{path_arg}' is not permitted by your filesystem policy."
+            );
+            (sentence.clone(), CallerAnswer::PathNotAllowed(sentence))
+        }
+        _ => {
+            tracing::error!(path = %path_arg, error = %e, "{context}: {tool} failed");
+            (
+                format!("[AEGIS] {tool} of '{path_arg}' failed; the server logged the cause."),
+                CallerAnswer::Internal(InternalFailure::Server),
+            )
+        }
     };
-    SealSessionError::InternalError(format!("{context}: {e}")).answered(answer)
+    if !matches!(answer, CallerAnswer::Internal(_)) {
+        // The storage error's text names storage paths: it goes to the log,
+        // and the inner loop is shown the caller's sentence.
+        tracing::warn!(path = %path_arg, error = %e, "{context}: refused");
+    }
+    SealSessionError::InternalError(shown).answered(answer)
 }
 
 /// The answer of `fs.read`, `fs.edit`, `fs.multi_edit` and `fs.write` to a
@@ -87,7 +110,7 @@ fn outside_repository_refusal(path_arg: &str, mounts: &[std::path::PathBuf]) -> 
 fn file_read_refusal(tool: &str, context: &str, path_arg: &str, e: FsalError) -> SealSessionError {
     match e {
         FsalError::Storage(StorageError::IsDirectory(_)) => directory_refusal(tool, path_arg),
-        e => fsal_refusal(context, path_arg, e),
+        e => fsal_refusal(tool, context, path_arg, e),
     }
 }
 
@@ -282,7 +305,7 @@ pub async fn invoke_fs_tool(
                     None,
                 )
                 .await
-                .map_err(|e| fsal_refusal("FSAL readdir error", path_arg, e))?;
+                .map_err(|e| fsal_refusal("fs.list", "FSAL readdir error", path_arg, e))?;
 
             let entries_json: Vec<serde_json::Value> = entries
                 .iter()
@@ -313,7 +336,7 @@ pub async fn invoke_fs_tool(
                 None,
             )
             .await
-            .map_err(|e| fsal_refusal("FSAL create_dir error", path_arg, e))?;
+            .map_err(|e| fsal_refusal("fs.create_dir", "FSAL create_dir error", path_arg, e))?;
 
             Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "status": "success",
@@ -338,7 +361,9 @@ pub async fn invoke_fs_tool(
                     None,
                 )
                 .await
-                .map_err(|e| fsal_refusal("FSAL delete_directory error", path_arg, e))?;
+                .map_err(|e| {
+                    fsal_refusal("fs.delete", "FSAL delete_directory error", path_arg, e)
+                })?;
             } else {
                 fsal.delete_file(
                     vol_ctx.execution_id,
@@ -350,7 +375,7 @@ pub async fn invoke_fs_tool(
                     None,
                 )
                 .await
-                .map_err(|e| fsal_refusal("FSAL delete_file error", path_arg, e))?;
+                .map_err(|e| fsal_refusal("fs.delete", "FSAL delete_file error", path_arg, e))?;
             }
 
             Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -716,10 +741,10 @@ async fn invoke_write(
         let written = fsal
             .write(&handle, &path, &vol_ctx.policy, 0, content.as_bytes())
             .await
-            .map_err(|e| fsal_refusal("FSAL write error", path_arg, e))?;
+            .map_err(|e| fsal_refusal("fs.write", "FSAL write error", path_arg, e))?;
         fsal.truncate(&handle, &path, &vol_ctx.policy, content.len() as u64)
             .await
-            .map_err(|e| fsal_refusal("FSAL truncate error", path_arg, e))?;
+            .map_err(|e| fsal_refusal("fs.write", "FSAL truncate error", path_arg, e))?;
         written
     } else {
         let _file_handle = fsal
@@ -734,10 +759,10 @@ async fn invoke_write(
                 workflow_execution_id: None,
             })
             .await
-            .map_err(|e| fsal_refusal("FSAL create_file error", path_arg, e))?;
+            .map_err(|e| fsal_refusal("fs.write", "FSAL create_file error", path_arg, e))?;
         fsal.write(&handle, &path, &vol_ctx.policy, 0, content.as_bytes())
             .await
-            .map_err(|e| fsal_refusal("FSAL write error", path_arg, e))?
+            .map_err(|e| fsal_refusal("fs.write", "FSAL write error", path_arg, e))?
     };
 
     let mut answer = serde_json::json!({
@@ -796,10 +821,10 @@ async fn invoke_edit(
     let _ = fsal
         .write(&handle, &path, &vol_ctx.policy, 0, new_content.as_bytes())
         .await
-        .map_err(|e| fsal_refusal("Edit error (write)", path_arg, e))?;
+        .map_err(|e| fsal_refusal("fs.edit", "Edit error (write)", path_arg, e))?;
     fsal.truncate(&handle, &path, &vol_ctx.policy, new_content.len() as u64)
         .await
-        .map_err(|e| fsal_refusal("Edit error (truncate)", path_arg, e))?;
+        .map_err(|e| fsal_refusal("fs.edit", "Edit error (truncate)", path_arg, e))?;
 
     let message = if found.escapes_decoded {
         format!("File edited successfully. {ESCAPES_DECODED}")
@@ -905,12 +930,12 @@ async fn invoke_multi_edit(
             workflow_execution_id: None,
         })
         .await
-        .map_err(|e| fsal_refusal("Multi-edit error (truncate)", path_arg, e))?;
+        .map_err(|e| fsal_refusal("fs.multi_edit", "Multi-edit error (truncate)", path_arg, e))?;
 
     let _ = fsal
         .write(&handle, &path, &vol_ctx.policy, 0, content.as_bytes())
         .await
-        .map_err(|e| fsal_refusal("Multi-edit error (write)", path_arg, e))?;
+        .map_err(|e| fsal_refusal("fs.multi_edit", "Multi-edit error (write)", path_arg, e))?;
 
     let mut answer = serde_json::json!({
         "status": "success",
@@ -957,7 +982,7 @@ async fn invoke_grep(
         let data = fsal
             .read(&handle, &path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
             .await
-            .map_err(|e| fsal_refusal("FSAL read error", path_arg, e))?;
+            .map_err(|e| fsal_refusal("fs.grep", "FSAL read error", path_arg, e))?;
         if let Ok(content) = String::from_utf8(data) {
             for (i, line) in content.lines().enumerate() {
                 if regex.is_match(line) {
@@ -1817,7 +1842,7 @@ mod tests {
                 "/aegis/volumes/u-1/v-1/repo/missing".to_string(),
             )),
         ] {
-            let refused = fsal_refusal("FSAL readdir error", "/workspace/missing", e);
+            let refused = fsal_refusal("fs.list", "FSAL readdir error", "/workspace/missing", e);
             let shown = refused.to_string();
             let refusal = refused.refusal();
             assert_eq!(shown, format!("Invalid tool arguments: {sentence}"));
@@ -1827,6 +1852,120 @@ mod tests {
             );
             assert!(!shown.contains("/aegis/volumes") && !shown.contains("Internal error"));
         }
+    }
+
+    /// Proof 19 (run `ebd5f9ae`): a storage failure no arm names showed the
+    /// model "Internal error: FSAL read error: Storage error: Unknown storage
+    /// error: Failed to read file /aegis/volumes/… HTTP 416". It is one
+    /// sentence with the tool and the caller's path; the cause goes to the
+    /// log, and the caller is answered a server failure.
+    #[test]
+    fn an_fs_storage_failure_answers_its_path_and_no_storage_path() {
+        let refused = file_read_refusal(
+            "fs.read",
+            "FSAL read error",
+            "/workspace/f",
+            FsalError::Storage(StorageError::Unknown(
+                "Failed to read file /aegis/volumes/x: HTTP 500".to_string(),
+            )),
+        );
+        let shown = refused.to_string();
+        let refusal = refused.refusal();
+        assert!(
+            shown.contains("fs.read of '/workspace/f' failed; the server logged the cause."),
+            "the inner loop is not shown the caller's path: {shown}"
+        );
+        for leaked in ["/aegis/volumes", "Unknown storage error"] {
+            assert!(
+                !shown.contains(leaked) && !refusal.message.contains(leaked),
+                "the refusal carries {leaked:?}: {shown}"
+            );
+        }
+        assert_eq!(refusal.http_status, 500);
+    }
+
+    /// Each refusal arm of `fsal_refusal` that answers the caller its own
+    /// sentence (an existing path, an invalid path, a full volume, a path
+    /// the policy refuses) shows the inner loop that sentence, with the
+    /// caller's path and nothing of the storage error's text (AEGIS ADR-048,
+    /// Update of 2026-10-15). The caller's answer is unchanged.
+    #[test]
+    fn an_fs_refusal_arm_answers_its_path_and_no_storage_text() {
+        let storage = "/aegis/volumes/x";
+        let arms = [
+            (
+                FsalError::Storage(StorageError::AlreadyExists(storage.to_string())),
+                409,
+                "Conflict: '/workspace/f' already exists.",
+            ),
+            (
+                FsalError::Storage(StorageError::InvalidPath(storage.to_string())),
+                422,
+                "Invalid tool arguments: '/workspace/f' is not a valid path in a volume.",
+            ),
+            (
+                FsalError::PathSanitization(
+                    crate::domain::path_sanitizer::PathSanitizerError::OutsideBoundary(
+                        storage.to_string(),
+                    ),
+                ),
+                422,
+                "Invalid tool arguments: '/workspace/f' is not a valid path in a volume.",
+            ),
+            (
+                FsalError::Storage(StorageError::QuotaExceeded {
+                    path: storage.to_string(),
+                    limit_bytes: 1,
+                    actual_bytes: 2,
+                }),
+                422,
+                "Quota exceeded: the volume is full.",
+            ),
+            (
+                FsalError::PolicyViolation(storage.to_string()),
+                403,
+                "Policy violation: '/workspace/f' is not permitted by your filesystem policy.",
+            ),
+        ];
+        for (e, status, sentence) in arms {
+            let refused = fsal_refusal("fs.write", "FSAL write error", "/workspace/f", e);
+            let shown = refused.to_string();
+            let refusal = refused.refusal();
+            assert_eq!(
+                (refusal.http_status, refusal.message.as_str()),
+                (status, sentence),
+                "the caller's answer changed"
+            );
+            assert_eq!(shown, format!("Internal error: {sentence}"));
+            assert!(
+                !shown.contains(storage) && !shown.contains("Storage error"),
+                "the inner loop is shown storage text: {shown}"
+            );
+        }
+    }
+
+    /// The local provider reads an empty file as empty; `fs.read` answers
+    /// its empty content, as the SeaweedFS provider now does too.
+    #[tokio::test]
+    async fn fs_read_of_an_empty_file_answers_empty_content() {
+        let fixture = edit_fixture("test/__init__.py", b"").await;
+        let registry = fixture_registry(&fixture);
+
+        let answer = invoke_fs_tool(
+            "fs.read",
+            &json!({"path": "/workspace/test/__init__.py"}),
+            fixture.context.execution_id,
+            &fixture.fsal,
+            &registry,
+        )
+        .await;
+        let value = match answer {
+            Ok(ToolInvocationResult::Direct(value)) => value,
+            other => panic!("fs.read of an empty file was not answered its content: {other:?}"),
+        };
+        assert_eq!(value["status"], "success");
+        assert_eq!(value["content"], "");
+        assert_eq!(value["size_bytes"], 0);
     }
 
     /// Regression (fs-list-missing-directory-answers-internal-error-2026-10-15):
@@ -1914,6 +2053,12 @@ mod tests {
     /// volume is when its tools are called.
     async fn directory_fixture() -> (EditFixture, NfsVolumeRegistry) {
         let fixture = edit_fixture("sub/kept.txt", b"kept\n").await;
+        let registry = fixture_registry(&fixture);
+        (fixture, registry)
+    }
+
+    /// A registry holding `fixture`'s volume, mounted at `/workspace`.
+    fn fixture_registry(fixture: &EditFixture) -> NfsVolumeRegistry {
         let registry = NfsVolumeRegistry::new();
         registry.register(crate::application::nfs_gateway::VolumeRegistration {
             volume_id: fixture.volume,
@@ -1926,7 +2071,7 @@ mod tests {
             mount_point: std::path::PathBuf::from("/workspace"),
             remote_path: String::new(),
         });
-        (fixture, registry)
+        registry
     }
 
     /// Asserts `answer` is the directory refusal of `tool` for `path`: the

@@ -429,6 +429,12 @@ impl StorageProvider for SeaweedFSAdapter {
         let path = String::from_utf8(handle.0.clone())
             .map_err(|_| StorageError::InvalidPath("Invalid file handle".to_string()))?;
 
+        // A read of no bytes reads nothing: its range would have no last
+        // byte, so the filer is not asked.
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+
         let url = self.build_url(&path);
 
         // Use HTTP Range header for partial reads
@@ -452,6 +458,10 @@ impl StorageProvider for SeaweedFSAdapter {
                 read_capped_body(response, cap).await
             }
             StatusCode::NOT_FOUND => Err(StorageError::FileNotFound(path)),
+            // The range starts at or past the file's end, an empty file's
+            // included (RFC 9110 15.5.17): there is nothing to read there,
+            // as the local provider reads it.
+            StatusCode::RANGE_NOT_SATISFIABLE => Ok(Vec::new()),
             status => Err(StorageError::Unknown(format!(
                 "Failed to read file {path}: HTTP {status}"
             ))),
@@ -1794,5 +1804,46 @@ mod tests {
 
         assert_eq!(adapter.truncate("/v/f", 5).await, Ok(()));
         put.assert_async().await;
+    }
+
+    /// Proof 19's `fs.read` of an empty `test/__init__.py` (run `ebd5f9ae`):
+    /// a range whose first byte is 0 cannot be satisfied by a file of no
+    /// bytes, so the filer answers 416, which was a storage error naming the
+    /// filer path. An empty file reads as empty, as the local provider reads
+    /// it (AEGIS ADR-048, Update of 2026-10-15).
+    #[tokio::test]
+    async fn read_at_of_an_empty_file_reads_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/aegis/volumes/x/test/__init__.py")
+            .match_header("range", "bytes=0-10485759")
+            .with_status(416)
+            .with_header("content-range", "bytes */0")
+            .create_async()
+            .await;
+
+        let adapter = SeaweedFSAdapter::new(server.url());
+        let handle = FileHandle(b"/aegis/volumes/x/test/__init__.py".to_vec());
+        let read = adapter.read_at(&handle, 0, 10 * 1024 * 1024).await;
+        assert_eq!(read, Ok(Vec::new()), "an empty file must read as empty");
+    }
+
+    /// A read of no bytes reads nothing and asks the filer nothing: the
+    /// range `offset..=offset + length - 1` has no last byte for a length of
+    /// 0 (and overflowed at offset 0).
+    #[tokio::test]
+    async fn read_at_of_length_zero_sends_no_request() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/aegis/volumes/x/empty")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let adapter = SeaweedFSAdapter::new(server.url());
+        let handle = FileHandle(b"/aegis/volumes/x/empty".to_vec());
+        let read = adapter.read_at(&handle, 0, 0).await;
+        assert_eq!(read, Ok(Vec::new()), "a read of no bytes reads nothing");
+        mock.assert_async().await;
     }
 }

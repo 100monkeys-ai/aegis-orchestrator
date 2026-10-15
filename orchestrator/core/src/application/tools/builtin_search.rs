@@ -1256,7 +1256,14 @@ pub async fn invoke_search(
         }
         Ok(_) => search.walk().await,
         Err(_) if !search.mounted_children(&root).is_empty() => search.walk().await,
-        Err(e) => return Err(fsal_refusal("FSAL getattr error", &path_arg, e)),
+        Err(e) => {
+            return Err(fsal_refusal(
+                "fs.search",
+                "FSAL getattr error",
+                &path_arg,
+                e,
+            ))
+        }
     }
 
     let answer = compose(
