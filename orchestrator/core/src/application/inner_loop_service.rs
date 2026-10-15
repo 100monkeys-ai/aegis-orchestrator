@@ -1658,9 +1658,10 @@ impl InnerLoopService {
                                     );
                                 }
 
-                                // Policy violations and not-found errors are fed back as
-                                // explicit "tool not available" messages so the LLM stops
-                                // retrying the denied tool (ADR-005 iterative refinement).
+                                // Policy violations and not-found errors are fed back with
+                                // the refusal's own sentence, so the LLM learns which tools
+                                // it has (ADR-005 iterative refinement; ADR-141 Update
+                                // `tool-refusal-states-the-refusal-2026-10-15`).
                                 let tool_result = if classification == SealErrorClass::PolicyFeedback {
                                     tracing::warn!(
                                         execution_id = %execution_id_str,
@@ -1669,7 +1670,7 @@ impl InnerLoopService {
                                         error = %e,
                                         "Policy/not-found error — feeding back to LLM as tool error"
                                     );
-                                    policy_feedback_message(&tool_call.name)
+                                    policy_feedback_message(&tool_call.name, &e)
                                 } else {
                                     // Recoverable errors (e.g. MalformedPayload, SessionExpired)
                                     // are fed back to the LLM as tool error messages so it can
@@ -2421,9 +2422,13 @@ fn classify_seal_error(e: &crate::domain::seal_session::SealSessionError) -> Sea
 }
 
 /// Build the tool-error message that gets fed back to the LLM for a
-/// policy-feedback error.
-fn policy_feedback_message(tool_name: &str) -> String {
-    format!("Tool '{tool_name}' is not available. Do not retry this tool.")
+/// policy-feedback error: the refusal's own sentence, with no imperative
+/// (AEGIS ADR-141 Update `tool-refusal-states-the-refusal-2026-10-15`).
+fn policy_feedback_message(
+    tool_name: &str,
+    refusal: &crate::domain::seal_session::SealSessionError,
+) -> String {
+    format!("Tool '{tool_name}' was not run: {refusal}")
 }
 
 // ---------------------------------------------------------------------------
@@ -2955,13 +2960,23 @@ mod tests {
         );
     }
 
+    /// AEGIS known-defects-24 `tool-unavailable-refusal-carries-imperative-2026-10-15`
+    /// (ADR-141 Update `tool-refusal-states-the-refusal-2026-10-15`): the model
+    /// reads the refusal's own sentence, with no imperative, instead of a fixed
+    /// "is not available. Do not retry this tool."
     #[test]
-    fn policy_feedback_message_contains_tool_name() {
-        let msg = policy_feedback_message("shell.run");
+    fn policy_feedback_message_states_the_refusal() {
+        let refusal = SealSessionError::PolicyViolation(PolicyViolation::ToolNotAllowed {
+            tool_name: "fs_run".to_string(),
+            allowed_tools: vec!["fs.*".to_string(), "cmd.run".to_string()],
+        });
+        let msg = policy_feedback_message("fs_run", &refusal);
         assert_eq!(
             msg,
-            "Tool 'shell.run' is not available. Do not retry this tool."
+            "Tool 'fs_run' was not run: Policy violation: tool 'fs_run' is not allowed; permitted tools: [fs.*, cmd.run]"
         );
+        assert!(!msg.contains("Do not"), "{msg}");
+        assert!(!msg.contains("retry"), "{msg}");
     }
 
     // Verify that truly fatal errors are still classified as Fatal.

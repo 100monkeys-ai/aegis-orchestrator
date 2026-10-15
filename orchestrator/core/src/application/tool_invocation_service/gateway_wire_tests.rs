@@ -2316,7 +2316,7 @@ async fn an_agents_run_lists_and_calls_its_persons_granted_remote_tool() {
 /// An agent its person did not grant the binding to is not offered the
 /// server's tools, and a call of one anyway is refused before any dial:
 /// the gateway receives no InvokeTool, and the model reads that the tool
-/// is not available.
+/// was not run, with the refusal's own sentence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_ungranted_agents_run_is_not_offered_the_remote_tool_and_its_call_is_refused_before_any_dial(
 ) {
@@ -2357,12 +2357,9 @@ async fn an_ungranted_agents_run_is_not_offered_the_remote_tool_and_its_call_is_
         .iter()
         .find(|m| m.role == "tool")
         .expect("the refusal is in the conversation");
-    assert!(
-        result
-            .content
-            .contains("Tool 'notes-1.lookup' is not available. Do not retry this tool."),
-        "{}",
-        result.content
+    assert_eq!(
+        result.content,
+        "Tool 'notes-1.lookup' was not run: Not found: This tool needs your own credential for 'notes-1', granted to this agent."
     );
 }
 
