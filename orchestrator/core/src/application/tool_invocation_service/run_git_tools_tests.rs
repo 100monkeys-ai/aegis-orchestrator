@@ -17,6 +17,8 @@
 //! | The tools and their schemas | `the_four_git_tools_are_listed_with_schemas_declaring_repository_and_binding_id` |
 //! | Offered to an agent naming them | `an_agent_naming_the_git_tools_with_an_admitting_context_is_offered_them` |
 //! | A label the run did not mount | `a_label_the_run_did_not_mount_is_refused_and_no_binding_id_is_read` |
+//! | No label, one repository | `a_call_naming_no_repository_in_a_one_repository_run_answers_that_repository` |
+//! | No label, two repositories | `a_call_naming_no_repository_in_a_two_repository_run_is_refused_with_the_labels` |
 //! | Commit, and the clean tree | `the_run_commits_on_the_binding_it_holds_and_a_clean_tree_answers_its_sentence` |
 //! | Status | `status_answers_the_work_branch_clean_or_changed_and_its_head` |
 //! | Push, and the credential | `the_run_pushes_only_its_work_branch_and_no_part_of_the_token_is_anywhere` |
@@ -163,6 +165,10 @@ async fn an_agent_naming_the_git_tools_with_an_admitting_context_is_offered_them
 // Inside a run
 // ---------------------------------------------------------------------------
 
+/// A label the run did not mount is refused, and a `binding_id` is never
+/// read inside a run: a call naming only a `binding_id` the run was never
+/// given answers the run's own repository (AEGIS ADR-136 G7, ADR-141's
+/// Update of 2026-10-15, clause (3)).
 #[tokio::test]
 async fn a_label_the_run_did_not_mount_is_refused_and_no_binding_id_is_read() {
     let harness = Harness::new(None).await;
@@ -182,18 +188,141 @@ async fn a_label_the_run_did_not_mount_is_refused_and_no_binding_id_is_read() {
         if told(&other) != NOT_ONE {
             wrong.push(format!("{tool} with label `other`: {}", told(&other)));
         }
-        let by_id = harness
-            .call(
-                tool,
-                json!({"binding_id": harness.binding.0.to_string(), "message": "m"}),
-            )
-            .await;
-        let empty = "repository '' is not one of this run's repositories";
-        if told(&by_id) != empty {
-            wrong.push(format!("{tool} by binding_id alone: {}", told(&by_id)));
-        }
+    }
+    // A binding id the run was never given: were it read, the call would be
+    // refused as a binding not found; it answers the run's own repository.
+    let elsewhere = || json!({"binding_id": uuid::Uuid::new_v4().to_string(), "message": "m"});
+    let status = harness.call("aegis.git.status", elsewhere()).await;
+    match &status {
+        Ok(ToolInvocationResult::Direct(v)) if v["repository"] == json!(LABEL) => {}
+        other => wrong.push(format!(
+            "aegis.git.status by binding_id alone: {}",
+            told(other)
+        )),
+    }
+    let diff = harness.call("aegis.git.diff", elsewhere()).await;
+    if !matches!(&diff, Ok(ToolInvocationResult::Direct(v)) if v["diff"].is_string()) {
+        wrong.push(format!(
+            "aegis.git.diff by binding_id alone: {}",
+            told(&diff)
+        ));
+    }
+    let commit = harness.call("aegis.git.commit", elsewhere()).await;
+    if told(&commit) != CLEAN {
+        wrong.push(format!(
+            "aegis.git.commit by binding_id alone: {}",
+            told(&commit)
+        ));
+    }
+    let push = harness.call("aegis.git.push", elsewhere()).await;
+    match &push {
+        Ok(ToolInvocationResult::Direct(v)) if v["branch"] == json!(harness.branch) => {}
+        other => wrong.push(format!(
+            "aegis.git.push by binding_id alone: {}",
+            told(other)
+        )),
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A run holding one repository answers a git call that names none as if
+/// its label had been named, for each of the four tools (ADR-141's Update of
+/// 2026-10-15, clause (1)).
+#[tokio::test]
+async fn a_call_naming_no_repository_in_a_one_repository_run_answers_that_repository() {
+    let secret = token();
+    let server = GitTestServer::start(GIT_USER, &secret);
+    let harness = Harness::new(Some((&server, &secret))).await;
+    let mut wrong = Vec::new();
+
+    let named = harness
+        .call("aegis.git.status", json!({"repository": LABEL}))
+        .await;
+    for args in [json!({}), json!({"repository": ""})] {
+        let status = harness.call("aegis.git.status", args.clone()).await;
+        match (&status, &named) {
+            (Ok(ToolInvocationResult::Direct(v)), Ok(ToolInvocationResult::Direct(n)))
+                if v == n && v["repository"] == json!(LABEL) => {}
+            _ => wrong.push(format!(
+                "aegis.git.status {args}: {}, not as named: {}",
+                told(&status),
+                told(&named)
+            )),
+        }
+    }
+
+    std::fs::write(harness.tree().join("CHANGE.md"), "a change\n").unwrap();
+    git(&harness.tree(), &["add", "CHANGE.md"]);
+    let named = harness
+        .call(
+            "aegis.git.diff",
+            json!({"repository": LABEL, "staged": true}),
+        )
+        .await;
+    let diff = harness
+        .call("aegis.git.diff", json!({"staged": true}))
+        .await;
+    match (&diff, &named) {
+        (Ok(ToolInvocationResult::Direct(v)), Ok(ToolInvocationResult::Direct(n)))
+            if v == n && v["diff"].as_str().unwrap_or_default().contains("CHANGE.md") => {}
+        _ => wrong.push(format!(
+            "aegis.git.diff {{}}: {}, not as named: {}",
+            told(&diff),
+            told(&named)
+        )),
+    }
+
+    let committed = harness
+        .call("aegis.git.commit", json!({"message": "m"}))
+        .await;
+    let sha = match &committed {
+        Ok(ToolInvocationResult::Direct(v)) => v["commit_sha"].as_str().unwrap_or("").to_string(),
+        other => {
+            wrong.push(format!("aegis.git.commit {{message}}: {}", told(other)));
+            String::new()
+        }
+    };
+    if !sha.is_empty() && git(&harness.tree(), &["rev-parse", "HEAD"]) != sha {
+        wrong.push(format!("aegis.git.commit answered {sha}, not HEAD"));
+    }
+
+    let pushed = harness.call("aegis.git.push", json!({})).await;
+    match &pushed {
+        Ok(ToolInvocationResult::Direct(v))
+            if *v == json!({"branch": harness.branch, "remote_url": server.url()}) =>
+        {
+            let remote = remote_heads(&server, &secret);
+            if remote.get(&format!("refs/heads/{}", harness.branch)) != Some(&sha) {
+                wrong.push(format!(
+                    "the work branch is not on the remote at {sha}: {remote:?}"
+                ));
+            }
+        }
+        other => wrong.push(format!("aegis.git.push {{}}: {}", told(other))),
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A run holding two repositories refuses a git call that names none, with
+/// the run's labels in its order (ADR-141's Update of 2026-10-15, clause
+/// (2)).
+#[tokio::test]
+async fn a_call_naming_no_repository_in_a_two_repository_run_is_refused_with_the_labels() {
+    let harness = Harness::new_also(&["lib"]).await;
+    let refused = harness.call("aegis.git.status", json!({})).await;
+    assert_eq!(
+        told(&refused),
+        "name one of this run's repositories by its label: app, lib",
+        "a call naming no repository in a run of two"
+    );
+    let named = harness
+        .call("aegis.git.status", json!({"repository": LABEL}))
+        .await;
+    assert_eq!(
+        direct(&named)["repository"],
+        json!(LABEL),
+        "a run of two still answers a label it holds"
+    );
 }
 
 #[tokio::test]
@@ -533,6 +662,22 @@ impl Harness {
         host: bool,
         profile: Option<(&str, &str)>,
     ) -> Self {
+        Self::build(server, host, profile, &[]).await
+    }
+
+    /// As [`Self::new`], the run also given one binding per label in
+    /// `also`, after `app` and in that order, each on the same volume and
+    /// not cloned: enough for a call to resolve the run's labels.
+    async fn new_also(also: &[&str]) -> Self {
+        Self::build(None, false, None, also).await
+    }
+
+    async fn build(
+        server: Option<(&GitTestServer, &str)>,
+        host: bool,
+        profile: Option<(&str, &str)>,
+        also: &[&str],
+    ) -> Self {
         let dirs = tempfile::tempdir().unwrap();
         let workspace = dirs.path().join("ws");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -674,13 +819,35 @@ impl Harness {
             )
             .await
             .expect("the run's repository is prepared");
+        let mut repositories = serde_json::to_value(&prepared).unwrap();
+        for label in also {
+            let other = GitRepoBinding::new(
+                tenant.clone(),
+                None,
+                url.clone(),
+                GitRef::Branch("main".to_string()),
+                None,
+                volume.id,
+                label.to_string(),
+                CloneStrategy::Libgit2,
+                false,
+                None,
+                None,
+                None,
+            );
+            bindings.save(&other).await.unwrap();
+            repositories
+                .as_array_mut()
+                .expect("the prepared repositories are a list")
+                .push(json!({ "binding_id": other.id }));
+        }
         let branch = default_work_branch(run);
         let mut execution = Execution::new_with_id(
             execution_id,
             agent_id,
             ExecutionInput {
                 intent: None,
-                input: json!({ "repositories": serde_json::to_value(&prepared).unwrap() }),
+                input: json!({ "repositories": repositories }),
                 workspace_volume_id: None,
                 workspace_volume_mount_path: None,
                 workspace_remote_path: None,

@@ -1358,7 +1358,7 @@ impl ToolRouter {
             "repository".to_string(),
             json!({
                 "type": "string",
-                "description": "Inside a run: the label of one of the run's repositories, mounted at /workspace/<label>."
+                "description": "Inside a run: the label of one of the run's repositories, mounted at /workspace/<label>. Inside a run that holds one repository it may be left out."
             }),
         );
         properties.insert(

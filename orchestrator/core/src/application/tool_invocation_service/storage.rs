@@ -892,7 +892,10 @@ impl ToolInvocationService {
 
     /// The binding the run mounted at the label `repository` names, with the
     /// label and the run's work branch; never an id the model typed (AEGIS
-    /// ADR-136 G7, G7a).
+    /// ADR-136 G7, G7a). A call naming no label (absent or empty) takes the
+    /// run's repository when the run holds exactly one, and is refused with
+    /// the run's labels when it holds several (AEGIS ADR-141's Update of
+    /// 2026-10-15, `git-tools-default-to-the-runs-one-repository`).
     async fn run_repository(
         &self,
         run: &RunGitCall,
@@ -905,19 +908,37 @@ impl ToolInvocationService {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
+        let branch_of = |entry: &crate::domain::git_repo::RunRepository| {
+            entry
+                .branch
+                .clone()
+                .unwrap_or_else(|| crate::domain::git_repo::default_work_branch(run.run))
+        };
+        // With no label named, the run's repositories whose bindings resolve,
+        // in the run's order.
+        let mut held = Vec::new();
         if let Some(svc) = &self.git_repo_service {
             for entry in &run.entries {
                 let Ok(binding) = svc.get_binding(&entry.binding_id, tenant_id, owner).await else {
                     continue;
                 };
-                if binding.label == label {
-                    let branch = entry
-                        .branch
-                        .clone()
-                        .unwrap_or_else(|| crate::domain::git_repo::default_work_branch(run.run));
-                    return Ok((label, binding.id, branch));
+                if label.is_empty() {
+                    held.push((binding, entry));
+                } else if binding.label == label {
+                    return Ok((label, binding.id, branch_of(entry)));
                 }
             }
+        }
+        match held.as_slice() {
+            [(binding, entry)] => return Ok((binding.label.clone(), binding.id, branch_of(entry))),
+            [_, _, ..] => {
+                let labels: Vec<&str> = held.iter().map(|(b, _)| b.label.as_str()).collect();
+                return Err(SealSessionError::InvalidArguments(format!(
+                    "name one of this run's repositories by its label: {}",
+                    labels.join(", ")
+                )));
+            }
+            [] => {}
         }
         Err(SealSessionError::InvalidArguments(format!(
             "repository '{label}' is not one of this run's repositories"
