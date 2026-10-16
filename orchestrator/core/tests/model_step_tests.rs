@@ -54,6 +54,13 @@ fn whisper_registry() -> StandardRuntimeRegistry {
         resources:
           cpu: 2000
           memory: "1Gi"
+          timeout: "10m"
+      whisper-small-en-tdrz:
+        image: "ghcr.io/100monkeys-ai/aegis-model-whisper:whisper-cpp-1.9.4-small.en-tdrz@{DIGEST}"
+        description: "Speech to text with speaker turns"
+        resources:
+          cpu: 2000
+          memory: "2Gi"
           timeout: "10m""#
     );
     StandardRuntimeRegistry::from_yaml_str(&registry_yaml(&models))
@@ -166,7 +173,7 @@ fn resolve_model_refuses_an_unknown_model() {
     assert_eq!(
         refusal,
         Err(
-            "unknown model 'speech-to-text/whisper-large'; the models are speech-to-text/whisper-base"
+            "unknown model 'speech-to-text/whisper-large'; the models are speech-to-text/whisper-base, speech-to-text/whisper-small-en-tdrz"
                 .to_string()
         )
     );
@@ -311,7 +318,8 @@ fn transcribe_audio_template_parses_and_resolves() {
     workflow
         .resolve_model_images(Some(&whisper_registry()))
         .expect("the template's model step resolves");
-    let model_steps: Vec<String> = workflow
+    // S8b: two model steps, the base model and the speaker-turn model.
+    let mut model_steps: Vec<String> = workflow
         .spec
         .states
         .values()
@@ -320,11 +328,15 @@ fn transcribe_audio_template_parses_and_resolves() {
             _ => None,
         })
         .collect();
+    model_steps.sort();
     assert_eq!(
         model_steps,
-        vec![format!(
-            "ghcr.io/100monkeys-ai/aegis-model-whisper:whisper-cpp-1.9.4-base@{DIGEST}"
-        )]
+        vec![
+            format!("ghcr.io/100monkeys-ai/aegis-model-whisper:whisper-cpp-1.9.4-base@{DIGEST}"),
+            format!(
+                "ghcr.io/100monkeys-ai/aegis-model-whisper:whisper-cpp-1.9.4-small.en-tdrz@{DIGEST}"
+            ),
+        ]
     );
 
     // The stack template's own registry resolves it to the published image.
@@ -336,7 +348,7 @@ fn transcribe_audio_template_parses_and_resolves() {
     workflow
         .resolve_model_images(Some(&template_registry))
         .expect("the template's model step resolves in the stack registry");
-    let images: Vec<String> = workflow
+    let mut images: Vec<String> = workflow
         .spec
         .states
         .values()
@@ -345,9 +357,13 @@ fn transcribe_audio_template_parses_and_resolves() {
             _ => None,
         })
         .collect();
+    images.sort();
     assert_eq!(
         images,
-        vec!["ghcr.io/100monkeys-ai/aegis-model-whisper:whisper-cpp-1.9.4-base@sha256:7ef552f84197b3c6a03efe059254e95517a05cf949e3454c04a9336a5090c88f".to_string()]
+        vec![
+            "ghcr.io/100monkeys-ai/aegis-model-whisper:whisper-cpp-1.9.4-base@sha256:7ef552f84197b3c6a03efe059254e95517a05cf949e3454c04a9336a5090c88f".to_string(),
+            "ghcr.io/100monkeys-ai/aegis-model-whisper:whisper-cpp-1.9.4-small.en-tdrz@sha256:bc770238d3b881d0ba9baa35ca9583241563c8677e566a0999b4bed4b6aba0c7".to_string(),
+        ]
     );
 }
 

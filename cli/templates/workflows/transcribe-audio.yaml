@@ -7,8 +7,10 @@ metadata:
     Transcribes one audio file to text with a pinned speech-to-text model, on
     the CPU, with no network and no language model. The file is one attached
     to the run, read where the run's attachments are mounted read-only; the
-    transcript is the step's standard output ({{TRANSCRIBE.output.stdout}})
-    and is the run's answer.
+    transcript is the model step's standard output and is the run's answer.
+    With speakers set to true it runs an English-only model that marks speaker
+    turns, and the transcript starts a new paragraph at each change of
+    speaker.
   labels:
     category: platform
     type: builtin-model
@@ -29,6 +31,14 @@ metadata:
         # run's only attachment when left out, and checked against the
         # attached names before the run starts.
         x-aegis-attachment-name: true
+      speakers:
+        type: boolean
+        default: false
+        description: >-
+          Set it to true when the recording has more than one voice: the
+          transcript then starts a new paragraph at each change of speaker,
+          labelled Speaker 1 and Speaker 2 in turn. English recordings only.
+          The labels mark turns, not who is speaking.
   output_schema:
     type: object
     properties:
@@ -38,12 +48,25 @@ metadata:
       exit_code:
         type: integer
         description: The model step's exit code
+  # Exactly one of TRANSCRIBE and TRANSCRIBE_TURNS runs; a state that did not
+  # run renders as nothing, so each field reads the step that ran.
   output_template:
-    transcript: "{{TRANSCRIBE.stdout}}"
-    exit_code: "{{TRANSCRIBE.exit_code}}"
+    transcript: "{{TRANSCRIBE.stdout}}{{TRANSCRIBE_TURNS.stdout}}"
+    exit_code: "{{TRANSCRIBE.exit_code}}{{TRANSCRIBE_TURNS.exit_code}}"
 spec:
-  initial_state: TRANSCRIBE
+  initial_state: ROUTE
   states:
+    # speakers true goes to the speaker-turn model step; false or absent (its
+    # default) to the base model step.
+    ROUTE:
+      kind: System
+      command: "echo routed"
+      transitions:
+        - condition: custom
+          expression: "(default input.speakers false)"
+          target: TRANSCRIBE_TURNS
+        - condition: on_success
+          target: TRANSCRIBE
     # A model step: the image is the registry's pinned speech-to-text model,
     # resolved at registration; it runs with no network, and the registry's
     # entry sets its CPU, memory and timeout. It reads the run's attachments,
@@ -65,6 +88,25 @@ spec:
         - condition: exit_code_non_zero
           target: FAILED
           feedback: "The recording could not be transcribed: {{{TRANSCRIBE.stderr}}}"
+    # The speaker-turn model step: the same program, mounts and no network, on
+    # whisper.cpp's tinydiarize model, which the program runs with turns marked
+    # and renders as Speaker 1 and Speaker 2 paragraphs.
+    TRANSCRIBE_TURNS:
+      kind: ContainerRun
+      name: "Transcribe with speaker turns"
+      image: "model:speech-to-text/whisper-small-en-tdrz"
+      command: ["transcribe", "/input/{{input.audio_path}}", "--out", "/tmp/transcript.txt"]
+      volumes:
+        - name: attachments
+          mount_path: /input
+          read_only: true
+      shell: false
+      transitions:
+        - condition: exit_code_zero
+          target: DONE
+        - condition: exit_code_non_zero
+          target: FAILED
+          feedback: "The recording could not be transcribed: {{{TRANSCRIBE_TURNS.stderr}}}"
     DONE:
       kind: System
       command: "echo transcribed"

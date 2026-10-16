@@ -94,3 +94,14 @@ spec:
           cpu: 2000
           memory: "1Gi"
           timeout: "15m"
+      # speech-to-text/whisper-small-en-tdrz: whisper.cpp 1.9.4 with the
+      # tinydiarize small.en model (English only), marking speaker turns; the
+      # same Dockerfile by build arguments. The digest is the one the
+      # pipeline's first publish of the tag gave (Pipeline 38843598793).
+      whisper-small-en-tdrz:
+        image: "ghcr.io/100monkeys-ai/aegis-model-whisper:whisper-cpp-1.9.4-small.en-tdrz@sha256:bc770238d3b881d0ba9baa35ca9583241563c8677e566a0999b4bed4b6aba0c7"
+        description: "Speech to text with speaker turns: whisper.cpp 1.9.4 with the tinydiarize small.en model (English only), on the CPU, with ffmpeg to decode the audio"
+        resources:
+          cpu: 2000
+          memory: "2Gi"
+          timeout: "15m"
