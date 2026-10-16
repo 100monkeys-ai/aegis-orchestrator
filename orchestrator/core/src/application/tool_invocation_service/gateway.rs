@@ -860,11 +860,10 @@ impl ToolInvocationService {
     }
 
     /// The tools a session acting as its person may call, as the Zaru MCP
-    /// server lists them (Zaru ADR-0069 D1, D7): its security context's
-    /// tools (with the person's plan context's added under an operator
-    /// escalation), less every connection family the person holds no active
-    /// binding of, with the tools of each remote server they hold one of. A
-    /// session with no person answers its context's tools.
+    /// server lists them (Zaru ADR-0069 D1, D7, Zaru ADR-0071 D3): see
+    /// [`Self::get_available_tools_for_person`], for the credential that
+    /// attested the session. A session with no person answers its context's
+    /// tools.
     pub async fn get_available_tools_for_session(
         &self,
         session: &crate::domain::seal_session::SealSession,
@@ -877,6 +876,7 @@ impl ToolInvocationService {
                     user_id,
                     session.zaru_tier.as_deref(),
                     session.operator_escalation.is_some(),
+                    session.attested_by,
                 )
                 .await
             }
@@ -887,10 +887,18 @@ impl ToolInvocationService {
         }
     }
 
-    /// [`Self::get_available_tools_for_session`] for the person `user_id` in
-    /// `tenant_id`, attested under `security_context_name` with the plan
-    /// `tier`, `escalated` when the key holds an operator escalation: what
+    /// The tools the person `user_id` in `tenant_id` may call, attested
+    /// under `security_context_name` with the plan `tier`, `escalated` when
+    /// the key holds an operator escalation, by `credential`: what
     /// `GET /v1/seal/tools` answers a caller that presents its credential.
+    ///
+    /// The context's tools (with the person's plan context's added under an
+    /// operator escalation), and of the connection families: for the person's
+    /// own session token, every family they hold an active binding of, with
+    /// the tools of each remote server they hold one of (Zaru ADR-0069 D1,
+    /// D7); for an API key, only the families its profile names, listed with
+    /// that profile's bindings and narrowed by its tools, and with no profile
+    /// none (Zaru ADR-0071 D1, D3, D4).
     pub async fn get_available_tools_for_person(
         &self,
         security_context_name: &str,
@@ -898,6 +906,7 @@ impl ToolInvocationService {
         user_id: &str,
         tier: Option<&str>,
         escalated: bool,
+        credential: crate::domain::seal_session::AttestingCredential,
     ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SealSessionError> {
         let mut tools = self
             .get_available_tools_for_context(security_context_name)
@@ -909,6 +918,19 @@ impl ToolInvocationService {
                     tools.push(tool);
                 }
             }
+        }
+        if let crate::domain::seal_session::AttestingCredential::ApiKey { profile } = credential {
+            return self
+                .tools_for_key(
+                    security_context_name,
+                    &plan_name,
+                    escalated,
+                    tenant_id,
+                    user_id,
+                    profile,
+                    tools,
+                )
+                .await;
         }
         let mut connected: std::collections::HashMap<String, Option<Vec<ContextBinding>>> =
             std::collections::HashMap::new();
@@ -979,6 +1001,97 @@ impl ToolInvocationService {
                     }
                 }
             }
+        }
+        Ok(kept)
+    }
+
+    /// The listing of an API key (Zaru ADR-0071 D1, D3): `tools` less every
+    /// connection family `profile` does not name (all of them with no
+    /// profile, or with one that can no longer be read), with the tools of
+    /// each remote server it names listed with its bindings, narrowed by
+    /// the profile's tools.
+    #[allow(clippy::too_many_arguments)]
+    async fn tools_for_key(
+        &self,
+        security_context_name: &str,
+        plan_name: &str,
+        escalated: bool,
+        tenant_id: &TenantId,
+        user_id: &str,
+        profile: Option<uuid::Uuid>,
+        tools: Vec<crate::infrastructure::tool_router::ToolMetadata>,
+    ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SealSessionError> {
+        let named = match profile {
+            Some(profile) => self
+                .profile_contexts(tenant_id, Some(user_id), profile)
+                .await
+                .unwrap_or_default(),
+            None => crate::domain::execution::ExecutionContexts::default(),
+        };
+        let names = |key: &str| {
+            matches!(
+                named.server(key),
+                crate::domain::execution::ServerChoice::Bindings(_)
+            )
+        };
+        let mut kept: Vec<_> = tools
+            .into_iter()
+            .filter(|tool| {
+                crate::application::credential_service::connection_key(
+                    &tool.name,
+                    &self.remote_tool_servers,
+                )
+                .is_none_or(names)
+            })
+            .collect();
+        let mut choices = serde_json::Map::new();
+        for (server, choice) in named.servers() {
+            if let crate::domain::execution::ServerChoice::Bindings(ids) = choice {
+                if self.remote_tool_servers.iter().any(|name| name == server) {
+                    choices.insert(
+                        server.to_string(),
+                        Value::Array(
+                            ids.iter()
+                                .map(|id| Value::String(id.0.to_string()))
+                                .collect(),
+                        ),
+                    );
+                }
+            }
+        }
+        if !choices.is_empty() {
+            let mut names = vec![security_context_name.to_string()];
+            if escalated && plan_name != security_context_name {
+                names.push(plan_name.to_string());
+            }
+            for name in names {
+                let Some(context) = self
+                    .security_context_repo
+                    .find_by_name(&name)
+                    .await
+                    .map_err(|e| SealSessionError::ConfigurationError(e.to_string()))?
+                else {
+                    continue;
+                };
+                for tool in self
+                    .listed_remote_tools(
+                        tenant_id,
+                        Some(user_id.to_string()),
+                        AgentId::new(),
+                        &context,
+                        &choices,
+                    )
+                    .await?
+                {
+                    if !kept.iter().any(|listed| listed.name == tool.name) {
+                        kept.push(tool);
+                    }
+                }
+            }
+        }
+        if let Some(profile) = profile {
+            self.narrow_by_profile(tenant_id, Some(user_id), profile, &mut kept)
+                .await;
         }
         Ok(kept)
     }

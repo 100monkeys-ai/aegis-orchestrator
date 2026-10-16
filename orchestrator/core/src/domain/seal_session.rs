@@ -606,6 +606,21 @@ pub trait EnvelopeVerifier {
     fn replay_nonce(&self) -> String;
 }
 
+/// The credential that attested a session (Zaru ADR-0071 D1 (c)): the
+/// person's own session token, as Zaru Web's turn presents it, or an API key
+/// with the profile chosen for it, if any (D3). A call is the person's own
+/// chat turn only when its session is `Interactive` and its execution has no
+/// record; every execution is a run, whatever attested its starter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum AttestingCredential {
+    /// The person's own session token (Zaru Web's turn).
+    Interactive,
+    /// An API key, carrying the profile chosen for it on the API keys page,
+    /// or none.
+    ApiKey { profile: Option<Uuid> },
+}
+
 /// Aggregate root for the SEAL session lifecycle (BC-12, ADR-035).
 ///
 /// Represents the security contract between one agent execution and the orchestrator.
@@ -658,6 +673,11 @@ pub struct SealSession {
     /// that the escalation is still active (D19).
     pub operator_escalation: Option<SealOperatorEscalation>,
 
+    /// The credential that attested the session (Zaru ADR-0071 D1 (c)). A
+    /// session no attestation recorded one for is an API key with no
+    /// profile, which reaches no connection.
+    pub attested_by: AttestingCredential,
+
     /// Session status
     pub status: SessionStatus,
 
@@ -692,6 +712,7 @@ impl SealSession {
             zaru_tier: None,
             tenant_id,
             operator_escalation: None,
+            attested_by: AttestingCredential::ApiKey { profile: None },
             status: SessionStatus::Active,
             created_at: now,
             expires_at: now + chrono::Duration::hours(SESSION_TTL_HOURS),
@@ -702,6 +723,13 @@ impl SealSession {
     /// attestation (AEGIS ADR-129 D14).
     pub fn with_operator_escalation(mut self, escalation: SealOperatorEscalation) -> Self {
         self.operator_escalation = Some(escalation);
+        self
+    }
+
+    /// Record the credential that attested the session (Zaru ADR-0071 D1
+    /// (c)).
+    pub fn with_attesting_credential(mut self, credential: AttestingCredential) -> Self {
+        self.attested_by = credential;
         self
     }
 

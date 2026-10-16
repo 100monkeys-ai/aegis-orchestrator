@@ -1,9 +1,11 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! The session's listing is the person's callable set (Zaru ADR-0069 D1,
-//! Trigger 1 (b)): the tier context's tools, less every connection family
-//! the person holds no active binding of. The person of the fixture holds
-//! one mailbox and no calendar and no remote server binding.
+//! The listing of a session attested by the person's own session token is
+//! the person's callable set (Zaru ADR-0069 D1, Trigger 1 (b)): the tier
+//! context's tools, less every connection family the person holds no active
+//! binding of. The person of the fixture holds one mailbox and no calendar
+//! and no remote server binding. A key's listing is bounded by its profile
+//! (Zaru ADR-0071 D3): `deny_by_default_orchestrator_listing.rs`.
 
 #[path = "support/mcp_connections_orchestrator_fixture.rs"]
 mod fixture;
@@ -12,6 +14,7 @@ mod mail_standins;
 
 use std::sync::Arc;
 
+use aegis_orchestrator_core::domain::seal_session::AttestingCredential;
 use aegis_orchestrator_core::domain::seal_session_repository::SealSessionRepository;
 use fixture::*;
 
@@ -25,7 +28,8 @@ async fn b_the_sessions_listing_holds_no_tool_of_a_family_the_person_has_not_con
         .find_active_by_security_token(&f.token.clone().into())
         .await
         .unwrap()
-        .expect("the session is active");
+        .expect("the session is active")
+        .with_attesting_credential(AttestingCredential::Interactive);
     let listed: Vec<String> = f
         .service
         .get_available_tools_for_session(&session)

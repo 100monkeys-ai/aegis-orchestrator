@@ -859,6 +859,42 @@ pub(crate) fn listing_person(
     })
 }
 
+/// The header a listing names the profile it is for by (Zaru ADR-0071 D3:
+/// a key's request may name one), one profile id.
+pub(crate) const PROFILE_HEADER: &str = "X-Zaru-Profile";
+
+/// What attested a listing's credential (Zaru ADR-0071 D1 (c), D3): an
+/// `aegis_*` key is an API key, its profile the one the request names in
+/// [`PROFILE_HEADER`]; any other bearer is the person's own session token.
+/// A header that is not one profile id is refused with the start's
+/// sentence.
+pub(crate) fn listing_credential(
+    headers: &HeaderMap,
+) -> Result<aegis_orchestrator_core::domain::seal_session::AttestingCredential, &'static str> {
+    use aegis_orchestrator_core::domain::seal_session::AttestingCredential;
+    let bearer = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .unwrap_or_default();
+    if !bearer.starts_with("aegis_") {
+        return Ok(AttestingCredential::Interactive);
+    }
+    let profile = match headers.get(PROFILE_HEADER) {
+        None => None,
+        Some(value) => Some(
+            value
+                .to_str()
+                .ok()
+                .map(str::trim)
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                .ok_or(aegis_orchestrator_core::domain::execution::PROFILE_SHAPE)?,
+        ),
+    };
+    Ok(AttestingCredential::ApiKey { profile })
+}
+
 /// `GET /v1/seal/tools`: the tools of the security context the request
 /// names (`X-Zaru-Security-Context`, or the `security_context` query). A
 /// request that presents its credential (`Authorization: Bearer`, an
@@ -866,8 +902,11 @@ pub(crate) fn listing_person(
 /// answered its person's callable set (Zaru ADR-0069 D1, D7): the context's
 /// tools, with the person's plan context's under an operator escalation,
 /// less every connection family the person has not connected, with the
-/// tools of each remote server they have; a credential that does not
-/// authenticate is answered 401, a context the caller may not attest 403.
+/// tools of each remote server they have; for an `aegis_*` key, only the
+/// families the profile it names in `X-Zaru-Profile` names, and with none
+/// no family (Zaru ADR-0071 D3); a credential that does not authenticate
+/// is answered 401, a context the caller may not attest 403, a profile
+/// header that is not one profile id 400.
 pub(crate) async fn list_seal_tools_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SealToolsQuery>,
@@ -883,6 +922,16 @@ pub(crate) async fn list_seal_tools_handler(
 
     let tools_result = match (&security_context, headers.contains_key("authorization")) {
         (Some(security_context), true) => {
+            let credential = match listing_credential(&headers) {
+                Ok(credential) => credential,
+                Err(sentence) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": sentence })),
+                    )
+                        .into_response();
+                }
+            };
             let Some(caller) = authenticate_attest_request(&state, &headers).await else {
                 return (
                     StatusCode::UNAUTHORIZED,
@@ -933,6 +982,7 @@ pub(crate) async fn list_seal_tools_handler(
                     &person.user_id,
                     person.tier.as_deref(),
                     person.escalated,
+                    credential,
                 )
                 .await
         }
@@ -1546,5 +1596,48 @@ mod refusal_needs_tests {
         );
         let (_, body) = body_of(&e, "github.list_issues").await;
         assert!(body["error"].get("needs").is_none(), "{body}");
+    }
+}
+
+/// What `GET /v1/seal/tools` lists a credential as (Zaru ADR-0071 D1 (c),
+/// D3, Trigger 1 (c), the route's half): an `aegis_*` key is an API key
+/// whose profile is the one `X-Zaru-Profile` names, or none; any other
+/// bearer is the person's own session token; a profile header that is not
+/// one profile id is refused.
+#[cfg(test)]
+mod listing_credential_tests {
+    use super::*;
+    use aegis_orchestrator_core::domain::seal_session::AttestingCredential;
+
+    fn headers(bearer: &str, profile: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {bearer}").parse().unwrap());
+        if let Some(profile) = profile {
+            headers.insert(PROFILE_HEADER, profile.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn c_a_key_names_its_profile_in_the_header_and_a_session_token_is_the_person() {
+        let profile = uuid::Uuid::new_v4();
+        assert_eq!(
+            listing_credential(&headers("aegis_k1", None)),
+            Ok(AttestingCredential::ApiKey { profile: None })
+        );
+        assert_eq!(
+            listing_credential(&headers("aegis_k1", Some(&profile.to_string()))),
+            Ok(AttestingCredential::ApiKey {
+                profile: Some(profile)
+            })
+        );
+        assert_eq!(
+            listing_credential(&headers("aegis_k1", Some("two, profiles"))),
+            Err("'profile' must be one profile id")
+        );
+        assert_eq!(
+            listing_credential(&headers("eyJhbGciOi.jwt.sig", Some(&profile.to_string()))),
+            Ok(AttestingCredential::Interactive)
+        );
     }
 }
