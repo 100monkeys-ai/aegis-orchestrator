@@ -937,7 +937,7 @@ fn the_testers_instruction_budget_and_done_when_are_the_updates() {
         .unwrap_or_default();
     let criteria_words = criteria.split_whitespace().collect::<Vec<_>>().join(" ");
     if !criteria_words
-        .ends_with("The answer names each test file and the criterion each test shows. No test asserts on a line ending, a '\\r' or an escape sequence that no acceptance criterion names.")
+        .ends_with("The answer names each test file and the criterion each test shows. No test asserts on a line ending, a '\\r' or an escape sequence that no acceptance criterion names. No test file names an absolute /workspace/... path: every test path is relative to the repository's root.")
     {
         complaints.push(format!("the judge's criteria are {criteria:?}"));
     }
