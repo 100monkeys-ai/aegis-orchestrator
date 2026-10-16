@@ -375,6 +375,7 @@ models:
                 .to_string(),
             aegis_role: None,
             zaru_tier: Some("free".to_string()),
+            profile_id: None,
         }
     }
 

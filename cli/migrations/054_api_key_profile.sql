@@ -1,0 +1,21 @@
+-- Migration 054: an API key carries the profile chosen for it
+-- (Zaru ADR-0071 D3 and D6, deny by default).
+--
+-- api_keys gains one nullable column:
+--   profile_id  the person's profile chosen for the key on the API keys
+--               page, or NULL. A call on the key reaches only the
+--               connections that profile names; NULL reaches none. Set at
+--               creation (`POST /v1/api-keys` with `profile`) or later
+--               (`PATCH /v1/api-keys/{id}` with `{"profile": id or null}`),
+--               answered by `GET /v1/api-keys` and by the validation answer.
+--               No foreign key: a profile is soft-deleted, and a key whose
+--               profile was deleted reaches none, as a run on a deleted
+--               profile is refused.
+--
+-- Forward-only and additive: one nullable column, no default, no existing
+-- row rewritten; a key stored before it reads with profile_id NULL and so
+-- reaches none of the person's connections until a profile is chosen for
+-- it. Idempotent, like every migration after 033: running it again over a
+-- migrated schema changes nothing.
+
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS profile_id UUID NULL;

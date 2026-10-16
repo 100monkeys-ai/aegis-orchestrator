@@ -24,6 +24,9 @@ pub struct ApiKeyRow {
     pub tenant_id: String,
     pub aegis_role: Option<String>,
     pub zaru_tier: Option<String>,
+    /// The profile chosen for the key (Zaru ADR-0071 D3): the only
+    /// connections a call on the key reaches. `None` reaches none.
+    pub profile_id: Option<Uuid>,
 }
 
 /// Data required to insert a new `api_keys` row.
@@ -38,6 +41,8 @@ pub struct CreateApiKeyRow {
     pub tenant_id: String,
     pub aegis_role: Option<String>,
     pub zaru_tier: Option<String>,
+    /// The profile chosen at creation, if any (Zaru ADR-0071 D3).
+    pub profile_id: Option<Uuid>,
 }
 
 // ── Repository ───────────────────────────────────────────────────────────────
@@ -67,11 +72,12 @@ impl PostgresApiKeyRepository {
             tenant_id: row.get("tenant_id"),
             aegis_role: row.get("aegis_role"),
             zaru_tier: row.get("zaru_tier"),
+            profile_id: row.get("profile_id"),
         }
     }
 
     /// Column list shared by all SELECT queries.
-    const SELECT_COLS: &str = "id, user_id, name, key_hash, scopes, expires_at, last_used_at, created_at, status, tenant_id, aegis_role, zaru_tier";
+    const SELECT_COLS: &str = "id, user_id, name, key_hash, scopes, expires_at, last_used_at, created_at, status, tenant_id, aegis_role, zaru_tier, profile_id";
 
     /// List all API keys belonging to `user_id`, newest first.
     pub async fn list_for_user(&self, user_id: &str) -> Result<Vec<ApiKeyRow>, sqlx::Error> {
@@ -109,8 +115,8 @@ impl PostgresApiKeyRepository {
     /// Insert a new API key row and return the persisted record.
     pub async fn create(&self, row: &CreateApiKeyRow) -> Result<ApiKeyRow, sqlx::Error> {
         let sql = format!(
-            r#"INSERT INTO api_keys (id, user_id, name, key_hash, scopes, expires_at, tenant_id, aegis_role, zaru_tier)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            r#"INSERT INTO api_keys (id, user_id, name, key_hash, scopes, expires_at, tenant_id, aegis_role, zaru_tier, profile_id)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                RETURNING {}"#,
             Self::SELECT_COLS
         );
@@ -124,6 +130,7 @@ impl PostgresApiKeyRepository {
             .bind(&row.tenant_id)
             .bind(&row.aegis_role)
             .bind(&row.zaru_tier)
+            .bind(row.profile_id)
             .fetch_one(&self.pool)
             .await?;
 
@@ -141,6 +148,30 @@ impl PostgresApiKeyRepository {
         )
         .bind(id)
         .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Set or clear the profile of the owner's active key (Zaru ADR-0071
+    /// D3). Returns `true` if the key was found and changed, `false` if it
+    /// does not exist, is not `user_id`'s, or is revoked.
+    pub async fn set_profile(
+        &self,
+        id: Uuid,
+        user_id: &str,
+        profile_id: Option<Uuid>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE api_keys SET profile_id = $3
+            WHERE id = $1 AND user_id = $2 AND status = 'active'
+            "#,
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(profile_id)
         .execute(&self.pool)
         .await?;
 

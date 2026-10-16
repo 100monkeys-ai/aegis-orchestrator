@@ -23,7 +23,8 @@ use crate::daemon::handlers::agents::{
     stream_agent_events_handler, update_agent_handler, update_agent_scope_handler,
 };
 use crate::daemon::handlers::api_keys::{
-    create_api_key_handler, list_api_keys_handler, revoke_api_key_handler, validate_api_key_handler,
+    create_api_key_handler, list_api_keys_handler, revoke_api_key_handler, update_api_key_handler,
+    validate_api_key_handler,
 };
 use crate::daemon::handlers::approvals::{approvals_router, ApprovalsState};
 use crate::daemon::handlers::billing::{
@@ -237,7 +238,11 @@ pub(crate) fn create_router(
         )
         // Validate route MUST come before /{id} to avoid matching "validate" as a UUID
         .route("/v1/api-keys/validate", post(validate_api_key_handler))
-        .route("/v1/api-keys/{id}", delete(revoke_api_key_handler))
+        // Zaru ADR-0071 D3, D6: PATCH sets or clears the key's profile.
+        .route(
+            "/v1/api-keys/{id}",
+            delete(revoke_api_key_handler).patch(update_api_key_handler),
+        )
         // Keycloak webhook for tenant provisioning (ADR-097)
         .route("/v1/webhooks/keycloak", post(keycloak_event_handler))
         // BC-8 Webhook stimulus ingestion (ADR-021).

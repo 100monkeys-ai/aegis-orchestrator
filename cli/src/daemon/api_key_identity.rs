@@ -312,6 +312,7 @@ pub(crate) mod test_keys {
             } else {
                 Some("pro".to_string())
             },
+            profile_id: None,
         }
     }
 }
