@@ -74,7 +74,8 @@ if [[ "$PLATFORM" == "linux" ]]; then
     command -v apt-get &>/dev/null \
         || die "apt-get not found. Linux installs require Ubuntu / Debian."
     MISSING_APT_PKGS=()
-    for pkg in curl ca-certificates; do
+    # fuse3: the released aegis binary links libfuse3.so.3 (its FUSE daemon).
+    for pkg in curl ca-certificates fuse3; do
         if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
             MISSING_APT_PKGS+=("$pkg")
         fi
@@ -174,12 +175,14 @@ ${DOCKER_REPO_BASE} $(lsb_release -cs) stable" \
     # Verify
     if ! docker info &>/dev/null; then
         echo ""
-        echo -e "${RED}${BOLD}[aegis] WARNING:${RESET} Docker daemon is not reachable after install."
+        echo -e "${RED}${BOLD}[aegis] ERROR:${RESET} Docker daemon is not reachable after install."
         if [[ "$IS_WSL" == "true" ]]; then
             echo -e "        In WSL you may need to start it manually: ${BOLD}sudo service docker start${RESET}"
             echo -e "        Or enable Docker Desktop WSL integration: https://docs.docker.com/desktop/wsl/"
         fi
+        echo -e "        Then run this installer again; 'aegis up' needs the daemon."
         echo ""
+        exit 1
     else
         success "Docker installed and running."
     fi
