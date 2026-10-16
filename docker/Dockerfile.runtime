@@ -62,7 +62,7 @@ RUN cargo build --release --bin aegis --locked
 
 # Stage 2: Runtime image
 # Using Ubuntu 22.04 for glibc 2.35 compatibility (matches CI build container)
-FROM ubuntu:24.04
+FROM ubuntu:25.10
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
