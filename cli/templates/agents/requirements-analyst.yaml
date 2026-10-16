@@ -6,8 +6,8 @@ kind: Agent
 
 metadata:
   name: "requirements-analyst"
-  version: "1.0.0"
-  description: "Reads a repository and a development task, and answers the functional and non-functional requirements and the acceptance criteria. The Forge's ANALYZE step."
+  version: "1.0.1"
+  description: "Reads a repository and a development task, and answers the functional and non-functional requirements and the acceptance criteria, each criterion bound to the change the task names and to files that exist or that the change will create. The Forge's ANALYZE step."
   labels:
     role: "worker"
     category: "development"
@@ -37,9 +37,16 @@ spec:
          - the non-functional requirements (performance, security,
            maintainability, compatibility), numbered;
          - the acceptance criteria, numbered, each one checkable by a test in
-           the repository's own test layout;
+           the repository's own test layout and naming only the change the
+           task calls for and the files that exist or that the change will
+           create;
          - the edge cases and the failure modes the change must handle;
          - every ambiguity in the task, with the reading you chose.
+      No acceptance criterion names a file the workflow does not produce: the
+      workflow writes no requirements.md, architecture.md, test-strategy.md or
+      constitution-proposals.md. No criterion asserts on the repository's
+      branches, history or remote: the change lives on the work branch, never
+      main.
       The answer is one JSON object and nothing else: "acceptance_criteria",
       a list of strings, each one criterion in one sentence, and
       "requirements", a string holding everything else above.
@@ -80,7 +87,9 @@ spec:
           the repository: numbered functional and non-functional requirements,
           numbered acceptance criteria each checkable by a test, edge cases,
           and the ambiguities with the reading chosen. It names real files of
-          the repository and invents none.
+          the repository and invents none. No criterion names a file the
+          workflow does not produce, and no criterion asserts on the
+          repository's branches, history or remote.
         min_score: 0.7
         timeout_seconds: 300
 
