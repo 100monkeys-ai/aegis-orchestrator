@@ -93,6 +93,32 @@ elif [[ "$PLATFORM" == "macos" ]]; then
     success "macOS requires no extra system packages for the release binary install."
 fi
 
+# ── Step 1b: libfuse3.so.3 ─────────────────────────────────────────────
+# The released aegis binary links libfuse3.so.3. Ubuntu 25.10 and later ship
+# libfuse3-4 (libfuse3.so.4) and no libfuse3-3, so the library is put in place
+# from Ubuntu's own pinned package when the distro cannot. Idempotent: skipped
+# when the library is already present.
+if [[ "$PLATFORM" == "linux" ]] && [[ "$(uname -m)" == "x86_64" ]]; then
+    if ldconfig -p 2>/dev/null | grep -q 'libfuse3\.so\.3'; then
+        success "libfuse3.so.3 present."
+    elif apt-cache show libfuse3-3 &>/dev/null; then
+        info "Installing libfuse3-3..."
+        sudo apt-get install -y --no-install-recommends libfuse3-3
+    else
+        LIBFUSE_DEB_URL="http://archive.ubuntu.com/ubuntu/pool/main/f/fuse3/libfuse3-3_3.14.0-5build1_amd64.deb"
+        LIBFUSE_DEB_SHA256="3042159c6d7d4dcb3df9d49cd21e49ecb57f4ba8c4153a72102f512a4fc534a2"
+        info "This release has no libfuse3-3 package; installing Ubuntu's pinned libfuse3-3 3.14.0-5build1..."
+        LIBFUSE_DEB="$(mktemp /tmp/libfuse3-3.XXXXXX.deb)"
+        curl -fsSL -o "$LIBFUSE_DEB" "$LIBFUSE_DEB_URL"
+        echo "$LIBFUSE_DEB_SHA256  $LIBFUSE_DEB" | sha256sum -c - >/dev/null \
+            || die "libfuse3-3 download did not match its pinned sha256."
+        sudo dpkg -i "$LIBFUSE_DEB" >/dev/null
+        rm -f "$LIBFUSE_DEB"
+        ldconfig -p 2>/dev/null | grep -q 'libfuse3\.so\.3' || die "libfuse3.so.3 still missing after install."
+        success "libfuse3.so.3 installed."
+    fi
+fi
+
 # ── Step 2: Docker ────────────────────────────────────────────────────────────
 info "Checking Docker..."
 
