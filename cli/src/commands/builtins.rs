@@ -1134,6 +1134,14 @@ mod tests {
                 coder["spec"]["security"]["resources"]["timeout"].as_str()
             ));
         }
+        // Clause 4: the coder's try makes at most 24 tool calls, as the
+        // tester's does; run `e7f2c2aa`'s try made 37 under the default 50.
+        if coder["spec"]["execution"]["max_tool_calls"].as_u64() != Some(24) {
+            complaints.push(format!(
+                "the coder's max_tool_calls is {:?}, not 24",
+                coder["spec"]["execution"]["max_tool_calls"].as_u64()
+            ));
+        }
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
 

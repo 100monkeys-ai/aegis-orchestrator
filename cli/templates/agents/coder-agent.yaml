@@ -69,6 +69,10 @@ spec:
     llm_timeout_seconds: 300
     iteration_timeout: "900s"
     require_tool_call: true
+    # At most 24 tool calls a try, as the tester's: every call the model asks
+    # for counts, repeats and refusals included, and the try then ends with
+    # the budget's sentence (AEGIS ADR-141, Update of 2026-10-16, clause 4).
+    max_tool_calls: 24
     validation:
       - type: semantic
         judge_agent: "code-quality-judge"
