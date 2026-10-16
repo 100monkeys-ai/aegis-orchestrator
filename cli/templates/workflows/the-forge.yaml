@@ -33,7 +33,7 @@ kind: Workflow
 
 metadata:
   name: "the-forge"
-  version: "2.0.1"
+  version: "2.0.2"
   description: |-
     Develops one change in one of your repositories: requirements and a design,
     each approved by you, then tests written first, the implementation, your
@@ -216,6 +216,8 @@ spec:
         # The repository
         The repository is at {{repository.path}}, on the work branch {{repository.branch}}. The suite will be run later in a container with the repository mounted at /workspace and the working directory /workspace, in the repository's root with: {{{input.test_command}}} Write every test path relative to the repository's root, never an absolute /workspace/... path.
 
+        The suite runs in the given test image as it is, with nothing installed: a test uses only the runtime's standard library and the repository's own tree, never a third-party module or an external binary the image may lack, and reads a text file in text mode or normalizes \r\n so a content match holds on CRLF.
+
         # The test files it tracks
         {{#if repository.tests}}{{{json repository.tests}}}{{else}}None: it tracks no test file.{{/if}}
         {{#if CHECK_TESTS}}
@@ -243,6 +245,9 @@ spec:
       image: "{{input.test_image}}"
       shell: true
       # The suite once, before CODE, with EXECUTE_TESTS's image and command.
+      # The image is the caller's test_image as it is: nothing is installed,
+      # tests are standard-library only, and text files are read robustly to
+      # line endings (text mode, or \r\n normalized).
       # Its output is printed as it was. When it shows that a test file the
       # tester wrote did not load, the step exits 86 and the run goes back to
       # TEST; any other run, its own exit code (a suite's own 86 as 1), goes
@@ -365,6 +370,9 @@ spec:
       name: "the-forge-tests"
       image: "{{input.test_image}}"
       shell: true
+      # Runs in the caller's test_image as it is: nothing is installed, tests
+      # are standard-library only, and text files are read robustly to line
+      # endings (text mode, or \r\n normalized).
       # The suite reaches the step's shell through its environment, never
       # spliced into the shell text.
       command:
