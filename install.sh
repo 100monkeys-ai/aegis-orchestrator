@@ -124,6 +124,12 @@ fi
 # the current user, activated for this session with sg. Idempotent.
 DOCKER_GROUP_PREFIX=""
 ensure_docker_engine() {
+    # A leftover Docker Desktop context would point the client at a socket
+    # that no longer exists; the engine installed here answers on the default
+    # context. DOCKER_HOST, when the person set it, is respected.
+    if [[ -z "${DOCKER_HOST:-}" ]]; then
+        export DOCKER_CONTEXT=default
+    fi
     if docker info &>/dev/null; then
         return 0
     fi
@@ -179,7 +185,14 @@ ensure_docker_engine() {
         DOCKER_GROUP_PREFIX="sg docker -c"
         success "Docker daemon running; the docker group applies to this session through sg, and to new shells on their own."
     else
-        die "the Docker engine runs but this user cannot reach it through the docker group; run 'docker info' in a new login shell, then this installer again."
+        echo ""
+        echo -e "${RED}${BOLD}[aegis] ERROR:${RESET} the Docker engine runs (root reaches it) but this user does not. The client says:"
+        sg docker -c "docker info" 2>&1 | grep -v -E '^(Client|Server| )' | head -n 5 | sed 's/^/        /'
+        echo -e "        socket: $(ls -l /var/run/docker.sock 2>&1)"
+        echo -e "        groups: $(id -nG "$USER")"
+        echo -e "        Fix the cause above (or run 'docker info' in a new login shell), then run this installer again."
+        echo ""
+        exit 1
     fi
 }
 
@@ -318,7 +331,7 @@ install_aegis_from_release
 # Socket access is resolved dynamically inside the aegis-runtime container at startup.
 info "Starting AEGIS stack (aegis up --tag $AEGIS_VERSION)..."
 if [[ -n "$DOCKER_GROUP_PREFIX" ]]; then
-    sg docker -c "\"$AEGIS_BIN_PATH\" up --tag \"$AEGIS_VERSION\""
+    sg docker -c "DOCKER_CONTEXT=${DOCKER_CONTEXT:-default} \"$AEGIS_BIN_PATH\" up --tag \"$AEGIS_VERSION\""
 else
     "$AEGIS_BIN_PATH" up --tag "$AEGIS_VERSION"
 fi
