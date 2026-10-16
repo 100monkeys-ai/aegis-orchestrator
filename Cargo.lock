@@ -14,7 +14,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-orchestrator"
-version = "0.15.0-pre-alpha"
+version = "1.0.0-beta"
 dependencies = [
  "aegis-orchestrator-core",
  "aegis-orchestrator-sdk",
@@ -80,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-orchestrator-core"
-version = "0.15.0-pre-alpha"
+version = "1.0.0-beta"
 dependencies = [
  "aegis-orchestrator-proto",
  "anyhow",
@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-orchestrator-proto"
-version = "0.15.0-pre-alpha"
+version = "1.0.0-beta"
 dependencies = [
  "prost",
  "prost-types",
@@ -177,7 +177,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-orchestrator-sdk"
-version = "0.15.0-pre-alpha"
+version = "1.0.0-beta"
 dependencies = [
  "aegis-orchestrator-core",
  "anyhow",
@@ -192,7 +192,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-orchestrator-swarm"
-version = "0.15.0-pre-alpha"
+version = "1.0.0-beta"
 dependencies = [
  "aegis-orchestrator-core",
  "anyhow",
