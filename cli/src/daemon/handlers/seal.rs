@@ -74,6 +74,8 @@ pub(crate) enum AttestTenantError {
     TenantMismatch { expected: String, got: String },
     /// The execution referenced by `request.execution_id` could not be loaded.
     ExecutionNotFound,
+    /// The caller supplied an execution_id that is not a valid UUID.
+    InvalidRequest(String),
     /// A system operator submitted a request without specifying a target
     /// tenant or execution. Operators must always specify what they are
     /// attesting against.
@@ -86,6 +88,7 @@ impl AttestTenantError {
             AttestTenantError::Unauthenticated => StatusCode::UNAUTHORIZED,
             AttestTenantError::TenantMismatch { .. } => StatusCode::FORBIDDEN,
             AttestTenantError::ExecutionNotFound => StatusCode::NOT_FOUND,
+            AttestTenantError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             AttestTenantError::OperatorMissingTarget => StatusCode::BAD_REQUEST,
         }
     }
@@ -97,6 +100,7 @@ impl AttestTenantError {
                 "permission_denied: tenant mismatch (identity tenant: {expected}, requested: {got})"
             ),
             AttestTenantError::ExecutionNotFound => "execution_not_found".to_string(),
+            AttestTenantError::InvalidRequest(message) => format!("bad_request: {message}"),
             AttestTenantError::OperatorMissingTarget => {
                 "bad_request: operators must specify tenant_id or execution_id".to_string()
             }
@@ -182,45 +186,57 @@ where
     let delegating = may_delegate(identity);
 
     // (2) execution_id branch — verify the execution's tenant matches.
-    if let Some(exec_id) = request
-        .execution_id
-        .as_deref()
-        .and_then(|s| ExecutionId::from_string(s).ok())
-    {
-        tracing::info!(
-            target: "aegis::seal::attest",
-            branch = "execution_id",
-            identity_tenant = %canonical.as_str(),
-            delegating,
-            "resolving tenant from execution_id"
-        );
-        let exec_tenant = match lookup_execution_tenant(exec_id).await {
-            Ok(t) => t,
-            Err(_) => {
-                tracing::warn!(
-                    target: "aegis::seal::attest",
-                    variant = "ExecutionNotFound",
-                    "tenant resolution rejected: execution lookup failed"
-                );
-                return Err(AttestTenantError::ExecutionNotFound);
+    if let Some(exec_id_raw) = request.execution_id.as_deref() {
+        if !exec_id_raw.is_empty() {
+            let exec_id = match ExecutionId::from_string(exec_id_raw) {
+                Ok(id) => id,
+                Err(_) => {
+                    tracing::warn!(
+                        target: "aegis::seal::attest",
+                        variant = "InvalidExecutionId",
+                        branch = "execution_id",
+                        "tenant resolution rejected: malformed execution_id"
+                    );
+                    return Err(AttestTenantError::InvalidRequest(
+                        "invalid execution_id".to_string(),
+                    ));
+                }
+            };
+            tracing::info!(
+                target: "aegis::seal::attest",
+                branch = "execution_id",
+                identity_tenant = %canonical.as_str(),
+                delegating,
+                "resolving tenant from execution_id"
+            );
+            let exec_tenant = match lookup_execution_tenant(exec_id).await {
+                Ok(t) => t,
+                Err(_) => {
+                    tracing::warn!(
+                        target: "aegis::seal::attest",
+                        variant = "ExecutionNotFound",
+                        "tenant resolution rejected: execution lookup failed"
+                    );
+                    return Err(AttestTenantError::ExecutionNotFound);
+                }
+            };
+            if exec_tenant == canonical || delegating {
+                return Ok(exec_tenant);
             }
-        };
-        if exec_tenant == canonical || delegating {
-            return Ok(exec_tenant);
+            tracing::warn!(
+                target: "aegis::seal::attest",
+                variant = "TenantMismatch",
+                branch = "execution_id",
+                identity_tenant = %canonical.as_str(),
+                execution_tenant = %exec_tenant.as_str(),
+                identity_sub = %identity.sub,
+                "tenant resolution rejected: execution belongs to a different tenant and caller cannot delegate"
+            );
+            return Err(AttestTenantError::TenantMismatch {
+                expected: canonical.as_str().to_string(),
+                got: exec_tenant.as_str().to_string(),
+            });
         }
-        tracing::warn!(
-            target: "aegis::seal::attest",
-            variant = "TenantMismatch",
-            branch = "execution_id",
-            identity_tenant = %canonical.as_str(),
-            execution_tenant = %exec_tenant.as_str(),
-            identity_sub = %identity.sub,
-            "tenant resolution rejected: execution belongs to a different tenant and caller cannot delegate"
-        );
-        return Err(AttestTenantError::TenantMismatch {
-            expected: canonical.as_str().to_string(),
-            got: exec_tenant.as_str().to_string(),
-        });
     }
 
     // (3) explicit tenant_id branch.
@@ -1251,6 +1267,22 @@ mod attest_tenant_resolution_tests {
         .await
         .unwrap();
         assert_eq!(result, own_tenant);
+    }
+
+    #[tokio::test]
+    async fn malformed_execution_id_is_a_bad_request_not_a_tenant_fallback() {
+        let identity = consumer_identity("user-alpha");
+        let mut request = req();
+        request.execution_id = Some("not-a-uuid".to_string());
+        request.tenant_id = Some("another-tenant".to_string());
+        let err = resolve_attest_tenant(lookup_unused(), Some(&identity), &request)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            AttestTenantError::InvalidRequest("invalid execution_id".to_string())
+        );
+        assert_eq!(err.http_status(), StatusCode::BAD_REQUEST);
     }
 
     /// This is a smaller, separate leak in the same handler: pre-fix, a

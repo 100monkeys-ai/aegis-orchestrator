@@ -82,7 +82,7 @@ pub fn connect_container_runtime(
 
 const AEGIS_CONTAINER_KIND_AGENT: &str = "agent";
 const AEGIS_CONTAINER_KIND_LABEL: &str = "aegis.container_kind";
-const AEGIS_EXECUTION_ID_LABEL: &str = "aegis.execution_id";
+pub(crate) const AEGIS_EXECUTION_ID_LABEL: &str = "aegis.execution_id";
 const AEGIS_KEEP_CONTAINER_ON_FAILURE_LABEL: &str = "aegis.keep_container_on_failure";
 const AEGIS_MANAGED_LABEL: &str = "aegis.managed";
 const AEGIS_RUNTIME_LABEL: &str = "aegis.runtime";

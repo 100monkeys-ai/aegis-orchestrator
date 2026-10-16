@@ -17,6 +17,9 @@
 //! independent of the runtime adapter's longer-lived lifecycle timeout.
 
 use crate::application::ports::ContainerVerificationPort;
+use crate::domain::execution::ExecutionId;
+use crate::infrastructure::runtime::AEGIS_EXECUTION_ID_LABEL;
+use std::collections::HashMap;
 
 /// Wall-clock budget for a single `inspect_container` call against the
 /// container runtime. Tight by design — attestation is on the request path
@@ -78,7 +81,11 @@ impl BollardContainerVerifier {
 
 #[async_trait::async_trait]
 impl ContainerVerificationPort for BollardContainerVerifier {
-    async fn verify_container_running(&self, container_id: &str) -> anyhow::Result<()> {
+    async fn verify_container_for_execution(
+        &self,
+        container_id: &str,
+        execution_id: &ExecutionId,
+    ) -> anyhow::Result<()> {
         let inspect = self
             .docker
             .inspect_container(container_id, None)
@@ -94,7 +101,8 @@ impl ContainerVerificationPort for BollardContainerVerifier {
         let running = inspect.state.and_then(|s| s.running).unwrap_or(false);
 
         if running {
-            Ok(())
+            let labels = inspect.config.and_then(|config| config.labels);
+            verify_execution_label(labels.as_ref(), execution_id)
         } else {
             Err(anyhow::anyhow!(
                 "Container '{}' is not in a running state",
@@ -104,12 +112,50 @@ impl ContainerVerificationPort for BollardContainerVerifier {
     }
 }
 
+fn verify_execution_label(
+    labels: Option<&HashMap<String, String>>,
+    execution_id: &ExecutionId,
+) -> anyhow::Result<()> {
+    match labels.and_then(|labels| labels.get(AEGIS_EXECUTION_ID_LABEL)) {
+        Some(actual) if actual == &execution_id.to_string() => Ok(()),
+        Some(actual) => Err(anyhow::anyhow!(
+            "Container execution ID '{}' does not match requested execution '{}'",
+            actual,
+            execution_id
+        )),
+        None => Err(anyhow::anyhow!(
+            "Container is missing the '{}' label",
+            AEGIS_EXECUTION_ID_LABEL
+        )),
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
     use tokio::net::UnixListener;
     use tokio::time::timeout;
+
+    #[test]
+    fn verifier_requires_matching_execution_label() {
+        let execution_id = ExecutionId::new();
+        let labels = HashMap::from([(
+            AEGIS_EXECUTION_ID_LABEL.to_string(),
+            execution_id.to_string(),
+        )]);
+        assert!(verify_execution_label(Some(&labels), &execution_id).is_ok());
+
+        let other_execution_id = ExecutionId::new();
+        assert!(
+            verify_execution_label(Some(&labels), &other_execution_id).is_err(),
+            "a running container from another execution must be rejected"
+        );
+        assert!(
+            verify_execution_label(None, &execution_id).is_err(),
+            "an unlabeled container must be rejected"
+        );
+    }
 
     /// Spawn a Unix listener at `path` that accepts connections but never
     /// writes a response. This simulates a runtime socket that is reachable
@@ -156,7 +202,7 @@ mod tests {
         let start = Instant::now();
         let result = timeout(
             Duration::from_secs(10),
-            verifier.verify_container_running("any-container"),
+            verifier.verify_container_for_execution("any-container", &ExecutionId::new()),
         )
         .await;
         let elapsed = start.elapsed();
@@ -206,7 +252,7 @@ mod tests {
         let start_a = Instant::now();
         let _err_a = timeout(
             Duration::from_secs(10),
-            verifier_a.verify_container_running("c"),
+            verifier_a.verify_container_for_execution("c", &ExecutionId::new()),
         )
         .await
         .expect("verifier A must fail fast")
@@ -216,7 +262,7 @@ mod tests {
         let start_b = Instant::now();
         let _err_b = timeout(
             Duration::from_secs(10),
-            verifier_b.verify_container_running("c"),
+            verifier_b.verify_container_for_execution("c", &ExecutionId::new()),
         )
         .await
         .expect("verifier B must fail fast")
