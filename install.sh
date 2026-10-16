@@ -119,6 +119,52 @@ if [[ "$PLATFORM" == "linux" ]] && [[ "$(uname -m)" == "x86_64" ]]; then
     fi
 fi
 
+# Start the Docker engine and make it reachable from this shell, without
+# Docker Desktop: systemd or the service script, then the docker group for
+# the current user, activated for this session with sg. Idempotent.
+DOCKER_GROUP_PREFIX=""
+ensure_docker_engine() {
+    if docker info &>/dev/null; then
+        return 0
+    fi
+    info "Docker daemon is not reachable. Starting the engine..."
+    if [[ -d /run/systemd/system ]] && command -v systemctl &>/dev/null; then
+        sudo systemctl enable --now docker 2>/dev/null || sudo systemctl start docker 2>/dev/null || true
+    else
+        sudo service docker start 2>/dev/null || true
+    fi
+    local i
+    for i in $(seq 1 15); do
+        sudo docker info &>/dev/null && break
+        sleep 1
+    done
+    if ! sudo docker info &>/dev/null; then
+        echo ""
+        echo -e "${RED}${BOLD}[aegis] ERROR:${RESET} the Docker engine did not start."
+        if [[ "$IS_WSL" == "true" ]]; then
+            echo -e "        In WSL: ${BOLD}sudo service docker start${RESET} (or enable systemd in /etc/wsl.conf), then run this installer again."
+        else
+            echo -e "        Start it (${BOLD}sudo systemctl start docker${RESET}), then run this installer again."
+        fi
+        echo ""
+        exit 1
+    fi
+    if docker info &>/dev/null; then
+        success "Docker daemon started."
+        return 0
+    fi
+    # The engine runs; this user cannot reach the socket in this session yet.
+    if ! id -nG "$USER" | tr ' ' '\n' | grep -qx docker; then
+        sudo usermod -aG docker "$USER"
+    fi
+    if sg docker -c "docker info" &>/dev/null; then
+        DOCKER_GROUP_PREFIX="sg docker -c"
+        success "Docker daemon running; the docker group applies to this session through sg, and to new shells on their own."
+    else
+        die "the Docker engine runs but this user cannot reach it through the docker group; run 'docker info' in a new login shell, then this installer again."
+    fi
+}
+
 # ── Step 2: Docker ────────────────────────────────────────────────────────────
 info "Checking Docker..."
 
@@ -129,38 +175,13 @@ if grep -qiE 'microsoft|WSL' /proc/version 2>/dev/null; then
 fi
 
 if command -v docker &>/dev/null; then
-    if docker info &>/dev/null; then
-        success "Docker is running ($(docker --version))."
-    else
-        info "Docker is installed but daemon is not reachable. Attempting to start daemon..."
-        if command -v systemctl &>/dev/null; then
-            sudo systemctl start docker 2>/dev/null || true
-        else
-            sudo service docker start 2>/dev/null || true
-        fi
-
-        if docker info &>/dev/null; then
-            success "Docker daemon started successfully."
-        else
-            echo ""
-            echo -e "${RED}${BOLD}[aegis] ERROR:${RESET} Docker is installed but not reachable for current user/session."
-            if [[ "$IS_WSL" == "true" ]]; then
-                echo -e "        WSL detected. Ensure Docker Desktop WSL integration is enabled:"
-                echo -e "          https://docs.docker.com/desktop/wsl/"
-            fi
-            echo -e "        Try:"
-            echo -e "          - restarting Docker Desktop / Docker daemon"
-            echo -e "          - re-login after docker group changes"
-            echo -e "          - verifying: ${BOLD}docker info${RESET}"
-            echo ""
-            exit 1
-        fi
-    fi
+    ensure_docker_engine
+    success "Docker is running ($(docker --version 2>/dev/null || sudo docker --version))."
 elif [[ "$PLATFORM" == "linux" ]]; then
     if [[ "$IS_WSL" == "true" ]]; then
         echo ""
         echo -e "${CYAN}${BOLD}[aegis] WSL detected.${RESET} Docker Engine is not installed in this WSL distro."
-        echo -e "        Docker Desktop with WSL integration is the easiest option:"
+        echo -e "        Installing Docker Engine (docker-ce) inside WSL; no Docker Desktop needed."
         echo -e "          https://docs.docker.com/desktop/wsl/"
         echo ""
         echo -e "        Alternatively, install Docker Engine natively inside WSL:"
@@ -191,27 +212,8 @@ ${DOCKER_REPO_BASE} $(lsb_release -cs) stable" \
         | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
     sudo apt-get update -qq
     sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-    # Add current user to the docker group so we don't need sudo
-    sudo usermod -aG docker "$USER"
-    echo ""
-    echo -e "${CYAN}${BOLD}[aegis] NOTE:${RESET} You may need to log out and back in (or restart your terminal)"
-    echo -e "        before using ${BOLD}docker${RESET} without ${BOLD}sudo${RESET}."
-    # Start the daemon (best-effort; may fail in some WSL environments)
-    sudo service docker start 2>/dev/null || true
-    # Verify
-    if ! docker info &>/dev/null; then
-        echo ""
-        echo -e "${RED}${BOLD}[aegis] ERROR:${RESET} Docker daemon is not reachable after install."
-        if [[ "$IS_WSL" == "true" ]]; then
-            echo -e "        In WSL you may need to start it manually: ${BOLD}sudo service docker start${RESET}"
-            echo -e "        Or enable Docker Desktop WSL integration: https://docs.docker.com/desktop/wsl/"
-        fi
-        echo -e "        Then run this installer again; 'aegis up' needs the daemon."
-        echo ""
-        exit 1
-    else
-        success "Docker installed and running."
-    fi
+    ensure_docker_engine
+    success "Docker installed and running."
 elif [[ "$PLATFORM" == "macos" ]]; then
     die "Docker is not running. Please install and start Docker Desktop: https://docs.docker.com/desktop/mac/install/"
 fi
@@ -297,7 +299,11 @@ install_aegis_from_release
 # ── Step 4: Start the AEGIS stack ─────────────────────────────────────────────
 # Socket access is resolved dynamically inside the aegis-runtime container at startup.
 info "Starting AEGIS stack (aegis up --tag $AEGIS_VERSION)..."
-"$AEGIS_BIN_PATH" up --tag "$AEGIS_VERSION"
+if [[ -n "$DOCKER_GROUP_PREFIX" ]]; then
+    sg docker -c "\"$AEGIS_BIN_PATH\" up --tag \"$AEGIS_VERSION\""
+else
+    "$AEGIS_BIN_PATH" up --tag "$AEGIS_VERSION"
+fi
 
 success "AEGIS is ready!"
 info "Run 'aegis --help' to get started."
