@@ -159,7 +159,7 @@ fn the_forge_and_its_seven_agents_are_listed_and_parse() {
                     if m.name != FORGE {
                         complaints.push(format!("metadata.name is {}", m.name));
                     }
-                    if m.version.as_deref() != Some("2.0.0") {
+                    if m.version.as_deref() != Some("2.0.1") {
                         complaints.push(format!("metadata.version is {:?}", m.version));
                     }
                     for (key, value) in [("builtin", "true"), ("category", "development")] {
