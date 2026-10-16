@@ -142,6 +142,9 @@ struct ExecutionContext {
     /// The seconds of the try kept after a command for the model to read its
     /// result and act on it ([`command_margin_secs`]).
     command_margin_secs: u64,
+    /// The seconds of the try kept after its last model call for the
+    /// answer's way back ([`call_transport_secs`]).
+    call_transport_secs: u64,
     /// The command in flight, as asked for and as dispatched.
     pending_command: Option<PendingCommand>,
     /// The tool call this try must make before a text answer completes it
@@ -366,6 +369,16 @@ fn repeated_call_runs(
 fn past_deadline_sentence(tool: &str) -> String {
     format!("[AEGIS] {tool} was not run: this try's time is up. The try ends here.")
 }
+
+/// The sentence a try ends with when its time is up before a model call:
+/// the call is not sent.
+const MODEL_NOT_CALLED: &str =
+    "[AEGIS] The model was not called: this try's time is up. The try ends here.";
+
+/// The sentence a try ends with when its model call gave no answer before
+/// the try's time was up.
+const MODEL_CALL_ENDED: &str = "[AEGIS] The model's answer did not come before this try's time \
+     was up. The try ends here.";
 
 /// The sentence a try ends with when the model asks for a call past its
 /// call budget (AEGIS ADR-141, Update of 2026-10-14, R4): the call is not run.
@@ -1010,6 +1023,7 @@ impl InnerLoopService {
                             llm_timeout_seconds,
                             iteration_bound,
                         ),
+                        call_transport_secs: call_transport_secs(iteration_bound),
                         pending_command: None,
                         tool_call_requirement,
                         tool_call_reminded: false,
@@ -1157,6 +1171,15 @@ impl InnerLoopService {
                 })
                 .collect();
 
+            // A model call is sent only with more of the try left than the
+            // seconds kept for its answer's way back; otherwise the try ends
+            // here and the loop answers from its facts (AEGIS ADR-141, Update
+            // of 2026-10-16 `tests-load-before-code-2026-10-16`, clause 3).
+            if self.try_time_is_up(&ctx) {
+                return self
+                    .end_the_try_on_its_clock(execution_id_str, MODEL_NOT_CALLED)
+                    .await;
+            }
             let call_started = std::time::Instant::now();
             let llm_output = match self
                 .call_llm(
@@ -1169,6 +1192,7 @@ impl InnerLoopService {
                     ctx.llm_timeout_seconds,
                     ctx.deadline,
                     ctx.command_margin_secs,
+                    ctx.call_transport_secs,
                 )
                 .await
             {
@@ -1197,6 +1221,18 @@ impl InnerLoopService {
                             &ctx.model_alias,
                             call_started.elapsed(),
                         ));
+                    }
+                    // A call the try's time ended ends the try, which the
+                    // loop answers from its facts (clause 3).
+                    if self.try_time_is_up(&ctx) {
+                        tracing::info!(
+                            execution_id = %execution_id_str,
+                            error = %e,
+                            "The try's time ended its model call"
+                        );
+                        return self
+                            .end_the_try_on_its_clock(execution_id_str, MODEL_CALL_ENDED)
+                            .await;
                     }
                     return Err(e);
                 }
@@ -1392,7 +1428,7 @@ impl InnerLoopService {
                                     .loop_end_answer(
                                         execution_id_str,
                                         &mut ended_ctx,
-                                        &tool_call.id,
+                                        Some(&tool_call.id),
                                         &sentence,
                                     )
                                     .await);
@@ -1436,7 +1472,7 @@ impl InnerLoopService {
                                     .loop_end_answer(
                                         execution_id_str,
                                         &mut ended_ctx,
-                                        &tool_call.id,
+                                        Some(&tool_call.id),
                                         &sentence,
                                     )
                                     .await);
@@ -1645,7 +1681,7 @@ impl InnerLoopService {
                                             .loop_end_answer(
                                                 execution_id_str,
                                                 &mut next_ctx,
-                                                &tool_call.id,
+                                                Some(&tool_call.id),
                                                 &refusal,
                                             )
                                             .await);
@@ -1947,6 +1983,46 @@ impl InnerLoopService {
         files
     }
 
+    /// Whether the try has no more time left than the seconds kept for a
+    /// model call's answer to come back: no model call is sent then, and a
+    /// call that failed then was ended by the try's time.
+    fn try_time_is_up(&self, ctx: &ExecutionContext) -> bool {
+        try_time_left(ctx.deadline, chrono::Utc::now())
+            .is_some_and(|left| left.as_secs() <= ctx.call_transport_secs)
+    }
+
+    /// The try's clock ends it before or inside a model call (AEGIS ADR-141,
+    /// Update of 2026-10-16 `tests-load-before-code-2026-10-16`, clause 3):
+    /// the try is recorded exhausted by its clock and the loop answers from
+    /// its facts, so the supervisor's iteration timeout does not end the try
+    /// in the middle of a model call.
+    async fn end_the_try_on_its_clock(
+        &self,
+        execution_id_str: &str,
+        sentence: &str,
+    ) -> anyhow::Result<OrchestratorMessage> {
+        let mut ended_ctx = self
+            .active_executions
+            .write()
+            .await
+            .remove(execution_id_str)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "execution context for '{execution_id_str}' not found in active_executions"
+                )
+            })?;
+        self.persist_trajectory(execution_id_str, &ended_ctx).await;
+        self.record_exhausted(
+            execution_id_str,
+            ended_ctx.iteration_number,
+            ExhaustedBy::Clock,
+        )
+        .await;
+        Ok(self
+            .loop_end_answer(execution_id_str, &mut ended_ctx, None, sentence)
+            .await)
+    }
+
     /// When the try clock, the call budget or the deadline ends a try (AEGIS
     /// ADR-141, Update of 2026-10-15, `try-end-answers-from-facts`), the
     /// try's end: the answer the loop writes itself from the try's facts, in
@@ -1960,7 +2036,7 @@ impl InnerLoopService {
         &self,
         execution_id_str: &str,
         ctx: &mut ExecutionContext,
-        tool_call_id: &str,
+        tool_call_id: Option<&str>,
         sentence: &str,
     ) -> OrchestratorMessage {
         tracing::info!(
@@ -1981,12 +2057,14 @@ impl InnerLoopService {
             Err(_) => Vec::new(),
         };
         let answer = facts_answer(&files);
-        ctx.conversation.push(ConversationMessage {
-            role: "tool".to_string(),
-            content: sentence.to_string(),
-            tool_call_id: Some(tool_call_id.to_string()),
-            tool_calls: None,
-        });
+        if let Some(tool_call_id) = tool_call_id {
+            ctx.conversation.push(ConversationMessage {
+                role: "tool".to_string(),
+                content: sentence.to_string(),
+                tool_call_id: Some(tool_call_id.to_string()),
+                tool_calls: None,
+            });
+        }
         ctx.conversation.push(ConversationMessage {
             role: "assistant".to_string(),
             content: answer.clone(),
@@ -2224,6 +2302,10 @@ impl InnerLoopService {
         // Kept after a command for its result (`command_margin_secs`): a
         // provider's rate limit is retried to the try's time left less it.
         command_margin_secs: u64,
+        // Kept after the call for its answer's way back
+        // (`call_transport_secs`): no window runs past the try's time left
+        // less it.
+        call_transport_secs: u64,
     ) -> anyhow::Result<LlmOutput> {
         let first_user = conversation.iter().position(|m| m.role == "user");
         let chat_messages: Vec<ChatMessage> = conversation
@@ -2380,6 +2462,7 @@ impl InnerLoopService {
             llm_timeout_seconds,
             try_time_left(deadline, chrono::Utc::now()),
             command_margin_secs,
+            call_transport_secs,
         )
         .await;
 
@@ -2572,6 +2655,7 @@ async fn generate_within_llm_timeout(
     llm_timeout_seconds: u64,
     try_left: Option<std::time::Duration>,
     command_margin_secs: u64,
+    call_transport_secs: u64,
 ) -> Result<crate::domain::llm::ChatResponse, crate::infrastructure::llm::registry::ModelCallFailure>
 {
     registry
@@ -2583,6 +2667,7 @@ async fn generate_within_llm_timeout(
             std::time::Duration::from_secs(llm_timeout_seconds),
             try_left,
             std::time::Duration::from_secs(command_margin_secs),
+            std::time::Duration::from_secs(call_transport_secs),
         )
         .await
 }
@@ -2669,8 +2754,18 @@ fn policy_feedback_message(
 // (retry-knows-what-failed: AEGIS ADR-005 "Context Injection", ADR-040)
 // ---------------------------------------------------------------------------
 
-/// Seconds a try's command result needs to come back to the orchestrator.
+/// Seconds a try's command result, or a model call's answer, needs to come
+/// back to the orchestrator.
 const COMMAND_RESULT_TRANSPORT_SECS: u64 = 10;
+
+/// Seconds of a try kept after its last model call for the answer's way back:
+/// `COMMAND_RESULT_TRANSPORT_SECS`, 10 s (AEGIS ADR-141, Update of 2026-10-16
+/// `tests-load-before-code-2026-10-16`, clause 3), at most a quarter of the
+/// try, half of [`command_margin_secs`]'s cap, so that a short try can still
+/// call its model, after a command too.
+pub fn call_transport_secs(iteration_bound: std::time::Duration) -> u64 {
+    COMMAND_RESULT_TRANSPORT_SECS.min(iteration_bound.as_secs() / 4)
+}
 
 /// The line the bootstrap ends a timed-out command's stderr with.
 const COMMAND_TIMED_OUT: &str = "[AEGIS] Command timed out after";
@@ -3100,6 +3195,7 @@ mod tests {
             120,
             None,
             0,
+            0,
         )
         .await;
         let waited = started.elapsed();
@@ -3131,6 +3227,7 @@ mod tests {
             &GenerationOptions::default(),
             120,
             None,
+            0,
             0,
         )
         .await;

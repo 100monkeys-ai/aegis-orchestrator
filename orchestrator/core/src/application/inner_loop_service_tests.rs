@@ -791,6 +791,40 @@ impl GradientValidator for RecordingJudge {
     }
 }
 
+/// A judge that fails the first answer it is given and passes every later
+/// one: a try the loop answered for is followed by the next.
+#[derive(Default)]
+struct RejectsTheFirstAnswer {
+    judged: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl GradientValidator for RejectsTheFirstAnswer {
+    async fn validate(&self, _ctx: &ValidationContext) -> anyhow::Result<GradientResult> {
+        let first = self
+            .judged
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 0;
+        Ok(GradientResult {
+            score: if first { 0.0 } else { 1.0 },
+            confidence: 1.0,
+            reasoning: if first { "not yet" } else { "ok" }.to_string(),
+            signals: vec![],
+            metadata: HashMap::new(),
+        })
+    }
+}
+
+/// A pipeline of one [`RejectsTheFirstAnswer`].
+fn rejecting_the_first_answer() -> Arc<ValidationPipeline> {
+    Arc::new(ValidationPipeline::new(vec![ValidatorEntry {
+        kind: ValidatorKind::Semantic,
+        validator: Box::new(RejectsTheFirstAnswer::default()),
+        min_score: 0.5,
+        min_confidence: 0.0,
+    }]))
+}
+
 // ---------------------------------------------------------------------------
 // The daemon's world
 // ---------------------------------------------------------------------------
@@ -1120,14 +1154,15 @@ async fn a_large_output_enters_the_conversation_as_head_and_tail_and_is_kept_who
     assert!(stored.get("context_notice").is_none());
 }
 
-/// A world whose try started 6 s ago under an 8 s bound: 2 s left, under
-/// the 4 s a try keeps after a command for the model, so the try clock
-/// refuses the command the model asks for.
+/// A world whose try started 4 s ago under an 8 s bound: 4 s left, more
+/// than the 2 s a model call keeps for its answer's way back, so the model is
+/// called, and not more than the 4 s a try keeps after a command for the
+/// model, so the try clock refuses the command the model asks for.
 async fn a_try_with_no_time_left(turns: Vec<Turn>) -> World {
     let w = world(agent("8s", 30), turns).await;
     w.records.update(w.execution_id, |e| {
         e.start_iteration("count the ticks".to_string()).unwrap();
-        e.iterations[0].started_at = chrono::Utc::now() - chrono::Duration::seconds(6);
+        e.iterations[0].started_at = chrono::Utc::now() - chrono::Duration::seconds(4);
     });
     w
 }
@@ -2052,12 +2087,14 @@ async fn the_same_call_answered_differently_runs_every_time() {
     assert_eq!(w.records.events_named("ToolDispatchEnded").len(), 4);
 }
 
-/// A call asked for once the execution's time is up is not run (run
-/// `ea6d7814` dispatched tool calls for two minutes after its 900 s ran
-/// out): the try ends there with the sentence, the call is a `refused` event
-/// naming the deadline, and the model is not called again.
+/// Once the execution's time is up nothing more runs (run `ea6d7814`
+/// dispatched tool calls for two minutes after its 900 s ran out): since the
+/// Update of 2026-10-16 (`tests-load-before-code-2026-10-16`, clause 3) the
+/// model is not called with no more of the try left than the seconds kept
+/// for its answer's way back, so the try ends before any call is asked for,
+/// with the loop's answer, exhausted by its clock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_call_asked_for_after_the_executions_time_is_up_is_not_run() {
+async fn once_the_executions_time_is_up_the_model_is_not_called() {
     let w = world(
         agent("60s", 30),
         vec![the_analysts_grep(), answer("as far as I got")],
@@ -2080,27 +2117,74 @@ async fn a_call_asked_for_after_the_executions_time_is_up_is_not_run() {
         )),
     }
     let statuses = w.dispatch_statuses();
-    if statuses != ["refused deadline"] {
+    if !statuses.is_empty() {
         complaints.push(format!(
-            "the call asked for after the deadline was {statuses:?}"
+            "calls were dispatched after the deadline: {statuses:?}"
+        ));
+    }
+    let calls = w.model.calls.lock().unwrap().len();
+    if calls != 0 {
+        complaints.push(format!("the model was called {calls} times"));
+    }
+    let record = w.records.get(w.execution_id);
+    let steps = record.iterations[0].trajectory.clone().unwrap_or_default();
+    if !steps.is_empty() {
+        complaints.push(format!("the try's trajectory is {steps:?}"));
+    }
+    match &record.iterations[0].exhausted {
+        Some(crate::domain::execution::Exhaustion {
+            by: crate::domain::execution::ExhaustedBy::Clock,
+            ..
+        }) => {}
+        other => complaints.push(format!("the iteration's end is {other:?}")),
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// AEGIS ADR-141, Update of 2026-10-16 `tests-load-before-code-2026-10-16`,
+/// clause 3 and Trigger (c): a model call is bounded by the try's time left
+/// less the seconds kept for its answer's way back (10 s, at most half the
+/// try). On run `e7f2c2aa` the coder's last call was still running when the
+/// supervisor ended the try at its clock, and the loop's answer from the
+/// try's facts was never reached. Here the model never answers its call
+/// made with 15 s of a 60 s try left: the loop ends the call 5 s in and
+/// answers from the try's facts, and the try is recorded exhausted by its
+/// clock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_model_call_the_tries_time_ends_ends_the_try_with_the_loops_answer() {
+    let w = world_with_silent_calls(
+        agent("60s", 300),
+        vec![answer("never: the model is silent here")],
+        vec![0],
+    )
+    .await
+    .with_an_empty_workspace();
+    w.records.update(w.execution_id, |e| {
+        e.start_iteration("change the README".to_string()).unwrap();
+        e.iterations[0].started_at = chrono::Utc::now() - chrono::Duration::seconds(45);
+    });
+    let started = std::time::Instant::now();
+    let outcome = w.generate().await;
+    let took = started.elapsed();
+    let mut complaints = Vec::new();
+    match &outcome {
+        Ok(OrchestratorMessage::Final { content, .. })
+            if content == "No file was written or changed in this try."
+                || content.starts_with("Files written:") => {}
+        other => complaints.push(format!(
+            "the try did not end with the loop's answer: {other:?}"
+        )),
+    }
+    if took > std::time::Duration::from_secs(8) {
+        complaints.push(format!(
+            "the call ran {took:?}, past the try's time left less 10 s"
         ));
     }
     let calls = w.model.calls.lock().unwrap().len();
     if calls != 1 {
         complaints.push(format!("the model was called {calls} times"));
     }
-    let record = w.records.get(w.execution_id);
-    let steps = record.iterations[0].trajectory.clone().unwrap_or_default();
-    if steps.len() != 1
-        || steps[0].status != "refused"
-        || !steps[0]
-            .error
-            .as_deref()
-            .is_some_and(|e| e.contains("fs.grep was not run"))
-    {
-        complaints.push(format!("the try's trajectory is {steps:?}"));
-    }
-    match &record.iterations[0].exhausted {
+    match &w.records.get(w.execution_id).iterations[0].exhausted {
         Some(crate::domain::execution::Exhaustion {
             by: crate::domain::execution::ExhaustedBy::Clock,
             ..
@@ -2441,7 +2525,7 @@ async fn the_try_after_an_exhausted_one_opens_from_a_constructed_history() {
         .with_a_writable_workspace()
         .await;
 
-    let outcome = w.run(None).await;
+    let outcome = w.run(Some(rejecting_the_first_answer())).await;
     let mut complaints = Vec::new();
     if !matches!(
         outcome.as_deref(),
@@ -2577,7 +2661,7 @@ async fn the_prefill_is_gone_once_the_model_calls_a_tool_instead() {
         .with_a_writable_workspace()
         .await;
 
-    let outcome = w.run(None).await;
+    let outcome = w.run(Some(rejecting_the_first_answer())).await;
     let mut complaints = Vec::new();
     if !matches!(outcome.as_deref(), Ok("done")) {
         complaints.push(format!("the execution ended {outcome:?}"));
@@ -2943,7 +3027,7 @@ async fn a_try_a_rate_limit_ends_is_recorded_exhausted_by_upstream() {
     let w = world(agent("8s", 30), rate_limited).await;
     w.records.update(w.execution_id, |e| {
         e.start_iteration("count the ticks".to_string()).unwrap();
-        e.iterations[0].started_at = chrono::Utc::now() - chrono::Duration::seconds(7);
+        e.iterations[0].started_at = chrono::Utc::now() - chrono::Duration::seconds(4);
     });
 
     let outcome = w.generate().await;
@@ -3009,7 +3093,7 @@ async fn a_try_ended_by_a_provider_internal_error_is_recorded_upstream() {
     let w = world(agent("8s", 30), turns).await;
     w.records.update(w.execution_id, |e| {
         e.start_iteration("count the ticks".to_string()).unwrap();
-        e.iterations[0].started_at = chrono::Utc::now() - chrono::Duration::seconds(7);
+        e.iterations[0].started_at = chrono::Utc::now() - chrono::Duration::seconds(4);
     });
 
     let outcome = w.generate().await;
@@ -3045,7 +3129,7 @@ async fn an_upstream_ended_try_is_on_the_task_log() {
     let w = world(agent("8s", 30), rate_limited).await;
     w.records.update(w.execution_id, |e| {
         e.start_iteration("count the ticks".to_string()).unwrap();
-        e.iterations[0].started_at = chrono::Utc::now() - chrono::Duration::seconds(7);
+        e.iterations[0].started_at = chrono::Utc::now() - chrono::Duration::seconds(4);
     });
 
     let outcome = w.generate().await;

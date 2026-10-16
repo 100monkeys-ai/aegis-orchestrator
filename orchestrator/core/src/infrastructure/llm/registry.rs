@@ -469,12 +469,24 @@ enum PrimaryEnd {
     TimeLimit(LLMError, tokio::time::Instant),
     /// The last failed retry of another retryable error.
     Exhausted(LLMError),
-    /// A bounded call's attempt window ran out with no answer: by the
-    /// node's overall budget where that is the shorter, otherwise by the
-    /// agent's `llm_timeout_seconds`.
+    /// A bounded call's attempt window ran out with no answer, ended by
+    /// the shortest of its bounds.
     Elapsed {
-        by_overall: bool,
+        end: WindowEnd,
     },
+}
+
+/// Which bound ended a bounded call's attempt window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowEnd {
+    /// The agent's `llm_timeout_seconds`.
+    Attempt,
+    /// The node's `llm_overall_timeout_secs`.
+    Overall,
+    /// The try's time left less the seconds kept for the answer's way back
+    /// (AEGIS ADR-141, Update of 2026-10-16
+    /// `tests-load-before-code-2026-10-16`, clause 3).
+    Try,
 }
 
 /// What bounds a chat call made inside a try (AEGIS ADR-141, Update of
@@ -494,20 +506,36 @@ struct CallBound {
     /// unavailability: the try's time left less the command margin, or the
     /// call's own bound for a call outside a try.
     retry_until: tokio::time::Instant,
+    /// The moment no window of a call made in a try runs past: the try's
+    /// deadline less `transport`; `None` outside a try.
+    try_ends: Option<tokio::time::Instant>,
+    /// The seconds of a try kept after its last model call for the answer's
+    /// way back.
+    transport: std::time::Duration,
 }
 
 impl CallBound {
     /// The error a run-out attempt window ends the call with.
-    fn elapsed_error(&self, alias: &str, by_overall: bool) -> LLMError {
-        if by_overall {
-            LLMError::Network(format!(
+    fn elapsed_error(&self, alias: &str, end: WindowEnd) -> LLMError {
+        match end {
+            WindowEnd::Overall => LLMError::Network(format!(
                 "upstream timeout after {}s",
                 self.overall.as_secs()
-            ))
-        } else {
-            llm_timeout_error(alias, self.attempt)
+            )),
+            WindowEnd::Attempt => llm_timeout_error(alias, self.attempt),
+            WindowEnd::Try => try_time_up_error(alias, self.transport),
         }
     }
+}
+
+/// The error of a call the try's time ended: the try's last `transport`
+/// seconds are kept for the answer's way back.
+fn try_time_up_error(alias: &str, transport: std::time::Duration) -> LLMError {
+    LLMError::Network(format!(
+        "model call on alias '{alias}' gave no answer before the last {} s of its try, \
+         which are kept for the answer's way back",
+        transport.as_secs()
+    ))
 }
 
 /// One attempt window of a bounded call: when it opened, when it runs out
@@ -516,16 +544,24 @@ impl CallBound {
 struct AttemptWindow {
     opened: tokio::time::Instant,
     ends: tokio::time::Instant,
-    by_overall: bool,
+    end: WindowEnd,
 }
 
 impl AttemptWindow {
     fn open(bound: &CallBound) -> Self {
         let opened = tokio::time::Instant::now();
-        Self {
-            opened,
-            ends: opened + bound.attempt.min(bound.overall),
-            by_overall: bound.overall < bound.attempt,
+        let (ends, end) = if bound.overall < bound.attempt {
+            (opened + bound.overall, WindowEnd::Overall)
+        } else {
+            (opened + bound.attempt, WindowEnd::Attempt)
+        };
+        match bound.try_ends {
+            Some(try_ends) if try_ends < ends => Self {
+                opened,
+                ends: try_ends,
+                end: WindowEnd::Try,
+            },
+            _ => Self { opened, ends, end },
         }
     }
 }
@@ -1131,11 +1167,7 @@ impl ProviderRegistry {
             let outcome = match &window {
                 Some(w) => match tokio::time::timeout_at(w.ends, attempt_call).await {
                     Ok(outcome) => outcome,
-                    Err(_) => {
-                        return PrimaryEnd::Elapsed {
-                            by_overall: w.by_overall,
-                        }
-                    }
+                    Err(_) => return PrimaryEnd::Elapsed { end: w.end },
                 },
                 None => attempt_call.await,
             }
@@ -1257,9 +1289,7 @@ impl ProviderRegistry {
                                     .await
                                     .is_err()
                                 {
-                                    return PrimaryEnd::Elapsed {
-                                        by_overall: w.by_overall,
-                                    };
+                                    return PrimaryEnd::Elapsed { end: w.end };
                                 }
                             }
                             None => tokio::time::sleep(backoff).await,
@@ -1344,9 +1374,9 @@ impl ProviderRegistry {
                     (None, Some(e))
                 }
                 PrimaryEnd::Exhausted(e) => return Err(e),
-                PrimaryEnd::Elapsed { by_overall } => {
+                PrimaryEnd::Elapsed { end } => {
                     return Err(bound
-                        .map(|b| b.elapsed_error(alias, by_overall))
+                        .map(|b| b.elapsed_error(alias, end))
                         .unwrap_or_else(|| LLMError::Provider("Unknown error".into())))
                 }
             };
@@ -1376,7 +1406,7 @@ impl ProviderRegistry {
                         let w = AttemptWindow::open(b);
                         match tokio::time::timeout_at(w.ends, attempt_call).await {
                             Ok(outcome) => outcome,
-                            Err(_) => Err(b.elapsed_error(alias, w.by_overall)),
+                            Err(_) => Err(b.elapsed_error(alias, w.end)),
                         }
                     }
                     None => attempt_call.await,
@@ -1437,6 +1467,12 @@ impl ProviderRegistry {
     /// `try_left` (the time to the try's deadline at the call's start) when
     /// that is shorter but at least half the bound (D2a), and where its window
     /// holds the request (D2b); a failure carries the registry's report (D10).
+    ///
+    /// Inside a try, no window runs past the try's time left less `transport`,
+    /// the seconds kept for the answer's way back: a call is bounded by the
+    /// lesser of `llm_timeout` and that, and a call with no more than
+    /// `transport` of the try left is not sent (AEGIS ADR-141, Update of
+    /// 2026-10-16 `tests-load-before-code-2026-10-16`, clause 3).
     #[allow(clippy::too_many_arguments)]
     pub async fn generate_chat_within(
         &self,
@@ -1447,15 +1483,33 @@ impl ProviderRegistry {
         llm_timeout: std::time::Duration,
         try_left: Option<std::time::Duration>,
         command_margin: std::time::Duration,
+        transport: std::time::Duration,
     ) -> Result<ChatResponse, ModelCallFailure> {
+        if let Some(left) = try_left.filter(|left| *left <= transport) {
+            warn!(
+                "LLM call not sent, the try's time is up: alias='{}', left={}s, kept={}s",
+                alias,
+                left.as_secs(),
+                transport.as_secs()
+            );
+            return Err(ModelCallFailure::unreported(LLMError::Network(format!(
+                "model call on alias '{alias}' was not sent: its try had {} s left, and the \
+                 last {} s of a try are kept for the answer's way back",
+                left.as_secs(),
+                transport.as_secs()
+            ))));
+        }
+        let now = tokio::time::Instant::now();
         // Until when a provider's rate limit or unavailability is retried:
         // the try's time left less the margin kept after it for a command's
         // result, or the call's own bound outside a try.
         let bound = CallBound {
             attempt: llm_timeout,
             overall: llm_timeout,
-            retry_until: tokio::time::Instant::now()
+            retry_until: now
                 + try_left.map_or(llm_timeout, |left| left.saturating_sub(command_margin)),
+            try_ends: try_left.map(|left| now + left.saturating_sub(transport)),
+            transport,
         };
         let (Some(own), Some((model_name, provider))) =
             (self.alias_fallbacks.get(alias), self.alias_map.get(alias))
@@ -1519,6 +1573,12 @@ impl ProviderRegistry {
             }
             PrimaryEnd::TimeLimit(timeout, window_opened) => {
                 let left = llm_timeout.saturating_sub(window_opened.elapsed());
+                let left = match bound.try_ends {
+                    Some(try_ends) => {
+                        left.min(try_ends.saturating_duration_since(tokio::time::Instant::now()))
+                    }
+                    None => left,
+                };
                 return match tokio::time::timeout(
                     left,
                     self.chat_on_fallback_alias(alias, own, timeout, messages, tools, options),
@@ -1532,6 +1592,20 @@ impl ProviderRegistry {
                         llm_timeout,
                     ))),
                 };
+            }
+            // The try's time is up: no fallback can answer inside it.
+            PrimaryEnd::Elapsed {
+                end: WindowEnd::Try,
+            } => {
+                return Err(ModelCallFailure {
+                    error: try_time_up_error(alias, transport),
+                    report: report(
+                        PrimaryFailure::Silent {
+                            secs: started.elapsed().as_secs(),
+                        },
+                        None,
+                    ),
+                });
             }
             PrimaryEnd::Elapsed { .. } => llm_timeout_error(alias, llm_timeout),
         };
@@ -1552,7 +1626,10 @@ impl ProviderRegistry {
         // The fallback's bound, or the time left to the try's deadline where
         // that is shorter and at least half the bound; otherwise not tried.
         let mut bound = bound;
-        if let Some(left) = try_left.map(|l| l.saturating_sub(started.elapsed())) {
+        if let Some(left) = try_left.map(|l| {
+            l.saturating_sub(started.elapsed())
+                .saturating_sub(transport)
+        }) {
             if left < bound / 2 {
                 let left_secs = left.as_secs_f64().round() as u64;
                 let needed_secs = (bound / 2).as_secs();
@@ -3220,6 +3297,7 @@ mod tests {
                 std::time::Duration::from_secs(3),
                 None,
                 std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
             )
             .await;
 
@@ -3276,6 +3354,7 @@ mod tests {
                 std::time::Duration::from_secs(1),
                 Some(std::time::Duration::from_secs(200)),
                 std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
             )
             .await;
         let waited = started.elapsed();
@@ -3317,6 +3396,7 @@ mod tests {
                 std::time::Duration::from_secs(1),
                 Some(std::time::Duration::from_secs(30)),
                 std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
             )
             .await
             .expect_err("no fallback fits in the try");
@@ -3351,6 +3431,7 @@ mod tests {
                 &GenerationOptions::default(),
                 std::time::Duration::from_secs(1),
                 None,
+                std::time::Duration::ZERO,
                 std::time::Duration::ZERO,
             )
             .await
@@ -3397,6 +3478,7 @@ mod tests {
                 &GenerationOptions::default(),
                 std::time::Duration::from_secs(1),
                 None,
+                std::time::Duration::ZERO,
                 std::time::Duration::ZERO,
             )
             .await
@@ -3490,6 +3572,7 @@ mod tests {
                 std::time::Duration::from_secs(2),
                 None,
                 std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
             )
             .await
             .expect_err("a silent primary with no fallback fails");
@@ -3533,6 +3616,7 @@ mod tests {
                 std::time::Duration::from_secs(60),
                 None,
                 std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
             )
             .await;
 
@@ -3566,6 +3650,7 @@ mod tests {
                 &GenerationOptions::default(),
                 std::time::Duration::from_secs(60),
                 Some(std::time::Duration::from_secs(2)),
+                std::time::Duration::ZERO,
                 std::time::Duration::ZERO,
             )
             .await
@@ -3609,6 +3694,7 @@ mod tests {
                 &GenerationOptions::default(),
                 std::time::Duration::from_secs(60),
                 Some(std::time::Duration::from_secs(10)),
+                std::time::Duration::ZERO,
                 std::time::Duration::ZERO,
             )
             .await
@@ -3714,6 +3800,7 @@ mod tests {
                 std::time::Duration::from_secs(60),
                 None,
                 std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
             )
             .await;
 
@@ -3752,6 +3839,7 @@ mod tests {
                 std::time::Duration::from_secs(120),
                 None,
                 std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
             )
             .await;
 
@@ -3789,6 +3877,7 @@ mod tests {
                 std::time::Duration::from_secs(120),
                 Some(std::time::Duration::from_secs(600)),
                 std::time::Duration::from_secs(130),
+                std::time::Duration::ZERO,
             )
             .await;
 
@@ -3804,6 +3893,109 @@ mod tests {
             started.elapsed() > std::time::Duration::from_secs(120),
             "the call outlived llm_timeout_seconds only by waiting, took {:?}",
             started.elapsed()
+        );
+    }
+
+    /// A provider that never answers.
+    struct NeverAnswers {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LLMProvider for NeverAnswers {
+        async fn generate(
+            &self,
+            _prompt: &str,
+            _options: &GenerationOptions,
+        ) -> Result<GenerationResponse, LLMError> {
+            unimplemented!("test provider: generate not used")
+        }
+
+        async fn generate_chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[ToolSchema],
+            _options: &GenerationOptions,
+        ) -> Result<ChatResponse, LLMError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            Ok(ok_response())
+        }
+
+        async fn health_check(&self) -> Result<(), LLMError> {
+            Ok(())
+        }
+    }
+
+    /// AEGIS ADR-141, Update of 2026-10-16 `tests-load-before-code-2026-10-16`,
+    /// clause 3: a model call in a try is bounded by the lesser of
+    /// `llm_timeout_seconds` and the try's time left less the 10 s kept for
+    /// the answer's way back. On run `e7f2c2aa` the coder's last call started
+    /// 26 s before its try's end and was still running when the supervisor
+    /// ended the try. With 40 s of the try left and `llm_timeout_seconds` 300,
+    /// the call ends at 30 s, saying so.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_with_40_s_of_the_try_left_ends_at_30_s() {
+        let primary = Arc::new(NeverAnswers {
+            calls: AtomicUsize::new(0),
+        });
+        let registry = ProviderRegistry::new_for_test(primary.clone(), None, 3, 1, 600);
+        let started = tokio::time::Instant::now();
+        let failure = registry
+            .generate_chat_within(
+                "default",
+                &[],
+                &[],
+                &GenerationOptions::default(),
+                std::time::Duration::from_secs(300),
+                Some(std::time::Duration::from_secs(40)),
+                std::time::Duration::from_secs(310),
+                std::time::Duration::from_secs(10),
+            )
+            .await
+            .expect_err("a call that never answers fails");
+        assert_eq!(
+            started.elapsed(),
+            std::time::Duration::from_secs(30),
+            "the call was ended after {:?}",
+            started.elapsed()
+        );
+        assert_eq!(primary.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            failure.error.to_string(),
+            "Network error: model call on alias 'default' gave no answer before the last 10 s \
+             of its try, which are kept for the answer's way back"
+        );
+    }
+
+    /// Clause 3: a call that cannot start with more than the 10 s kept for
+    /// the answer's way back is not sent.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_with_10_s_of_the_try_left_is_not_sent() {
+        let primary = Arc::new(NeverAnswers {
+            calls: AtomicUsize::new(0),
+        });
+        let registry = ProviderRegistry::new_for_test(primary.clone(), None, 3, 1, 600);
+        let started = tokio::time::Instant::now();
+        let failure = registry
+            .generate_chat_within(
+                "default",
+                &[],
+                &[],
+                &GenerationOptions::default(),
+                std::time::Duration::from_secs(300),
+                Some(std::time::Duration::from_secs(10)),
+                std::time::Duration::from_secs(310),
+                std::time::Duration::from_secs(10),
+            )
+            .await
+            .expect_err("a call with no time left is not sent");
+        assert_eq!(primary.calls.load(Ordering::SeqCst), 0, "the call was sent");
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+        assert_eq!(
+            failure.error.to_string(),
+            "Network error: model call on alias 'default' was not sent: its try had 10 s left, \
+             and the last 10 s of a try are kept for the answer's way back"
         );
     }
 }
