@@ -563,6 +563,56 @@ fn audits_timeouts_follow_its_agents_bounds() {
     assert!(complaints.is_empty(), "{}", complaints.join("\n"));
 }
 
+// ---------------------------------------------------------------------------
+// Clause 5: the run's last line states the cause
+// ---------------------------------------------------------------------------
+
+/// FAILED's `sentence`, rendered over `blackboard` as the workflow worker
+/// renders an Action state's arguments (Handlebars, a missing field empty).
+fn failed_sentence(blackboard: serde_json::Value) -> String {
+    let workflow = forge();
+    let Some(StateKind::Action { args, .. }) = state(&workflow, "FAILED").map(|s| &s.kind) else {
+        panic!("FAILED is an Action state");
+    };
+    let template = args.get("sentence").expect("FAILED writes a sentence");
+    handlebars::Handlebars::new()
+        .render_template(template, &blackboard)
+        .unwrap_or_else(|e| panic!("FAILED's sentence does not render: {e}"))
+}
+
+/// Run `e7f2c2aa` failed in CODE, and its blackboard's FAILED sentence was
+/// "": the sentence was built from DIFF and COMMIT only. A failed state with
+/// an `on_failure` route leaves `{status: "failed", error}` on the
+/// blackboard; FAILED's sentence now carries that error when DIFF and
+/// COMMIT carry none.
+#[test]
+fn a_code_failure_is_the_failed_states_sentence() {
+    let error = "Agent execution failed: Failed to execute task: Execution ended: 899 s left \
+                 under the 1815 s bound, under the 900 s a try needs";
+    let sentence = failed_sentence(serde_json::json!({
+        "ANALYZE": {"status": "completed", "output": "the requirements"},
+        "ARCHITECT": {"status": "completed", "output": "the design"},
+        "TEST": {"status": "completed", "output": "Files written:\ntest/test_readme_section.py"},
+        "CHECK_TESTS": {"status": "success", "exit_code": 1, "output": {"exit_code": 1, "stdout": "", "stderr": "FAILED (failures=1)"}},
+        "CODE": {"status": "failed", "error": error},
+        "repository": {"branch": "aegis/e7f2c2aa"},
+    }));
+    assert_eq!(sentence, error);
+}
+
+/// A guard: a failed DIFF or COMMIT keeps its own sentence, once.
+#[test]
+fn a_repository_steps_failure_keeps_its_own_sentence() {
+    for step in ["DIFF", "COMMIT"] {
+        let refusal = "nothing to commit: working tree is clean";
+        let sentence = failed_sentence(serde_json::json!({
+            "CODE": {"status": "completed", "output": "done"},
+            step: {"status": "failed", "error": refusal, "output": {"sentence": refusal}},
+        }));
+        assert_eq!(sentence, refusal, "{step}'s failure");
+    }
+}
+
 // The outputs below were printed by Python 3.12's unittest and pytest 9.0.2,
 // the first two on the tester's file of run `e7f2c2aa` as TEST answered it.
 

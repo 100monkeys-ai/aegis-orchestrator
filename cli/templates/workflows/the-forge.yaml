@@ -516,6 +516,9 @@ spec:
         sentence: ""
       transitions: []
 
+    # The run's last line states the cause: a failed DIFF's or COMMIT's own
+    # sentence, else the error the failed agent state left (each failure
+    # comes straight here, so one state at most carries one).
     FAILED:
       kind: Action
       action: update_blackboard
@@ -523,7 +526,7 @@ spec:
         outcome: "failed"
         commit_sha: "{{COMMIT.output.commit_sha}}"
         branch: "{{repository.branch}}"
-        sentence: "{{{DIFF.output.sentence}}}{{{COMMIT.output.sentence}}}"
+        sentence: "{{{DIFF.output.sentence}}}{{{COMMIT.output.sentence}}}{{#unless DIFF.output.sentence}}{{#unless COMMIT.output.sentence}}{{{ANALYZE.error}}}{{{ARCHITECT.error}}}{{{TEST.error}}}{{{CODE.error}}}{{/unless}}{{/unless}}"
       transitions: []
 
     LAND_REFUSED:
