@@ -4,11 +4,15 @@ set -eu
 # Determine container runtime socket path.
 # Priority: CONTAINER_HOST env > DOCKER_HOST env > well-known paths.
 SOCK_PATH=""
+# Under set -u an unset CONTAINER_HOST or DOCKER_HOST must expand to empty,
+# not abort the entrypoint ("CONTAINER_HOST: parameter not set").
 for candidate in \
-    "${CONTAINER_HOST#unix://}" \
-    "${DOCKER_HOST#unix://}" \
+    "${CONTAINER_HOST:-}" \
+    "${DOCKER_HOST:-}" \
     "/run/podman/podman.sock" \
     "/var/run/docker.sock"; do
+  candidate="${candidate#unix://}"
+  [ -n "$candidate" ] || continue
   if [ -S "$candidate" ] 2>/dev/null; then
     SOCK_PATH="$candidate"
     break
