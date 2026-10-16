@@ -17,10 +17,12 @@ use aegis_orchestrator_core::domain::tenant::TenantId;
 
 use aegis_orchestrator_core::domain::operator_escalation::OperatorEscalation;
 use aegis_orchestrator_core::domain::seal_session::{
-    CallerAnswer, SealOperatorEscalation, SealSessionError,
+    AttestingCredential, CallerAnswer, SealOperatorEscalation, SealSessionError,
 };
 
-use crate::daemon::api_key_identity::{key_hash_prefix, lookup_from_repo, resolve_api_key};
+use crate::daemon::api_key_identity::{
+    key_hash_prefix, lookup_from_repo, resolve_api_key, ResolvedApiKey,
+};
 use crate::daemon::state::AppState;
 
 #[derive(serde::Deserialize)]
@@ -299,7 +301,7 @@ where
 async fn authenticate_attest_request(
     state: &AppState,
     headers: &HeaderMap,
-) -> Option<AttestCaller> {
+) -> Option<(AttestCaller, AttestingCredential)> {
     let raw_header = match headers.get("authorization").and_then(|v| v.to_str().ok()) {
         Some(v) => v,
         None => {
@@ -343,12 +345,16 @@ async fn authenticate_attest_request(
             raw,
         )
         .await?;
-        return Some(AttestCaller {
-            identity: resolved.identity,
-            escalation: resolved
-                .escalation
-                .map(|escalation| (escalation, resolved.home_tenant)),
-        });
+        let credential = key_credential(&resolved);
+        return Some((
+            AttestCaller {
+                identity: resolved.identity,
+                escalation: resolved
+                    .escalation
+                    .map(|escalation| (escalation, resolved.home_tenant)),
+            },
+            credential,
+        ));
     }
     tracing::info!(
         target: "aegis::seal::attest",
@@ -382,10 +388,21 @@ async fn authenticate_attest_request(
         realm = %validated.identity.realm_slug,
         "JWT validated successfully"
     );
-    Some(AttestCaller {
-        identity: validated.identity,
-        escalation: None,
-    })
+    Some((
+        AttestCaller {
+            identity: validated.identity,
+            escalation: None,
+        },
+        AttestingCredential::Interactive,
+    ))
+}
+
+/// The credential an `aegis_*` key attests a session as (Zaru ADR-0071
+/// D1 (c), D3): an API key carrying the profile stored for it, or none.
+pub(crate) fn key_credential(resolved: &ResolvedApiKey) -> AttestingCredential {
+    AttestingCredential::ApiKey {
+        profile: resolved.profile_id,
+    }
 }
 
 /// The authenticated caller of `/v1/seal/attest`: its identity and, for an
@@ -500,7 +517,24 @@ pub(crate) fn attestation_request(
         tenant_id: binding.tenant_id.clone(),
         realm: binding.realm.clone(),
         task_summary: request.task_summary.clone(),
+        // Until the route names the credential it authenticated
+        // ([`attested_request`]): an API key with no profile, which reaches
+        // no connection.
+        attested_by: AttestingCredential::ApiKey { profile: None },
     }
+}
+
+/// [`attestation_request`], attested by `credential`: the one the route
+/// authenticated (Zaru ADR-0071 D1 (c)), which the attestation service
+/// records on the session.
+pub(crate) fn attested_request(
+    request: &HttpAttestationRequest,
+    binding: &AttestBinding,
+    credential: AttestingCredential,
+) -> aegis_orchestrator_core::infrastructure::seal::attestation::AttestationRequest {
+    let mut sent = attestation_request(request, binding);
+    sent.attested_by = credential;
+    sent
 }
 
 pub(crate) async fn attest_seal_handler(
@@ -521,7 +555,10 @@ pub(crate) async fn attest_seal_handler(
     // JWTs (Zaru consumer flow) and `aegis_*` API keys (SDK flow). The
     // global middleware only knows JWTs, so we authenticate in-handler
     // and derive a `UserIdentity` from whichever credential was supplied.
-    let caller = authenticate_attest_request(&state, &headers).await;
+    let (caller, credential) = match authenticate_attest_request(&state, &headers).await {
+        Some((caller, credential)) => (Some(caller), credential),
+        None => (None, AttestingCredential::ApiKey { profile: None }),
+    };
 
     let lookup = |exec_id: ExecutionId| {
         let svc = state.execution_service.clone();
@@ -549,7 +586,7 @@ pub(crate) async fn attest_seal_handler(
     // `aegis-system-*` SecurityContext ownership checks see the right realm
     // for operator-issued attestations.
 
-    let internal_req = attestation_request(&request, &binding);
+    let internal_req = attested_request(&request, &binding, credential);
 
     let tenant_for_log = internal_req.tenant_id.as_str().to_string();
     match state
@@ -865,13 +902,13 @@ pub(crate) const PROFILE_HEADER: &str = "X-Zaru-Profile";
 
 /// What attested a listing's credential (Zaru ADR-0071 D1 (c), D3): an
 /// `aegis_*` key is an API key, its profile the one the request names in
-/// [`PROFILE_HEADER`]; any other bearer is the person's own session token.
-/// A header that is not one profile id is refused with the start's
-/// sentence.
+/// [`PROFILE_HEADER`], else `stored`, the one chosen for the key; any other
+/// bearer is the person's own session token. A header that is not one
+/// profile id is refused with the start's sentence.
 pub(crate) fn listing_credential(
     headers: &HeaderMap,
-) -> Result<aegis_orchestrator_core::domain::seal_session::AttestingCredential, &'static str> {
-    use aegis_orchestrator_core::domain::seal_session::AttestingCredential;
+    stored: Option<uuid::Uuid>,
+) -> Result<AttestingCredential, &'static str> {
     let bearer = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
@@ -882,7 +919,7 @@ pub(crate) fn listing_credential(
         return Ok(AttestingCredential::Interactive);
     }
     let profile = match headers.get(PROFILE_HEADER) {
-        None => None,
+        None => stored,
         Some(value) => Some(
             value
                 .to_str()
@@ -922,7 +959,23 @@ pub(crate) async fn list_seal_tools_handler(
 
     let tools_result = match (&security_context, headers.contains_key("authorization")) {
         (Some(security_context), true) => {
-            let credential = match listing_credential(&headers) {
+            let Some((caller, attested)) = authenticate_attest_request(&state, &headers).await
+            else {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "error": "The credential presented could not be authenticated.",
+                    })),
+                )
+                    .into_response();
+            };
+            // Zaru ADR-0071 D3: a key's listing naming no profile is for the
+            // one chosen for the key.
+            let stored = match attested {
+                AttestingCredential::ApiKey { profile } => profile,
+                AttestingCredential::Interactive => None,
+            };
+            let credential = match listing_credential(&headers, stored) {
                 Ok(credential) => credential,
                 Err(sentence) => {
                     return (
@@ -931,15 +984,6 @@ pub(crate) async fn list_seal_tools_handler(
                     )
                         .into_response();
                 }
-            };
-            let Some(caller) = authenticate_attest_request(&state, &headers).await else {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    Json(serde_json::json!({
-                        "error": "The credential presented could not be authenticated.",
-                    })),
-                )
-                    .into_response();
             };
             let request = HttpAttestationRequest {
                 agent_id: None,
@@ -1622,22 +1666,29 @@ mod listing_credential_tests {
     fn c_a_key_names_its_profile_in_the_header_and_a_session_token_is_the_person() {
         let profile = uuid::Uuid::new_v4();
         assert_eq!(
-            listing_credential(&headers("aegis_k1", None)),
+            listing_credential(&headers("aegis_k1", None), None),
             Ok(AttestingCredential::ApiKey { profile: None })
         );
         assert_eq!(
-            listing_credential(&headers("aegis_k1", Some(&profile.to_string()))),
+            listing_credential(&headers("aegis_k1", Some(&profile.to_string())), None),
             Ok(AttestingCredential::ApiKey {
                 profile: Some(profile)
             })
         );
         assert_eq!(
-            listing_credential(&headers("aegis_k1", Some("two, profiles"))),
+            listing_credential(&headers("aegis_k1", Some("two, profiles")), None),
             Err("'profile' must be one profile id")
         );
         assert_eq!(
-            listing_credential(&headers("eyJhbGciOi.jwt.sig", Some(&profile.to_string()))),
+            listing_credential(
+                &headers("eyJhbGciOi.jwt.sig", Some(&profile.to_string())),
+                None
+            ),
             Ok(AttestingCredential::Interactive)
         );
     }
 }
+
+#[cfg(test)]
+#[path = "deny_by_default_orchestrator_2_seal_tests.rs"]
+mod deny_by_default_orchestrator_2_seal_tests;

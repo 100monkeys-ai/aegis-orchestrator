@@ -851,6 +851,10 @@ impl AegisRuntime for AegisRuntimeService {
             tenant_id: crate::domain::tenant::TenantId::system(),
             realm: crate::domain::iam::RealmKind::System,
             task_summary: None,
+            // Zaru ADR-0071 D1 (c): no person's own session token attests
+            // here; an agent's session is a run, and with no profile it
+            // reaches no connection.
+            attested_by: crate::domain::seal_session::AttestingCredential::ApiKey { profile: None },
         };
 
         match attestation_service.attest(attestation_req).await {

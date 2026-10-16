@@ -77,6 +77,13 @@ pub struct AttestationRequest {
     /// Embedded as the `task_summary` JWT claim in the issued `SecurityToken`.
     /// Truncated to 256 characters if longer.
     pub task_summary: Option<String>,
+    /// The credential that attested the session (Zaru ADR-0071 D1 (c)): the
+    /// person's own session token, as Zaru Web's turn presents it, or an API
+    /// key with the profile chosen for it. Recorded on the session, so the
+    /// orchestrator, not a header, tells the person's own chat turn from a
+    /// key. A caller that cannot say is an API key with no profile, which
+    /// reaches no connection.
+    pub attested_by: crate::domain::seal_session::AttestingCredential,
 }
 
 /// The orchestrator's response to a successful attestation handshake.

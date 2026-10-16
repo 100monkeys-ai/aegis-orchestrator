@@ -400,6 +400,8 @@ impl AttestationServiceImpl {
             request.workload_id.clone(),
             request.zaru_tier.clone(),
         );
+        // Zaru ADR-0071 D1 (c): the credential that attested the session.
+        session = session.with_attesting_credential(request.attested_by);
         if let Some(escalation) = operator_escalation {
             session = session.with_operator_escalation(escalation);
         }
@@ -559,6 +561,7 @@ mod tests {
                 tenant_id: TenantId::consumer(),
                 realm: RealmKind::Consumer,
                 task_summary: None,
+                attested_by: crate::domain::seal_session::AttestingCredential::Interactive,
             })
             .await
             .unwrap();
@@ -603,6 +606,7 @@ mod tests {
                 tenant_id: TenantId::consumer(),
                 realm: RealmKind::Consumer,
                 task_summary: None,
+                attested_by: crate::domain::seal_session::AttestingCredential::Interactive,
             })
             .await;
 
@@ -636,6 +640,7 @@ mod tests {
                 tenant_id: TenantId::system(),
                 realm: RealmKind::System,
                 task_summary: None,
+                attested_by: crate::domain::seal_session::AttestingCredential::Interactive,
             })
             .await;
 
@@ -674,6 +679,7 @@ mod tests {
                 tenant_id: TenantId::consumer(),
                 realm: RealmKind::Consumer,
                 task_summary: None,
+                attested_by: crate::domain::seal_session::AttestingCredential::Interactive,
             })
             .await;
 
@@ -716,6 +722,7 @@ mod tests {
                     slug: "other-corp".to_string(),
                 },
                 task_summary: None,
+                attested_by: crate::domain::seal_session::AttestingCredential::Interactive,
             })
             .await;
 
@@ -758,6 +765,7 @@ mod tests {
                     slug: "acme-corp".to_string(),
                 },
                 task_summary: None,
+                attested_by: crate::domain::seal_session::AttestingCredential::Interactive,
             })
             .await;
 
@@ -803,6 +811,7 @@ mod tests {
                     tenant_id: TenantId::consumer(),
                     realm: RealmKind::Consumer,
                     task_summary: Some(summary),
+                    attested_by: crate::domain::seal_session::AttestingCredential::Interactive,
                 })
                 .await
                 .unwrap();

@@ -99,6 +99,8 @@ pub(crate) struct ResolvedApiKey {
     /// The key's active escalation; only a key with no stored role holds
     /// one (D10).
     pub(crate) escalation: Option<OperatorEscalation>,
+    /// The profile chosen for the key (Zaru ADR-0071 D3), or none.
+    pub(crate) profile_id: Option<Uuid>,
 }
 
 /// Returns the first 12 hex chars of the SHA-256 hash of an API key for
@@ -248,6 +250,7 @@ pub(crate) async fn resolve_api_key(
         home_tenant: row.tenant_id,
         has_stored_role: row.aegis_role.is_some(),
         escalation,
+        profile_id: row.profile_id,
     })
 }
 
