@@ -3,9 +3,11 @@
 #
 # The Forge: a development workflow on one repository of the person's.
 #
-#   ANALYZE ─► AWAIT_REQUIREMENTS_APPROVAL ─yes─► ARCHITECT ─► AWAIT_ARCH_APPROVAL ─yes─► TEST
-#      ▲                 │ no                        ▲                  │ no                │
-#      └─────────────────┘                           └──────────────────┘                   ▼
+#   ANALYZE ─► AWAIT_REQUIREMENTS_APPROVAL ─yes─► ARCHITECT ─► AWAIT_ARCH_APPROVAL ─yes─► TEST ◄─┐
+#      ▲                 │ no                        ▲                  │ no                │    │ the tests
+#      └─────────────────┘                           └──────────────────┘                   ▼    │ did not load
+#                                                                                     CHECK_TESTS ┘
+#                                                                                           │ any other run
 #   CODE ◄──────────── exit_code_non_zero ─── EXECUTE_TESTS ◄───────────────────────────── CODE
 #    ▲                                            │ exit_code_zero
 #    │ score_below 0.95                           ▼
@@ -20,7 +22,8 @@
 # DIFF, COMMIT and LAND are the workflow interpreter's own repository steps,
 # and COMPLETE, FAILED and LAND_REFUSED its own blackboard writes: no state of
 # this workflow runs a shell command in the core process. The suite runs in a
-# container on the clone (EXECUTE_TESTS). The two Human gates are the only ones.
+# container on the clone (CHECK_TESTS once after TEST, then EXECUTE_TESTS after
+# each CODE). The two Human gates are the only ones.
 
 apiVersion: 100monkeys.ai/v1
 kind: Workflow
@@ -195,6 +198,9 @@ spec:
     TEST:
       kind: Agent
       agent: "tester-agent"
+      # TEST and CHECK_TESTS's returns to it: a third suite that does not load
+      # ends the run.
+      max_state_visits: 3
       input: |-
         # The approved requirements
         {{{json ANALYZE.output}}}
@@ -207,13 +213,89 @@ spec:
 
         # The test files it tracks
         {{#if repository.tests}}{{{json repository.tests}}}{{else}}None: it tracks no test file.{{/if}}
+        {{#if CHECK_TESTS}}
+
+        # The tests did not load
+        The suite was run once on the tests you wrote, and a file you wrote did not load: it does not parse, or its own module cannot be imported. Fix those files so that every test loads and runs; a test may still fail where the implementation is not written yet. Change no implementation file.
+
+        stderr:
+        {{{CHECK_TESTS.output.stderr}}}
+
+        stdout:
+        {{{CHECK_TESTS.output.stdout}}}
+        {{/if}}
 
         Write the tests that show each acceptance criterion met, in the repository's own test layout and style, under {{repository.path}}. Write tests only: change no implementation file.
       transitions:
         - condition: on_success
-          target: CODE
+          target: CHECK_TESTS
         - condition: on_failure
           target: FAILED
+
+    CHECK_TESTS:
+      kind: ContainerRun
+      name: "the-forge-check-tests"
+      image: "{{input.test_image}}"
+      shell: true
+      # The suite once, before CODE, with EXECUTE_TESTS's image and command.
+      # Its output is printed as it was. When it shows that a test file the
+      # tester wrote did not load, the step exits 86 and the run goes back to
+      # TEST; any other run, its own exit code (a suite's own 86 as 1), goes
+      # to CODE. A file does not load when the suite names it as not loaded
+      # (unittest's _FailedTest, pytest's "ERROR collecting") and either a
+      # SyntaxError, IndentationError or TabError points into the clone, or
+      # the module that cannot be found is the test module itself. A test
+      # importing code not written yet is CODE's to write. At this step the
+      # clone holds no change but the tester's. The suite runs in a subshell,
+      # so its own exit ends only it. Plain sh, grep and sed: the image is the
+      # person's.
+      command:
+        - |-
+          out="${TMPDIR:-/tmp}/forge-check-tests.$$.out"
+          err="${TMPDIR:-/tmp}/forge-check-tests.$$.err"
+          (eval "$FORGE_TEST_COMMAND") >"$out" 2>"$err"
+          code=$?
+          cat "$out"
+          cat "$err" >&2
+          all="$out.all"
+          cat "$out" "$err" >"$all"
+          loaded=yes
+          if grep -Eq '_FailedTest|Failed to import test module|ERROR collecting|ImportError while importing test module' "$all"; then
+            where=$(sed -nE '/File "/h; /(SyntaxError|IndentationError|TabError): /{x;p;q;}' "$all")
+            case "$where" in
+              *'File "'"$PWD/"*) loaded=no ;;
+              *'File "/'*|*'File "<'*|'') ;;
+              *'File "'*) loaded=no ;;
+            esac
+            for missing in $(sed -n "s/.*No module named '\([^']*\)'.*/\1/p" "$all"); do
+              for module in $(sed -n 's/.*Failed to import test module: \([A-Za-z0-9_.]*\).*/\1/p' "$all") $(sed -n 's/.*ERROR collecting \([^ ]*\)\.py.*/\1/p' "$all" | tr / .); do
+                case "$module" in
+                  "$missing"|"$missing".*|*."$missing") loaded=no ;;
+                esac
+              done
+            done
+          fi
+          rm -f "$out" "$err" "$all"
+          if [ "$loaded" = no ]; then exit 86; fi
+          if [ "$code" -eq 86 ]; then exit 1; fi
+          exit "$code"
+      env:
+        FORGE_TEST_COMMAND: "{{{input.test_command}}}"
+      workdir: "/workspace/repository"
+      volumes:
+        - name: repository
+          mount_path: "/workspace/repository"
+      network_mode: egress
+      resources:
+        cpu: 2000
+        memory: "4Gi"
+        timeout: 1800s
+      transitions:
+        - condition: exit_code
+          value: 86
+          target: TEST
+        - condition: always
+          target: CODE
 
     CODE:
       kind: Agent
@@ -241,6 +323,18 @@ spec:
 
         stdout:
         {{{EXECUTE_TESTS.output.stdout}}}
+        {{else}}
+        {{#if CHECK_TESTS}}
+
+        # The last run of the suite
+        Exit code {{CHECK_TESTS.output.exit_code}}.
+
+        stderr:
+        {{{CHECK_TESTS.output.stderr}}}
+
+        stdout:
+        {{{CHECK_TESTS.output.stdout}}}
+        {{/if}}
         {{/if}}
         {{#if AUDIT}}
 

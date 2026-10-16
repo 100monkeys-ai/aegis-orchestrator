@@ -267,6 +267,7 @@ fn the_forges_states_are_f4s_table() {
         ("ARCHITECT", "Agent architect-agent"),
         ("AWAIT_ARCH_APPROVAL", "Human"),
         ("TEST", "Agent tester-agent"),
+        ("CHECK_TESTS", "ContainerRun"),
         ("CODE", "Agent coder-agent"),
         ("EXECUTE_TESTS", "ContainerRun"),
         ("DIFF", "Action repository_diff"),
@@ -311,7 +312,16 @@ fn the_forges_states_are_f4s_table() {
             vec![on_success("AWAIT_ARCH_APPROVAL"), on_failure("FAILED")],
         ),
         ("AWAIT_ARCH_APPROVAL", vec![yes("TEST"), no("ARCHITECT")]),
-        ("TEST", vec![on_success("CODE"), on_failure("FAILED")]),
+        ("TEST", vec![on_success("CHECK_TESTS"), on_failure("FAILED")]),
+        // The suite once before CODE: tests that did not load go back to
+        // TEST, any other run to CODE.
+        (
+            "CHECK_TESTS",
+            vec![
+                "{\"condition\":\"exit_code\",\"value\":86} -> TEST".to_string(),
+                "{\"condition\":\"always\"} -> CODE".to_string(),
+            ],
+        ),
         ("CODE", vec![on_success("EXECUTE_TESTS"), on_failure("FAILED")]),
         (
             "EXECUTE_TESTS",
@@ -817,6 +827,17 @@ fn the_forge_resets_its_tree_and_gives_the_tester_its_tracked_tests() {
                 \n\
                 # The test files it tracks\n\
                 {{#if repository.tests}}{{{json repository.tests}}}{{else}}None: it tracks no test file.{{/if}}\n\
+                {{#if CHECK_TESTS}}\n\
+                \n\
+                # The tests did not load\n\
+                The suite was run once on the tests you wrote, and a file you wrote did not load: it does not parse, or its own module cannot be imported. Fix those files so that every test loads and runs; a test may still fail where the implementation is not written yet. Change no implementation file.\n\
+                \n\
+                stderr:\n\
+                {{{CHECK_TESTS.output.stderr}}}\n\
+                \n\
+                stdout:\n\
+                {{{CHECK_TESTS.output.stdout}}}\n\
+                {{/if}}\n\
                 \n\
                 Write the tests that show each acceptance criterion met, in the repository's own test layout and style, under {{repository.path}}. Write tests only: change no implementation file.";
     match &state(&workflow, "TEST").kind {
