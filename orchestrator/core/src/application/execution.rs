@@ -6258,6 +6258,22 @@ mod tests {
             .run_repository_mounts(id)
             .is_empty());
     }
+
+    // Zaru ADR-0071 D3 and D1 (d): a child never widens its parent's
+    // choice; a repository by URL only through the run's GitHub binding.
+    mod deny_by_default_orchestrator_2 {
+        use super::*;
+        include!("deny_by_default_orchestrator_2_execution_tests.rs");
+    }
+}
+
+/// The refusal of a run started by another run (a child, or a workflow's
+/// agent state) whose own choice for `server` names a binding its parent
+/// did not choose (Zaru ADR-0071 D3: it never widens its parent's choice).
+pub fn child_widens_sentence(server: &str) -> String {
+    format!(
+        "A run started by another run can only use connections that run chose; the connection chosen for '{server}' is not one of them."
+    )
 }
 
 struct ExecutionMonitor {
@@ -7188,16 +7204,41 @@ impl StandardExecutionService {
 
     /// Keep `from`'s dispatch choices on `input` when it carries none of its
     /// own (Zaru ADR-0055 D14): an agent state takes its workflow
-    /// execution's, a child its parent's, as each takes its person.
-    fn inherit_contexts(input: &mut ExecutionInput, from: Option<&JsonValue>) {
+    /// execution's, a child its parent's, as each takes its person. A
+    /// choice of its own never widens `from`'s (Zaru ADR-0071 D3): server by
+    /// server it names only bindings `from` chose, or `null`; anything wider
+    /// refuses the start with [`child_widens_sentence`]. With no `from` (a
+    /// run started on its own) there is nothing to inherit or to widen.
+    fn inherit_contexts(input: &mut ExecutionInput, from: Option<&JsonValue>) -> Result<()> {
+        use crate::domain::execution::{ExecutionContexts, ServerChoice};
         let key = crate::domain::execution::CONTEXTS_INPUT_KEY;
-        let Some(contexts) = from.and_then(|from| from.get(key)) else {
-            return;
+        let Some(from) = from else {
+            return Ok(());
+        };
+        if let Some(own) = input.input.get(key) {
+            let parent = ExecutionContexts::from_value(from.get(key));
+            let child = ExecutionContexts::from_value(Some(own));
+            for (server, choice) in child.servers() {
+                let within = match (choice, parent.server(server)) {
+                    (ServerChoice::NotGiven | ServerChoice::None, _) => true,
+                    (ServerChoice::Bindings(chosen), ServerChoice::Bindings(allowed)) => {
+                        chosen.iter().all(|id| allowed.contains(id))
+                    }
+                    (ServerChoice::Bindings(_), _) => false,
+                };
+                if !within {
+                    return Err(ExecutionError::Refused(child_widens_sentence(server)).into());
+                }
+            }
+            return Ok(());
+        }
+        let Some(contexts) = from.get(key) else {
+            return Ok(());
         };
         if let JsonValue::Object(map) = &mut input.input {
-            map.entry(key.to_string())
-                .or_insert_with(|| contexts.clone());
+            map.insert(key.to_string(), contexts.clone());
         }
+        Ok(())
     }
 
     /// Keep `from`'s conversation on `input` when it carries none of its own
@@ -7649,10 +7690,13 @@ impl StandardExecutionService {
             crate::domain::execution::check_profile_choice(&input.input)
                 .map_err(|sentence| ExecutionError::Refused(sentence.to_string()))?;
         }
-        if input
-            .input
-            .get(crate::domain::execution::CONTEXTS_INPUT_KEY)
-            .is_none()
+        // Zaru ADR-0071 D3: an agent state's own choice is checked against
+        // its workflow execution's whenever it has one.
+        if input.workflow_execution_id.is_some()
+            || input
+                .input
+                .get(crate::domain::execution::CONTEXTS_INPUT_KEY)
+                .is_none()
             || input
                 .input
                 .get(crate::domain::git_repo::REPOSITORIES_INPUT_KEY)
@@ -7669,7 +7713,7 @@ impl StandardExecutionService {
             let workflow_input = self
                 .workflow_execution_input(&tenant_id, input.workflow_execution_id)
                 .await?;
-            Self::inherit_contexts(&mut input, workflow_input.as_ref());
+            Self::inherit_contexts(&mut input, workflow_input.as_ref())?;
             Self::inherit_repositories(&mut input, workflow_input.as_ref());
             // AEGIS ADR-126, Update of 2026-10-07 (2), clause 3: and so does
             // it take the conversation its workflow was started from.
@@ -8834,7 +8878,7 @@ impl ExecutionService for StandardExecutionService {
         Self::refuse_at_start(&agent, &input)?;
         // Zaru ADR-0055 D14: a child with no binding choices of its own takes
         // its parent's; D16: a required context left unfilled refuses it.
-        Self::inherit_contexts(&mut input, Some(&parent.input.input));
+        Self::inherit_contexts(&mut input, Some(&parent.input.input))?;
         // AEGIS ADR-126, Update of 2026-10-07 (2), clause 3: and its
         // parent's conversation.
         Self::inherit_conversation(&mut input, Some(&parent.input.input));
