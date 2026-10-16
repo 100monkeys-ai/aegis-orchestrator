@@ -823,7 +823,7 @@ fn the_forge_resets_its_tree_and_gives_the_tester_its_tracked_tests() {
                 {{{json ARCHITECT.output}}}\n\
                 \n\
                 # The repository\n\
-                The repository is at {{repository.path}}, on the work branch {{repository.branch}}. The suite will be run in its root with: {{{input.test_command}}}\n\
+                The repository is at {{repository.path}}, on the work branch {{repository.branch}}. The suite will be run later in a container with the repository mounted at /workspace and the working directory /workspace, in the repository's root with: {{{input.test_command}}} Write every test path relative to the repository's root, never an absolute /workspace/... path.\n\
                 \n\
                 # The test files it tracks\n\
                 {{#if repository.tests}}{{{json repository.tests}}}{{else}}None: it tracks no test file.{{/if}}\n\
