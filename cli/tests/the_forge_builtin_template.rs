@@ -825,6 +825,8 @@ fn the_forge_resets_its_tree_and_gives_the_tester_its_tracked_tests() {
                 # The repository\n\
                 The repository is at {{repository.path}}, on the work branch {{repository.branch}}. The suite will be run later in a container with the repository mounted at /workspace and the working directory /workspace, in the repository's root with: {{{input.test_command}}} Write every test path relative to the repository's root, never an absolute /workspace/... path.\n\
                 \n\
+                The suite runs in the given test image as it is, with nothing installed: a test uses only the runtime's standard library and the repository's own tree, never a third-party module or an external binary the image may lack, and reads a text file in text mode or normalizes \\r\\n so a content match holds on CRLF.\n\
+                \n\
                 # The test files it tracks\n\
                 {{#if repository.tests}}{{{json repository.tests}}}{{else}}None: it tracks no test file.{{/if}}\n\
                 {{#if CHECK_TESTS}}\n\
@@ -865,6 +867,14 @@ root, with the command your input names. Write every path relative to
 the repository's root — never an absolute /workspace/... path: the same
 relative path holds in this sandbox and in the suite's container.
 
+The suite runs in a step container with the given test_image and
+test_command, as they are: nothing is installed (no pip, no apk, no
+apt). A test may use only the runtime's standard library and the
+repository's own tree: never import a third-party module the image
+does not ship, and never shell out to an external binary the image may
+lack (git, node, curl, ...) unless the task or the design requires it
+and the image is known to carry it.
+
 1. Read those of the listed test files you need to learn the
    repository's test layout, framework and style. When the list is
    empty, the repository has no tests yet: choose the layout the
@@ -875,9 +885,10 @@ relative path holds in this sandbox and in the suite's container.
    formatting, whitespace or line endings that no acceptance criterion
    names, and a design's line endings or escape sequences are not
    criteria: no test asserts on '\r', a line ending or a byte
-   sequence. When a test reads a text file, read it the way the
-   suite's own tests do, and never assert on an escaped sequence such
-   as '\\n' where a newline is meant. Write tests only: change no
+   sequence. When a test reads a text file, read it in text mode
+   (universal newlines) or normalize '\r\n' before matching, so a
+   content match never silently fails on a CRLF file, and never assert
+   on an escaped sequence such as '\\n' where a newline is meant. Write tests only: change no
    implementation file, and never test the repository's branches,
    history or remote.
 3. Do not run the tests: the suite runs later, in its own container,
@@ -938,7 +949,7 @@ fn the_testers_instruction_budget_and_done_when_are_the_updates() {
         .unwrap_or_default();
     let criteria_words = criteria.split_whitespace().collect::<Vec<_>>().join(" ");
     if !criteria_words
-        .ends_with("The answer names each test file and the criterion each test shows. No test asserts on a line ending, a '\\r' or an escape sequence that no acceptance criterion names. No test file names an absolute /workspace/... path: every test path is relative to the repository's root.")
+        .ends_with("The answer names each test file and the criterion each test shows. No test asserts on a line ending, a '\\r' or an escape sequence that no acceptance criterion names. No test file names an absolute /workspace/... path: every test path is relative to the repository's root. Every test runs in the given test_image as it is: it uses only the runtime's standard library and the repository's own tree, imports no third-party module the image does not ship and shells out to no external binary the image may lack. Every test that reads a text file reads it in text mode or normalizes '\\r\\n' before matching.")
     {
         complaints.push(format!("the judge's criteria are {criteria:?}"));
     }
