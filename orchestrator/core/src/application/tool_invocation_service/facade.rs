@@ -718,6 +718,24 @@ impl ToolInvocationService {
             None => call_contexts,
         };
 
+        // 4b2. Zaru ADR-0071 D1 (c), D2, D3: a call acting as its person
+        // reaches a connection only as the credential that attested its
+        // session allows; refused before anything runs otherwise.
+        let (call_profile, call_contexts) = match (acts_as_person, session.user_id.as_deref()) {
+            (true, Some(user_id)) => {
+                self.bound_by_attestation(
+                    session.attested_by,
+                    &tool_name,
+                    &tenant_id,
+                    user_id,
+                    call_profile,
+                    call_contexts,
+                )
+                .await?
+            }
+            _ => (call_profile, call_contexts),
+        };
+
         // 4c. Zaru ADR-0069 D1, D3, D4: a call for a family its person has
         // not connected is refused before anything runs; an absent `mailbox`
         // or `account` resolves to the person's own, which the answer names.
@@ -828,6 +846,95 @@ impl ToolInvocationService {
                 "status": "dispatch_required",
                 "action": format!("{:?}", action)
             })),
+        }
+    }
+
+    /// Bound a call of a session acting as its person by the credential that
+    /// attested the session (Zaru ADR-0071 D1 (c), D2, D3), for a tool of a
+    /// connection family the person has connected; a family not connected,
+    /// or not served by the node, is left to [`Self::admit_person_connection`].
+    ///
+    /// - An API key reaches a connection only through the profile the call
+    ///   names, else the key's own (which then stands for the call's, so
+    ///   its bindings and its tools bound the call), or bindings the call
+    ///   chose; a family none of them names is refused with D1 (e)'s key
+    ///   sentence and `needs` naming the Profiles page.
+    /// - The person's own chat turn (the person's session token, a call
+    ///   carrying the turn's choice in `_meta.contexts`) that chose nothing
+    ///   for the family is refused with the sentence for a family connected
+    ///   but not chosen, and the family's `needs`. A call with no choice at
+    ///   all, and one on a profile, keep their rule.
+    ///
+    /// Answers the call's profile and contexts, as they then stand.
+    async fn bound_by_attestation(
+        &self,
+        attested_by: crate::domain::seal_session::AttestingCredential,
+        tool_name: &str,
+        tenant_id: &TenantId,
+        user_id: &str,
+        call_profile: Option<uuid::Uuid>,
+        call_contexts: Option<crate::domain::execution::ExecutionContexts>,
+    ) -> Result<
+        (
+            Option<uuid::Uuid>,
+            Option<crate::domain::execution::ExecutionContexts>,
+        ),
+        SealSessionError,
+    > {
+        use crate::application::credential_service::{
+            connection_key, connection_needs, not_chosen_sentence, KEY_REACHES_NONE,
+        };
+        use crate::domain::execution::ServerChoice;
+        use crate::domain::seal_session::{AttestingCredential, RefusalNeeds};
+        let Some(key) = connection_key(tool_name, &self.remote_tool_servers) else {
+            return Ok((call_profile, call_contexts));
+        };
+        let connected = matches!(
+            self.person_bindings(tenant_id, user_id, key).await?,
+            Some(bindings) if !bindings.is_empty()
+        );
+        if !connected {
+            return Ok((call_profile, call_contexts));
+        }
+        let not_given = |contexts: &Option<crate::domain::execution::ExecutionContexts>| {
+            contexts
+                .as_ref()
+                .is_none_or(|contexts| contexts.server(key) == ServerChoice::NotGiven)
+        };
+        match attested_by {
+            AttestingCredential::ApiKey { profile } => {
+                let chose_binding = call_contexts.as_ref().is_some_and(|contexts| {
+                    contexts
+                        .servers()
+                        .any(|(_, choice)| matches!(choice, ServerChoice::Bindings(_)))
+                });
+                let (call_profile, call_contexts) = match (call_profile, profile) {
+                    (None, Some(profile)) if !chose_binding => (
+                        Some(profile),
+                        Some(
+                            self.profile_contexts(tenant_id, Some(user_id), profile)
+                                .await?,
+                        ),
+                    ),
+                    _ => (call_profile, call_contexts),
+                };
+                if not_given(&call_contexts) {
+                    return Err(super::gateway::binding_required_needing(
+                        KEY_REACHES_NONE.to_string(),
+                        RefusalNeeds::profile(None),
+                    ));
+                }
+                Ok((call_profile, call_contexts))
+            }
+            AttestingCredential::Interactive => {
+                if call_profile.is_none() && call_contexts.is_some() && not_given(&call_contexts) {
+                    return Err(super::gateway::binding_required_needing(
+                        not_chosen_sentence(key),
+                        connection_needs(key),
+                    ));
+                }
+                Ok((call_profile, call_contexts))
+            }
         }
     }
 

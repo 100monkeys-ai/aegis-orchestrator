@@ -271,7 +271,11 @@ fn needs(family: &str, page: &str) -> Option<RefusalNeeds> {
 #[tokio::test]
 async fn c_a_key_with_no_profile_and_no_choice_reaches_no_connection() {
     let (f, token) = node(|_| AttestingCredential::ApiKey { profile: None }).await;
-    for tool in ["mail.list", "github.list_issues", "nuclear-notes.pages_read"] {
+    for tool in [
+        "mail.list",
+        "github.list_issues",
+        "nuclear-notes.pages_read",
+    ] {
         for meta in [None, Some(json!({ "contexts": {} }))] {
             assert_eq!(
                 refused(&call(&f, &token, tool, meta.clone()).await),
@@ -301,7 +305,10 @@ async fn a_keys_own_profile_or_the_calls_chosen_binding_reaches_the_mailbox() {
     let (f, token) = node(|_| AttestingCredential::ApiKey { profile: None }).await;
     let chosen = json!({ "contexts": { "imap": [f.mailbox.0.to_string()] } });
     let answer = told(&call(&f, &token, "mail.list", Some(chosen)).await);
-    assert!(answer.contains(REACHED), "the call's chosen mailbox: {answer}");
+    assert!(
+        answer.contains(REACHED),
+        "the call's chosen mailbox: {answer}"
+    );
 }
 
 /// D1 (c), D3: a key's profile that names no binding of the family reaches
@@ -338,7 +345,10 @@ async fn d_an_interactive_turn_with_nothing_chosen_for_imap_is_refused_mail_list
     );
     let chosen = json!({ "contexts": { "imap": [f.mailbox.0.to_string()] } });
     let answer = told(&call(&f, &token, "mail.list", Some(chosen)).await);
-    assert!(answer.contains(REACHED), "the turn's chosen mailbox: {answer}");
+    assert!(
+        answer.contains(REACHED),
+        "the turn's chosen mailbox: {answer}"
+    );
 }
 
 /// ADR-0069 D3 stands: a family the person has not connected is refused

@@ -16,6 +16,12 @@
 //!   pattern (the pattern of `facing_text_no_record_refs.rs`).
 //!
 //! (c) is in `gateway_wire_tests.rs`, (d) in `operator_escalation_tests.rs`.
+//!
+//! The session is an API key with no profile, so (a) and (e) choose the
+//! person's mailbox in `_meta.contexts`, as a remote client does through
+//! `x-zaru-contexts`: a key reaches a connection only through a profile or
+//! bindings the call chose (Zaru ADR-0071 D1, D3), and with neither it is
+//! refused (`deny_by_default_orchestrator_3_calls.rs`).
 
 #[path = "support/mcp_connections_orchestrator_fixture.rs"]
 mod fixture;
@@ -25,25 +31,72 @@ mod mail_standins;
 use std::sync::Arc;
 
 use aegis_orchestrator_core::domain::credential::CredentialBindingId;
-use aegis_orchestrator_core::domain::seal_session::{CallerAnswer, SealSessionError};
+use aegis_orchestrator_core::domain::seal_session::{
+    CallerAnswer, EnvelopeVerifier, SealSessionError,
+};
+use aegis_orchestrator_core::domain::secrets::SensitiveString;
 use aegis_orchestrator_core::domain::tool_approval::{
     ToolApprovalPolicy, ToolApprovalPolicyEffect, ToolApprovalPolicyId, ToolApprovalRepository,
 };
 use fixture::*;
 use mail_standins::{imap_mailbox_standin, PlainConnector};
-use serde_json::json;
+use serde_json::{json, Value};
+
+/// A call as `POST /v1/seal/invoke` receives it, with its own token.
+struct Call {
+    token: SensitiveString,
+    tool: String,
+    arguments: Value,
+}
+
+impl EnvelopeVerifier for Call {
+    fn security_token(&self) -> &SensitiveString {
+        &self.token
+    }
+    fn verify_signature(&self, _: &[u8]) -> Result<(), SealSessionError> {
+        Ok(())
+    }
+    fn extract_tool_name(&self) -> Option<String> {
+        Some(self.tool.clone())
+    }
+    fn extract_arguments(&self) -> Option<Value> {
+        Some(self.arguments.clone())
+    }
+    fn replay_nonce(&self) -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+}
+
+/// A call of the key's session choosing the person's mailbox in
+/// `_meta.contexts` (Zaru ADR-0071 D3).
+async fn call_choosing_the_mailbox(
+    f: &Fixture,
+    tool: &str,
+    arguments: Value,
+) -> Result<Value, SealSessionError> {
+    f.service
+        .invoke_tool_with_meta(
+            &Call {
+                token: f.token.clone().into(),
+                tool: tool.to_string(),
+                arguments,
+            },
+            Some(&json!({ "contexts": { "imap": [f.mailbox.0.to_string()] } })),
+        )
+        .await
+}
 
 // ---------------------------------------------------------------------------
 // Trigger 1
 // ---------------------------------------------------------------------------
 
-/// (a) D4: one mailbox and no `mailbox`: `mail.list` answers that mailbox's
-/// threads and names it by its context name.
+/// (a) D4: one mailbox chosen and no `mailbox`: `mail.list` answers that
+/// mailbox's threads and names it by its context name.
 #[tokio::test]
 async fn a_mail_list_with_no_mailbox_answers_the_persons_one_mailbox_and_names_it() {
     let standin = imap_mailbox_standin(LOGIN, PASSWORD, inbox(), "\\Seen \\*").await;
     let f = fixture(standin.port(), Arc::new(PlainConnector)).await;
-    let answer = f.call("mail.list", json!({})).await;
+    let answer = call_choosing_the_mailbox(&f, "mail.list", json!({})).await;
     let answer = match answer {
         Ok(answer) => answer,
         Err(_) => panic!("mail.list with no mailbox was refused: {}", told(&answer)),
@@ -99,7 +152,7 @@ async fn e_a_mail_send_waits_for_the_keys_user_and_passes_under_a_standing_choic
         "subject": "Figures",
         "body": "Thanks, received."
     });
-    let pending = f.call("mail.send", send.clone()).await;
+    let pending = call_choosing_the_mailbox(&f, "mail.send", send.clone()).await;
     let pending = match pending {
         Ok(pending) => pending,
         Err(_) => panic!("mail.send was refused: {}", told(&pending)),
@@ -135,7 +188,7 @@ async fn e_a_mail_send_waits_for_the_keys_user_and_passes_under_a_standing_choic
         })
         .await
         .unwrap();
-    let allowed = f.call("mail.send", send).await;
+    let allowed = call_choosing_the_mailbox(&f, "mail.send", send).await;
     if !told(&allowed).contains(REACHED) {
         wrong.push(format!(
             "under the standing choice the call did not run: {}",

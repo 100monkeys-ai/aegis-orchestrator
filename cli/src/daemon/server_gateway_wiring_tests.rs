@@ -445,7 +445,10 @@ async fn unwired(
 }
 
 /// The daemon's service for `gateway` and `credentials`, with a session as
-/// `/v1/seal/attest` binds it for `USER` through the Zaru MCP server.
+/// `/v1/seal/attest` binds it for `USER` through the Zaru MCP server on the
+/// person's own session token: with no choice it reaches the person's own
+/// binding (Zaru ADR-0069 D4), where an API key with no profile reaches none
+/// (Zaru ADR-0071 D1, D3).
 async fn daemon(gateway: Option<&SealGatewayConfig>, credentials: Arc<Credentials>) -> Daemon {
     let (service, sessions) = unwired(gateway).await;
     let service =
@@ -459,7 +462,10 @@ async fn daemon(gateway: Option<&SealGatewayConfig>, credentials: Arc<Credential
         context(),
         TenantId::for_consumer_user(USER).unwrap(),
     )
-    .with_principal_metadata(Some(USER.to_string()), Some(USER.to_string()), None, None);
+    .with_principal_metadata(Some(USER.to_string()), Some(USER.to_string()), None, None)
+    .with_attesting_credential(
+        aegis_orchestrator_core::domain::seal_session::AttestingCredential::Interactive,
+    );
     sessions.save(session).await.unwrap();
     Daemon { service, token }
 }

@@ -1071,7 +1071,10 @@ impl crate::infrastructure::mail::MailConnector for StopAtTheMailServer {
 
 /// Trigger 1 (d): an escalated session admits the person's `mail.list` (it
 /// reaches the mail server) and the operator's `aegis.system.info` (it reaches
-/// the gate) both.
+/// the gate) both. The escalation reaches the key's connections and no more
+/// (Zaru ADR-0071 D4): the mailbox is reached as the call chose it, and with
+/// nothing chosen and no profile on the key it is refused with the key
+/// sentence.
 #[tokio::test]
 async fn d_an_escalated_session_admits_the_persons_mail_list_and_the_operators_system_info() {
     let mut h = harness().await;
@@ -1083,13 +1086,32 @@ async fn d_an_escalated_session_admits_the_persons_mail_list_and_the_operators_s
     let escalation = h.escalate(AegisRole::Operator).await;
     let token = h.escalated_session(&escalation).await;
     let mut wrong = Vec::new();
-    match h
-        .call(
-            &token,
-            "mail.list",
-            json!({ "mailbox": mailbox.0.to_string() }),
-        )
-        .await
+    let mail_list = |meta: Option<Value>| {
+        let service = &h.service;
+        let token = token.clone();
+        async move {
+            service
+                .invoke_tool_with_meta(
+                    &Envelope {
+                        token: token.into(),
+                        tool: "mail.list".to_string(),
+                        args: json!({ "mailbox": mailbox.0.to_string() }),
+                        nonce: uuid::Uuid::new_v4().to_string(),
+                    },
+                    meta.as_ref(),
+                )
+                .await
+        }
+    };
+    match mail_list(None).await {
+        Err(e)
+            if e.refusal().message == crate::application::credential_service::KEY_REACHES_NONE => {}
+        other => wrong.push(format!("mail.list with nothing chosen answered {other:?}")),
+    }
+    match mail_list(Some(
+        json!({ "contexts": { "imap": [mailbox.0.to_string()] } }),
+    ))
+    .await
     {
         Err(e) if format!("{e:?}").contains(MAIL_REACHED) => {}
         other => wrong.push(format!("mail.list answered {other:?}")),

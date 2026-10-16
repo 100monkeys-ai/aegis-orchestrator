@@ -1923,6 +1923,25 @@ impl Harness {
     /// MCP server: the user's tenant and subject, a random agent id (a
     /// chat session has no agent of its own), the test's context.
     async fn session(&self) -> String {
+        self.session_attested_by(crate::domain::seal_session::AttestingCredential::ApiKey {
+            profile: None,
+        })
+        .await
+    }
+
+    /// [`Self::session`], attested by the person's own session token
+    /// (Zaru ADR-0071 D1 (c)): outside a turn's choice, the person's own
+    /// session reaches their newest binding (Zaru ADR-0069 D4, ADR-0071 D2).
+    async fn interactive_session(&self) -> String {
+        self.session_attested_by(crate::domain::seal_session::AttestingCredential::Interactive)
+            .await
+    }
+
+    /// [`Self::session`], attested by `credential`.
+    async fn session_attested_by(
+        &self,
+        credential: crate::domain::seal_session::AttestingCredential,
+    ) -> String {
         let token = format!("token-{}", uuid::Uuid::new_v4());
         let session = crate::domain::seal_session::SealSession::new(
             AgentId::new(),
@@ -1932,12 +1951,8 @@ impl Harness {
             security_context(&["*"]),
             self.tenant.clone(),
         )
-        .with_principal_metadata(
-            Some(USER.to_string()),
-            Some(USER.to_string()),
-            None,
-            None,
-        );
+        .with_principal_metadata(Some(USER.to_string()), Some(USER.to_string()), None, None)
+        .with_attesting_credential(credential);
         self.sessions.save(session).await.unwrap();
         token
     }
@@ -1980,7 +1995,7 @@ async fn the_configured_gateway_takes_a_granted_users_call_through_the_route() {
         )
         .await;
 
-    let token = h.session().await;
+    let token = h.interactive_session().await;
     let value = h
         .route(&token, &format!("{SERVER}.pages.read"))
         .await
@@ -2001,10 +2016,12 @@ async fn the_configured_gateway_takes_a_granted_users_call_through_the_route() {
 }
 
 /// Zaru ADR-0069 D4, Trigger 1 (c): a call through the route with no
-/// execution record and no choice (a remote client acting as its person)
+/// execution record and no choice, on the person's own session token,
 /// carries the person's newest active binding for the server, though no grant
 /// names the session's agent; an older one of theirs and another person's
-/// newer one are never carried.
+/// newer one are never carried. The same call on an API key with no profile
+/// (a remote client acting as its person) carries none and is refused with
+/// the key sentence (Zaru ADR-0071 D1, D3).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn c_a_route_call_with_no_choice_carries_the_persons_newest_binding_with_no_grant() {
     let stub = StubGateway::new(vec![], remote_result());
@@ -2050,7 +2067,25 @@ async fn c_a_route_call_with_no_choice_carries_the_persons_newest_binding_with_n
         )
         .await;
 
-    let token = h.session().await;
+    let key = h.session().await;
+    let refusal = h
+        .route(&key, &format!("{SERVER}.pages.read"))
+        .await
+        .expect_err("a key with no profile reaches no binding")
+        .refusal();
+    assert_eq!(
+        (refusal.code, refusal.message.as_str()),
+        (
+            "CREDENTIAL_BINDING_REQUIRED",
+            crate::application::credential_service::KEY_REACHES_NONE
+        )
+    );
+    assert!(
+        stub.received.lock().unwrap().tools.is_empty(),
+        "the key's call reached the gateway"
+    );
+
+    let token = h.interactive_session().await;
     let value = h
         .route(&token, &format!("{SERVER}.pages.read"))
         .await
@@ -2105,7 +2140,7 @@ async fn mismatched_server_names_are_refused_with_the_reason() {
             &[GrantTarget::AllAgents],
         )
         .await;
-    let token = h.session().await;
+    let token = h.interactive_session().await;
 
     // Named here, not registered there.
     let error = h
