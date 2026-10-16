@@ -18,10 +18,27 @@
 //! from the template, under `sh` against the suite outputs Python's unittest
 //! and pytest print.
 
+use aegis_orchestrator_core::domain::agent::{
+    ExecutionMode, ExecutionStrategy, ImagePullPolicy, ValidatorSpec,
+};
+use aegis_orchestrator_core::domain::execution::{ExecutionId, ExecutionInput, ExhaustedBy};
+use aegis_orchestrator_core::domain::runtime::{
+    AgentRuntime, InstanceId, InstanceStatus, ResourceLimits, RuntimeConfig, RuntimeError,
+    TaskInput, TaskOutput,
+};
+use aegis_orchestrator_core::domain::supervisor::{
+    two_tries_bound, Supervisor, SupervisorObserver,
+};
+use aegis_orchestrator_core::domain::validation::ValidationResults;
 use aegis_orchestrator_core::domain::workflow::{StateKind, Workflow, WorkflowState};
 use aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser;
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 /// The exit code `CHECK_TESTS` ends with when the tests did not load.
 const DID_NOT_LOAD: i32 = 86;
@@ -334,6 +351,216 @@ fn a_suite_that_loads_goes_to_code_with_its_own_exit_code() {
     assert_eq!(failed.stderr, "FAILED (failures=2)\n");
     let reserved = check("", "", DID_NOT_LOAD);
     assert_eq!(reserved.exit_code, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Clause 2: a built-in agent's bound fits two whole tries
+// ---------------------------------------------------------------------------
+
+/// A runtime whose every try takes a second to start and then works longer
+/// than any clock in the test.
+#[derive(Default)]
+struct SlowRuntime {
+    spawns: Mutex<u32>,
+}
+
+#[async_trait]
+impl AgentRuntime for SlowRuntime {
+    async fn spawn(&self, _config: RuntimeConfig) -> Result<InstanceId, RuntimeError> {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let mut spawns = self.spawns.lock().await;
+        *spawns += 1;
+        Ok(InstanceId::new(format!("instance-{spawns}")))
+    }
+
+    async fn execute(
+        &self,
+        _id: &InstanceId,
+        _input: TaskInput,
+    ) -> Result<TaskOutput, RuntimeError> {
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        Ok(TaskOutput {
+            result: serde_json::Value::String("late".to_string()),
+            logs: vec![],
+            tool_calls: vec![],
+            exit_code: 0,
+            trajectory: vec![],
+        })
+    }
+
+    async fn terminate(&self, _id: &InstanceId) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    async fn status(&self, id: &InstanceId) -> Result<InstanceStatus, RuntimeError> {
+        Ok(InstanceStatus {
+            id: id.clone(),
+            state: "running".to_string(),
+            uptime_seconds: 0,
+            memory_usage_mb: 0,
+            cpu_usage_percent: 0.0,
+        })
+    }
+}
+
+/// Records which iterations started and which were recorded exhausted.
+#[derive(Default)]
+struct RecordingObserver {
+    starts: Mutex<Vec<u8>>,
+    exhausted: Mutex<Vec<(u8, ExhaustedBy)>>,
+    failures: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl SupervisorObserver for RecordingObserver {
+    async fn on_iteration_start(&self, iteration: u8, _prompt: &str) {
+        self.starts.lock().await.push(iteration);
+    }
+    async fn on_console_output(&self, _iteration: u8, _stream: &str, _content: &str) {}
+    async fn on_iteration_complete(&self, _iteration: u8, _result: &str, _exit_code: i64) {}
+    async fn on_iteration_fail(&self, _iteration: u8, error: &str) {
+        self.failures.lock().await.push(error.to_string());
+    }
+    async fn on_instance_spawned(&self, _iteration: u8, _instance_id: &InstanceId) {}
+    async fn on_instance_terminated(&self, _iteration: u8, _instance_id: &InstanceId) {}
+    async fn on_validation_complete(
+        &self,
+        _iteration: u8,
+        _results: &ValidationResults,
+        _passed: bool,
+    ) {
+    }
+    async fn on_iteration_exhausted(&self, iteration: u8, by: ExhaustedBy) {
+        self.exhausted.lock().await.push((iteration, by));
+    }
+}
+
+/// An iterative agent with a 10 s iteration timeout and a 5 s judge, under
+/// the bound [`two_tries_bound`] gives it.
+fn ten_second_tries_judged_in_five() -> RuntimeConfig {
+    let execution = ExecutionStrategy {
+        mode: ExecutionMode::Iterative,
+        max_retries: 2,
+        iteration_timeout: Some("10s".to_string()),
+        validation: Some(vec![ValidatorSpec::Semantic {
+            judge_agent: "code-quality-judge".to_string(),
+            criteria: "The answer does what was asked.".to_string(),
+            min_score: 0.7,
+            min_confidence: 0.0,
+            timeout_seconds: 5,
+        }]),
+        ..Default::default()
+    };
+    let bound = two_tries_bound(&execution).as_secs();
+    RuntimeConfig {
+        language: "python".to_string(),
+        version: "3.12".to_string(),
+        isolation: "process".to_string(),
+        env: HashMap::new(),
+        image_pull_policy: ImagePullPolicy::IfNotPresent,
+        container_uid: 1000,
+        container_gid: 1000,
+        resources: ResourceLimits {
+            cpu_millis: None,
+            memory_bytes: None,
+            disk_bytes: None,
+            timeout_seconds: Some(bound),
+        },
+        execution,
+        volumes: Vec::new(),
+        keep_container_on_failure: false,
+        image: "python:3.12".to_string(),
+        bootstrap_path: None,
+        execution_id: ExecutionId::new(),
+        workflow_execution_id: None,
+        program_files: Vec::new(),
+        program_input: None,
+    }
+}
+
+/// Run `e7f2c2aa`'s CODE, scaled down: try 1 starts after a second, runs to
+/// its 10 s clock and is recorded exhausted, and the supervisor waits its
+/// 15 s; under the bound of 2 x (10 + 5) + 15 + 30 = 75 s, try 2 then starts.
+/// Under the bound before (2 x 10 + 15 = 35 s), 9 s were left and try 2 was
+/// refused, as the coder's second try was refused with 899 s left under 1815.
+#[tokio::test(start_paused = true)]
+async fn a_clock_ended_try_leaves_room_for_the_second() {
+    let runtime = Arc::new(SlowRuntime::default());
+    let observer = Arc::new(RecordingObserver::default());
+    let config = ten_second_tries_judged_in_five();
+    let bound = config.resources.timeout_seconds;
+
+    let result = Supervisor::new(runtime.clone())
+        .run_loop(
+            config,
+            ExecutionInput {
+                intent: Some("Change the implementation".to_string()),
+                input: serde_json::json!({}),
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
+                workspace_remote_path: None,
+                workflow_execution_id: None,
+                attachments: Vec::new(),
+            },
+            2,
+            observer.clone(),
+            CancellationToken::new(),
+            None,
+        )
+        .await;
+
+    let mut complaints = Vec::new();
+    if bound != Some(75) {
+        complaints.push(format!("the bound is {bound:?} s, not 75"));
+    }
+    let starts = observer.starts.lock().await.clone();
+    if starts != vec![1, 2] {
+        complaints.push(format!(
+            "iterations started: {starts:?}, expected [1, 2]; the execution ended {result:?}"
+        ));
+    }
+    let exhausted = observer.exhausted.lock().await.clone();
+    if exhausted.first() != Some(&(1, ExhaustedBy::Clock)) {
+        complaints.push(format!(
+            "recorded exhausted: {exhausted:?}, expected try 1 by its clock"
+        ));
+    }
+    let spawns = *runtime.spawns.lock().await;
+    if spawns != 2 {
+        complaints.push(format!("{spawns} tries were spawned, expected 2"));
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// The bound of every Forge agent, computed from its own manifest: AUDIT's
+/// three judges wait for each agent as long as that agent's bound.
+#[test]
+fn audits_timeouts_follow_its_agents_bounds() {
+    let workflow = forge();
+    let Some(StateKind::ParallelAgents { agents, .. }) = state(&workflow, "AUDIT").map(|s| &s.kind)
+    else {
+        panic!("AUDIT is a ParallelAgents state");
+    };
+    let mut complaints = Vec::new();
+    for member in agents {
+        let yaml = std::fs::read_to_string(format!(
+            "{}/../../cli/templates/agents/{}.yaml",
+            env!("CARGO_MANIFEST_DIR"),
+            member.agent
+        ))
+        .unwrap_or_else(|e| panic!("{}'s manifest: {e}", member.agent));
+        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let execution: ExecutionStrategy =
+            serde_yaml::from_value(doc["spec"]["execution"].clone()).unwrap();
+        let bound = two_tries_bound(&execution).as_secs();
+        if member.timeout_seconds != bound {
+            complaints.push(format!(
+                "AUDIT waits {} s for {}, whose bound is {bound} s",
+                member.timeout_seconds, member.agent
+            ));
+        }
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
 }
 
 // The outputs below were printed by Python 3.12's unittest and pytest 9.0.2,

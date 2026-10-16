@@ -148,6 +148,51 @@ pub fn failed_execution_backoff(failed: u32) -> Duration {
     Duration::from_secs((15u64 << failed.saturating_sub(1).min(3)).min(120))
 }
 
+/// The time an execution's bound gives each try beyond its clock and its
+/// judges': the container's spawn and teardown (0.6 s measured with a cached
+/// image on Forge run `e7f2c2aa`).
+pub const TRY_START_ALLOWANCE: Duration = Duration::from_secs(30);
+
+/// The judges' time on one try's answer: the validators run in order after
+/// the try, each judge step bounded by its own `timeout_seconds`.
+pub fn judges_timeout(execution: &crate::domain::agent::ExecutionStrategy) -> Duration {
+    use crate::domain::agent::ValidatorSpec;
+    Duration::from_secs(
+        execution
+            .validation
+            .iter()
+            .flatten()
+            .map(|validator| match validator {
+                ValidatorSpec::Semantic {
+                    timeout_seconds, ..
+                }
+                | ValidatorSpec::MultiJudge {
+                    timeout_seconds, ..
+                } => *timeout_seconds,
+                ValidatorSpec::ExitCode { .. }
+                | ValidatorSpec::JsonSchema { .. }
+                | ValidatorSpec::Regex { .. } => 0,
+            })
+            .sum(),
+    )
+}
+
+/// What one whole try of an agent needs: its clock, then its judges'.
+pub fn whole_try(execution: &crate::domain::agent::ExecutionStrategy) -> Duration {
+    iteration_timeout(execution) + judges_timeout(execution)
+}
+
+/// The execution bound under which an agent fits two whole tries, the wait
+/// after a failed first try between them and [`TRY_START_ALLOWANCE`]:
+/// `2 x (iteration_timeout + its judges' timeout_seconds) +
+/// failed_execution_backoff(1) + TRY_START_ALLOWANCE` (AEGIS ADR-141, Update
+/// of 2026-10-16 `tests-load-before-code-2026-10-16`, clause 2). The built-in
+/// agents' bounds are held to it, and the supervisor refuses a later try
+/// with less than a [`whole_try`] left under the bound.
+pub fn two_tries_bound(execution: &crate::domain::agent::ExecutionStrategy) -> Duration {
+    2 * whole_try(execution) + failed_execution_backoff(1) + TRY_START_ALLOWANCE
+}
+
 /// The execution's overall bound, as the loop sees it before each try.
 #[derive(Debug, Clone, Copy)]
 struct TryBound {
@@ -155,13 +200,17 @@ struct TryBound {
     deadline: tokio::time::Instant,
     /// The bound, in seconds.
     seconds: u64,
+    /// What a later try needs left under the bound: a [`whole_try`].
+    try_needs: Duration,
 }
 
 impl TryBound {
     /// The sentence the execution ends with when the time left under the
     /// bound is less than a try needs (AEGIS ADR-141, Update of 2026-10-15,
-    /// clause (1)); `None` when a try fits.
-    fn refuses_a_try(&self, try_needs: Duration) -> Option<String> {
+    /// clause (1)); `None` when a try fits. A try needs its clock and its
+    /// judges' time (Update of 2026-10-16, clause 2).
+    fn refuses_a_try(&self) -> Option<String> {
+        let try_needs = self.try_needs;
         let left = self
             .deadline
             .saturating_duration_since(tokio::time::Instant::now());
@@ -504,6 +553,8 @@ impl Supervisor {
         // DEFAULT_ITERATION_TIMEOUT_SECONDS. This ensures each iteration has
         // sufficient time for LLM calls + tool invocations.
         let per_iteration_timeout = iteration_timeout(&runtime_config.execution);
+        // What a later try needs under the bound: its clock and its judges'.
+        let try_needs = whole_try(&runtime_config.execution);
 
         info!(
             overall_timeout_secs = overall_timeout_secs,
@@ -516,6 +567,7 @@ impl Supervisor {
         let bound = TryBound {
             deadline: tokio::time::Instant::now() + overall_timeout,
             seconds: overall_timeout_secs,
+            try_needs,
         };
 
         // Wrap the entire loop in an overall deadline
@@ -609,7 +661,7 @@ impl Supervisor {
             // 2026-10-15, clause (1)). The last try was recorded exhausted
             // where it ended (R2).
             if attempts > 0 {
-                if let Some(ended) = bound.refuses_a_try(per_iteration_timeout) {
+                if let Some(ended) = bound.refuses_a_try() {
                     warn!(iteration = attempts + 1, "{}", ended);
                     return Err(RuntimeError::ExecutionFailed(ended));
                 }

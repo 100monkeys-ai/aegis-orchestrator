@@ -772,7 +772,8 @@ mod tests {
     /// The Forge's tester: each try is 900 s and each model call is bounded
     /// at 120 s, so a try keeps 130 s after a command and a command may start
     /// until 770 s into it; its five tries stay, under an execution bound of
-    /// 1815 s that fits two of them (AEGIS ADR-141, Update of 2026-10-15).
+    /// 2445 s that fits two of them with their judges (AEGIS ADR-141, Updates
+    /// of 2026-10-15 and 2026-10-16).
     /// On run `dcf60c18` its 600 s tries kept 300 s and four of five ended at
     /// the try clock's refusal without an answer.
     #[test]
@@ -795,7 +796,7 @@ mod tests {
         );
         assert_eq!(execution.llm_timeout_seconds, 120);
         assert_eq!(execution.max_retries, 5);
-        assert_eq!(resources.parse_timeout_seconds(), Some(1815));
+        assert_eq!(resources.parse_timeout_seconds(), Some(2445));
     }
 
     /// Every `timeout_seconds` a validator of `execution` carries, after the
@@ -1052,17 +1053,23 @@ mod tests {
     /// `forge-architect-tries-exceed-state-bound-2026-10-15`): ARCHITECT's
     /// first try ended at the default 600 s iteration timeout and the second
     /// was cut by the execution's 900 s bound. AEGIS ADR-141, Update of
-    /// 2026-10-15, clause (2): every built-in agent that may make two tries
-    /// fits two of them under its execution bound, with the wait the
-    /// supervisor makes after a failed try between them
-    /// (`resources.timeout >= 2 x iteration_timeout + failed_execution_backoff(1)`),
-    /// outside the exemptions above; the Forge's seven agents take
-    /// `iteration_timeout: "900s"` and `resources.timeout: "1815s"`.
+    /// 2026-10-15, clause (2), as the Update of 2026-10-16
+    /// `tests-load-before-code-2026-10-16`, clause 2, widens it: every
+    /// built-in agent that may make two tries fits two whole tries under its
+    /// execution bound, each its clock and its judges', with the wait the
+    /// supervisor makes after a failed try and the time a try takes to start
+    /// (`resources.timeout >= 2 x (iteration_timeout + judges' timeout_seconds)
+    /// + failed_execution_backoff(1) + TRY_START_ALLOWANCE`, the supervisor's
+    /// `two_tries_bound`), outside the exemptions above. Run `e7f2c2aa`'s
+    /// coder had 899 s left of 1815 s after its first try ran to its 900 s
+    /// clock, and its second try was refused. The Forge's seven agents take
+    /// `iteration_timeout: "900s"` and exactly the bound their own manifest
+    /// computes: 2 x (900 + 300) + 15 + 30 = 2445 s.
     #[test]
     fn builtin_agent_execution_bound_fits_two_tries() {
         use aegis_orchestrator_core::domain::agent::{ExecutionStrategy, ResourceLimits};
         use aegis_orchestrator_core::domain::supervisor::{
-            failed_execution_backoff, iteration_timeout, DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+            iteration_timeout, two_tries_bound, DEFAULT_EXECUTION_TIMEOUT_SECONDS,
         };
 
         let names: Vec<&str> = BUILTIN_AGENTS.iter().map(|(name, _)| *name).collect();
@@ -1074,7 +1081,6 @@ mod tests {
                 ));
             }
         }
-        let backoff = failed_execution_backoff(1).as_secs();
         for (name, yaml) in BUILTIN_AGENTS {
             let doc: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
             let spec = &doc["spec"];
@@ -1090,13 +1096,15 @@ mod tests {
                 .parse_timeout_seconds()
                 .unwrap_or(DEFAULT_EXECUTION_TIMEOUT_SECONDS);
             let iteration = iteration_timeout(&execution).as_secs();
+            let needed = two_tries_bound(&execution).as_secs();
 
             if FORGE_AGENTS.contains(name)
                 && (execution.iteration_timeout.as_deref() != Some("900s")
-                    || spec["security"]["resources"]["timeout"].as_str() != Some("1815s"))
+                    || spec["security"]["resources"]["timeout"].as_str()
+                        != Some(format!("{needed}s").as_str()))
             {
                 complaints.push(format!(
-                    "{name}: a Forge agent takes iteration_timeout \"900s\" and resources.timeout \"1815s\", it has {:?} and {:?}",
+                    "{name}: a Forge agent takes iteration_timeout \"900s\" and resources.timeout \"{needed}s\", it has {:?} and {:?}",
                     execution.iteration_timeout,
                     spec["security"]["resources"]["timeout"].as_str()
                 ));
@@ -1104,10 +1112,9 @@ mod tests {
             if execution.max_retries < 2 || TWO_TRIES_EXEMPT.iter().any(|(n, _)| n == name) {
                 continue;
             }
-            let needed = 2 * iteration + backoff;
             if bound < needed {
                 complaints.push(format!(
-                    "{name}: resources.timeout {bound} s is under two tries of {iteration} s and the {backoff} s wait between them ({needed} s)"
+                    "{name}: resources.timeout {bound} s is under two whole tries of {iteration} s and their judges', the wait between them and the time a try takes to start ({needed} s)"
                 ));
             }
         }
@@ -1115,6 +1122,17 @@ mod tests {
             if !names.contains(name) {
                 complaints.push(format!("{name} is a Forge agent but not a built-in agent"));
             }
+        }
+        let coder = BUILTIN_AGENTS
+            .iter()
+            .find(|(name, _)| *name == "coder-agent")
+            .map(|(_, yaml)| serde_yaml::from_str::<serde_yaml::Value>(yaml).unwrap())
+            .expect("coder-agent is a built-in agent");
+        if coder["spec"]["security"]["resources"]["timeout"].as_str() != Some("2445s") {
+            complaints.push(format!(
+                "the coder's resources.timeout is {:?}, not \"2445s\"",
+                coder["spec"]["security"]["resources"]["timeout"].as_str()
+            ));
         }
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
