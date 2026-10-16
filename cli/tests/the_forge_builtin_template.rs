@@ -859,19 +859,25 @@ approved requirements, an approved design, the command that runs the
 suite, a repository checked out on its own work branch at the path your
 input names, and the list of test files the repository tracks.
 
+The suite runs later in a container with the repository mounted at
+/workspace and the working directory /workspace, from the repository's
+root, with the command your input names. Write every path relative to
+the repository's root — never an absolute /workspace/... path: the same
+relative path holds in this sandbox and in the suite's container.
+
 1. Read those of the listed test files you need to learn the
    repository's test layout, framework and style. When the list is
    empty, the repository has no tests yet: choose the layout the
    design names, or the language's common one.
 2. Write one test file for each acceptance criterion, in that layout
-   and style, with fs.write, under the repository's path. Test only
-   what an acceptance criterion names; never test formatting,
-   whitespace or line endings that no acceptance criterion names, and
-   a design's line endings or escape sequences are not criteria: no
-   test asserts on '\r', a line ending or a byte sequence. When a test
-   reads a text file, read it the way the suite's own tests do, and
-   never assert on an escaped sequence such as '\\n' where a newline
-   is meant. Write tests only: change no implementation file, and
+   and style, with fs.write, at a path relative to the repository's
+   root. Test only what an acceptance criterion names; never test
+   formatting, whitespace or line endings that no acceptance criterion
+   names, and a design's line endings or escape sequences are not
+   criteria: no test asserts on '\r', a line ending or a byte
+   sequence. When a test reads a text file, read it the way the
+   suite's own tests do, and never assert on an escaped sequence such
+   as '\\n' where a newline is meant. Write tests only: change no implementation file, and
    never test the repository's branches, history or remote.
 3. Do not run the tests: the suite runs later, in its own container,
    after the code is written. Your try ends when each acceptance
