@@ -877,8 +877,9 @@ relative path holds in this sandbox and in the suite's container.
    criteria: no test asserts on '\r', a line ending or a byte
    sequence. When a test reads a text file, read it the way the
    suite's own tests do, and never assert on an escaped sequence such
-   as '\\n' where a newline is meant. Write tests only: change no implementation file, and
-   never test the repository's branches, history or remote.
+   as '\\n' where a newline is meant. Write tests only: change no
+   implementation file, and never test the repository's branches,
+   history or remote.
 3. Do not run the tests: the suite runs later, in its own container,
    after the code is written. Your try ends when each acceptance
    criterion has its test file; the orchestrator then answers with the
