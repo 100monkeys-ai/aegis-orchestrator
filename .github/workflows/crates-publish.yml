@@ -27,6 +27,20 @@ jobs:
   verify:
     name: Verify build and tests
     runs-on: ubuntu-latest
+    # The tests that need PostgreSQL read AEGIS_TEST_POSTGRES_URL and fail
+    # without it, as pipeline.yml's Test job provides it.
+    services:
+      postgres:
+        image: postgres:15-alpine@sha256:f7d23353e1b15400d22ebe31189f4d314b87a4c129cc400c8c2d8d4ca127bf81
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -58,6 +72,8 @@ jobs:
 
       - name: Run tests
         working-directory: aegis-orchestrator
+        env:
+          AEGIS_TEST_POSTGRES_URL: postgres://postgres@localhost:5432/postgres
         run: cargo test --workspace --locked --lib
 
   # Publish in dependency order: core → swarm → sdk → cli

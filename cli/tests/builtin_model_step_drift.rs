@@ -39,6 +39,7 @@ fn stored(template: &str, registry: &StandardRuntimeRegistry) -> Workflow {
 }
 
 const PUBLISHED: &str = "ghcr.io/100monkeys-ai/aegis-model-whisper:whisper-cpp-1.9.4-base@sha256:7ef552f84197b3c6a03efe059254e95517a05cf949e3454c04a9336a5090c88f";
+const PUBLISHED_TDRZ: &str = "ghcr.io/100monkeys-ai/aegis-model-whisper:whisper-cpp-1.9.4-small.en-tdrz@sha256:bc770238d3b881d0ba9baa35ca9583241563c8677e566a0999b4bed4b6aba0c7";
 
 fn registry() -> StandardRuntimeRegistry {
     StandardRuntimeRegistry::from_yaml_str(&registry_yaml()).expect("the stack registry loads")
@@ -98,7 +99,9 @@ fn transcribe_audio_is_a_builtin_workflow_on_the_published_image() {
         .expect("transcribe-audio is in BUILTIN_WORKFLOWS");
     assert_eq!(*yaml, transcribe_audio());
     let stored = stored(yaml, &registry());
-    let images: Vec<String> = stored
+    // ADR-143 S8b: the base step and the speaker-turn step, each on its
+    // published image.
+    let mut images: Vec<String> = stored
         .spec
         .states
         .values()
@@ -107,7 +110,11 @@ fn transcribe_audio_is_a_builtin_workflow_on_the_published_image() {
             _ => None,
         })
         .collect();
-    assert_eq!(images, vec![PUBLISHED.to_string()]);
+    images.sort();
+    assert_eq!(
+        images,
+        vec![PUBLISHED.to_string(), PUBLISHED_TDRZ.to_string()]
+    );
 }
 
 /// The `TRANSCRIBE` state of a parsed `transcribe-audio`.
