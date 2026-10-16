@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0-beta"
+version = "1.0.1-beta"
 edition = "2021"
 rust-version = "1.91"
 authors = ["100monkeys AI, Inc."]
