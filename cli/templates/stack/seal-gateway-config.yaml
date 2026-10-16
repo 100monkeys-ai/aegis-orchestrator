@@ -1,4 +1,4 @@
-apiVersion: 100monkeys.ai/v1
+apiVersion: seal.100monkeys.ai/v1
 kind: SealGatewayConfig
 metadata:
   name: aegis-seal-gateway
