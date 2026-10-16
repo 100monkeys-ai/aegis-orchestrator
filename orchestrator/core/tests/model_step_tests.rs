@@ -9,8 +9,10 @@
 //! - The parser checks a `model:` reference's form and gives a model step no
 //!   network: `network_mode` absent reads `none`, any other value is refused.
 //! - Resolution replaces the reference with the registry's pinned image.
-//! - The built-in `transcribe-audio` parses and resolves; the whisper image's
-//!   tag in the stack template is the one its Dockerfile's versions give.
+//! - The built-in `transcribe-audio` parses and resolves; each whisper image's
+//!   tag in the stack template is the one its Dockerfile's versions give for
+//!   one of the builds `pipeline.yml` publishes (the default build, and the
+//!   speaker-turn build of ADR-143's Update S8).
 
 use aegis_orchestrator_core::domain::runtime_registry::StandardRuntimeRegistry;
 use aegis_orchestrator_core::domain::workflow::{StateKind, StateName, Workflow};
@@ -349,41 +351,156 @@ fn transcribe_audio_template_parses_and_resolves() {
     );
 }
 
-/// S1, M4: the stack template's whisper entry names the tag
-/// `whisper-cpp-<WHISPER_CPP_VERSION>-<WHISPER_MODEL>` that
-/// `docker/Dockerfile.model-whisper`'s versions give and `pipeline.yml`
-/// publishes, with the digest of that publish.
-#[test]
-fn the_template_whisper_tag_is_the_dockerfiles_versions() {
+/// One whisper image `pipeline.yml` builds and publishes: the
+/// `WHISPER_MODEL` it builds (its step's `env`, else the Dockerfile's
+/// default), its step's `env`, and its run script.
+struct WhisperBuild {
+    model: String,
+    env: std::collections::BTreeMap<String, String>,
+    run: String,
+}
+
+fn dockerfile_arg(dockerfile: &str, name: &str) -> String {
+    dockerfile
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("ARG {name}=")))
+        .unwrap_or_else(|| panic!("the Dockerfile names no {name}"))
+        .to_string()
+}
+
+/// Every step of `pipeline.yml` that builds `docker/Dockerfile.model-whisper`.
+fn whisper_builds() -> Vec<WhisperBuild> {
     let dockerfile =
         std::fs::read_to_string(repo_root().join("docker/Dockerfile.model-whisper")).unwrap();
-    let arg = |name: &str| {
-        dockerfile
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("ARG {name}=")))
-            .unwrap_or_else(|| panic!("the Dockerfile names no {name}"))
-            .to_string()
-    };
-    let tag = format!(
+    let pipeline: serde_yaml::Value = serde_yaml::from_str(
+        &std::fs::read_to_string(repo_root().join(".github/workflows/pipeline.yml")).unwrap(),
+    )
+    .unwrap();
+    let mut builds = Vec::new();
+    for (_, job) in pipeline["jobs"].as_mapping().unwrap() {
+        let Some(steps) = job["steps"].as_sequence() else {
+            continue;
+        };
+        for step in steps {
+            let Some(run) = step["run"].as_str() else {
+                continue;
+            };
+            if !run.contains("docker/Dockerfile.model-whisper") {
+                continue;
+            }
+            let env: std::collections::BTreeMap<String, String> = step["env"]
+                .as_mapping()
+                .map(|m| {
+                    m.iter()
+                        .map(|(k, v)| {
+                            (
+                                k.as_str().unwrap().to_string(),
+                                v.as_str().unwrap_or_default().to_string(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let model = env
+                .get("WHISPER_MODEL")
+                .cloned()
+                .unwrap_or_else(|| dockerfile_arg(&dockerfile, "WHISPER_MODEL"));
+            builds.push(WhisperBuild {
+                model,
+                env,
+                run: run.to_string(),
+            });
+        }
+    }
+    builds
+}
+
+/// The version tag `pipeline.yml` gives a whisper build:
+/// `whisper-cpp-<WHISPER_CPP_VERSION>-<its WHISPER_MODEL>`.
+fn whisper_tag(model: &str) -> String {
+    let dockerfile =
+        std::fs::read_to_string(repo_root().join("docker/Dockerfile.model-whisper")).unwrap();
+    format!(
         "whisper-cpp-{}-{}",
-        arg("WHISPER_CPP_VERSION"),
-        arg("WHISPER_MODEL")
+        dockerfile_arg(&dockerfile, "WHISPER_CPP_VERSION"),
+        model
+    )
+}
+
+/// S1, M4, S8a: each whisper entry of the stack template names a tag
+/// `whisper-cpp-<WHISPER_CPP_VERSION>-<WHISPER_MODEL>` that
+/// `docker/Dockerfile.model-whisper`'s versions give for one of the builds
+/// `pipeline.yml` publishes, with the digest of that publish; the
+/// Dockerfile's default build is one of them.
+#[test]
+fn each_template_whisper_tag_is_the_dockerfiles_versions_for_its_build() {
+    let dockerfile =
+        std::fs::read_to_string(repo_root().join("docker/Dockerfile.model-whisper")).unwrap();
+    let published: Vec<String> = whisper_builds()
+        .iter()
+        .map(|build| whisper_tag(&build.model))
+        .collect();
+    assert!(
+        published.contains(&whisper_tag(&dockerfile_arg(&dockerfile, "WHISPER_MODEL"))),
+        "pipeline.yml does not publish the Dockerfile's default build: {published:?}"
     );
     let template =
         std::fs::read_to_string(repo_root().join("cli/templates/stack/runtime-registry.yaml"))
             .unwrap();
-    let named = template
+    let named: Vec<String> = template
         .lines()
-        .find_map(|line| {
+        .filter_map(|line| {
             line.split("ghcr.io/100monkeys-ai/aegis-model-whisper:")
                 .nth(1)
         })
-        .expect("the template names the whisper image")
-        .split(['@', '"'])
-        .next()
-        .unwrap()
-        .to_string();
-    assert_eq!(named, tag);
+        .map(|rest| rest.split(['@', '"']).next().unwrap().to_string())
+        .collect();
+    assert!(!named.is_empty(), "the template names no whisper image");
+    for tag in &named {
+        assert!(
+            published.contains(tag),
+            "the template names {tag}, which pipeline.yml does not publish: {published:?}"
+        );
+    }
+}
+
+/// S8a: `pipeline.yml` builds and pushes the speaker-turn image beside the
+/// first, from the same Dockerfile, with the tinydiarize model's name, its
+/// sha256 and its location at the pinned revision as build arguments, under
+/// the tag `whisper-cpp-1.9.4-small.en-tdrz`.
+#[test]
+fn the_pipeline_publishes_the_tdrz_tag_with_its_build_arguments() {
+    let builds = whisper_builds();
+    let tdrz = builds
+        .iter()
+        .find(|build| build.model == "small.en-tdrz")
+        .unwrap_or_else(|| {
+            panic!(
+                "pipeline.yml builds no small.en-tdrz whisper image; it builds {:?}",
+                builds.iter().map(|b| b.model.as_str()).collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(whisper_tag(&tdrz.model), "whisper-cpp-1.9.4-small.en-tdrz");
+    assert_eq!(
+        tdrz.env.get("WHISPER_MODEL_SHA256").map(String::as_str),
+        Some("ceac3ec06d1d98ef71aec665283564631055fd6129b79d8e1be4f9cc33cc54b4")
+    );
+    assert_eq!(
+        tdrz.env.get("WHISPER_MODEL_URL").map(String::as_str),
+        Some("https://huggingface.co/akashmjn/tinydiarize-whisper.cpp/resolve/d44ba793fc67e509623a88a409723311fa677744/ggml-small.en-tdrz.bin")
+    );
+    for arg in [
+        r#"--build-arg WHISPER_MODEL="$WHISPER_MODEL""#,
+        r#"--build-arg WHISPER_MODEL_SHA256="$WHISPER_MODEL_SHA256""#,
+        r#"--build-arg WHISPER_MODEL_URL="$WHISPER_MODEL_URL""#,
+        r#"version_tag="whisper-cpp-${engine_version}-${WHISPER_MODEL}""#,
+        r#"podman push --digestfile"#,
+    ] {
+        assert!(
+            tdrz.run.contains(arg),
+            "the small.en-tdrz build's script lacks {arg}"
+        );
+    }
 }
 
 /// G1, M4: the whisper image is a CPU build whose base is pinned by digest and

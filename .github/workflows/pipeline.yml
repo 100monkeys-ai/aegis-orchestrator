@@ -343,6 +343,36 @@ jobs:
           podman push "${WHISPER_IMAGE}:sha-${GITHUB_SHA::7}"
           echo "${WHISPER_IMAGE}:${version_tag}@$(cat whisper.digest)"
 
+      # The speaker-turn speech-to-text image, from the same Dockerfile with
+      # whisper.cpp's tinydiarize model (small.en-tdrz) by build arguments: the
+      # image a model step naming "model:speech-to-text/whisper-small-en-tdrz"
+      # runs. Its version tag is the Dockerfile's WHISPER_CPP_VERSION and this
+      # step's WHISPER_MODEL; the registry names it with the digest this push
+      # gives.
+      - name: Build and push whisper small.en-tdrz model image
+        env:
+          WHISPER_IMAGE: ${{ env.REGISTRY }}/100monkeys-ai/aegis-model-whisper
+          WHISPER_MODEL: small.en-tdrz
+          WHISPER_MODEL_SHA256: ceac3ec06d1d98ef71aec665283564631055fd6129b79d8e1be4f9cc33cc54b4
+          WHISPER_MODEL_URL: https://huggingface.co/akashmjn/tinydiarize-whisper.cpp/resolve/d44ba793fc67e509623a88a409723311fa677744/ggml-small.en-tdrz.bin
+        run: |
+          dockerfile=aegis-orchestrator/docker/Dockerfile.model-whisper
+          engine_version="$(sed -n 's/^ARG WHISPER_CPP_VERSION=//p' "$dockerfile")"
+          if [ -z "$engine_version" ]; then
+            echo "::error::$dockerfile names no WHISPER_CPP_VERSION"
+            exit 1
+          fi
+          version_tag="whisper-cpp-${engine_version}-${WHISPER_MODEL}"
+          podman build \
+            -f "$dockerfile" \
+            --build-arg WHISPER_MODEL="$WHISPER_MODEL" \
+            --build-arg WHISPER_MODEL_SHA256="$WHISPER_MODEL_SHA256" \
+            --build-arg WHISPER_MODEL_URL="$WHISPER_MODEL_URL" \
+            -t "${WHISPER_IMAGE}:${version_tag}" \
+            .
+          podman push --digestfile whisper-tdrz.digest "${WHISPER_IMAGE}:${version_tag}"
+          echo "${WHISPER_IMAGE}:${version_tag}@$(cat whisper-tdrz.digest)"
+
       # Semver tags for release pushes
       - name: Tag and push semver (release only)
         if: startsWith(github.ref, 'refs/tags/')

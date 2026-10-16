@@ -1,0 +1,9 @@
+
+[00:00:00.000 --> 00:00:03.780]   Okay Houston, we've had a problem here. [SPEAKER_TURN]
+[00:00:04.800 --> 00:00:06.180]   This is Houston. Say again, please. [SPEAKER_TURN]
+[00:00:06.960 --> 00:00:08.260]   Uh Houston, we've had a problem.
+[00:00:09.760 --> 00:00:11.320]   We've had a main beam up on a volt. [SPEAKER_TURN]
+[00:00:12.700 --> 00:00:13.800]   Roger, main beam under volt. [SPEAKER_TURN]
+[00:00:13.800 --> 00:00:15.100]   Uh uh uh [SPEAKER_TURN]
+[00:00:16.020 --> 00:00:18.020]   So okay, stand by thirteen, we're looking at it. [SPEAKER_TURN]
+[00:00:19.800 --> 00:00:25.740]   Okay, uh right now uh Houston, the uh voltage is uh is looking good um.
