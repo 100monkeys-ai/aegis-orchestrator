@@ -882,6 +882,17 @@ pub fn no_profile_names_sentence(key: &str) -> String {
     )
 }
 
+/// The sentence the person's own chat turn is refused with when it chose
+/// nothing of the family `key`, which the person has connected (Zaru
+/// ADR-0071 D2, in ADR-0070 D2's words for a family connected but not
+/// chosen).
+pub fn not_chosen_sentence(key: &str) -> String {
+    format!(
+        "Your {} is connected but not chosen for this conversation.",
+        your_family(key)
+    )
+}
+
 /// The sentence a call on an API key is refused with when neither the
 /// key's profile nor the request names a binding of the call's family
 /// (Zaru ADR-0071 D1 (e), D3).
