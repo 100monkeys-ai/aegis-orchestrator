@@ -4,8 +4,9 @@
 //! granted binding"). The start check admits a declared `<server>.<tool>`
 //! whose server is one of the node's `seal_gateway.remote_servers`; whether
 //! its call is made stays where it is decided at call time: the security
-//! context, then the person's granted binding, else
-//! `CREDENTIAL_BINDING_REQUIRED` (H3), before anything reaches the gateway.
+//! context, then the person's binding the run chose (a grant names none,
+//! Zaru ADR-0071 D1), else `CREDENTIAL_BINDING_REQUIRED` (H3), before
+//! anything reaches the gateway.
 //!
 //! Each test drives the types the daemon constructs: a
 //! `StandardExecutionService` given the node's configuration and the
@@ -15,10 +16,12 @@
 
 use super::tests::{make_agent, TestRuntime, TestVolumeService};
 use super::*;
-use crate::application::credential_service::{ToolCallActor, ToolCredentialSource};
+use crate::application::credential_service::{ContextBinding, ToolCallActor, ToolCredentialSource};
 use crate::application::nfs_gateway::NfsVolumeRegistry;
 use crate::application::tool_invocation_service::{ToolInvocationResult, ToolInvocationService};
 use crate::domain::agent::Agent;
+use crate::domain::credential::CredentialBindingId;
+use crate::domain::execution::ContextChoice;
 use crate::domain::fsal::AegisFSAL;
 use crate::domain::iam::{IdentityKind, ZaruTier};
 use crate::domain::node_config::{NodeConfigManifest, SealGatewayConfig};
@@ -133,25 +136,43 @@ async fn serve_tls(
     (format!("https://localhost:{port}"), ca_path, tx)
 }
 
-/// The person's binding to `SERVER`, granted to one agent: answers its
-/// secret for that agent's call by that person, and none otherwise.
-struct GrantedBinding {
-    granted_agent: AgentId,
+/// The person's binding `id` to `SERVER`: answers its secret for a call by
+/// that person whose run chose it, and none otherwise (a run reaches only
+/// the bindings it names, Zaru ADR-0071 D1).
+struct ChosenBinding {
+    id: CredentialBindingId,
     lookups: Mutex<Vec<String>>,
 }
 
 #[async_trait::async_trait]
-impl ToolCredentialSource for GrantedBinding {
+impl ToolCredentialSource for ChosenBinding {
     async fn tool_server_credential(
         &self,
         actor: &ToolCallActor<'_>,
         server: &str,
     ) -> anyhow::Result<Option<SensitiveString>> {
         self.lookups.lock().unwrap().push(server.to_string());
-        Ok(
-            (server == SERVER && actor.user_id == PERSON && actor.agent_id == self.granted_agent)
-                .then(|| SensitiveString::new(MARKER)),
-        )
+        Ok((server == SERVER
+            && actor.user_id == PERSON
+            && actor.context == ContextChoice::Binding(self.id))
+        .then(|| SensitiveString::new(MARKER)))
+    }
+
+    async fn context_bindings(
+        &self,
+        _: &CoreTenantId,
+        user_id: &str,
+        server: &str,
+    ) -> anyhow::Result<Vec<ContextBinding>> {
+        Ok(if user_id == PERSON && server == SERVER {
+            vec![ContextBinding {
+                id: self.id,
+                name: "notes".to_string(),
+                reach: None,
+            }]
+        } else {
+            Vec::new()
+        })
     }
 }
 
@@ -175,10 +196,16 @@ fn person(tenant_id: &CoreTenantId) -> UserIdentity {
     }
 }
 
-fn input() -> ExecutionInput {
+/// The run's input, its `contexts` choosing `chosen` for `SERVER` when
+/// given.
+fn input(chosen: Option<CredentialBindingId>) -> ExecutionInput {
+    let mut input = serde_json::json!({ "tenant_id": CoreTenantId::consumer().as_str() });
+    if let Some(id) = chosen {
+        input["contexts"] = serde_json::json!({ SERVER: id.0.to_string() });
+    }
     ExecutionInput {
         intent: Some("read a page".to_string()),
-        input: serde_json::json!({ "tenant_id": CoreTenantId::consumer().as_str() }),
+        input,
         workspace_volume_id: None,
         workspace_volume_mount_path: None,
         workspace_remote_path: None,
@@ -282,11 +309,15 @@ async fn node(
 }
 
 impl Node {
-    async fn start(&self, agent: &Agent) -> anyhow::Result<ExecutionId> {
+    async fn start(
+        &self,
+        agent: &Agent,
+        chosen: Option<CredentialBindingId>,
+    ) -> anyhow::Result<ExecutionId> {
         self.executions
             .start_execution(
                 agent.id,
-                input(),
+                input(chosen),
                 CONTEXT.to_string(),
                 Some(&person(&self.tenant)),
             )
@@ -329,15 +360,15 @@ fn gateway_config(url: &str, ca: &std::path::Path, servers: &[&str]) -> SealGate
 }
 
 /// The reproduction: an agent declaring `<configured server>.<tool>`
-/// starts, and its call reaches the gateway with its person's binding's
-/// credential resolved.
+/// starts, and its call reaches the gateway with the credential of the
+/// person's binding its run chose.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_agent_declaring_a_configured_servers_tool_starts_and_its_call_reaches_the_gateway() {
     let gateway = Gateway::default();
     let (url, ca, _shutdown) = serve_tls(gateway.clone()).await;
     let agent = agent_declaring(&[&format!("{SERVER}.pages.read")]);
-    let binding = Arc::new(GrantedBinding {
-        granted_agent: agent.id,
+    let binding = Arc::new(ChosenBinding {
+        id: CredentialBindingId::new(),
         lookups: Mutex::new(Vec::new()),
     });
     let node = node(
@@ -348,13 +379,13 @@ async fn an_agent_declaring_a_configured_servers_tool_starts_and_its_call_reache
     .await;
 
     let execution = node
-        .start(&agent)
+        .start(&agent, Some(binding.id))
         .await
         .expect("an agent declaring a configured remote server's tool starts");
     let value = node
         .call(&agent, execution, &format!("{SERVER}.pages.read"))
         .await
-        .expect("the granted call is made");
+        .expect("the chosen binding's call is made");
 
     assert_eq!(
         value,
@@ -370,15 +401,16 @@ async fn an_agent_declaring_a_configured_servers_tool_starts_and_its_call_reache
     assert_eq!(calls[0].credential.as_ref().unwrap().value, MARKER);
 }
 
-/// The same agent with no grant starts; its call is refused
-/// `CREDENTIAL_BINDING_REQUIRED` and nothing reaches the gateway.
+/// The same agent whose run named no binding starts; its call is refused
+/// `CREDENTIAL_BINDING_REQUIRED` with Zaru ADR-0071 D1 (e)'s run sentence
+/// before any credential is looked up, and nothing reaches the gateway.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_same_agent_without_a_grant_starts_and_its_call_is_refused_before_the_gateway() {
+async fn the_same_agent_naming_no_binding_starts_and_its_call_is_refused_before_the_gateway() {
     let gateway = Gateway::default();
     let (url, ca, _shutdown) = serve_tls(gateway.clone()).await;
     let agent = agent_declaring(&[&format!("{SERVER}.pages.read")]);
-    let binding = Arc::new(GrantedBinding {
-        granted_agent: AgentId::new(),
+    let binding = Arc::new(ChosenBinding {
+        id: CredentialBindingId::new(),
         lookups: Mutex::new(Vec::new()),
     });
     let node = node(
@@ -389,18 +421,25 @@ async fn the_same_agent_without_a_grant_starts_and_its_call_is_refused_before_th
     .await;
 
     let execution = node
-        .start(&agent)
+        .start(&agent, None)
         .await
         .expect("the start check does not decide admission");
     let err = node
         .call(&agent, execution, &format!("{SERVER}.pages.read"))
         .await
-        .expect_err("no grant, no call");
+        .expect_err("no binding named, no call");
 
     let refusal = err.refusal();
     assert_eq!(refusal.code, "CREDENTIAL_BINDING_REQUIRED");
     assert_eq!(refusal.http_status, 403);
-    assert_eq!(binding.lookups.lock().unwrap().as_slice(), [SERVER]);
+    assert_eq!(
+        refusal.message,
+        crate::application::credential_service::no_profile_names_sentence(SERVER)
+    );
+    assert!(
+        binding.lookups.lock().unwrap().is_empty(),
+        "a credential was looked up"
+    );
     assert!(gateway.calls.lock().unwrap().is_empty(), "nothing sent");
 }
 
@@ -413,14 +452,17 @@ async fn an_agent_declaring_a_tool_of_an_unconfigured_server_is_refused_at_start
     let node = node(
         &agent,
         Some(gateway_config(&url, &ca, &[SERVER])),
-        Some(Arc::new(GrantedBinding {
-            granted_agent: agent.id,
+        Some(Arc::new(ChosenBinding {
+            id: CredentialBindingId::new(),
             lookups: Mutex::new(Vec::new()),
         })),
     )
     .await;
 
-    let err = node.start(&agent).await.expect_err("refused at start");
+    let err = node
+        .start(&agent, None)
+        .await
+        .expect_err("refused at start");
     assert_eq!(
         err.to_string(),
         "Failed to extract user input from execution input: Agent requested tool \
@@ -436,7 +478,7 @@ async fn an_agent_declaring_a_tool_of_an_unconfigured_server_is_refused_at_start
 async fn without_a_seal_gateway_the_start_check_is_todays() {
     let remote = agent_declaring(&[&format!("{SERVER}.pages.read")]);
     let node_remote = node(&remote, None, None).await;
-    let err = node_remote.start(&remote).await.expect_err("refused");
+    let err = node_remote.start(&remote, None).await.expect_err("refused");
     assert_eq!(
         err.to_string(),
         format!(
@@ -448,7 +490,7 @@ async fn without_a_seal_gateway_the_start_check_is_todays() {
     let builtin = agent_declaring(&["fs.read"]);
     let node_builtin = node(&builtin, None, None).await;
     node_builtin
-        .start(&builtin)
+        .start(&builtin, None)
         .await
         .expect("a declared builtin starts as today");
 }
