@@ -138,9 +138,27 @@ ensure_docker_engine() {
         sudo docker info &>/dev/null && break
         sleep 1
     done
+    # WSL without systemd: dockerd often dies at once on nftables-backed
+    # iptables ("iptables ... nf_tables" in its log). Switch to the legacy
+    # backend once and start again. Idempotent: the alternative stays set.
+    if ! sudo docker info &>/dev/null && [[ "$IS_WSL" == "true" ]] \
+        && sudo grep -qiE 'iptables|nf_tables|nftables' /var/log/docker.log 2>/dev/null \
+        && [[ -x /usr/sbin/iptables-legacy ]]; then
+        info "dockerd failed on nftables iptables; switching to iptables-legacy and starting again..."
+        sudo update-alternatives --set iptables /usr/sbin/iptables-legacy >/dev/null 2>&1 || true
+        sudo update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy >/dev/null 2>&1 || true
+        sudo service docker start 2>/dev/null || true
+        for i in $(seq 1 15); do
+            sudo docker info &>/dev/null && break
+            sleep 1
+        done
+    fi
     if ! sudo docker info &>/dev/null; then
         echo ""
-        echo -e "${RED}${BOLD}[aegis] ERROR:${RESET} the Docker engine did not start."
+        echo -e "${RED}${BOLD}[aegis] ERROR:${RESET} the Docker engine did not start. Its log says:"
+        sudo tail -n 20 /var/log/docker.log 2>/dev/null | sed 's/^/        /' \
+            || sudo journalctl -u docker --no-pager -n 20 2>/dev/null | sed 's/^/        /' \
+            || echo "        (no /var/log/docker.log and no journal)"
         if [[ "$IS_WSL" == "true" ]]; then
             echo -e "        In WSL: ${BOLD}sudo service docker start${RESET} (or enable systemd in /etc/wsl.conf), then run this installer again."
         else
