@@ -23,14 +23,17 @@
 # and COMPLETE, FAILED and LAND_REFUSED its own blackboard writes: no state of
 # this workflow runs a shell command in the core process. The suite runs in a
 # container on the clone (CHECK_TESTS once after TEST, then EXECUTE_TESTS after
-# each CODE). The two Human gates are the only ones.
+# each CODE). The two Human gates are the only ones. All mounts unify at
+# /workspace: every step container mounts the clone at /workspace with the
+# working directory /workspace, and every path in the prompts and in tests is
+# written relative to the repository's root, never absolute.
 
 apiVersion: 100monkeys.ai/v1
 kind: Workflow
 
 metadata:
   name: "the-forge"
-  version: "2.0.0"
+  version: "2.0.1"
   description: |-
     Develops one change in one of your repositories: requirements and a design,
     each approved by you, then tests written first, the implementation, your
@@ -107,7 +110,7 @@ spec:
         # The repository
         The repository is at {{repository.path}}, on the work branch {{repository.branch}}, which started from {{repository.started_from}} on {{repository.ref}}. Read it before you answer: its layout, its conventions, the code the task touches and its tests. Change nothing.
 
-        The test suite will be run in the repository's root with: {{{input.test_command}}}
+        The test suite will be run later in a container with the repository mounted at /workspace and the working directory /workspace: every path is written relative to the repository's root, never an absolute /workspace/... path. The suite's command: {{{input.test_command}}}
         {{#if AWAIT_REQUIREMENTS_APPROVAL}}
 
         # Your last requirements were sent back
@@ -156,6 +159,8 @@ spec:
 
         # The repository
         The repository is at {{repository.path}}, on the work branch {{repository.branch}}. Read its layout and its conventions before you design anything. Change nothing.
+
+        The test suite will be run later in a container with the repository mounted at /workspace and the working directory /workspace: name every path relative to the repository's root, never an absolute /workspace/... path.
         {{#if AWAIT_ARCH_APPROVAL}}
 
         # Your last design was sent back
@@ -209,7 +214,7 @@ spec:
         {{{json ARCHITECT.output}}}
 
         # The repository
-        The repository is at {{repository.path}}, on the work branch {{repository.branch}}. The suite will be run in its root with: {{{input.test_command}}}
+        The repository is at {{repository.path}}, on the work branch {{repository.branch}}. The suite will be run later in a container with the repository mounted at /workspace and the working directory /workspace, in the repository's root with: {{{input.test_command}}} Write every test path relative to the repository's root, never an absolute /workspace/... path.
 
         # The test files it tracks
         {{#if repository.tests}}{{{json repository.tests}}}{{else}}None: it tracks no test file.{{/if}}
@@ -267,7 +272,7 @@ spec:
               *'File "/'*|*'File "<'*|'') ;;
               *'File "'*) loaded=no ;;
             esac
-            for missing in $(sed -n "s/.*No module named '\([^']*\)'.*/\1/p" "$all"); do
+            for missing in $(sed -n "s/.*No module named '\([^']*\)'./\1/p" "$all"); do
               for module in $(sed -n 's/.*Failed to import test module: \([A-Za-z0-9_.]*\).*/\1/p' "$all") $(sed -n 's/.*ERROR collecting \([^ ]*\)\.py.*/\1/p' "$all" | tr / .); do
                 case "$module" in
                   "$missing"|"$missing".*|*."$missing") loaded=no ;;
@@ -281,10 +286,10 @@ spec:
           exit "$code"
       env:
         FORGE_TEST_COMMAND: "{{{input.test_command}}}"
-      workdir: "/workspace/repository"
+      workdir: "/workspace"
       volumes:
         - name: repository
-          mount_path: "/workspace/repository"
+          mount_path: "/workspace"
       network_mode: egress
       resources:
         cpu: 2000
@@ -312,7 +317,7 @@ spec:
         {{{json TEST.output}}}
 
         # The repository
-        The repository is at {{repository.path}}, on the work branch {{repository.branch}}. The suite will be run in its root with: {{{input.test_command}}}
+        The repository is at {{repository.path}}, on the work branch {{repository.branch}}. The suite will be run in a container with the repository mounted at /workspace and the working directory /workspace, in the repository's root with: {{{input.test_command}}} Write and change paths relative to the repository's root, never an absolute /workspace/... path.
         {{#if EXECUTE_TESTS}}
 
         # The last run of the suite
@@ -366,10 +371,10 @@ spec:
         - "eval \"$FORGE_TEST_COMMAND\""
       env:
         FORGE_TEST_COMMAND: "{{{input.test_command}}}"
-      workdir: "/workspace/repository"
+      workdir: "/workspace"
       volumes:
         - name: repository
-          mount_path: "/workspace/repository"
+          mount_path: "/workspace"
       network_mode: egress
       resources:
         cpu: 2000
