@@ -48,7 +48,7 @@ use aegis_orchestrator_core::domain::credential::{
     CredentialProvider, CredentialScope, CredentialStatus, CredentialType, GrantTarget,
     OAuthPendingState, UserCredentialBinding,
 };
-use aegis_orchestrator_core::domain::execution::ExecutionError;
+use aegis_orchestrator_core::domain::execution::{ExecutionError, ServerChoice};
 use aegis_orchestrator_core::domain::fsal::{AegisFSAL, EventPublisher};
 use aegis_orchestrator_core::domain::git_repo::{
     parse_requested_repositories, CloneStrategy, GitRef, GitRepoBinding, GitRepoBindingId,
@@ -678,11 +678,23 @@ impl Fixture {
         binding.id
     }
 
-    async fn resolve(&self, value: Value) -> Result<Vec<RunRepository>, RunRepositoryError> {
+    /// Resolve `value`'s entries for a run whose GitHub choice is `github`
+    /// (Zaru ADR-0071 D1 (d)).
+    async fn resolve(
+        &self,
+        value: Value,
+        github: ServerChoice,
+    ) -> Result<Vec<RunRepository>, RunRepositoryError> {
         let requested = parse_requested_repositories(&value)
             .unwrap_or_else(|e| panic!("{value} was not admitted: {e}"));
         self.service
-            .resolve_requested(&self.tenant, Some(PERSON), ZaruTier::Pro, requested)
+            .resolve_requested(
+                &self.tenant,
+                Some(PERSON),
+                ZaruTier::Pro,
+                &github,
+                requested,
+            )
             .await
     }
 }
@@ -701,7 +713,9 @@ fn refusal<T: std::fmt::Debug>(result: Result<T, RunRepositoryError>) -> String 
 #[tokio::test]
 async fn a_url_with_a_binding_of_that_url_and_ref_reuses_it_before_any_credential_is_read() {
     let fx = fixture().await;
-    // No credential at all: a reuse never asks for one.
+    // The run names a GitHub binding (Zaru ADR-0071 D1 (d)); the binding of
+    // that URL, made with no credential, is reused with no git step.
+    let github = fx.credential("github", CredentialStatus::Active).await;
     let on_release = fx
         .existing_binding(
             "https://git.example.test/org/repo",
@@ -714,7 +728,10 @@ async fn a_url_with_a_binding_of_that_url_and_ref_reuses_it_before_any_credentia
         .await;
 
     let entries = fx
-        .resolve(json!([{ "url": URL, "branch": "feature/x" }]))
+        .resolve(
+            json!([{ "url": URL, "branch": "feature/x" }]),
+            ServerChoice::Bindings(vec![github]),
+        )
         .await
         .unwrap_or_else(|e| panic!("the URL with a binding of it on main was refused: {e:?}"));
 
@@ -752,7 +769,10 @@ async fn a_url_with_no_binding_is_bound_with_the_persons_one_github_credential_a
     fx.credential("github", CredentialStatus::Revoked).await;
 
     let entries = fx
-        .resolve(json!([{ "url": URL }]))
+        .resolve(
+            json!([{ "url": URL }]),
+            ServerChoice::Bindings(vec![github]),
+        )
         .await
         .unwrap_or_else(|e| panic!("the URL with one active GitHub credential was refused: {e:?}"));
 
@@ -801,9 +821,15 @@ async fn a_url_with_no_binding_is_bound_with_the_persons_one_github_credential_a
 async fn a_url_is_refused_when_the_person_has_no_active_github_credential() {
     let fx = fixture().await;
     fx.credential("gitlab", CredentialStatus::Active).await;
-    fx.credential("github", CredentialStatus::Revoked).await;
+    let revoked = fx.credential("github", CredentialStatus::Revoked).await;
 
-    let sentence = refusal(fx.resolve(json!([{ "url": URL }])).await);
+    let sentence = refusal(
+        fx.resolve(
+            json!([{ "url": URL }]),
+            ServerChoice::Bindings(vec![revoked]),
+        )
+        .await,
+    );
 
     assert_eq!(sentence, "no active GitHub credential of yours");
     assert!(fx.bindings.all().is_empty(), "a binding was made");
@@ -813,10 +839,16 @@ async fn a_url_is_refused_when_the_person_has_no_active_github_credential() {
 #[tokio::test]
 async fn a_url_is_refused_when_the_person_has_two_active_github_credentials() {
     let fx = fixture().await;
-    fx.credential("github", CredentialStatus::Active).await;
-    fx.credential("github", CredentialStatus::Active).await;
+    let first = fx.credential("github", CredentialStatus::Active).await;
+    let second = fx.credential("github", CredentialStatus::Active).await;
 
-    let sentence = refusal(fx.resolve(json!([{ "url": URL }])).await);
+    let sentence = refusal(
+        fx.resolve(
+            json!([{ "url": URL }]),
+            ServerChoice::Bindings(vec![first, second]),
+        )
+        .await,
+    );
 
     assert_eq!(
         sentence,
@@ -829,9 +861,15 @@ async fn a_url_is_refused_when_the_person_has_two_active_github_credentials() {
 #[tokio::test]
 async fn a_url_the_clone_cannot_reach_is_refused_with_the_clones_sentence_and_leaves_no_binding() {
     let fx = fixture().await;
-    fx.credential("github", CredentialStatus::Active).await;
+    let github = fx.credential("github", CredentialStatus::Active).await;
 
-    let sentence = refusal(fx.resolve(json!([{ "url": MISSING_URL }])).await);
+    let sentence = refusal(
+        fx.resolve(
+            json!([{ "url": MISSING_URL }]),
+            ServerChoice::Bindings(vec![github]),
+        )
+        .await,
+    );
 
     assert!(
         sentence.starts_with("git: ") && sentence.contains("missing.git"),
@@ -909,6 +947,8 @@ impl WorkflowEnginePort for RecordingEngine {
 struct Resolving {
     refuse: Option<&'static str>,
     calls: Mutex<Vec<String>>,
+    /// The GitHub choice each resolution was given (Zaru ADR-0071 D1 (d)).
+    github: Mutex<Vec<ServerChoice>>,
 }
 
 #[async_trait]
@@ -918,9 +958,11 @@ impl RunRepositories for Resolving {
         _tenant_id: &TenantId,
         _person: Option<&str>,
         _tier: ZaruTier,
+        github: &ServerChoice,
         requested: Vec<RequestedRepository>,
     ) -> Result<Vec<RunRepository>, RunRepositoryError> {
         self.calls.lock().unwrap().push("resolve".to_string());
+        self.github.lock().unwrap().push(github.clone());
         if let Some(sentence) = self.refuse {
             return Err(RunRepositoryError::Refused(sentence.to_string()));
         }
@@ -998,6 +1040,7 @@ async fn start_with(
     let repositories = Arc::new(Resolving {
         refuse,
         calls: Mutex::new(Vec::new()),
+        github: Mutex::new(Vec::new()),
     });
     use_case.set_repositories(repositories.clone());
     (use_case, engine, repositories)
@@ -1071,3 +1114,8 @@ async fn a_workflow_start_whose_url_is_refused_prepares_nothing_and_starts_nothi
         "Temporal was started"
     );
 }
+
+// Zaru ADR-0071 D1 (d): the URL form only through the run's named GitHub
+// binding, with this file's fixture.
+#[path = "deny_by_default_orchestrator_2/repository.rs"]
+mod deny_by_default_orchestrator_2;

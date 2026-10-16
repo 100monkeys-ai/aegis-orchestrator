@@ -5357,6 +5357,8 @@ mod tests {
         released: Mutex<Vec<uuid::Uuid>>,
         taken: Mutex<Vec<uuid::Uuid>>,
         resolved: Mutex<Vec<(Option<String>, crate::domain::iam::ZaruTier)>>,
+        /// The GitHub choice each resolution was given (Zaru ADR-0071 D1 (d)).
+        github_choices: Mutex<Vec<crate::domain::execution::ServerChoice>>,
     }
 
     impl RecordingRunRepositories {
@@ -5369,6 +5371,7 @@ mod tests {
                 released: Mutex::new(Vec::new()),
                 taken: Mutex::new(Vec::new()),
                 resolved: Mutex::new(Vec::new()),
+                github_choices: Mutex::new(Vec::new()),
             })
         }
 
@@ -5391,11 +5394,13 @@ mod tests {
             _tenant_id: &TenantId,
             person: Option<&str>,
             tier: crate::domain::iam::ZaruTier,
+            github: &crate::domain::execution::ServerChoice,
             requested: Vec<crate::domain::git_repo::RequestedRepository>,
         ) -> std::result::Result<
             Vec<crate::domain::git_repo::RunRepository>,
             crate::application::git_repo_service::RunRepositoryError,
         > {
+            self.github_choices.lock().unwrap().push(github.clone());
             self.resolved
                 .lock()
                 .unwrap()
@@ -7427,11 +7432,17 @@ impl StandardExecutionService {
             }
         };
         let entries = if prepare {
+            // Zaru ADR-0071 D1 (d): a URL only through the GitHub binding the
+            // run named (its profile's bindings are written there first).
+            let github = input
+                .contexts()
+                .server(crate::application::git_repo_service::GITHUB_PROVIDER);
             let entries = repositories
                 .resolve_requested(
                     tenant_id,
                     person,
                     crate::application::git_repo_service::zaru_tier_of(identity),
+                    &github,
                     requested,
                 )
                 .await

@@ -177,3 +177,73 @@ async fn an_agent_state_cannot_choose_a_binding_its_workflow_did_not() {
         .await;
     assert_eq!(refusal(started), widens("nuclear-notes"));
 }
+
+// ── Zaru ADR-0071 D1 (d): a repository by URL through the run's named GitHub binding ──
+
+const GITHUB_BINDING: &str = "5c7e9a1b-4d6f-4b8a-9e0c-2f4a6c8e0b3d";
+
+/// Start a root run naming its repository by URL with `contexts` (none when
+/// `None`); answers the GitHub choice each resolution was given.
+async fn github_choices_for(
+    contexts: Option<serde_json::Value>,
+) -> Vec<crate::domain::execution::ServerChoice> {
+    let tenant_id = CoreTenantId::consumer();
+    let agent = make_agent("fixer", None, None);
+    let agent_repo = Arc::new(InMemoryAgentRepository::new());
+    agent_repo
+        .save_for_tenant(&tenant_id, &agent)
+        .await
+        .unwrap();
+    let runtime = Arc::new(TestRuntime::default());
+    let service = StandardExecutionService::new(
+        agent_repo,
+        Arc::new(TestVolumeService {
+            volumes: HashMap::new(),
+        }),
+        Arc::new(Supervisor::new(runtime.clone())),
+        Arc::new(InMemoryExecutionRepository::new()),
+        Arc::new(EventBus::with_default_capacity()),
+        Arc::new(crate::domain::node_config::NodeConfigManifest::default()),
+    );
+    let repositories = RecordingRunRepositories::new(None);
+    service.set_repositories(repositories.clone());
+    let mut input = serde_json::json!({
+        "tenant_id": "zaru-consumer",
+        "task": "fix the bug",
+        "repositories": [{ "url": "https://github.com/100monkeys-ai/aegis-examples.git" }],
+    });
+    if let Some(contexts) = contexts {
+        input["contexts"] = contexts;
+    }
+    service
+        .start_execution(
+            agent.id,
+            input_with(input),
+            "test-ctx".to_string(),
+            Some(&repository_person()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the run did not start: {e}"));
+    wait_for_spawn(runtime.as_ref()).await;
+    let choices = repositories.github_choices.lock().unwrap().clone();
+    choices
+}
+
+/// The root start hands the URL's resolution the GitHub binding the run
+/// named, and, when it named none, nothing.
+#[tokio::test]
+async fn a_root_start_resolves_a_url_through_the_github_binding_it_named() {
+    let github = crate::domain::credential::CredentialBindingId(
+        uuid::Uuid::parse_str(GITHUB_BINDING).unwrap(),
+    );
+    assert_eq!(
+        github_choices_for(Some(serde_json::json!({ "github": GITHUB_BINDING }))).await,
+        vec![crate::domain::execution::ServerChoice::Bindings(vec![
+            github
+        ])]
+    );
+    assert_eq!(
+        github_choices_for(None).await,
+        vec![crate::domain::execution::ServerChoice::NotGiven]
+    );
+}

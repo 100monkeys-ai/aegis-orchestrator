@@ -299,11 +299,18 @@ impl StandardStartWorkflowExecutionUseCase {
         };
         // AEGIS ADR-141 F2a: a repository named by its URL becomes a binding
         // of the person's before anything is held.
+        // Zaru ADR-0071 D1 (d): only through the GitHub binding the run
+        // named (a profile's bindings are written into `contexts` first).
+        let github = crate::domain::execution::ExecutionContexts::from_value(
+            input.get(crate::domain::execution::CONTEXTS_INPUT_KEY),
+        )
+        .server(crate::application::git_repo_service::GITHUB_PROVIDER);
         let mut entries = repositories
             .resolve_requested(
                 tenant_id,
                 person.as_deref(),
                 crate::application::git_repo_service::zaru_tier_of(identity),
+                &github,
                 requested,
             )
             .await
