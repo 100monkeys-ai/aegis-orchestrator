@@ -1170,7 +1170,7 @@ mod tests {
     /// a final-newline test no criterion named and which cannot pass.
     #[test]
     fn the_tester_tests_only_what_a_criterion_names() {
-        const STEP: &str = "Write one test file for each acceptance criterion, in that layout and style, with fs.write, at a path relative to the repository's root. Test only what an acceptance criterion names; never test formatting, whitespace or line endings that no acceptance criterion names, and a design's line endings or escape sequences are not criteria: no test asserts on '\\r', a line ending or a byte sequence. When a test reads a text file, read it the way the suite's own tests do, and never assert on an escaped sequence such as '\\\\n' where a newline is meant.";
+        const STEP: &str = "Write one test file for each acceptance criterion, in that layout and style, with fs.write, at a path relative to the repository's root. Test only what an acceptance criterion names; never test formatting, whitespace or line endings that no acceptance criterion names, and a design's line endings or escape sequences are not criteria: no test asserts on '\\r', a line ending or a byte sequence. When a test reads a text file, read it in text mode (universal newlines) or normalize '\\r\\n' before matching, so a content match never silently fails on a CRLF file, and never assert on an escaped sequence such as '\\\\n' where a newline is meant.";
         let (_, yaml) = BUILTIN_AGENTS
             .iter()
             .find(|(name, _)| *name == "tester-agent")
