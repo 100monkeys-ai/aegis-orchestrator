@@ -2597,6 +2597,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     }
     // AEGIS ADR-147 C4: a run's Nuclear Notes tree is materialized, mounted at /workspace and written back through the SEAL gateway.
     start_workflow_execution_use_case.set_trees(tool_invocation_service.clone());
+    temporal_event_listener.set_execution_tokens(tool_invocation_service.clone());
     execution_service.set_trees(tool_invocation_service.clone());
     run_container_step_use_case.set_run_trees(tool_invocation_service.clone());
     // A step mounts a copy of its run's attachments (AEGIS ADR-143 S4).
@@ -4684,6 +4685,47 @@ models:
             ));
         }
         assert!(failures.is_empty(), "{}", failures.join("; "));
+    }
+
+    /// AEGIS ADR-147 Update execution-token-2026-10-17 X4: the daemon gives
+    /// the temporal event listener the tool invocation service, so a run's
+    /// terminal event revokes its execution token and deletes its secret.
+    /// `start_daemon` builds Postgres, Temporal and the SEAL gateway, so the
+    /// wiring is read from its own source: once, after the run's trees are
+    /// wired to the same service. The release itself is proved in core by
+    /// `execution_token_released_on_the_terminal_event_of_a_run_naming_a_tree`.
+    #[test]
+    fn execution_token_the_daemon_wires_the_listener_to_the_tool_invocation_service() {
+        let source = include_str!("server.rs");
+        let start = source
+            .find("pub async fn start_daemon(")
+            .expect("server.rs defines start_daemon");
+        let body = &source[start..];
+        let body = &body[..body.find("\n#[cfg(test)]").unwrap_or(body.len())];
+        let wiring =
+            "temporal_event_listener.set_execution_tokens(tool_invocation_service.clone());";
+        assert_eq!(
+            body.matches(wiring).count(),
+            1,
+            "X4: the daemon does not give the temporal event listener the tool invocation service once"
+        );
+        let trees = body
+            .find("start_workflow_execution_use_case.set_trees(tool_invocation_service.clone());")
+            .expect("the daemon wires the run's trees");
+        assert!(
+            body.find(wiring).expect("wired") > trees,
+            "X4: the listener is wired before the tool invocation service's trees"
+        );
+
+        // The service the daemon passes is the one the listener holds.
+        fn _wires(
+            listener: &aegis_orchestrator_core::infrastructure::temporal_event_listener::TemporalEventListener,
+            service: std::sync::Arc<
+                aegis_orchestrator_core::application::tool_invocation_service::ToolInvocationService,
+            >,
+        ) {
+            listener.set_execution_tokens(service);
+        }
     }
 
     #[test]
