@@ -136,11 +136,11 @@ RUN mkdir -p /usr/local/share/transcribe \
     'model=$(cat /opt/whisper/model) || { echo "transcribe: the image names no model" >&2; exit 1; }' \
     'case "$model" in' \
     '*-tdrz)' \
-    'if ! whisper-cli --model /opt/whisper/ggml-model.bin --file "$work/audio.wav" --language en --temperature 0 --no-fallback --no-prints -tdrz --output-txt --output-file "$work/transcript" > "$work/segments.txt" 2> "$work/whisper.log"; then cat "$work/whisper.log" >&2; echo "transcribe: the model could not transcribe $in" >&2; exit 1; fi' \
+    'if ! whisper-cli --model /opt/whisper/ggml-model.bin --file "$work/audio.wav" --language en --temperature 0 --no-fallback --no-prints -tdrz --output-txt --output-file "$work/transcript" > "$work/segments.txt" 2> "$work/whisper.log"; then echo "transcribe: the model could not transcribe $in" >&2; exit 1; fi' \
     'if ! mkdir -p "$(dirname "$out")" || ! awk -f /usr/local/share/transcribe/turns.awk "$work/segments.txt" > "$out"; then echo "transcribe: the transcript could not be written to $out" >&2; exit 1; fi' \
     ';;' \
     '*)' \
-    'if ! whisper-cli --model /opt/whisper/ggml-model.bin --file "$work/audio.wav" --language auto --temperature 0 --no-fallback --no-timestamps --no-prints --output-txt --output-file "$work/transcript" > "$work/whisper.log" 2>&1; then cat "$work/whisper.log" >&2; echo "transcribe: the model could not transcribe $in" >&2; exit 1; fi' \
+    'if ! whisper-cli --model /opt/whisper/ggml-model.bin --file "$work/audio.wav" --language auto --temperature 0 --no-fallback --no-timestamps --no-prints --output-txt --output-file "$work/transcript" > "$work/whisper.log" 2>&1; then echo "transcribe: the model could not transcribe $in" >&2; exit 1; fi' \
     'if ! mkdir -p "$(dirname "$out")" || ! sed -e "s/^[[:space:]]*//" "$work/transcript.txt" > "$out"; then echo "transcribe: the transcript could not be written to $out" >&2; exit 1; fi' \
     ';;' \
     'esac' \

@@ -173,13 +173,18 @@ pub trait SecurityTokenIssuerPort: Send + Sync {
 /// exited or never started.
 #[async_trait]
 pub trait ContainerVerificationPort: Send + Sync {
-    /// Returns `Ok(())` if the container with the given ID is currently running.
+    /// Returns `Ok(())` if the container with the given ID is running and
+    /// carries the given execution ID.
     ///
     /// # Errors
     ///
     /// Returns an error if the container is not running, cannot be found,
-    /// or the container runtime is unreachable.
-    async fn verify_container_running(&self, container_id: &str) -> anyhow::Result<()>;
+    /// does not belong to the execution, or the container runtime is unreachable.
+    async fn verify_container_for_execution(
+        &self,
+        container_id: &str,
+        execution_id: &crate::domain::execution::ExecutionId,
+    ) -> anyhow::Result<()>;
 }
 
 /// Port for workflow execution control operations (cancel, signal, remove).

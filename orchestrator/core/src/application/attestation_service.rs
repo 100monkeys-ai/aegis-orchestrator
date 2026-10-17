@@ -204,12 +204,13 @@ impl AttestationServiceImpl {
     ) -> Result<AttestationResponse> {
         let (agent_id, execution_id) = self.resolve_ids(&request)?;
 
-        // 1. Verify the requesting container is running (ADR-035 §4.1).
+        // 1. Verify the requesting container is running and belongs to the
+        // claimed execution (ADR-035 §4.1).
         if let (Some(container_id), Some(verifier)) =
             (&request.container_id, &self.container_verifier)
         {
             verifier
-                .verify_container_running(container_id)
+                .verify_container_for_execution(container_id, &execution_id)
                 .await
                 .map_err(|e| anyhow::anyhow!("Container identity verification failed: {e}"))?;
         }
@@ -268,7 +269,10 @@ impl AttestationServiceImpl {
                 .clone()
                 .unwrap_or_else(|| execution_id.0.to_string()),
             tenant_id: Some(request.tenant_id.to_string()),
-            task_summary: request.task_summary.clone().filter(|s| s.len() <= 256),
+            task_summary: request
+                .task_summary
+                .clone()
+                .filter(|s| s.chars().count() <= 256),
         };
 
         // 3. Issue Token
@@ -834,6 +838,17 @@ mod tests {
             issued_task_summary("b".repeat(257)).await,
             None,
             "a 257-character task_summary is over the limit and must be dropped"
+        );
+        let unicode_at_limit = "é".repeat(256);
+        assert_eq!(
+            issued_task_summary(unicode_at_limit.clone()).await,
+            Some(unicode_at_limit),
+            "256 Unicode characters are within the limit regardless of UTF-8 byte length"
+        );
+        assert_eq!(
+            issued_task_summary("é".repeat(257)).await,
+            None,
+            "257 Unicode characters exceed the limit"
         );
     }
 }
