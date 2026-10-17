@@ -2555,4 +2555,163 @@ mod tests {
         }
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
+
+    /// AEGIS ADR-147 (carbon-forge, Proposed, page revision 55541), clauses
+    /// C1, C3, C4, C5 and C6 as the template holds them: `carbon-forge` is a
+    /// second built-in registered beside `the-forge` (C1); it keeps every
+    /// state of the-forge, and DIFF, COMMIT and LAND are the Action states
+    /// `tree_diff`, `tree_write` and `tree_land`, with no repository step
+    /// left (C3); every ContainerRun mounts the run's tree volume `tree` at
+    /// `/workspace` and none the run's repository, and the workflow works on
+    /// no repository (C2, C4); a refused landing ends in LAND_REFUSED
+    /// carrying the landing's own sentence, Nuclear Notes' (C5); `draft_only`
+    /// defaults to true and routes the write to COMPLETE (C6).
+    #[test]
+    fn carbon_forge_is_a_second_builtin_beside_the_forge_on_a_nuclear_notes_tree() {
+        let names: Vec<&str> = BUILTIN_WORKFLOWS.iter().map(|(n, _)| *n).collect();
+        let forge_at = names
+            .iter()
+            .position(|n| *n == "the-forge")
+            .expect("the-forge is a built-in");
+        let Some(carbon_at) = names.iter().position(|n| *n == "carbon-forge") else {
+            panic!(
+                "AEGIS ADR-147 C1: carbon-forge is not registered beside the-forge; the built-in workflows are {names:?}"
+            );
+        };
+        assert_eq!(
+            carbon_at,
+            forge_at + 1,
+            "AEGIS ADR-147 C1: carbon-forge is registered at {carbon_at}, not beside the-forge at {forge_at}"
+        );
+        let forge_yaml = BUILTIN_WORKFLOWS[forge_at].1;
+        let carbon_yaml = BUILTIN_WORKFLOWS[carbon_at].1;
+        aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(
+            carbon_yaml,
+        )
+        .unwrap_or_else(|e| panic!("AEGIS ADR-147 C1: carbon-forge does not parse: {e}"));
+
+        let forge: serde_yaml::Value = serde_yaml::from_str(forge_yaml).unwrap();
+        let carbon: serde_yaml::Value = serde_yaml::from_str(carbon_yaml).unwrap();
+        let mut complaints = Vec::new();
+        if carbon["metadata"]["name"].as_str() != Some("carbon-forge") {
+            complaints.push(format!(
+                "C1: its metadata.name is {:?}",
+                carbon["metadata"]["name"]
+            ));
+        }
+        let states = &carbon["spec"]["states"];
+        let forge_states = forge["spec"]["states"].as_mapping().unwrap();
+        for name in forge_states.keys() {
+            if states.get(name).is_none() {
+                complaints.push(format!("C3: the-forge's state {name:?} is not kept"));
+            }
+        }
+        for (state, action) in [
+            ("DIFF", "tree_diff"),
+            ("COMMIT", "tree_write"),
+            ("LAND", "tree_land"),
+        ] {
+            let kind = states[state]["kind"].as_str();
+            let named = states[state]["action"].as_str();
+            if kind != Some("Action") || named != Some(action) {
+                complaints.push(format!(
+                    "C3: {state} is kind {kind:?} action {named:?}, not the Action {action}"
+                ));
+            }
+        }
+        if let Some(states) = states.as_mapping() {
+            for (name, state) in states {
+                if let Some(action) = state["action"].as_str() {
+                    if action.starts_with("repository_") {
+                        complaints.push(format!("C3: {name:?} still runs {action}"));
+                    }
+                }
+                let mounts = state["volumes"].as_sequence().cloned().unwrap_or_default();
+                if state["kind"].as_str() == Some("ContainerRun") {
+                    let tree_at_workspace = mounts.iter().any(|m| {
+                        m["name"].as_str() == Some("tree")
+                            && m["mount_path"].as_str() == Some("/workspace")
+                    });
+                    if !tree_at_workspace {
+                        complaints.push(format!(
+                            "C4: the ContainerRun {name:?} does not mount the volume tree at /workspace"
+                        ));
+                    }
+                }
+                for m in &mounts {
+                    if m["name"]
+                        .as_str()
+                        .is_some_and(|n| n == "repository" || n.starts_with("repository:"))
+                    {
+                        complaints.push(format!("C4: {name:?} mounts the run's repository"));
+                    }
+                }
+            }
+        }
+        if !carbon["spec"]["repositories"].is_null() {
+            complaints.push(format!(
+                "C2: it works on repositories ({:?}); a run names its tree by `trees`",
+                carbon["spec"]["repositories"]
+            ));
+        }
+        let draft_only = &carbon["metadata"]["input_schema"]["properties"]["draft_only"];
+        if draft_only["default"].as_bool() != Some(true) {
+            complaints.push(format!(
+                "C6: draft_only's default is {:?}, not true",
+                draft_only["default"]
+            ));
+        }
+        let routes = |state: &str| -> Vec<(String, String)> {
+            states[state]["transitions"]
+                .as_sequence()
+                .map(|ts| {
+                    ts.iter()
+                        .map(|t| {
+                            (
+                                format!(
+                                    "{} {}",
+                                    t["condition"].as_str().unwrap_or(""),
+                                    t["expression"].as_str().unwrap_or("")
+                                )
+                                .trim()
+                                .to_string(),
+                                t["target"].as_str().unwrap_or("").to_string(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let write = routes("COMMIT");
+        let draft_first = write
+            .iter()
+            .position(|(c, t)| c.contains("input.draft_only") && t == "COMPLETE");
+        let land_at = write.iter().position(|(_, t)| t == "LAND");
+        if !matches!((draft_first, land_at), (Some(d), Some(l)) if d < l) {
+            complaints.push(format!(
+                "C6: COMMIT does not end a draft_only run at COMPLETE before LAND: {write:?}"
+            ));
+        }
+        if !routes("LAND")
+            .iter()
+            .any(|(c, t)| c == "on_failure" && t == "LAND_REFUSED")
+        {
+            complaints.push(format!(
+                "C5: a refused landing does not end in LAND_REFUSED: {:?}",
+                routes("LAND")
+            ));
+        }
+        if states["LAND_REFUSED"]["args"]["sentence"].as_str() != Some("{{{LAND.output.sentence}}}")
+        {
+            complaints.push(format!(
+                "C5: LAND_REFUSED does not carry the landing's own sentence: {:?}",
+                states["LAND_REFUSED"]["args"]["sentence"]
+            ));
+        }
+        assert!(
+            complaints.is_empty(),
+            "AEGIS ADR-147: carbon-forge is not the template the clauses name:\n{}",
+            complaints.join("\n")
+        );
+    }
 }
