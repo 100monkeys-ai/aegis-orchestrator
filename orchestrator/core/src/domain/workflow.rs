@@ -1234,6 +1234,10 @@ pub enum ActionName {
     /// Queues the push of the run's tree's git archive to its remote; gated
     /// (AEGIS ADR-149 C2).
     ArchivePush,
+    /// Waits for the deploy runs on the remote of the pushed cut `cut` to
+    /// conclude, up to `timeout_seconds`, answering `no_run` when none
+    /// appeared within `no_run_grace_seconds` (AEGIS ADR-149 C2).
+    ArchiveDeployWait,
 }
 
 /// Where `image_generate` writes its files when a state names no `path`.
@@ -1277,7 +1281,7 @@ pub enum ActionNeed {
 
 impl ActionName {
     /// Every action, in the order the refusal lists them.
-    pub const ALL: [ActionName; 11] = [
+    pub const ALL: [ActionName; 12] = [
         ActionName::UpdateBlackboard,
         ActionName::RepositoryDiff,
         ActionName::RepositoryCommit,
@@ -1289,6 +1293,7 @@ impl ActionName {
         ActionName::TreeCut,
         ActionName::ArchiveRender,
         ActionName::ArchivePush,
+        ActionName::ArchiveDeployWait,
     ];
 
     /// The literal a manifest writes.
@@ -1305,6 +1310,7 @@ impl ActionName {
             ActionName::TreeCut => "tree_cut",
             ActionName::ArchiveRender => "archive_render",
             ActionName::ArchivePush => "archive_push",
+            ActionName::ArchiveDeployWait => "archive_deploy_wait",
         }
     }
 
@@ -1348,6 +1354,10 @@ impl ActionName {
                 required: &[],
                 optional: &[],
             },
+            ActionName::ArchiveDeployWait => ActionArguments::Declared {
+                required: &["cut"],
+                optional: &["timeout_seconds", "no_run_grace_seconds"],
+            },
         }
     }
 
@@ -1362,9 +1372,10 @@ impl ActionName {
             ActionName::TreeDiff | ActionName::TreeWrite | ActionName::TreeLand => {
                 ActionNeed::RunTree
             }
-            ActionName::TreeCut | ActionName::ArchiveRender | ActionName::ArchivePush => {
-                ActionNeed::RunTreeRef
-            }
+            ActionName::TreeCut
+            | ActionName::ArchiveRender
+            | ActionName::ArchivePush
+            | ActionName::ArchiveDeployWait => ActionNeed::RunTreeRef,
         }
     }
 

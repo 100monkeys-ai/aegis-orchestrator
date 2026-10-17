@@ -1351,6 +1351,7 @@ impl ToolInvocationService {
                 | "tree_cut"
                 | "archive_render"
                 | "archive_push"
+                | "archive_deploy_wait"
         ) {
             return self.run_tree_action(tenant_id, run, action, message).await;
         }

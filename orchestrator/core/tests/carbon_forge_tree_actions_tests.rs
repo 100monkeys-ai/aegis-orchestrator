@@ -830,3 +830,197 @@ async fn a_tree_named_and_not_materialized_has_no_files_to_diff_or_write() {
         "AEGIS ADR-149 C1: an unknown tree action reached the landing"
     );
 }
+
+// ===========================================================================
+// AEGIS ADR-149 C2: the deploy run on the remote is waited for
+// ===========================================================================
+
+/// The refusal of a JSON `message` the wait cannot read (AEGIS ADR-149
+/// Update `deploy-wait-arguments-2026-10-17`).
+const DEPLOY_WAIT_ARGUMENTS: &str = "archive_deploy_wait takes a cut name, or a JSON object {\"cut\": ..., \"timeout_seconds\": ..., \"no_run_grace_seconds\": ...}; nothing was waited for";
+
+/// One GitHub Actions run of the pushed tag's commit, as
+/// `archives.deploy_status` answers it.
+fn deploy_run(id: u64, name: &str, status: &str, conclusion: Option<&str>) -> Value {
+    json!({
+        "id": id,
+        "name": name,
+        "status": status,
+        "conclusion": conclusion,
+        "html_url": format!("https://github.com/100monkeys-ai/aegis-platform-deployment/actions/runs/{id}")
+    })
+}
+
+/// A fixture whose `archives.deploy_status` answers `runs`.
+async fn deploy_status_answering(runs: Value) -> Fixture {
+    fixture_of(
+        move |_, answers| {
+            answers.insert(
+                "archives.deploy_status".to_string(),
+                Answer::Result(json!({
+                    "tree": TREE_PATH,
+                    "cut": "v1.2",
+                    "commit_sha1": "0123456789abcdef0123456789abcdef01234567",
+                    "runs": runs
+                })),
+            );
+        },
+        false,
+    )
+    .await
+}
+
+fn deploy_status_calls(fx: &Fixture) -> Vec<Value> {
+    fx.calls()
+        .into_iter()
+        .filter(|(t, _)| t == "archives.deploy_status")
+        .map(|(_, a)| a)
+        .collect()
+}
+
+#[test]
+fn archive_deploy_wait_is_an_action_naming_the_tree_that_touches_nothing() {
+    let wait = ActionName::from_literal("archive_deploy_wait")
+        .unwrap_or_else(|e| panic!("AEGIS ADR-149 C2: archive_deploy_wait is not an action: {e}"));
+    assert_eq!(wait.as_str(), "archive_deploy_wait");
+    assert!(ActionName::ALL.contains(&wait));
+    assert!(
+        !wait.touches_the_world(),
+        "AEGIS ADR-149 C2: the deploy wait reads; it waits at no gate"
+    );
+    assert_eq!(
+        format!("{:?}", wait.needs()),
+        "RunTreeRef",
+        "AEGIS ADR-149 C2: archive_deploy_wait needs only the tree's name"
+    );
+    let no_args = HashMap::new();
+    let cut = HashMap::from([("cut".to_string(), "v1.2".to_string())]);
+    let all = HashMap::from([
+        ("cut".to_string(), "v1.2".to_string()),
+        ("timeout_seconds".to_string(), "600".to_string()),
+        ("no_run_grace_seconds".to_string(), "60".to_string()),
+    ]);
+    assert!(
+        wait.check_args(&no_args).is_err()
+            && wait.check_args(&cut).is_ok()
+            && wait.check_args(&all).is_ok(),
+        "AEGIS ADR-149 C2: archive_deploy_wait requires its cut and may name its two waits"
+    );
+}
+
+#[tokio::test]
+async fn archive_deploy_wait_answers_success_when_every_run_of_the_commit_concluded_success() {
+    let fx = deploy_status_answering(json!([
+        deploy_run(9001, "deploy", "completed", Some("success")),
+        deploy_run(9002, "smoke", "completed", Some("success")),
+    ]))
+    .await;
+    let answer = answered(run_action(&fx, "archive_deploy_wait", Some("v1.2"))).await;
+    assert_eq!(
+        answer.sentence, None,
+        "AEGIS ADR-149 C2: a deploy whose every run succeeded was refused: {answer:?}"
+    );
+    let calls = deploy_status_calls(&fx);
+    assert_eq!(
+        calls.len(),
+        1,
+        "AEGIS ADR-149 C2: the wait did not read archives.deploy_status once: {:?}",
+        fx.calls().into_iter().map(|(t, _)| t).collect::<Vec<_>>()
+    );
+    assert_eq!(calls[0]["tree"].as_str(), Some(TREE_PATH));
+    assert_eq!(calls[0]["cut"].as_str(), Some("v1.2"));
+    assert_eq!(
+        answer.commit_sha.as_deref(),
+        Some("9001"),
+        "the run id rides `commit_sha`: {answer:?}"
+    );
+    assert_eq!(answer.branch, "success", "the conclusion rides `branch`");
+    assert_eq!(
+        answer.git_ref,
+        "https://github.com/100monkeys-ai/aegis-platform-deployment/actions/runs/9001",
+        "the run's html_url rides `ref`"
+    );
+    let whole: Value =
+        serde_json::from_str(answer.diff.as_deref().unwrap_or("null")).unwrap_or_default();
+    assert_eq!(
+        whole["runs"].as_array().map(Vec::len),
+        Some(2),
+        "the whole answer rides `diff`: {answer:?}"
+    );
+    fx.assert_each_call_is_the_persons_in_the_workspace();
+}
+
+#[tokio::test]
+async fn archive_deploy_wait_refuses_naming_the_first_failed_runs_name_and_html_url() {
+    let fx = deploy_status_answering(json!([
+        deploy_run(9001, "build", "completed", Some("success")),
+        deploy_run(9002, "deploy", "completed", Some("failure")),
+        deploy_run(9003, "smoke", "completed", Some("cancelled")),
+    ]))
+    .await;
+    let answer = answered(run_action(&fx, "archive_deploy_wait", Some("v1.2"))).await;
+    let sentence = answer.sentence.clone().unwrap_or_default();
+    assert!(
+        sentence.contains("deploy")
+            && sentence.contains(
+                "https://github.com/100monkeys-ai/aegis-platform-deployment/actions/runs/9002"
+            ),
+        "AEGIS ADR-149 C2: a failed deploy run was not refused by its name and html_url: {answer:?}"
+    );
+    assert_eq!(answer.commit_sha.as_deref(), Some("9002"), "{answer:?}");
+    assert_eq!(answer.branch, "failure", "{answer:?}");
+}
+
+#[tokio::test]
+async fn archive_deploy_wait_with_no_run_after_its_grace_answers_no_run() {
+    let fx = deploy_status_answering(json!("none")).await;
+    let answer = answered(run_action(
+        &fx,
+        "archive_deploy_wait",
+        Some(r#"{"cut": "v1.2", "no_run_grace_seconds": 0}"#),
+    ))
+    .await;
+    assert_eq!(
+        (answer.sentence.as_deref(), answer.branch.as_str()),
+        (None, "no_run"),
+        "AEGIS ADR-149 C2: a remote with no run after the grace is not answered no_run: {answer:?}"
+    );
+    assert_eq!(deploy_status_calls(&fx)[0]["cut"].as_str(), Some("v1.2"));
+}
+
+#[tokio::test]
+async fn archive_deploy_wait_refuses_a_run_not_concluded_by_its_timeout() {
+    let fx =
+        deploy_status_answering(json!([deploy_run(9001, "deploy", "in_progress", None)])).await;
+    let answer = answered(run_action(
+        &fx,
+        "archive_deploy_wait",
+        Some(r#"{"cut": "v1.2", "timeout_seconds": 0}"#),
+    ))
+    .await;
+    let sentence = answer.sentence.clone().unwrap_or_default();
+    assert!(
+        sentence.contains("deploy")
+            && sentence.contains(
+                "https://github.com/100monkeys-ai/aegis-platform-deployment/actions/runs/9001"
+            ),
+        "AEGIS ADR-149 C2: a run unconcluded at the timeout was not refused by its name and html_url: {answer:?}"
+    );
+}
+
+#[tokio::test]
+async fn archive_deploy_wait_refuses_a_json_message_it_cannot_read_and_waits_for_nothing() {
+    let fx = deploy_status_answering(json!([])).await;
+    for message in [r#"{"timeout_seconds": 5}"#, r#"{"cut": "v1.2""#] {
+        let answer = answered(run_action(&fx, "archive_deploy_wait", Some(message))).await;
+        assert_eq!(
+            answer.sentence.as_deref(),
+            Some(DEPLOY_WAIT_ARGUMENTS),
+            "AEGIS ADR-149 deploy-wait-arguments-2026-10-17: the message {message} was not refused: {answer:?}"
+        );
+    }
+    assert!(
+        deploy_status_calls(&fx).is_empty(),
+        "AEGIS ADR-149: a message without its cut was waited for"
+    );
+}

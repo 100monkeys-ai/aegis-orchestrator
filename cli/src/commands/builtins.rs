@@ -2922,4 +2922,87 @@ mod tests {
             complaints.join("\n")
         );
     }
+
+    /// AEGIS ADR-149 C2: `carbon-deploy` 1.1.0 waits for the deploy run on
+    /// the remote: PUSH goes on success to WAIT (`archive_deploy_wait` of
+    /// the input's cut), WAIT on success to COMPLETE, whose blackboard gains
+    /// deploy_run_id and deploy_conclusion, and on failure to DEPLOY_FAILED,
+    /// a terminal state carrying WAIT's sentence.
+    #[test]
+    fn carbon_deploy_waits_for_the_deploy_run_between_push_and_complete() {
+        let deploy_yaml = BUILTIN_WORKFLOWS
+            .iter()
+            .find(|(n, _)| *n == "carbon-deploy")
+            .map(|(_, y)| *y)
+            .expect("AEGIS ADR-149 C2: carbon-deploy is not registered");
+        aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(
+            deploy_yaml,
+        )
+        .unwrap_or_else(|e| panic!("AEGIS ADR-149 C2: carbon-deploy does not parse: {e}"));
+        let deploy: serde_yaml::Value = serde_yaml::from_str(deploy_yaml).unwrap();
+        let states = &deploy["spec"]["states"];
+        let target = |state: &str, condition: &str| -> Option<String> {
+            states[state]["transitions"].as_sequence().and_then(|ts| {
+                ts.iter()
+                    .find(|t| t["condition"].as_str() == Some(condition))
+                    .and_then(|t| t["target"].as_str())
+                    .map(str::to_string)
+            })
+        };
+        let mut complaints = Vec::new();
+        if deploy["metadata"]["version"].as_str() != Some("1.1.0") {
+            complaints.push(format!(
+                "the version is {:?}, not 1.1.0",
+                deploy["metadata"]["version"]
+            ));
+        }
+        if target("PUSH", "on_success").as_deref() != Some("WAIT") {
+            complaints.push(format!(
+                "PUSH on_success goes to {:?}, not WAIT",
+                target("PUSH", "on_success")
+            ));
+        }
+        if states["WAIT"]["kind"].as_str() != Some("Action")
+            || states["WAIT"]["action"].as_str() != Some("archive_deploy_wait")
+            || states["WAIT"]["args"]["cut"].as_str() != Some("{{input.cut}}")
+        {
+            complaints.push(format!(
+                "WAIT is not the Action archive_deploy_wait of the input's cut: {:?}",
+                states["WAIT"]
+            ));
+        }
+        for (condition, to) in [("on_success", "COMPLETE"), ("on_failure", "DEPLOY_FAILED")] {
+            if target("WAIT", condition).as_deref() != Some(to) {
+                complaints.push(format!(
+                    "WAIT {condition} goes to {:?}, not {to}",
+                    target("WAIT", condition)
+                ));
+            }
+        }
+        for (key, value) in [
+            ("deploy_run_id", "{{WAIT.output.commit_sha}}"),
+            ("deploy_conclusion", "{{WAIT.output.branch}}"),
+        ] {
+            if states["COMPLETE"]["args"][key].as_str() != Some(value) {
+                complaints.push(format!(
+                    "COMPLETE's {key} is {:?}, not {value}",
+                    states["COMPLETE"]["args"][key]
+                ));
+            }
+        }
+        let failed = &states["DEPLOY_FAILED"];
+        if failed["args"]["sentence"].as_str() != Some("{{{WAIT.output.sentence}}}")
+            || failed["args"]["outcome"].as_str() != Some("deploy_failed")
+            || failed["transitions"].as_sequence().map(Vec::len) != Some(0)
+        {
+            complaints.push(format!(
+                "DEPLOY_FAILED is not a terminal state carrying WAIT's sentence: {failed:?}"
+            ));
+        }
+        assert!(
+            complaints.is_empty(),
+            "AEGIS ADR-149 C2: carbon-deploy does not wait for the deploy run:\n{}",
+            complaints.join("\n")
+        );
+    }
 }

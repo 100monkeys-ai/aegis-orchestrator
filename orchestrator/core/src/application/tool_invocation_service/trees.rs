@@ -82,6 +82,198 @@ const ARCHIVE_PUSH_IS_THE_WORKFLOWS: &str =
 /// `snapshot.ts` CUT_NAME_PATTERN).
 const CUT_NAME_DEFAULT_PREFIX: &str = "forge-";
 
+/// How often the deploy wait reads `archives.deploy_status` (AEGIS ADR-149
+/// C2): each read is one GitHub API call made by Nuclear Notes.
+const DEPLOY_POLL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long the deploy wait waits for every run to conclude when its
+/// `message` names no `timeout_seconds`.
+const DEPLOY_WAIT_TIMEOUT_SECONDS: u64 = 1800;
+
+/// How long the deploy wait waits for a first run to appear when its
+/// `message` names no `no_run_grace_seconds`; a remote with none by then
+/// has no pipeline for the tag, and the wait answers `no_run`.
+const DEPLOY_NO_RUN_GRACE_SECONDS: u64 = 300;
+
+/// The refusal of a deploy wait's JSON `message` that does not parse, or
+/// parses without its `cut` (AEGIS ADR-149 Update
+/// `deploy-wait-arguments-2026-10-17`).
+const DEPLOY_WAIT_ARGUMENTS: &str = "archive_deploy_wait takes a cut name, or a JSON object {\"cut\": ..., \"timeout_seconds\": ..., \"no_run_grace_seconds\": ...}; nothing was waited for";
+
+/// The arguments of one `archive_deploy_wait` (AEGIS ADR-149 C2, Update
+/// `deploy-wait-arguments-2026-10-17`).
+///
+/// The wait's arguments ride the step's `message`, since the proto is not
+/// changed: a `message` whose first character is `{` is a JSON object with
+/// the keys `cut` (required), `timeout_seconds` (optional, default 1800)
+/// and `no_run_grace_seconds` (optional, default 300); any other `message`
+/// is a bare cut name with both defaults. The two cannot be confused
+/// because a cut name cannot start with `{` (Nuclear Notes `snapshot.ts`
+/// CUT_NAME_PATTERN).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeployWait {
+    cut: String,
+    timeout_seconds: u64,
+    no_run_grace_seconds: u64,
+}
+
+impl DeployWait {
+    /// The wait a step's `message` names, or `None` for a JSON `message`
+    /// that does not parse or names no `cut` (refused with
+    /// [`DEPLOY_WAIT_ARGUMENTS`]). A number may be given as a JSON number or
+    /// as its decimal string, as a state's `args` carry strings.
+    fn of_message(message: &str) -> Option<Self> {
+        if !message.starts_with('{') {
+            return Some(Self {
+                cut: message.to_string(),
+                timeout_seconds: DEPLOY_WAIT_TIMEOUT_SECONDS,
+                no_run_grace_seconds: DEPLOY_NO_RUN_GRACE_SECONDS,
+            });
+        }
+        let object: serde_json::Map<String, Value> = serde_json::from_str(message).ok()?;
+        let cut = object
+            .get("cut")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|c| !c.is_empty())?
+            .to_string();
+        let seconds = |key: &str, default: u64| match object.get(key) {
+            None | Some(Value::Null) => Some(default),
+            Some(Value::Number(n)) => n.as_u64(),
+            Some(Value::String(s)) => s.trim().parse().ok(),
+            Some(_) => None,
+        };
+        Some(Self {
+            cut,
+            timeout_seconds: seconds("timeout_seconds", DEPLOY_WAIT_TIMEOUT_SECONDS)?,
+            no_run_grace_seconds: seconds("no_run_grace_seconds", DEPLOY_NO_RUN_GRACE_SECONDS)?,
+        })
+    }
+}
+
+/// What one read of `archives.deploy_status` decides, `elapsed` seconds into
+/// the wait; `None` while it waits on.
+#[derive(Debug, Clone, PartialEq)]
+enum DeployVerdict {
+    /// Every run of the commit concluded `success`; the first is named.
+    Succeeded(Value),
+    /// Every run concluded and this one, the first not `success`, failed.
+    Failed(Value),
+    /// No run appeared within the grace: the remote runs no pipeline for
+    /// the tag.
+    NoRun,
+    /// The timeout passed with this run, the first not concluded `success`,
+    /// still unconcluded, or with no run at all.
+    TimedOut(Option<Value>),
+}
+
+/// The runs of an `archives.deploy_status` answer: its `runs`, none when it
+/// answers `none` or no list.
+fn deploy_runs(status: &Value) -> Vec<Value> {
+    status
+        .get("runs")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn run_conclusion(run: &Value) -> Option<&str> {
+    run.get("conclusion")
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+}
+
+fn deploy_verdict(status: &Value, elapsed: u64, wait: &DeployWait) -> Option<DeployVerdict> {
+    let runs = deploy_runs(status);
+    if runs.is_empty() {
+        if elapsed >= wait.no_run_grace_seconds {
+            return Some(DeployVerdict::NoRun);
+        }
+        return (elapsed >= wait.timeout_seconds).then_some(DeployVerdict::TimedOut(None));
+    }
+    let not_success = runs
+        .iter()
+        .find(|run| run_conclusion(run) != Some("success"))
+        .cloned();
+    if runs.iter().all(|run| run_conclusion(run).is_some()) {
+        return Some(match not_success {
+            Some(failed) => DeployVerdict::Failed(failed),
+            None => DeployVerdict::Succeeded(runs[0].clone()),
+        });
+    }
+    (elapsed >= wait.timeout_seconds).then_some(DeployVerdict::TimedOut(not_success))
+}
+
+/// A run's `id`, a number or a string, as text.
+fn run_id(run: &Value) -> Option<String> {
+    match run.get("id")? {
+        Value::String(id) => Some(id.clone()),
+        Value::Null => None,
+        id => Some(id.to_string()),
+    }
+}
+
+fn run_text<'a>(run: &'a Value, key: &str) -> &'a str {
+    run.get(key).and_then(Value::as_str).unwrap_or_default()
+}
+
+impl DeployVerdict {
+    /// The step's answer: the named run's id rides `commit_sha`, its
+    /// conclusion (or `no_run`, or `timed_out`) `branch`, its html_url
+    /// `git_ref`, the whole `archives.deploy_status` answer `diff`; a
+    /// failure or a timeout answers its sentence.
+    fn answer(&self, wait: &DeployWait, status: &Value) -> RepositoryActionAnswer {
+        let named =
+            |run: &Value, branch: String, sentence: Option<String>| RepositoryActionAnswer {
+                commit_sha: run_id(run),
+                branch,
+                git_ref: run_text(run, "html_url").to_string(),
+                diff: Some(status.to_string()),
+                sentence,
+            };
+        let cut = &wait.cut;
+        match self {
+            DeployVerdict::Succeeded(run) => named(run, "success".to_string(), None),
+            DeployVerdict::Failed(run) => {
+                let conclusion = run_conclusion(run).unwrap_or_default();
+                named(
+                    run,
+                    conclusion.to_string(),
+                    Some(format!(
+                        "the deploy run '{}' of cut '{cut}' concluded {conclusion}: {}",
+                        run_text(run, "name"),
+                        run_text(run, "html_url")
+                    )),
+                )
+            }
+            DeployVerdict::NoRun => RepositoryActionAnswer {
+                branch: "no_run".to_string(),
+                diff: Some(status.to_string()),
+                ..RepositoryActionAnswer::default()
+            },
+            DeployVerdict::TimedOut(Some(run)) => named(
+                run,
+                "timed_out".to_string(),
+                Some(format!(
+                    "the deploy run '{}' of cut '{cut}' had not concluded success after {} seconds: {}",
+                    run_text(run, "name"),
+                    wait.timeout_seconds,
+                    run_text(run, "html_url")
+                )),
+            ),
+            DeployVerdict::TimedOut(None) => RepositoryActionAnswer {
+                branch: "timed_out".to_string(),
+                diff: Some(status.to_string()),
+                sentence: Some(format!(
+                    "no deploy run of cut '{cut}' appeared on the remote within {} seconds",
+                    wait.timeout_seconds
+                )),
+                ..RepositoryActionAnswer::default()
+            },
+        }
+    }
+}
+
 /// One entry of a tree's revision, as `trees.materialize` answers it.
 #[derive(Debug, Clone, Deserialize)]
 struct ManifestEntry {
@@ -809,6 +1001,24 @@ impl ToolInvocationService {
                     sentence: string_of(&pushed, "sentence"),
                 })
             }
+            // AEGIS ADR-149 C2: the deploy run on the remote waited for; see
+            // [`DeployWait`] for how its arguments ride `message`.
+            "archive_deploy_wait" => {
+                let message = message
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                    .ok_or(RepositoryActionError::NoMessage)?;
+                let Some(wait) = DeployWait::of_message(message) else {
+                    return Ok(RepositoryActionAnswer {
+                        sentence: Some(DEPLOY_WAIT_ARGUMENTS.to_string()),
+                        ..answer
+                    });
+                };
+                match self.archive_deploy_wait(tenant_id, &tree, &wait).await {
+                    Ok((status, verdict)) => Ok(verdict.answer(&wait, &status)),
+                    Err(e) => refused_or_failed(e, answer),
+                }
+            }
             "tree_land" => {
                 let message = message
                     .filter(|m| !m.trim().is_empty())
@@ -859,7 +1069,7 @@ impl ToolInvocationService {
             }
             other => Ok(RepositoryActionAnswer {
                 sentence: Some(format!(
-                    "unknown tree action '{other}': expected tree_diff, tree_write, tree_land, tree_cut, archive_render or archive_push"
+                    "unknown tree action '{other}': expected tree_diff, tree_write, tree_land, tree_cut, archive_render, archive_push or archive_deploy_wait"
                 )),
                 ..answer
             }),
@@ -1151,6 +1361,43 @@ impl ToolInvocationService {
             "A run's cut was rendered into its tree's git archive"
         );
         Ok(rendered)
+    }
+
+    /// The wait for the deploy runs on the remote of the pushed cut (AEGIS
+    /// ADR-149 C2): `archives.deploy_status` of the tree and the cut read
+    /// every [`DEPLOY_POLL`] until every run of the tag's commit has a
+    /// conclusion, no run appeared within `no_run_grace_seconds`, or
+    /// `timeout_seconds` passed. Answers the last read and its verdict.
+    async fn archive_deploy_wait(
+        &self,
+        tenant_id: &TenantId,
+        tree: &TreeOfRun,
+        wait: &DeployWait,
+    ) -> Result<(Value, DeployVerdict), SealSessionError> {
+        let started = tokio::time::Instant::now();
+        loop {
+            let status = self
+                .nuclear_notes(
+                    tree.run,
+                    tenant_id,
+                    &tree.acting,
+                    &tree.tree.workspace,
+                    "archives.deploy_status",
+                    json!({ "tree": tree.tree.path, "cut": wait.cut }),
+                )
+                .await?;
+            if let Some(verdict) = deploy_verdict(&status, started.elapsed().as_secs(), wait) {
+                tracing::info!(
+                    workflow_execution_id = %tree.run,
+                    tree = %tree.tree.path,
+                    cut = %wait.cut,
+                    verdict = ?verdict,
+                    "A run's deploy on the remote was waited for"
+                );
+                return Ok((status, verdict));
+            }
+            tokio::time::sleep(DEPLOY_POLL).await;
+        }
     }
 
     /// The push itself, for the workflow execution `execution_id`'s own step
