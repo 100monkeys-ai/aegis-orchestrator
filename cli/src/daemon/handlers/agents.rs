@@ -288,6 +288,19 @@ fn execute_start_failure(e: &anyhow::Error) -> (StatusCode, serde_json::Value) {
             serde_json::json!({"error": refused.to_string()}),
         );
     }
+    // AEGIS ADR-148, A10: a run naming an archived version is refused 409
+    // with the name's active version.
+    if let Some(archived) =
+        e.downcast_ref::<aegis_orchestrator_core::domain::repository::ArchivedTarget>()
+    {
+        return (
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "error": archived.to_string(),
+                "active_version": archived.active_version,
+            }),
+        );
+    }
     let error_str = e.to_string();
     let status = if error_str.contains("InvalidExecutionInput") {
         StatusCode::UNPROCESSABLE_ENTITY
@@ -338,6 +351,9 @@ pub(crate) struct ListAgentsQuery {
     scope: Option<String>,
     #[serde(default)]
     visible: Option<bool>,
+    /// `active` (the default: every row not archived), `archived` or `all`
+    /// (AEGIS ADR-148).
+    status: Option<String>,
 }
 
 pub(crate) async fn list_agents_handler(
@@ -359,21 +375,32 @@ pub(crate) async fn list_agents_handler(
     // every agent across every tenant — each carries its own `tenant_id`
     // in the projection below. Future `?tenant=<slug>` pivot composes
     // cleanly onto the tenant-scoped branch.
-    let list_result = if is_operator(identity_ref) && query.scope.as_deref() != Some("global") {
-        state.agent_service.list_all_agents().await
-    } else if query.scope.as_deref() == Some("global") {
-        state
-            .agent_service
-            .list_agents_for_tenant(&TenantId::system())
-            .await
-    } else if query.visible.unwrap_or(true) {
-        state
-            .agent_service
-            .list_agents_visible_for_tenant(&tenant_id)
-            .await
-    } else {
-        state.agent_service.list_agents_for_tenant(&tenant_id).await
+    use aegis_orchestrator_core::domain::repository::{
+        AgentListing, StatusFilter, STATUS_FILTER_REFUSAL,
     };
+    let filter = match StatusFilter::parse(query.status.as_deref()) {
+        Ok(filter) => filter,
+        Err(_) => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": STATUS_FILTER_REFUSAL})),
+            ))
+        }
+    };
+    let system_tenant = TenantId::system();
+    let listing = if is_operator(identity_ref) && query.scope.as_deref() != Some("global") {
+        AgentListing::All
+    } else if query.scope.as_deref() == Some("global") {
+        AgentListing::Tenant(&system_tenant)
+    } else if query.visible.unwrap_or(true) {
+        AgentListing::Visible(&tenant_id)
+    } else {
+        AgentListing::Tenant(&tenant_id)
+    };
+    let list_result = state
+        .agent_service
+        .list_agents_by_status(listing, filter)
+        .await;
 
     match list_result {
         Ok(agents) => {
@@ -382,9 +409,27 @@ pub(crate) async fn list_agents_handler(
                     .iter()
                     .map(|agent| {
                         let repo = state.execution_repo.clone();
+                        let service = state.agent_service.clone();
                         let tid = agent.tenant_id.clone();
                         let aid = agent.id;
-                        async move { repo.count_by_agent_for_tenant(&tid, aid).await.unwrap_or(0) }
+                        let name = agent.name.clone();
+                        async move {
+                            // A name's executions across its versions (AEGIS ADR-148).
+                            let mut ids: Vec<AgentId> = service
+                                .list_agent_versions_by_name(&tid, &name)
+                                .await
+                                .map(|rows| rows.into_iter().map(|a| a.id).collect())
+                                .unwrap_or_default();
+                            if !ids.contains(&aid) {
+                                ids.push(aid);
+                            }
+                            let mut total = 0;
+                            for id in ids {
+                                total +=
+                                    repo.count_by_agent_for_tenant(&tid, id).await.unwrap_or(0);
+                            }
+                            total
+                        }
                     })
                     .collect();
                 futures::future::join_all(futs).await
@@ -615,6 +660,71 @@ pub(crate) async fn list_agent_versions_handler(
             Json(serde_json::to_value(versions).unwrap_or_default()),
         )),
         // Audit 002 §4.37.6 — return 500 on backend errors instead of 200.
+        Err(e) => Ok((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )),
+    }
+}
+
+/// POST /v1/agents/:id_or_name/status - Archive or unarchive an agent
+/// version of the caller's tenant (AEGIS ADR-148). A built-in is refused
+/// 403: its status is set by its deploy. A name with several versions and no
+/// `version` is refused 409.
+pub(crate) async fn set_agent_status_handler(
+    State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
+    identity: Option<Extension<UserIdentity>>,
+    headers: HeaderMap,
+    Path(id_or_name): Path<String>,
+    Json(body): Json<crate::daemon::handlers::workflows::SetStatusBody>,
+) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    scope_guard.require("agent:deploy")?;
+    use aegis_orchestrator_core::domain::agent::AgentStatus;
+    use aegis_orchestrator_core::domain::repository::{StatusChange, BUILTIN_STATUS_REFUSAL};
+
+    let status = match body.status.trim() {
+        "active" => AgentStatus::Active,
+        "archived" => AgentStatus::Archived,
+        _ => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "status must be one of: active, archived"})),
+            ))
+        }
+    };
+    let delegation = headers
+        .get(TENANT_DELEGATION_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let tenant_id = tenant_id_from_request(identity.as_ref().map(|e| &e.0), delegation);
+    match state
+        .agent_service
+        .change_agent_status(&tenant_id, &id_or_name, body.version.as_deref(), status)
+        .await
+    {
+        Ok(StatusChange::Changed(agent)) => Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": agent.id.0,
+                "name": agent.name,
+                "version": agent.manifest.metadata.version,
+                "status": format!("{:?}", agent.status).to_lowercase(),
+            })),
+        )),
+        Ok(StatusChange::NotFound) => Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("agent '{id_or_name}' not found")})),
+        )),
+        Ok(StatusChange::Global) => Ok((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": BUILTIN_STATUS_REFUSAL})),
+        )),
+        Ok(StatusChange::Ambiguous { name, versions }) => Ok((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": StatusChange::<()>::ambiguous_sentence(&name, versions)
+            })),
+        )),
         Err(e) => Ok((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),

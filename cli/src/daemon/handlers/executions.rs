@@ -397,6 +397,23 @@ pub(crate) async fn list_executions_handler(
         None
     };
 
+    // A workflow name's executions roll up across its versions, active and
+    // archived (AEGIS ADR-148).
+    let workflow_ids = match (&query.workflow_name, workflow_id) {
+        (Some(wf_name), Some(wid)) => {
+            let mut ids = state
+                .workflow_repo
+                .version_ids_visible(&tenant_id, wf_name)
+                .await
+                .unwrap_or_default();
+            if !ids.contains(&wid) {
+                ids.push(wid);
+            }
+            ids
+        }
+        _ => Vec::new(),
+    };
+
     // Operator cross-tenant aggregation (ADR-097). When agent/workflow
     // filters are present, fall through to the tenant-scoped path —
     // operators wanting to filter cross-tenant by agent/workflow can use
@@ -408,6 +425,11 @@ pub(crate) async fn list_executions_handler(
                 .list_recent_all_paginated(limit, 0)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))
+        } else if workflow_ids.len() > 1 {
+            state
+                .execution_service
+                .list_executions_for_workflows_for_tenant(&tenant_id, &workflow_ids, limit)
+                .await
         } else {
             state
                 .execution_service

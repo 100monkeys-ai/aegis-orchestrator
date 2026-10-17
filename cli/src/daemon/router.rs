@@ -20,7 +20,8 @@ use crate::daemon::handlers::admin::{
 use crate::daemon::handlers::agents::{
     delete_agent_handler, deploy_agent_handler, execute_agent_handler, get_agent_handler,
     list_agent_versions_handler, list_agents_handler, lookup_agent_handler,
-    stream_agent_events_handler, update_agent_handler, update_agent_scope_handler,
+    set_agent_status_handler, stream_agent_events_handler, update_agent_handler,
+    update_agent_scope_handler,
 };
 use crate::daemon::handlers::api_keys::{
     create_api_key_handler, list_api_keys_handler, revoke_api_key_handler, update_api_key_handler,
@@ -96,7 +97,7 @@ use crate::daemon::handlers::workflow_gates::{workflow_gates_router, WorkflowGat
 use crate::daemon::handlers::workflows::{
     delete_workflow_handler, execute_temporal_workflow_handler, get_workflow_handler,
     list_workflow_versions_handler, list_workflows_handler, register_temporal_workflow_handler,
-    run_workflow_legacy_handler, update_workflow_scope_handler,
+    run_workflow_legacy_handler, set_workflow_status_handler, update_workflow_scope_handler,
 };
 use crate::daemon::state::AppState;
 
@@ -144,6 +145,8 @@ pub(crate) fn create_router(
                 .patch(update_agent_handler),
         )
         .route("/v1/agents/{id}/scope", post(update_agent_scope_handler))
+        // AEGIS ADR-148: archive or unarchive a tenant's agent version.
+        .route("/v1/agents/{id}/status", post(set_agent_status_handler))
         .route("/v1/agents/lookup/{name}", get(lookup_agent_handler))
         .route("/v1/dispatch-gateway", post(dispatch_gateway_handler))
         .route(
@@ -161,6 +164,11 @@ pub(crate) fn create_router(
         .route(
             "/v1/workflows/{name}/scope",
             post(update_workflow_scope_handler),
+        )
+        // AEGIS ADR-148: archive or unarchive a tenant's workflow version.
+        .route(
+            "/v1/workflows/{name}/status",
+            post(set_workflow_status_handler),
         )
         .route(
             "/v1/workflows/{name}/run",

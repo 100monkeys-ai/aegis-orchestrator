@@ -812,6 +812,24 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
         Ok(count)
     }
 
+    /// AEGIS ADR-148: a name's count is every version's, in one query.
+    async fn count_by_workflows_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        workflow_ids: &[crate::domain::workflow::WorkflowId],
+    ) -> Result<i64, RepositoryError> {
+        let ids: Vec<uuid::Uuid> = workflow_ids.iter().map(|id| id.0).collect();
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workflow_executions WHERE tenant_id = $1 AND workflow_id = ANY($2)",
+        )
+        .bind(tenant_id.as_str())
+        .bind(&ids)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(count)
+    }
+
     async fn list_paginated_for_tenant(
         &self,
         tenant_id: &TenantId,

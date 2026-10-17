@@ -3915,6 +3915,21 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             }
         }
 
+        // AEGIS ADR-148, A9: each built-in name keeps one active row.
+        let archive =
+            archive_superseded_builtins(workflow_repo.as_ref(), agent_repo.as_ref()).await;
+        if archive.failed > 0 {
+            error!(
+                "Built-in archive step: {} archived, {} failed",
+                archive.archived, archive.failed
+            );
+        } else {
+            info!(
+                "Built-in archive step: {} older row(s) archived",
+                archive.archived
+            );
+        }
+
         let summary = builtin_deploy_summary(
             registered,
             failed,
@@ -3951,6 +3966,113 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     info!("Daemon shutting down");
 
     Ok(())
+}
+
+/// What the start's archive step did: how many older built-in rows it
+/// archived, and how many built-ins it could not settle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BuiltinArchiveOutcome {
+    pub archived: usize,
+    pub failed: usize,
+}
+
+/// AEGIS ADR-148, A9: at every start each built-in name keeps one active
+/// global row, the row of its template's version; every other global row of
+/// the name is archived, never deleted. It runs whether or not the drift gate
+/// deployed the built-in. A name with no row of the template's version keeps
+/// what it has.
+pub async fn archive_superseded_builtins(
+    workflows: &dyn aegis_orchestrator_core::domain::repository::WorkflowRepository,
+    agents: &dyn aegis_orchestrator_core::domain::repository::AgentRepository,
+) -> BuiltinArchiveOutcome {
+    use crate::commands::builtins;
+    let mut outcome = BuiltinArchiveOutcome::default();
+    for (name, template) in builtins::BUILTIN_WORKFLOWS {
+        let parsed =
+            aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(
+                template,
+            );
+        // The row's name is the template's, which a built-in's key need not be.
+        let (wf_name, version) = match parsed {
+            Ok(workflow) => (
+                workflow.metadata.name,
+                workflow.metadata.version.unwrap_or_else(|| {
+                    aegis_orchestrator_core::application::temporal_mapper::DEFAULT_WORKFLOW_VERSION
+                        .to_string()
+                }),
+            ),
+            Err(e) => {
+                outcome.failed += 1;
+                error!(
+                    "Failed to parse built-in workflow template '{}': {:#}",
+                    name, e
+                );
+                continue;
+            }
+        };
+        match workflows
+            .archive_superseded_global(&wf_name, &version)
+            .await
+        {
+            Ok(ids) => {
+                if !ids.is_empty() {
+                    info!(
+                        "Archived {} older version(s) of built-in workflow '{}'; v{} is active",
+                        ids.len(),
+                        name,
+                        version
+                    );
+                }
+                outcome.archived += ids.len();
+            }
+            Err(e) => {
+                outcome.failed += 1;
+                error!(
+                    "Failed to archive older versions of built-in workflow '{}': {}",
+                    name, e
+                );
+            }
+        }
+    }
+    for (name, template) in builtins::BUILTIN_AGENTS {
+        // The row's name is the manifest's, which a built-in's key need not be.
+        let (agent_name, version) =
+            match serde_yaml::from_str::<aegis_orchestrator_sdk::AgentManifest>(template) {
+                Ok(manifest) => (manifest.metadata.name, manifest.metadata.version),
+                Err(e) => {
+                    outcome.failed += 1;
+                    error!(
+                        "Failed to parse built-in agent template '{}': {:#}",
+                        name, e
+                    );
+                    continue;
+                }
+            };
+        match agents
+            .archive_superseded_global(&agent_name, &version)
+            .await
+        {
+            Ok(ids) => {
+                if !ids.is_empty() {
+                    info!(
+                        "Archived {} older version(s) of built-in agent '{}'; v{} is active",
+                        ids.len(),
+                        name,
+                        version
+                    );
+                }
+                outcome.archived += ids.len();
+            }
+            Err(e) => {
+                outcome.failed += 1;
+                error!(
+                    "Failed to archive older versions of built-in agent '{}': {}",
+                    name, e
+                );
+            }
+        }
+    }
+    outcome
 }
 
 /// The startup's closing line for the built-in deploy: how many built-ins were

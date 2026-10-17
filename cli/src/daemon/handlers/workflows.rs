@@ -93,6 +93,20 @@ pub(crate) async fn execute_temporal_workflow_handler(
     {
         Ok(res) => Ok((StatusCode::OK, Json(res)).into_response()),
         Err(e) => {
+            // AEGIS ADR-148, A10: a run naming an archived version is
+            // refused 409 with the name's active version.
+            if let Some(archived) =
+                e.downcast_ref::<aegis_orchestrator_core::domain::repository::ArchivedTarget>()
+            {
+                return Ok((
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": archived.to_string(),
+                        "active_version": archived.active_version,
+                    })),
+                )
+                    .into_response());
+            }
             let error_str = e.to_string();
             let status = if error_str.contains("InvalidExecutionInput") {
                 StatusCode::UNPROCESSABLE_ENTITY
@@ -173,6 +187,8 @@ pub(crate) struct ListWorkflowsQuery {
     scope: Option<String>,
     #[serde(default)]
     visible: Option<bool>,
+    /// `active` (the default), `archived` or `all` (AEGIS ADR-148).
+    status: Option<String>,
 }
 
 /// GET /v1/workflows - List all workflows
@@ -186,46 +202,37 @@ pub(crate) async fn list_workflows_handler(
     let identity_ref = identity.as_ref().map(|identity| &identity.0);
     let tenant_id = tenant_id_from_identity(identity_ref);
 
+    use aegis_orchestrator_core::domain::repository::{
+        StatusFilter, WorkflowListing, STATUS_FILTER_REFUSAL,
+    };
+    let Ok(filter) = StatusFilter::parse(query.status.as_deref()) else {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": STATUS_FILTER_REFUSAL})),
+        )
+            .into_response());
+    };
+
     // Operator cross-tenant aggregation (ADR-097): when caller is an operator
     // and no explicit scope filter is supplied, return every workflow across
     // every tenant — each carries its own `tenant_id` in the projection.
-    let workflows = if is_operator(identity_ref) && query.scope.as_deref() != Some("global") {
-        match state.workflow_repo.list_all().await {
-            Ok(workflows) => workflows,
-            Err(err) => {
-                warn!("Failed to list all workflows (operator path): {}", err);
-                Vec::new()
-            }
-        }
+    let listing = if is_operator(identity_ref) && query.scope.as_deref() != Some("global") {
+        WorkflowListing::All
     } else if query.scope.as_deref() == Some("global") {
-        match state.workflow_repo.list_global().await {
-            Ok(workflows) => workflows,
-            Err(err) => {
-                warn!("Failed to list global workflows: {}", err);
-                Vec::new()
-            }
-        }
+        WorkflowListing::Global
     } else if query.visible.unwrap_or(false) {
-        match state.workflow_repo.list_visible(&tenant_id).await {
-            Ok(workflows) => workflows,
-            Err(err) => {
-                warn!(
-                    "Failed to list visible workflows for tenant_id={}: {}",
-                    tenant_id, err
-                );
-                Vec::new()
-            }
-        }
+        WorkflowListing::Visible(&tenant_id)
     } else {
-        match state.workflow_repo.list_all_for_tenant(&tenant_id).await {
-            Ok(workflows) => workflows,
-            Err(err) => {
-                warn!(
-                    "Failed to list all workflows for tenant_id={}: {}",
-                    tenant_id, err
-                );
-                Vec::new()
-            }
+        WorkflowListing::Tenant(&tenant_id)
+    };
+    let workflows = match state.workflow_repo.list_by_status(listing, filter).await {
+        Ok(workflows) => workflows,
+        Err(err) => {
+            warn!(
+                "Failed to list workflows for tenant_id={}: {}",
+                tenant_id, err
+            );
+            Vec::new()
         }
     };
 
@@ -234,10 +241,17 @@ pub(crate) async fn list_workflows_handler(
             .iter()
             .map(|w| {
                 let repo = state.workflow_execution_repo.clone();
+                let workflows = state.workflow_repo.clone();
                 let tid = w.tenant_id.clone();
                 let wid = w.id;
+                let name = w.metadata.name.clone();
                 async move {
-                    match repo.count_by_workflow_for_tenant(&tid, wid).await {
+                    // A name's executions across its versions (AEGIS ADR-148).
+                    let ids = match workflows.version_ids_visible(&tid, &name).await {
+                        Ok(ids) if !ids.is_empty() => ids,
+                        _ => vec![wid],
+                    };
+                    match repo.count_by_workflows_for_tenant(&tid, &ids).await {
                         Ok(count) => count,
                         Err(err) => {
                             warn!(
@@ -264,7 +278,7 @@ pub(crate) async fn list_workflows_handler(
                 "version": w.metadata.version,
                 "description": w.metadata.description,
                 "scope": w.scope.to_string(),
-                "status": "active",
+                "status": w.status.as_db_str(),
                 "labels": w.metadata.labels,
                 "created_at": w.created_at.to_rfc3339(),
                 "updated_at": w.updated_at.map(|t| t.to_rfc3339()),
@@ -275,7 +289,7 @@ pub(crate) async fn list_workflows_handler(
         })
         .collect();
 
-    Ok((StatusCode::OK, Json(workflow_list)))
+    Ok((StatusCode::OK, Json(workflow_list)).into_response())
 }
 
 /// GET /v1/workflows/:name - Get workflow details
@@ -326,6 +340,7 @@ pub(crate) async fn get_workflow_handler(
                     "version": workflow.metadata.version,
                     "description": workflow.metadata.description,
                     "scope": workflow.scope.to_string(),
+                    "status": workflow.status.as_db_str(),
                     "labels": workflow.metadata.labels,
                     "created_at": workflow.created_at.to_rfc3339(),
                     "updated_at": workflow.updated_at.map(|t| t.to_rfc3339()),
@@ -399,11 +414,30 @@ pub(crate) async fn list_workflow_versions_handler(
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("workflow:list")?;
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
-    match state
-        .workflow_repo
-        .list_by_name_for_tenant(&tenant_id, &name)
-        .await
-    {
+    // The tenant's rows of the name and, for a tenant other than the
+    // system's, the built-in's global rows, any status (AEGIS ADR-148).
+    let rows = async {
+        let mut rows = state
+            .workflow_repo
+            .list_by_name_for_tenant(&tenant_id, &name)
+            .await?;
+        if !tenant_id.is_system() {
+            rows.extend(
+                state
+                    .workflow_repo
+                    .list_by_name_for_tenant(&TenantId::system(), &name)
+                    .await?
+                    .into_iter()
+                    .filter(|w| {
+                        w.scope == aegis_orchestrator_core::domain::workflow::WorkflowScope::Global
+                    }),
+            );
+        }
+        rows.sort_by_key(|w| std::cmp::Reverse(w.created_at));
+        Ok::<_, aegis_orchestrator_core::domain::repository::RepositoryError>(rows)
+    }
+    .await;
+    match rows {
         Ok(workflows) => {
             let versions: Vec<serde_json::Value> = workflows
                 .iter()
@@ -414,6 +448,7 @@ pub(crate) async fn list_workflow_versions_handler(
                         "version": w.metadata.version,
                         "description": w.metadata.description,
                         "scope": w.scope.to_string(),
+                        "status": w.status.as_db_str(),
                         "created_at": w.created_at.to_rfc3339(),
                         "tenant_id": w.tenant_id.as_str(),
                     })
@@ -421,6 +456,74 @@ pub(crate) async fn list_workflow_versions_handler(
                 .collect();
             Ok((StatusCode::OK, Json(serde_json::json!(versions))))
         }
+        Err(e) => Ok((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )),
+    }
+}
+
+/// The body of `POST /v1/workflows/{id_or_name}/status` and
+/// `POST /v1/agents/{id_or_name}/status` (AEGIS ADR-148).
+#[derive(serde::Deserialize)]
+pub(crate) struct SetStatusBody {
+    /// `active` or `archived`.
+    pub(crate) status: String,
+    /// The version, when a name has several.
+    #[serde(default)]
+    pub(crate) version: Option<String>,
+}
+
+/// POST /v1/workflows/:id_or_name/status - Archive or unarchive a workflow
+/// version of the caller's tenant (AEGIS ADR-148). A built-in is
+/// refused 403: its status is set by its deploy. A name with several
+/// versions and no `version` is refused 409.
+pub(crate) async fn set_workflow_status_handler(
+    State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
+    identity: Option<Extension<UserIdentity>>,
+    Path(id_or_name): Path<String>,
+    Json(body): Json<SetStatusBody>,
+) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    scope_guard.require("workflow:deploy")?;
+    use aegis_orchestrator_core::domain::repository::{StatusChange, BUILTIN_STATUS_REFUSAL};
+    use aegis_orchestrator_core::domain::workflow::WorkflowStatus;
+
+    let Some(status) = WorkflowStatus::from_db_str(body.status.trim()) else {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "status must be one of: active, archived"})),
+        ));
+    };
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    match state
+        .workflow_repo
+        .change_status(&tenant_id, &id_or_name, body.version.as_deref(), status)
+        .await
+    {
+        Ok(StatusChange::Changed(workflow)) => Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": workflow.id.0,
+                "name": workflow.metadata.name,
+                "version": workflow.metadata.version,
+                "status": workflow.status.as_db_str(),
+            })),
+        )),
+        Ok(StatusChange::NotFound) => Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("workflow '{id_or_name}' not found")})),
+        )),
+        Ok(StatusChange::Global) => Ok((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": BUILTIN_STATUS_REFUSAL})),
+        )),
+        Ok(StatusChange::Ambiguous { name, versions }) => Ok((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": StatusChange::<()>::ambiguous_sentence(&name, versions)
+            })),
+        )),
         Err(e) => Ok((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),

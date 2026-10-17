@@ -156,8 +156,22 @@ async fn a_new_global_workflow_version_leaves_one_live_global_row() {
     let repo = Arc::new(InMemoryWorkflowRepository::new());
     let use_case = register_use_case(repo.clone());
     let system = TenantId::system();
-    let old = register(&use_case, &system, "builtin-flow", "1.0.0", WorkflowScope::Global).await;
-    let new = register(&use_case, &system, "builtin-flow", "1.1.0", WorkflowScope::Global).await;
+    let old = register(
+        &use_case,
+        &system,
+        "builtin-flow",
+        "1.0.0",
+        WorkflowScope::Global,
+    )
+    .await;
+    let new = register(
+        &use_case,
+        &system,
+        "builtin-flow",
+        "1.1.0",
+        WorkflowScope::Global,
+    )
+    .await;
 
     let live: Vec<_> = repo
         .list_global()
@@ -188,8 +202,22 @@ async fn the_live_global_row_is_the_one_saved_last_not_the_greatest_version_text
     let repo = Arc::new(InMemoryWorkflowRepository::new());
     let use_case = register_use_case(repo.clone());
     let system = TenantId::system();
-    register(&use_case, &system, "builtin-flow", "2.0.9", WorkflowScope::Global).await;
-    let newest = register(&use_case, &system, "builtin-flow", "2.0.10", WorkflowScope::Global).await;
+    register(
+        &use_case,
+        &system,
+        "builtin-flow",
+        "2.0.9",
+        WorkflowScope::Global,
+    )
+    .await;
+    let newest = register(
+        &use_case,
+        &system,
+        "builtin-flow",
+        "2.0.10",
+        WorkflowScope::Global,
+    )
+    .await;
 
     let found = repo
         .find_by_name_for_tenant(&system, "builtin-flow")
@@ -211,11 +239,23 @@ async fn a_new_tenant_agent_version_is_a_new_row_and_the_old_stays_live() {
     let service = agent_service(repo.clone());
     let tenant = alice();
     let v1 = service
-        .deploy_agent_for_tenant(&tenant, manifest("alpha", "1.0.0"), false, AgentScope::Tenant, None)
+        .deploy_agent_for_tenant(
+            &tenant,
+            manifest("alpha", "1.0.0"),
+            false,
+            AgentScope::Tenant,
+            None,
+        )
         .await
         .expect("v1 deploys");
     let v2 = service
-        .deploy_agent_for_tenant(&tenant, manifest("alpha", "1.1.0"), false, AgentScope::Tenant, None)
+        .deploy_agent_for_tenant(
+            &tenant,
+            manifest("alpha", "1.1.0"),
+            false,
+            AgentScope::Tenant,
+            None,
+        )
         .await
         .expect("v2 deploys");
 
@@ -226,10 +266,20 @@ async fn a_new_tenant_agent_version_is_a_new_row_and_the_old_stays_live() {
         .unwrap()
         .expect("the old row is kept");
     assert_eq!(old.manifest.metadata.version, "1.0.0");
-    assert_eq!(old.status, AgentStatus::Active, "the old version stays active");
+    assert_eq!(
+        old.status,
+        AgentStatus::Active,
+        "the old version stays active"
+    );
 
     let again = service
-        .deploy_agent_for_tenant(&tenant, manifest("alpha", "1.0.0"), true, AgentScope::Tenant, None)
+        .deploy_agent_for_tenant(
+            &tenant,
+            manifest("alpha", "1.0.0"),
+            true,
+            AgentScope::Tenant,
+            None,
+        )
         .await
         .expect("force on the same version deploys");
     assert_eq!(again, v1, "force on the same version overwrites in place");
@@ -255,7 +305,13 @@ async fn a_global_agent_deploy_leaves_one_live_global_row() {
 
     let service = agent_service(repo.clone());
     let deployed = service
-        .deploy_agent_for_tenant(&system, manifest("beta", "1.0.0"), true, AgentScope::Global, None)
+        .deploy_agent_for_tenant(
+            &system,
+            manifest("beta", "1.0.0"),
+            true,
+            AgentScope::Global,
+            None,
+        )
         .await
         .expect("the built-in deploys");
 
@@ -272,11 +328,18 @@ async fn a_global_agent_deploy_leaves_one_live_global_row() {
         vec![(deployed, "1.0.0".to_string())],
         "one live global row of the name"
     );
-    assert_eq!(deployed, ids[1], "the newest global row is updated in place");
+    assert_eq!(
+        deployed, ids[1],
+        "the newest global row is updated in place"
+    );
     let archived = repo
         .find_by_id_for_tenant(&system, ids[0])
         .await
         .unwrap()
         .expect("the older row is kept");
-    assert_eq!(archived.status, AgentStatus::Archived, "the older row is archived");
+    assert_eq!(
+        archived.status,
+        AgentStatus::Archived,
+        "the older row is archived"
+    );
 }

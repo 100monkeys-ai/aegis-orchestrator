@@ -58,19 +58,34 @@ async fn the_start_archives_every_older_builtin_row() {
     let older_wf = global_workflow(wf_template, Some("0.0.1"), 2);
     let current_wf = global_workflow(wf_template, None, 1);
     workflows.save_for_tenant(&system, &older_wf).await.unwrap();
-    workflows.save_for_tenant(&system, &current_wf).await.unwrap();
+    workflows
+        .save_for_tenant(&system, &current_wf)
+        .await
+        .unwrap();
     let older_agent = global_agent(agent_template, Some("0.0.1"), 2);
     let current_agent = global_agent(agent_template, None, 1);
     agents.save_for_tenant(&system, &older_agent).await.unwrap();
-    agents.save_for_tenant(&system, &current_agent).await.unwrap();
+    agents
+        .save_for_tenant(&system, &current_agent)
+        .await
+        .unwrap();
 
     let outcome = archive_superseded_builtins(&workflows, &agents).await;
-    assert_eq!(outcome.archived, 2, "one older workflow row and one older agent row");
+    assert_eq!(
+        outcome.archived, 2,
+        "one older workflow row and one older agent row"
+    );
     assert_eq!(outcome.failed, 0);
 
     let read = |id| workflows.find_by_id_for_tenant(&system, id);
-    assert_eq!(read(older_wf.id).await.unwrap().unwrap().status, WorkflowStatus::Archived);
-    assert_eq!(read(current_wf.id).await.unwrap().unwrap().status, WorkflowStatus::Active);
+    assert_eq!(
+        read(older_wf.id).await.unwrap().unwrap().status,
+        WorkflowStatus::Archived
+    );
+    assert_eq!(
+        read(current_wf.id).await.unwrap().unwrap().status,
+        WorkflowStatus::Active
+    );
     let read_agent = |id| agents.find_by_id_for_tenant(&system, id);
     assert_eq!(
         read_agent(older_agent.id).await.unwrap().unwrap().status,
@@ -97,6 +112,10 @@ async fn a_name_without_the_templates_version_keeps_its_live_row() {
 
     let outcome = archive_superseded_builtins(&workflows, &agents).await;
     assert_eq!(outcome.archived, 0);
-    let read = workflows.find_by_id_for_tenant(&system, only.id).await.unwrap().unwrap();
+    let read = workflows
+        .find_by_id_for_tenant(&system, only.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(read.status, WorkflowStatus::Active);
 }

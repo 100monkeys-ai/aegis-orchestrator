@@ -329,6 +329,17 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
             .await
             .context("Failed to persist workflow to repository")?;
 
+        // Step 4b (AEGIS ADR-148, A9): a built-in name keeps one live row,
+        // the version saved last. Every older global row of the name is
+        // archived, never deleted, so it stays readable with its versions and
+        // executions. A tenant's older versions are left active.
+        if workflow.scope == WorkflowScope::Global {
+            self.workflow_repository
+                .archive_superseded_global(&workflow_name, &workflow_version)
+                .await
+                .context("Failed to archive the older global versions of the workflow")?;
+        }
+
         // Step 5: Publish domain event
         self.event_bus.publish_workflow_event(
             crate::domain::events::WorkflowEvent::WorkflowRegistered {

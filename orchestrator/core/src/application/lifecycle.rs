@@ -63,6 +63,102 @@ impl StandardAgentLifecycleService {
         self
     }
 
+    /// Save a new agent row of `manifest` in `scope` and announce it.
+    async fn create_agent(
+        &self,
+        tenant_id: &TenantId,
+        manifest: AgentManifest,
+        scope: AgentScope,
+    ) -> Result<AgentId> {
+        let mut agent = Agent::new(manifest);
+        agent.scope = scope;
+        agent.tenant_id = tenant_id.clone();
+        self.repository.save_for_tenant(tenant_id, &agent).await?;
+        self.archive_superseded_global(&agent).await?;
+
+        self.event_bus
+            .publish_agent_event(AgentLifecycleEvent::AgentDeployed {
+                agent_id: agent.id,
+                tenant_id: tenant_id.clone(),
+                manifest: agent.manifest.clone(),
+                deployed_at: Utc::now(),
+            });
+
+        metrics::counter!(
+            "aegis_agent_lifecycle_operations_total",
+            "operation" => "deploy",
+            "result" => "success"
+        )
+        .increment(1);
+
+        Ok(agent.id)
+    }
+
+    /// AEGIS ADR-148, A9: after a global row is saved, its name keeps one
+    /// live row, the one saved; every other global row of the name is
+    /// archived, never deleted. A tenant row archives nothing.
+    async fn archive_superseded_global(&self, saved: &Agent) -> Result<()> {
+        if saved.scope == AgentScope::Global {
+            self.repository
+                .archive_superseded_global(&saved.name, &saved.manifest.metadata.version)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to archive the older global versions: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// The rows of `listing` whose status `filter` admits (AEGIS ADR-148,
+    /// `?status`).
+    pub async fn list_agents_by_status(
+        &self,
+        listing: crate::domain::repository::AgentListing<'_>,
+        filter: crate::domain::repository::StatusFilter,
+    ) -> Result<Vec<Agent>> {
+        self.repository
+            .list_by_status(listing, filter)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to list agents: {e}"))
+    }
+
+    /// Every row of the name the tenant sees, any status, newest first: its
+    /// own rows and, for a tenant other than the system's, the global rows.
+    pub async fn list_agent_versions_by_name(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+    ) -> Result<Vec<Agent>> {
+        let mut rows = self
+            .repository
+            .list_by_name_for_tenant(tenant_id, name)
+            .await?;
+        if !tenant_id.is_system() {
+            rows.extend(
+                self.repository
+                    .list_by_name_for_tenant(&TenantId::system(), name)
+                    .await?
+                    .into_iter()
+                    .filter(|a| a.scope == AgentScope::Global),
+            );
+        }
+        rows.sort_by_key(|a| std::cmp::Reverse(a.created_at));
+        Ok(rows)
+    }
+
+    /// Archive or unarchive the tenant's agent row named by `id_or_name`
+    /// (and `version`); a built-in is answered `Global` (AEGIS ADR-148).
+    pub async fn change_agent_status(
+        &self,
+        tenant_id: &TenantId,
+        id_or_name: &str,
+        version: Option<&str>,
+        status: crate::domain::agent::AgentStatus,
+    ) -> Result<crate::domain::repository::StatusChange<Agent>> {
+        Ok(self
+            .repository
+            .change_status(tenant_id, id_or_name, version, status)
+            .await?)
+    }
+
     /// Cross-tenant agent list (ADR-097). Operator-only — callers MUST gate
     /// on [`crate::domain::iam::IdentityKind::Operator`]. Each returned
     /// [`Agent`] carries its own `tenant_id`; surface it in projections.
@@ -135,34 +231,65 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
             }
         }
 
-        // Check if an agent with the same name already exists
+        // Same name and the same version: only allowed when --force is set,
+        // and then the row is overwritten in place, keeping its AgentId so
+        // existing execution references remain valid. An archived row of the
+        // version deployed again is active again (AEGIS ADR-148).
+        if let Some(existing) = self
+            .repository
+            .find_by_name_and_version_for_tenant(
+                tenant_id,
+                &manifest.metadata.name,
+                &manifest.metadata.version,
+            )
+            .await?
+        {
+            let existing_version = existing.manifest.metadata.version.clone();
+            if !force {
+                anyhow::bail!(
+                    "Agent '{}' version '{}' is already deployed (ID: {}). \
+                     Use --force to overwrite it.",
+                    existing.name,
+                    existing_version,
+                    existing.id.0
+                );
+            }
+            // Preserve the existing scope on force-overwrite.
+            let mut updated = existing.clone();
+            updated.update_manifest(manifest);
+            if updated.status == crate::domain::agent::AgentStatus::Archived {
+                updated.resume();
+            }
+            self.repository.save_for_tenant(tenant_id, &updated).await?;
+            self.archive_superseded_global(&updated).await?;
+            self.event_bus
+                .publish_agent_event(AgentLifecycleEvent::AgentUpdated {
+                    agent_id: updated.id,
+                    tenant_id: tenant_id.clone(),
+                    old_version: existing_version.clone(),
+                    new_version: updated.manifest.metadata.version.clone(),
+                    updated_at: Utc::now(),
+                });
+            return Ok(updated.id);
+        }
+
+        // Another version of the name is live.
         if let Some(existing) = self
             .repository
             .find_by_name_for_tenant(tenant_id, &manifest.metadata.name)
             .await?
         {
-            let existing_version = &existing.manifest.metadata.version;
-            let incoming_version = &manifest.metadata.version;
-
-            if existing_version == incoming_version {
-                // Same name AND same version — only allowed when --force is set
-                if !force {
-                    anyhow::bail!(
-                        "Agent '{}' version '{}' is already deployed (ID: {}). \
-                         Use --force to overwrite it.",
-                        existing.name,
-                        existing_version,
-                        existing.id.0
-                    );
-                }
-                // --force: overwrite the existing agent's manifest in place,
-                // preserving its AgentId so existing execution references remain valid.
-                // Preserve the existing scope on force-overwrite.
+            if existing.scope == AgentScope::Global {
+                // A built-in's new version updates its live row in place, so
+                // the workflows whose definitions name its AgentId keep it;
+                // any older global row of the name is archived (AEGIS
+                // ADR-148, A9).
+                let old_version = existing.manifest.metadata.version.clone();
+                let new_version = manifest.metadata.version.clone();
                 let mut updated = existing.clone();
-                let new_version = updated.manifest.metadata.version.clone();
-                let old_version = existing_version.clone();
                 updated.update_manifest(manifest);
                 self.repository.save_for_tenant(tenant_id, &updated).await?;
+                self.archive_superseded_global(&updated).await?;
                 self.event_bus
                     .publish_agent_event(AgentLifecycleEvent::AgentUpdated {
                         agent_id: updated.id,
@@ -173,47 +300,17 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
                     });
                 return Ok(updated.id);
             }
-
-            // Different version — treat as an in-place update (new version replaces old).
-            // Preserve existing scope when updating version.
-            let old_version = existing_version.clone();
-            let new_version = manifest.metadata.version.clone();
-            let mut updated = existing.clone();
-            updated.update_manifest(manifest);
-            self.repository.save_for_tenant(tenant_id, &updated).await?;
-            self.event_bus
-                .publish_agent_event(AgentLifecycleEvent::AgentUpdated {
-                    agent_id: updated.id,
-                    tenant_id: tenant_id.clone(),
-                    old_version,
-                    new_version,
-                    updated_at: Utc::now(),
-                });
-            return Ok(updated.id);
+            // A tenant's new version is a new agent row with the scope of
+            // the name's live row; the old version stays active, and the
+            // tenant archives it when it chooses (AEGIS ADR-148; Jeshua,
+            // 2026-10-16 02:48Z).
+            return self
+                .create_agent(tenant_id, manifest, existing.scope.clone())
+                .await;
         }
 
         // No existing agent with this name — create a fresh one with the requested scope
-        let mut agent = Agent::new(manifest);
-        agent.scope = scope;
-        agent.tenant_id = tenant_id.clone();
-        self.repository.save_for_tenant(tenant_id, &agent).await?;
-
-        self.event_bus
-            .publish_agent_event(AgentLifecycleEvent::AgentDeployed {
-                agent_id: agent.id,
-                tenant_id: tenant_id.clone(),
-                manifest: agent.manifest.clone(),
-                deployed_at: Utc::now(),
-            });
-
-        metrics::counter!(
-            "aegis_agent_lifecycle_operations_total",
-            "operation" => "deploy",
-            "result" => "success"
-        )
-        .increment(1);
-
-        Ok(agent.id)
+        self.create_agent(tenant_id, manifest, scope).await
     }
 
     async fn get_agent_for_tenant(&self, tenant_id: &TenantId, id: AgentId) -> Result<Agent> {
@@ -467,17 +564,11 @@ mod tests {
         // drain the deployed event
         let _ = rx.recv().await.expect("deploy event");
 
-        // Update via versioned re-deploy → publishes AgentUpdated.
-        let _ = svc
-            .deploy_agent_for_tenant(
-                &alice,
-                manifest("alpha", "1.1.0"),
-                false,
-                AgentScope::Tenant,
-                None,
-            )
+        // Update the row in place → publishes AgentUpdated. A versioned
+        // re-deploy is a new row (AEGIS ADR-148) and publishes AgentDeployed.
+        svc.update_agent_for_tenant(&alice, id, manifest("alpha", "1.1.0"))
             .await
-            .expect("deploy v2 ok");
+            .expect("update to v2 ok");
 
         let received = rx.recv().await.expect("update event");
         match received {

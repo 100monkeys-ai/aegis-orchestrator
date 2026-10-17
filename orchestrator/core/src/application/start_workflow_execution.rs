@@ -20,9 +20,11 @@
 use crate::application::ports::WorkflowEnginePort;
 use crate::domain::execution::ExecutionId;
 use crate::domain::iam::UserIdentity;
-use crate::domain::repository::{WorkflowExecutionRepository, WorkflowRepository};
+use crate::domain::repository::{ArchivedTarget, WorkflowExecutionRepository, WorkflowRepository};
 use crate::domain::tenant::TenantId;
-use crate::domain::workflow::{Workflow, WorkflowExecution, WorkflowId};
+use crate::domain::workflow::{
+    Workflow, WorkflowExecution, WorkflowId, WorkflowScope, WorkflowStatus,
+};
 use crate::infrastructure::event_bus::EventBus;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -573,10 +575,15 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
 
         // Step 1: Load workflow from repository
         let workflow = if let Ok(uuid) = uuid::Uuid::parse_str(&request.workflow_id) {
+            // A UUID names the tenant's row or a built-in's global row, as
+            // the Postgres repository reads it (AEGIS ADR-148).
             let id = WorkflowId::from_uuid(uuid);
             self.workflow_repository
-                .find_by_id_for_tenant(tenant_id, id)
+                .find_by_id_visible(tenant_id, id)
                 .await
+                .map(|found| {
+                    found.filter(|w| w.tenant_id == *tenant_id || w.scope == WorkflowScope::Global)
+                })
         } else if let Some(ref version) = request.version {
             self.workflow_repository
                 .resolve_by_name_and_version(tenant_id, &request.workflow_id, version)
@@ -588,6 +595,18 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
         }
         .context("Failed to query workflow repository")?
         .ok_or_else(|| anyhow::anyhow!("Workflow not found: {}", request.workflow_id))?;
+
+        // AEGIS ADR-148, A10: an archived version stays readable, and a new
+        // run naming it is refused with the name's active version.
+        if workflow.status == WorkflowStatus::Archived {
+            let active_version = self
+                .workflow_repository
+                .resolve_by_name(tenant_id, &workflow.metadata.name)
+                .await
+                .context("Failed to query workflow repository")?
+                .and_then(|w| w.metadata.version.clone());
+            return Err(ArchivedTarget::workflow(&workflow, active_version).into());
+        }
 
         // AEGIS ADR-141 F2: a workflow that works on a fixed number of
         // repositories refuses a run naming another number, before anything

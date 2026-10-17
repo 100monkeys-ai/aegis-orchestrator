@@ -37,12 +37,12 @@
 //
 // Follows DDD Repository Pattern from AGENTS.md
 
-use crate::domain::agent::{Agent, AgentId, AgentScope};
+use crate::domain::agent::{Agent, AgentId, AgentScope, AgentStatus};
 use crate::domain::execution::{Execution, ExecutionId};
 use crate::domain::tenancy::Tenant;
 use crate::domain::tenant::TenantId;
 use crate::domain::volume::{Volume, VolumeId, VolumeOwnership};
-use crate::domain::workflow::{Workflow, WorkflowId, WorkflowScope};
+use crate::domain::workflow::{Workflow, WorkflowId, WorkflowScope, WorkflowStatus};
 use async_trait::async_trait;
 
 /// Storage backend enum for pluggable persistence
@@ -57,6 +57,155 @@ pub enum StorageBackend {
 pub struct PostgresConfig {
     /// A connection URL, which may carry the password; prints redacted.
     pub connection_string: crate::domain::secrets::SensitiveUrl,
+}
+
+// ============================================================================
+// Active and archived rows (AEGIS ADR-148)
+// ============================================================================
+
+/// Which rows a list reads by status (AEGIS ADR-148): the live lists
+/// read `Active` unless `?status=archived|all` asks for the others. For an
+/// agent, `Active` is every row not archived, so a paused agent stays listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StatusFilter {
+    #[default]
+    Active,
+    Archived,
+    All,
+}
+
+/// The sentence a `?status` of another word is refused with.
+pub const STATUS_FILTER_REFUSAL: &str = "status must be one of: active, archived, all";
+
+impl StatusFilter {
+    /// The text a repository binds for the filter: `active`, `archived`
+    /// or `all`.
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Archived => "archived",
+            Self::All => "all",
+        }
+    }
+
+    /// `?status`: `active` when absent, else `active`, `archived` or `all`.
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.map(str::trim) {
+            None | Some("") | Some("active") => Ok(Self::Active),
+            Some("archived") => Ok(Self::Archived),
+            Some("all") => Ok(Self::All),
+            Some(_) => Err(STATUS_FILTER_REFUSAL.to_string()),
+        }
+    }
+
+    /// Whether a workflow of `status` is read.
+    pub fn admits_workflow(self, status: WorkflowStatus) -> bool {
+        match self {
+            Self::Active => status == WorkflowStatus::Active,
+            Self::Archived => status == WorkflowStatus::Archived,
+            Self::All => true,
+        }
+    }
+
+    /// Whether an agent of `status` is read.
+    pub fn admits_agent(self, status: &AgentStatus) -> bool {
+        match self {
+            Self::Active => *status != AgentStatus::Archived,
+            Self::Archived => *status == AgentStatus::Archived,
+            Self::All => true,
+        }
+    }
+}
+
+/// The set of workflows a list reads, before its status filter.
+#[derive(Debug, Clone, Copy)]
+pub enum WorkflowListing<'a> {
+    /// Every tenant's (operator only, ADR-097).
+    All,
+    /// The global (built-in) rows.
+    Global,
+    /// A tenant's own rows and the global rows.
+    Visible(&'a TenantId),
+    /// A tenant's own rows.
+    Tenant(&'a TenantId),
+}
+
+/// The set of agents a list reads, before its status filter.
+#[derive(Debug, Clone, Copy)]
+pub enum AgentListing<'a> {
+    /// Every tenant's (operator only, ADR-097).
+    All,
+    /// A tenant's own rows and the global rows.
+    Visible(&'a TenantId),
+    /// A tenant's own rows.
+    Tenant(&'a TenantId),
+}
+
+/// The sentence a caller asking to set a built-in's status is refused with.
+pub const BUILTIN_STATUS_REFUSAL: &str = "a built-in's status is set by its deploy";
+
+/// What a status change asked for by id, or by name and version, did.
+#[derive(Debug, Clone)]
+pub enum StatusChange<T> {
+    /// The row now has the status asked for.
+    Changed(T),
+    /// No row of the caller's tenant has that id or name (and version).
+    NotFound,
+    /// The row is a built-in: its status is set by its deploy (403).
+    Global,
+    /// The name has several rows and no version was named (409).
+    Ambiguous { name: String, versions: usize },
+}
+
+impl<T> StatusChange<T> {
+    /// The refusal's sentence for `Ambiguous`.
+    pub fn ambiguous_sentence(name: &str, versions: usize) -> String {
+        format!("'{name}' has {versions} versions; name the version")
+    }
+}
+
+/// A new run or schedule naming an archived row by its id, or by name and
+/// version, is refused with the name's active version (A10). A schedule that
+/// names an archived id fails its next run with this refusal and is never
+/// retargeted.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{kind} '{name}' version '{version}' is archived; {}", active_clause(name, active_version.as_deref()))]
+pub struct ArchivedTarget {
+    /// `workflow` or `agent`.
+    pub kind: &'static str,
+    pub name: String,
+    pub version: String,
+    /// The version of the name a run resolves to now, if any is active.
+    pub active_version: Option<String>,
+}
+
+fn active_clause(name: &str, active_version: Option<&str>) -> String {
+    match active_version {
+        Some(version) => format!("the active version is '{version}'"),
+        None => format!("no version of '{name}' is active"),
+    }
+}
+
+impl ArchivedTarget {
+    /// The refusal of a run of the archived `workflow`.
+    pub fn workflow(workflow: &Workflow, active_version: Option<String>) -> Self {
+        Self {
+            kind: "workflow",
+            name: workflow.metadata.name.clone(),
+            version: workflow.metadata.version.clone().unwrap_or_default(),
+            active_version,
+        }
+    }
+
+    /// The refusal of a run of the archived `agent`.
+    pub fn agent(agent: &Agent, active_version: Option<String>) -> Self {
+        Self {
+            kind: "agent",
+            name: agent.name.clone(),
+            version: agent.manifest.metadata.version.clone(),
+            active_version,
+        }
+    }
 }
 
 /// A snapshot of a specific agent version from the append-only version history.
@@ -149,6 +298,127 @@ pub trait AgentRepository: Send + Sync {
 
     /// Count agents with `status = 'active'` for a tenant (used by quota enforcement).
     async fn count_active(&self, tenant_id: &TenantId) -> Result<u64, RepositoryError>;
+
+    // --- Active and archived rows (AEGIS ADR-148) ---
+
+    /// Every row of the name in the tenant, any status, newest first.
+    async fn list_by_name_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+    ) -> Result<Vec<Agent>, RepositoryError>;
+
+    /// The rows of `listing` whose status `filter` admits. The live lists
+    /// above read [`StatusFilter::Active`]: every row not archived.
+    async fn list_by_status(
+        &self,
+        listing: AgentListing<'_>,
+        filter: StatusFilter,
+    ) -> Result<Vec<Agent>, RepositoryError>;
+
+    /// Set the status of the tenant's row `id`; nothing else of it changes.
+    async fn set_status_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: AgentId,
+        status: AgentStatus,
+    ) -> Result<(), RepositoryError> {
+        let mut agent = self
+            .find_by_id_for_tenant(tenant_id, id)
+            .await?
+            .ok_or_else(|| RepositoryError::NotFound(format!("Agent {} not found", id.0)))?;
+        agent.status = status;
+        self.save_for_tenant(tenant_id, &agent).await
+    }
+
+    /// A built-in name keeps one live row, the row of `keep_version`: every
+    /// other global row of `name` not archived is archived, and the row of
+    /// `keep_version` is made active if it was archived. A name with no
+    /// global row of `keep_version` is left as it is. Nothing is deleted.
+    /// Answers the ids archived.
+    async fn archive_superseded_global(
+        &self,
+        name: &str,
+        keep_version: &str,
+    ) -> Result<Vec<AgentId>, RepositoryError> {
+        let system = TenantId::system();
+        let rows: Vec<Agent> = self
+            .list_by_name_for_tenant(&system, name)
+            .await?
+            .into_iter()
+            .filter(|a| a.scope == AgentScope::Global)
+            .collect();
+        let Some(keep) = rows
+            .iter()
+            .find(|a| a.manifest.metadata.version == keep_version)
+            .map(|a| (a.id, a.status.clone()))
+        else {
+            return Ok(Vec::new());
+        };
+        let mut archived = Vec::new();
+        for row in &rows {
+            if row.id != keep.0 && row.status != AgentStatus::Archived {
+                self.set_status_for_tenant(&system, row.id, AgentStatus::Archived)
+                    .await?;
+                archived.push(row.id);
+            }
+        }
+        if keep.1 == AgentStatus::Archived {
+            self.set_status_for_tenant(&system, keep.0, AgentStatus::Active)
+                .await?;
+        }
+        Ok(archived)
+    }
+
+    /// Archive or unarchive the tenant's row named by `id_or_name`: a UUID
+    /// names one row; a name names the tenant's rows of it, narrowed by
+    /// `version`. A built-in's status is set by its deploy, never here.
+    async fn change_status(
+        &self,
+        tenant_id: &TenantId,
+        id_or_name: &str,
+        version: Option<&str>,
+        status: AgentStatus,
+    ) -> Result<StatusChange<Agent>, RepositoryError> {
+        let rows: Vec<Agent> = match uuid::Uuid::parse_str(id_or_name) {
+            Ok(uuid) => self
+                .find_by_id_visible(tenant_id, AgentId(uuid))
+                .await?
+                .into_iter()
+                .collect(),
+            Err(_) => {
+                let mut rows = self.list_by_name_for_tenant(tenant_id, id_or_name).await?;
+                if !tenant_id.is_system() {
+                    rows.extend(
+                        self.list_by_name_for_tenant(&TenantId::system(), id_or_name)
+                            .await?
+                            .into_iter()
+                            .filter(|a| a.scope == AgentScope::Global),
+                    );
+                }
+                rows
+            }
+        };
+        let (own, global): (Vec<Agent>, Vec<Agent>) = rows
+            .into_iter()
+            .filter(|a| version.is_none_or(|v| a.manifest.metadata.version == v))
+            .partition(|a| a.scope == AgentScope::Tenant && &a.tenant_id == tenant_id);
+        let mut target = match own.len() {
+            0 if !global.is_empty() => return Ok(StatusChange::Global),
+            0 => return Ok(StatusChange::NotFound),
+            1 => own.into_iter().next().expect("one row"),
+            versions => {
+                return Ok(StatusChange::Ambiguous {
+                    name: own[0].name.clone(),
+                    versions,
+                })
+            }
+        };
+        self.set_status_for_tenant(tenant_id, target.id, status.clone())
+            .await?;
+        target.status = status;
+        Ok(StatusChange::Changed(target))
+    }
 }
 
 /// Repository interface for Execution aggregates
@@ -208,6 +478,32 @@ pub trait ExecutionRepository: Send + Sync {
             .into_iter()
             .map(Ok)
             .collect())
+    }
+
+    /// The executions of any of `workflow_ids`, newest first, at most
+    /// `limit` (AEGIS ADR-148: a name's executions are every version's).
+    /// The default reads each id in turn; a repository that can read them
+    /// at once overrides it.
+    async fn find_by_workflows_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        workflow_ids: &[WorkflowId],
+        limit: usize,
+    ) -> Result<Vec<Execution>, RepositoryError> {
+        let mut all: Vec<Execution> = Vec::new();
+        for id in workflow_ids {
+            for execution in self
+                .find_by_workflow_for_tenant(tenant_id, *id, limit)
+                .await?
+            {
+                if !all.iter().any(|e| e.id == execution.id) {
+                    all.push(execution);
+                }
+            }
+        }
+        all.sort_by_key(|e| std::cmp::Reverse(e.started_at));
+        all.truncate(limit);
+        Ok(all)
     }
 
     async fn find_recent_for_tenant(
@@ -395,6 +691,147 @@ pub trait WorkflowRepository: Send + Sync {
             .map_err(|e| anyhow::anyhow!("Repository error: {e}"))?
             .ok_or_else(|| anyhow::anyhow!("Workflow not found"))
     }
+
+    // --- Active and archived rows (AEGIS ADR-148) ---
+
+    /// The rows of `listing` whose status `filter` admits. The live lists
+    /// above read [`StatusFilter::Active`]; a repository that keeps no
+    /// archived rows answers the active ones and refuses the others.
+    async fn list_by_status(
+        &self,
+        listing: WorkflowListing<'_>,
+        filter: StatusFilter,
+    ) -> Result<Vec<Workflow>, RepositoryError> {
+        if filter != StatusFilter::Active {
+            return Err(RepositoryError::Unknown(
+                "this workflow repository does not list archived workflows".to_string(),
+            ));
+        }
+        match listing {
+            WorkflowListing::All => self.list_all().await,
+            WorkflowListing::Global => self.list_global().await,
+            WorkflowListing::Visible(tenant_id) => self.list_visible(tenant_id).await,
+            WorkflowListing::Tenant(tenant_id) => self.list_all_for_tenant(tenant_id).await,
+        }
+    }
+
+    /// Set the status of the tenant's row `id`; nothing else of it changes.
+    async fn set_status_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: WorkflowId,
+        status: WorkflowStatus,
+    ) -> Result<(), RepositoryError> {
+        let mut workflow = self
+            .find_by_id_for_tenant(tenant_id, id)
+            .await?
+            .ok_or_else(|| RepositoryError::NotFound(format!("Workflow {} not found", id.0)))?;
+        workflow.status = status;
+        self.save_for_tenant(tenant_id, &workflow).await
+    }
+
+    /// A built-in name keeps one active row, the row of `keep_version`
+    /// (A9): every other global row of `name` that is active is archived,
+    /// and the row of `keep_version` is made active. A name with no global
+    /// row of `keep_version`, as when its deploy failed, is left as it is.
+    /// Nothing is deleted. Answers the ids archived.
+    async fn archive_superseded_global(
+        &self,
+        name: &str,
+        keep_version: &str,
+    ) -> Result<Vec<WorkflowId>, RepositoryError> {
+        let system = TenantId::system();
+        let rows: Vec<Workflow> = self
+            .list_by_name_for_tenant(&system, name)
+            .await?
+            .into_iter()
+            .filter(|w| w.scope == WorkflowScope::Global && w.tenant_id.is_system())
+            .collect();
+        let Some(keep) = rows
+            .iter()
+            .find(|w| w.metadata.version.as_deref() == Some(keep_version))
+            .map(|w| (w.id, w.status))
+        else {
+            return Ok(Vec::new());
+        };
+        let mut archived = Vec::new();
+        for row in &rows {
+            if row.id != keep.0 && row.status == WorkflowStatus::Active {
+                self.set_status_for_tenant(&system, row.id, WorkflowStatus::Archived)
+                    .await?;
+                archived.push(row.id);
+            }
+        }
+        if keep.1 != WorkflowStatus::Active {
+            self.set_status_for_tenant(&system, keep.0, WorkflowStatus::Active)
+                .await?;
+        }
+        Ok(archived)
+    }
+
+    /// Archive or unarchive the tenant's row named by `id_or_name`: a UUID
+    /// names one row; a name names the tenant's rows of it, narrowed by
+    /// `version`. A built-in's status is set by its deploy, never here.
+    async fn change_status(
+        &self,
+        tenant_id: &TenantId,
+        id_or_name: &str,
+        version: Option<&str>,
+        status: WorkflowStatus,
+    ) -> Result<StatusChange<Workflow>, RepositoryError> {
+        let rows: Vec<Workflow> = match uuid::Uuid::parse_str(id_or_name) {
+            Ok(uuid) => self
+                .find_by_id_for_tenant(tenant_id, WorkflowId(uuid))
+                .await?
+                .into_iter()
+                .collect(),
+            Err(_) => self.list_by_name_for_tenant(tenant_id, id_or_name).await?,
+        };
+        let (own, global): (Vec<Workflow>, Vec<Workflow>) = rows
+            .into_iter()
+            .filter(|w| version.is_none_or(|v| w.metadata.version.as_deref() == Some(v)))
+            .partition(|w| w.scope == WorkflowScope::Tenant && &w.tenant_id == tenant_id);
+        let mut target = match own.len() {
+            0 if !global.is_empty() => return Ok(StatusChange::Global),
+            0 => return Ok(StatusChange::NotFound),
+            1 => own.into_iter().next().expect("one row"),
+            versions => {
+                return Ok(StatusChange::Ambiguous {
+                    name: own[0].metadata.name.clone(),
+                    versions,
+                })
+            }
+        };
+        self.set_status_for_tenant(tenant_id, target.id, status)
+            .await?;
+        target.status = status;
+        Ok(StatusChange::Changed(target))
+    }
+
+    /// Every version's id of the name the tenant sees, any status: its own
+    /// rows and the global rows. A name's executions roll up to these.
+    async fn version_ids_visible(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+    ) -> Result<Vec<WorkflowId>, RepositoryError> {
+        let mut rows = self.list_by_name_for_tenant(tenant_id, name).await?;
+        if !tenant_id.is_system() {
+            rows.extend(
+                self.list_by_name_for_tenant(&TenantId::system(), name)
+                    .await?
+                    .into_iter()
+                    .filter(|w| w.scope == WorkflowScope::Global),
+            );
+        }
+        let mut ids: Vec<WorkflowId> = Vec::new();
+        for row in rows {
+            if !ids.contains(&row.id) {
+                ids.push(row.id);
+            }
+        }
+        Ok(ids)
+    }
 }
 
 /// Repository interface for WorkflowExecution aggregates
@@ -450,6 +887,20 @@ pub trait WorkflowExecutionRepository: Send + Sync {
         tenant_id: &TenantId,
         workflow_id: crate::domain::workflow::WorkflowId,
     ) -> Result<i64, RepositoryError>;
+
+    /// The workflow executions of any of `workflow_ids` (AEGIS ADR-148: a
+    /// name's count is every version's). The default sums each id's count.
+    async fn count_by_workflows_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        workflow_ids: &[crate::domain::workflow::WorkflowId],
+    ) -> Result<i64, RepositoryError> {
+        let mut total = 0;
+        for id in workflow_ids {
+            total += self.count_by_workflow_for_tenant(tenant_id, *id).await?;
+        }
+        Ok(total)
+    }
 
     /// Persist Temporal workflow/run linkage for an already-created workflow execution.
     async fn update_temporal_linkage_for_tenant(

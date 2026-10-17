@@ -227,6 +227,31 @@ pub trait ExecutionService: Send + Sync {
         limit: usize,
     ) -> Result<Vec<Execution>>;
 
+    /// The tenant's executions of any of `workflow_ids`, newest first, at
+    /// most `limit`: a workflow name's executions across its versions (AEGIS
+    /// ADR-148).
+    async fn list_executions_for_workflows_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        workflow_ids: &[crate::domain::workflow::WorkflowId],
+        limit: usize,
+    ) -> Result<Vec<Execution>> {
+        let mut rows: Vec<Execution> = Vec::new();
+        for id in workflow_ids {
+            for execution in self
+                .list_executions_for_tenant(tenant_id, None, Some(*id), limit)
+                .await?
+            {
+                if !rows.iter().any(|e| e.id == execution.id) {
+                    rows.push(execution);
+                }
+            }
+        }
+        rows.sort_by_key(|e| std::cmp::Reverse(e.started_at));
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
     /// Permanently delete an execution record and all its iterations within
     /// a tenant scope.
     ///
@@ -7682,6 +7707,32 @@ impl StandardExecutionService {
             .agent_service
             .get_agent_visible(&tenant_id, agent_id)
             .await?;
+
+        // AEGIS ADR-148, A10: an archived agent version stays readable, and
+        // a new run naming it is refused with the name's active version. A
+        // workflow's own step runs the agent its definition names.
+        if agent.status == crate::domain::agent::AgentStatus::Archived
+            && input.workflow_execution_id.is_none()
+        {
+            let active_version = match self
+                .agent_service
+                .lookup_agent_visible_for_tenant(&tenant_id, &agent.name)
+                .await?
+            {
+                Some(active_id) => Some(
+                    self.agent_service
+                        .get_agent_visible(&tenant_id, active_id)
+                        .await?
+                        .manifest
+                        .metadata
+                        .version,
+                ),
+                None => None,
+            };
+            return Err(
+                crate::domain::repository::ArchivedTarget::agent(&agent, active_version).into(),
+            );
+        }
 
         // Gap-056-7: Cross-tenant access guard.
         //

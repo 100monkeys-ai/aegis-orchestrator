@@ -128,6 +128,45 @@ impl std::str::FromStr for WorkflowScope {
     }
 }
 
+/// Whether a workflow row is live (AEGIS ADR-148).
+///
+/// The live lists and finds read `Active` rows. An `Archived` row stays
+/// readable by its id with its versions and executions, and a new run naming
+/// it is refused with the active version of its name (A10). A global
+/// (built-in) name keeps one `Active` row, the version deployed last (A9).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkflowStatus {
+    #[default]
+    Active,
+    Archived,
+}
+
+impl WorkflowStatus {
+    /// The `workflows.status` text.
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            WorkflowStatus::Active => "active",
+            WorkflowStatus::Archived => "archived",
+        }
+    }
+
+    /// The status a `workflows.status` text names, or `None`.
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        match value {
+            "active" => Some(WorkflowStatus::Active),
+            "archived" => Some(WorkflowStatus::Archived),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for WorkflowStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_db_str())
+    }
+}
+
 // ============================================================================
 // Aggregate Root: Workflow
 // ============================================================================
@@ -149,6 +188,10 @@ pub struct Workflow {
     pub tenant_id: TenantId,
     #[serde(default)]
     pub scope: WorkflowScope,
+    /// Active or archived (AEGIS ADR-148). A row stored before it reads
+    /// active; a stored row's status is its `workflows.status` column.
+    #[serde(default)]
+    pub status: WorkflowStatus,
     pub metadata: WorkflowMetadata,
     pub spec: WorkflowSpec,
     pub created_at: DateTime<Utc>,
@@ -429,11 +472,23 @@ impl Workflow {
             id: WorkflowId::new(),
             tenant_id: TenantId::default(),
             scope: WorkflowScope::default(),
+            status: WorkflowStatus::Active,
             metadata,
             spec,
             created_at: Utc::now(),
             updated_at: None,
         })
+    }
+
+    /// Archive this version (AEGIS ADR-148): it stays readable, and a new
+    /// run naming it is refused.
+    pub fn archive(&mut self) {
+        self.status = WorkflowStatus::Archived;
+    }
+
+    /// Make this version active again.
+    pub fn activate(&mut self) {
+        self.status = WorkflowStatus::Active;
     }
 
     /// Return all judge-agent references used anywhere in the workflow.
@@ -2079,6 +2134,7 @@ mod tests {
             id: WorkflowId::new(),
             tenant_id: TenantId::default(),
             scope: WorkflowScope::default(),
+            status: WorkflowStatus::Active,
             metadata: WorkflowMetadata {
                 name: "test".to_string(),
                 version: Some("1.0.0".to_string()),

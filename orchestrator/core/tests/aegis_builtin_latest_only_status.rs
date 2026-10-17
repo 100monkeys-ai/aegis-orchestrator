@@ -166,7 +166,11 @@ fn alice() -> TenantId {
     TenantId::for_consumer_user("alice").expect("a tenant for alice")
 }
 
-fn start_request(tenant: &TenantId, workflow_id: &str, version: Option<&str>) -> StartWorkflowExecutionRequest {
+fn start_request(
+    tenant: &TenantId,
+    workflow_id: &str,
+    version: Option<&str>,
+) -> StartWorkflowExecutionRequest {
     StartWorkflowExecutionRequest {
         workflow_id: workflow_id.to_string(),
         input: json!({}),
@@ -185,23 +189,50 @@ fn start_request(tenant: &TenantId, workflow_id: &str, version: Option<&str>) ->
 async fn an_archived_global_row_is_read_and_listed_by_status() {
     let repo = Arc::new(InMemoryWorkflowRepository::new());
     let system = TenantId::system();
-    let old = register(&repo, &system, "builtin-flow", "1.0.0", WorkflowScope::Global).await;
-    let new = register(&repo, &system, "builtin-flow", "1.1.0", WorkflowScope::Global).await;
+    let old = register(
+        &repo,
+        &system,
+        "builtin-flow",
+        "1.0.0",
+        WorkflowScope::Global,
+    )
+    .await;
+    let new = register(
+        &repo,
+        &system,
+        "builtin-flow",
+        "1.1.0",
+        WorkflowScope::Global,
+    )
+    .await;
 
-    let read = repo.find_by_id_for_tenant(&system, old).await.unwrap().unwrap();
+    let read = repo
+        .find_by_id_for_tenant(&system, old)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(read.status, WorkflowStatus::Archived);
     let ids = |rows: Vec<aegis_orchestrator_core::domain::workflow::Workflow>| {
         rows.into_iter().map(|w| w.id).collect::<Vec<_>>()
     };
     assert_eq!(
-        ids(repo.list_by_status(WorkflowListing::Global, StatusFilter::Active).await.unwrap()),
+        ids(repo
+            .list_by_status(WorkflowListing::Global, StatusFilter::Active)
+            .await
+            .unwrap()),
         vec![new]
     );
     assert_eq!(
-        ids(repo.list_by_status(WorkflowListing::Global, StatusFilter::Archived).await.unwrap()),
+        ids(repo
+            .list_by_status(WorkflowListing::Global, StatusFilter::Archived)
+            .await
+            .unwrap()),
         vec![old]
     );
-    let mut all = ids(repo.list_by_status(WorkflowListing::Global, StatusFilter::All).await.unwrap());
+    let mut all = ids(repo
+        .list_by_status(WorkflowListing::Global, StatusFilter::All)
+        .await
+        .unwrap());
     all.sort_by_key(|id| id.0);
     let mut both = vec![old, new];
     both.sort_by_key(|id| id.0);
@@ -213,8 +244,14 @@ async fn an_archived_global_row_is_read_and_listed_by_status() {
 #[test]
 fn the_status_query_reads_three_words() {
     assert_eq!(StatusFilter::parse(None), Ok(StatusFilter::Active));
-    assert_eq!(StatusFilter::parse(Some("active")), Ok(StatusFilter::Active));
-    assert_eq!(StatusFilter::parse(Some("archived")), Ok(StatusFilter::Archived));
+    assert_eq!(
+        StatusFilter::parse(Some("active")),
+        Ok(StatusFilter::Active)
+    );
+    assert_eq!(
+        StatusFilter::parse(Some("archived")),
+        Ok(StatusFilter::Archived)
+    );
     assert_eq!(StatusFilter::parse(Some("all")), Ok(StatusFilter::All));
     assert!(StatusFilter::parse(Some("paused")).is_err());
 }
@@ -248,7 +285,11 @@ async fn a_tenant_archives_and_unarchives_its_workflow_version() {
         other => panic!("expected the version archived, got {other:?}"),
     }
     let live = repo.list_all_for_tenant(&tenant).await.unwrap();
-    assert_eq!(live.len(), 1, "the live list leaves the archived version out");
+    assert_eq!(
+        live.len(),
+        1,
+        "the live list leaves the archived version out"
+    );
     match repo
         .change_status(&tenant, &v1.0.to_string(), None, WorkflowStatus::Active)
         .await
@@ -272,21 +313,44 @@ async fn a_tenant_archives_and_unarchives_its_workflow_version() {
 async fn a_builtin_status_is_not_changed_by_a_caller() {
     let repo = Arc::new(InMemoryWorkflowRepository::new());
     let system = TenantId::system();
-    let id = register(&repo, &system, "builtin-flow", "1.0.0", WorkflowScope::Global).await;
+    let id = register(
+        &repo,
+        &system,
+        "builtin-flow",
+        "1.0.0",
+        WorkflowScope::Global,
+    )
+    .await;
     assert!(matches!(
         repo.change_status(&system, &id.0.to_string(), None, WorkflowStatus::Archived)
             .await
             .unwrap(),
         StatusChange::Global
     ));
-    let read = repo.find_by_id_for_tenant(&system, id).await.unwrap().unwrap();
+    let read = repo
+        .find_by_id_for_tenant(&system, id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(read.status, WorkflowStatus::Active);
 
     let agents = InMemoryAgentRepository::new();
-    let builtin = save_agent(&agents, &system, "builtin-agent", "1.0.0", AgentScope::Global).await;
+    let builtin = save_agent(
+        &agents,
+        &system,
+        "builtin-agent",
+        "1.0.0",
+        AgentScope::Global,
+    )
+    .await;
     assert!(matches!(
         agents
-            .change_status(&system, &builtin.id.0.to_string(), None, AgentStatus::Archived)
+            .change_status(
+                &system,
+                &builtin.id.0.to_string(),
+                None,
+                AgentStatus::Archived
+            )
             .await
             .unwrap(),
         StatusChange::Global
@@ -317,8 +381,15 @@ async fn a_tenant_archives_its_agent_version() {
         StatusChange::Changed(a) => assert_eq!((a.id, a.status), (v2.id, AgentStatus::Archived)),
         other => panic!("expected the version archived, got {other:?}"),
     }
-    let resolved = agents.resolve_by_name(&tenant, "alpha").await.unwrap().unwrap();
-    assert_eq!(resolved.id, v1.id, "the name resolves to the active version");
+    let resolved = agents
+        .resolve_by_name(&tenant, "alpha")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        resolved.id, v1.id,
+        "the name resolves to the active version"
+    );
     let archived: Vec<_> = agents
         .list_by_status(AgentListing::Visible(&tenant), StatusFilter::Archived)
         .await
@@ -327,8 +398,15 @@ async fn a_tenant_archives_its_agent_version() {
         .map(|a| a.id)
         .collect();
     assert_eq!(archived, vec![v2.id]);
-    let versions = agents.list_by_name_for_tenant(&tenant, "alpha").await.unwrap();
-    assert_eq!(versions.len(), 2, "an archived version is still one of the name's versions");
+    let versions = agents
+        .list_by_name_for_tenant(&tenant, "alpha")
+        .await
+        .unwrap();
+    assert_eq!(
+        versions.len(),
+        2,
+        "an archived version is still one of the name's versions"
+    );
 }
 
 /// A new run naming an archived workflow by its id, or by name and version,
@@ -338,8 +416,22 @@ async fn a_tenant_archives_its_agent_version() {
 async fn a_run_naming_an_archived_workflow_is_refused_with_the_active_version() {
     let repo = Arc::new(InMemoryWorkflowRepository::new());
     let system = TenantId::system();
-    let old = register(&repo, &system, "builtin-flow", "1.0.0", WorkflowScope::Global).await;
-    register(&repo, &system, "builtin-flow", "1.1.0", WorkflowScope::Global).await;
+    let old = register(
+        &repo,
+        &system,
+        "builtin-flow",
+        "1.0.0",
+        WorkflowScope::Global,
+    )
+    .await;
+    register(
+        &repo,
+        &system,
+        "builtin-flow",
+        "1.1.0",
+        WorkflowScope::Global,
+    )
+    .await;
     let use_case = StandardStartWorkflowExecutionUseCase::new(
         repo.clone(),
         Arc::new(InMemoryWorkflowExecutionRepository::new()),
@@ -394,10 +486,27 @@ fn an_archived_agent_refusal_names_the_active_version() {
 async fn a_names_executions_roll_up_every_version() {
     let repo = Arc::new(InMemoryWorkflowRepository::new());
     let system = TenantId::system();
-    let old = register(&repo, &system, "builtin-flow", "1.0.0", WorkflowScope::Global).await;
-    let new = register(&repo, &system, "builtin-flow", "1.1.0", WorkflowScope::Global).await;
+    let old = register(
+        &repo,
+        &system,
+        "builtin-flow",
+        "1.0.0",
+        WorkflowScope::Global,
+    )
+    .await;
+    let new = register(
+        &repo,
+        &system,
+        "builtin-flow",
+        "1.1.0",
+        WorkflowScope::Global,
+    )
+    .await;
 
-    let mut ids = repo.version_ids_visible(&alice(), "builtin-flow").await.unwrap();
+    let mut ids = repo
+        .version_ids_visible(&alice(), "builtin-flow")
+        .await
+        .unwrap();
     ids.sort_by_key(|id| id.0);
     let mut both = vec![old, new];
     both.sort_by_key(|id| id.0);
@@ -405,13 +514,23 @@ async fn a_names_executions_roll_up_every_version() {
 
     let executions = InMemoryWorkflowExecutionRepository::new();
     for id in [old, old, new] {
-        let workflow = repo.find_by_id_for_tenant(&system, id).await.unwrap().unwrap();
+        let workflow = repo
+            .find_by_id_for_tenant(&system, id)
+            .await
+            .unwrap()
+            .unwrap();
         let mut execution = WorkflowExecution::new(&workflow, ExecutionId::new(), json!({}));
         execution.tenant_id = system.clone();
-        executions.save_for_tenant(&system, &execution).await.unwrap();
+        executions
+            .save_for_tenant(&system, &execution)
+            .await
+            .unwrap();
     }
     assert_eq!(
-        executions.count_by_workflows_for_tenant(&system, &ids).await.unwrap(),
+        executions
+            .count_by_workflows_for_tenant(&system, &ids)
+            .await
+            .unwrap(),
         3
     );
 }

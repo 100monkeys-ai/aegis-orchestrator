@@ -11,7 +11,7 @@
 //! See ADR-025 (PostgreSQL Schema Design and Migration Strategy).
 
 use crate::domain::agent::{Agent, AgentId, AgentManifest, AgentScope, AgentStatus};
-use crate::domain::repository::{AgentRepository, RepositoryError};
+use crate::domain::repository::{AgentListing, AgentRepository, RepositoryError, StatusFilter};
 use crate::domain::tenant::TenantId;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -25,6 +25,90 @@ pub struct PostgresAgentRepository {
 impl PostgresAgentRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+}
+
+/// The columns every agent read selects.
+const AGENT_COLUMNS: &str =
+    "id, tenant_id, name, manifest_json, status, scope, created_at, updated_at";
+
+/// An agent from a row of [`AGENT_COLUMNS`].
+fn agent_of_row(row: &sqlx::postgres::PgRow) -> Result<Agent, RepositoryError> {
+    let id: uuid::Uuid = row.get("id");
+    let tenant_str: String = row.get("tenant_id");
+    let tenant_id = TenantId::from_string(&tenant_str)
+        .map_err(|e| RepositoryError::Serialization(format!("Invalid tenant_id in row: {e}")))?;
+    let name: String = row.get("name");
+    let manifest_val: serde_json::Value = row.get("manifest_json");
+    let status_str: String = row.get("status");
+    let scope_str: String = row.get("scope");
+    let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
+    let updated_at: chrono::DateTime<chrono::Utc> = row.get("updated_at");
+    let status = match status_str.as_str() {
+        "paused" => AgentStatus::Paused,
+        "archived" => AgentStatus::Archived,
+        _ => AgentStatus::Active,
+    };
+    let scope = match scope_str.as_str() {
+        "global" => AgentScope::Global,
+        _ => AgentScope::Tenant,
+    };
+    let manifest: AgentManifest = serde_json::from_value(manifest_val).map_err(|e| {
+        RepositoryError::Serialization(format!("Failed to deserialize manifest: {e}"))
+    })?;
+    Ok(Agent {
+        id: AgentId(id),
+        tenant_id,
+        scope,
+        name,
+        manifest,
+        status,
+        created_at,
+        updated_at,
+    })
+}
+
+/// The `agents.status` text of a status.
+fn agent_status_str(status: &AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::Active => "active",
+        AgentStatus::Paused => "paused",
+        AgentStatus::Archived => "archived",
+        AgentStatus::Failed => "active", // Table stores active/paused/archived states only.
+    }
+}
+
+/// The SQL predicate of a status filter on `agents.status`, bound at `$n`:
+/// `active` reads every row not archived, so a paused agent stays listed.
+fn agent_status_predicate(n: usize) -> String {
+    format!(
+        "(${n} = 'all' OR (${n} = 'active' AND status <> 'archived') OR (${n} = 'archived' AND status = 'archived'))"
+    )
+}
+
+impl PostgresAgentRepository {
+    async fn fetch_one(&self, sql: &str, binds: &[&str]) -> Result<Option<Agent>, RepositoryError> {
+        let mut query = sqlx::query(sql);
+        for bind in binds {
+            query = query.bind(*bind);
+        }
+        let row = query
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        row.as_ref().map(agent_of_row).transpose()
+    }
+
+    async fn fetch_all(&self, sql: &str, binds: &[&str]) -> Result<Vec<Agent>, RepositoryError> {
+        let mut query = sqlx::query(sql);
+        for bind in binds {
+            query = query.bind(*bind);
+        }
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        rows.iter().map(agent_of_row).collect()
     }
 }
 
@@ -117,300 +201,165 @@ impl AgentRepository for PostgresAgentRepository {
         Ok(())
     }
 
+    /// Any status: an archived row is read by its id (AEGIS ADR-148, A10).
     async fn find_by_id_for_tenant(
         &self,
         tenant_id: &TenantId,
         id: AgentId,
     ) -> Result<Option<Agent>, RepositoryError> {
-        let row = sqlx::query(
-            r#"
-            SELECT
-                id, name, manifest_json, status, scope, created_at, updated_at
-            FROM agents
-            WHERE tenant_id = $1 AND id = $2
-            "#,
-        )
+        let row = sqlx::query(&format!(
+            "SELECT {AGENT_COLUMNS} FROM agents WHERE tenant_id = $1 AND id = $2"
+        ))
         .bind(tenant_id.as_str())
         .bind(id.0)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        if let Some(row) = row {
-            let id: uuid::Uuid = row.get("id");
-            let name: String = row.get("name");
-            let manifest_val: serde_json::Value = row.get("manifest_json");
-            let status_str: String = row.get("status");
-            let scope_str: String = row.get("scope");
-            let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
-            let updated_at: chrono::DateTime<chrono::Utc> = row.get("updated_at");
-
-            let status = match status_str.as_str() {
-                "active" => AgentStatus::Active,
-                "paused" => AgentStatus::Paused,
-                "archived" => AgentStatus::Archived,
-                _ => AgentStatus::Active,
-            };
-
-            let scope = match scope_str.as_str() {
-                "global" => AgentScope::Global,
-                _ => AgentScope::Tenant,
-            };
-
-            let manifest: AgentManifest = serde_json::from_value(manifest_val).map_err(|e| {
-                RepositoryError::Serialization(format!("Failed to deserialize manifest: {e}"))
-            })?;
-
-            Ok(Some(Agent {
-                id: AgentId(id),
-                tenant_id: tenant_id.clone(),
-                scope,
-                name,
-                manifest,
-                status,
-                created_at,
-                updated_at,
-            }))
-        } else {
-            Ok(None)
-        }
+        row.as_ref().map(agent_of_row).transpose()
     }
 
+    /// The newest live row of the name by `created_at`, never by version
+    /// text (AEGIS ADR-148).
     async fn find_by_name_for_tenant(
         &self,
         tenant_id: &TenantId,
         name: &str,
     ) -> Result<Option<Agent>, RepositoryError> {
-        let row = sqlx::query(
-            r#"
-            SELECT
-                id, name, manifest_json, status, scope, created_at, updated_at
-            FROM agents
-            WHERE tenant_id = $1 AND name = $2
-            ORDER BY version DESC
-            LIMIT 1
-            "#,
+        self.fetch_one(
+            &format!(
+                r#"
+                SELECT {AGENT_COLUMNS}
+                FROM agents
+                WHERE tenant_id = $1 AND name = $2 AND status <> 'archived'
+                ORDER BY created_at DESC
+                LIMIT 1
+                "#
+            ),
+            &[tenant_id.as_str(), name],
         )
-        .bind(tenant_id.as_str())
-        .bind(name)
-        .fetch_optional(&self.pool)
         .await
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        if let Some(row) = row {
-            let id: uuid::Uuid = row.get("id");
-            let name: String = row.get("name");
-            let manifest_val: serde_json::Value = row.get("manifest_json");
-            let status_str: String = row.get("status");
-            let scope_str: String = row.get("scope");
-            let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
-            let updated_at: chrono::DateTime<chrono::Utc> = row.get("updated_at");
-
-            let status = match status_str.as_str() {
-                "active" => AgentStatus::Active,
-                "paused" => AgentStatus::Paused,
-                "archived" => AgentStatus::Archived,
-                _ => AgentStatus::Active,
-            };
-
-            let scope = match scope_str.as_str() {
-                "global" => AgentScope::Global,
-                _ => AgentScope::Tenant,
-            };
-
-            let manifest: AgentManifest = serde_json::from_value(manifest_val).map_err(|e| {
-                RepositoryError::Serialization(format!("Failed to deserialize manifest: {e}"))
-            })?;
-
-            Ok(Some(Agent {
-                id: AgentId(id),
-                tenant_id: tenant_id.clone(),
-                scope,
-                name,
-                manifest,
-                status,
-                created_at,
-                updated_at,
-            }))
-        } else {
-            Ok(None)
-        }
     }
 
+    /// Any status: a version named exactly is read even when archived.
     async fn find_by_name_and_version_for_tenant(
         &self,
         tenant_id: &TenantId,
         name: &str,
         version: &str,
     ) -> Result<Option<Agent>, RepositoryError> {
-        let row = sqlx::query(
-            r#"
-            SELECT
-                id, name, manifest_json, status, scope, created_at, updated_at
-            FROM agents
-            WHERE tenant_id = $1 AND name = $2 AND version = $3
-            "#,
+        self.fetch_one(
+            &format!(
+                r#"
+                SELECT {AGENT_COLUMNS}
+                FROM agents
+                WHERE tenant_id = $1 AND name = $2 AND version = $3
+                ORDER BY created_at DESC
+                LIMIT 1
+                "#
+            ),
+            &[tenant_id.as_str(), name, version],
         )
-        .bind(tenant_id.as_str())
-        .bind(name)
-        .bind(version)
-        .fetch_optional(&self.pool)
         .await
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        if let Some(row) = row {
-            let id: uuid::Uuid = row.get("id");
-            let name: String = row.get("name");
-            let manifest_val: serde_json::Value = row.get("manifest_json");
-            let status_str: String = row.get("status");
-            let scope_str: String = row.get("scope");
-            let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
-            let updated_at: chrono::DateTime<chrono::Utc> = row.get("updated_at");
-
-            let status = match status_str.as_str() {
-                "active" => AgentStatus::Active,
-                "paused" => AgentStatus::Paused,
-                "archived" => AgentStatus::Archived,
-                _ => AgentStatus::Active,
-            };
-
-            let scope = match scope_str.as_str() {
-                "global" => AgentScope::Global,
-                _ => AgentScope::Tenant,
-            };
-
-            let manifest: AgentManifest = serde_json::from_value(manifest_val).map_err(|e| {
-                RepositoryError::Serialization(format!("Failed to deserialize manifest: {e}"))
-            })?;
-
-            Ok(Some(Agent {
-                id: AgentId(id),
-                tenant_id: tenant_id.clone(),
-                scope,
-                name,
-                manifest,
-                status,
-                created_at,
-                updated_at,
-            }))
-        } else {
-            Ok(None)
-        }
     }
 
     async fn list_all_for_tenant(
         &self,
         tenant_id: &TenantId,
     ) -> Result<Vec<Agent>, RepositoryError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                id, name, manifest_json, status, scope, created_at, updated_at
-            FROM agents
-            WHERE tenant_id = $1
-            ORDER BY name ASC
-            "#,
-        )
-        .bind(tenant_id.as_str())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let mut agents = Vec::new();
-        for row in rows {
-            let id: uuid::Uuid = row.get("id");
-            let name: String = row.get("name");
-            let manifest_val: serde_json::Value = row.get("manifest_json");
-            let status_str: String = row.get("status");
-            let scope_str: String = row.get("scope");
-            let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
-            let updated_at: chrono::DateTime<chrono::Utc> = row.get("updated_at");
-
-            let status = match status_str.as_str() {
-                "active" => AgentStatus::Active,
-                "paused" => AgentStatus::Paused,
-                "archived" => AgentStatus::Archived,
-                _ => AgentStatus::Active,
-            };
-
-            let scope = match scope_str.as_str() {
-                "global" => AgentScope::Global,
-                _ => AgentScope::Tenant,
-            };
-
-            let manifest: AgentManifest = serde_json::from_value(manifest_val).map_err(|e| {
-                RepositoryError::Serialization(format!("Failed to deserialize manifest: {e}"))
-            })?;
-
-            agents.push(Agent {
-                id: AgentId(id),
-                tenant_id: tenant_id.clone(),
-                scope,
-                name,
-                manifest,
-                status,
-                created_at,
-                updated_at,
-            });
-        }
-        Ok(agents)
+        self.list_by_status(AgentListing::Tenant(tenant_id), StatusFilter::Active)
+            .await
     }
 
     async fn list_all(&self) -> Result<Vec<Agent>, RepositoryError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                id, tenant_id, name, manifest_json, status, scope, created_at, updated_at
-            FROM agents
-            ORDER BY tenant_id ASC, name ASC
-            "#,
+        self.list_by_status(AgentListing::All, StatusFilter::Active)
+            .await
+    }
+
+    async fn list_by_name_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+    ) -> Result<Vec<Agent>, RepositoryError> {
+        self.fetch_all(
+            &format!(
+                r#"
+                SELECT {AGENT_COLUMNS}
+                FROM agents
+                WHERE tenant_id = $1 AND name = $2
+                ORDER BY created_at DESC
+                "#
+            ),
+            &[tenant_id.as_str(), name],
         )
-        .fetch_all(&self.pool)
         .await
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+    }
 
-        let mut agents = Vec::new();
-        for row in rows {
-            let id: uuid::Uuid = row.get("id");
-            let tenant_str: String = row.get("tenant_id");
-            let tenant_id = TenantId::from_string(&tenant_str).map_err(|e| {
-                RepositoryError::Serialization(format!("Invalid tenant_id in row: {e}"))
-            })?;
-            let name: String = row.get("name");
-            let manifest_val: serde_json::Value = row.get("manifest_json");
-            let status_str: String = row.get("status");
-            let scope_str: String = row.get("scope");
-            let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
-            let updated_at: chrono::DateTime<chrono::Utc> = row.get("updated_at");
-
-            let status = match status_str.as_str() {
-                "active" => AgentStatus::Active,
-                "paused" => AgentStatus::Paused,
-                "archived" => AgentStatus::Archived,
-                _ => AgentStatus::Active,
-            };
-
-            let scope = match scope_str.as_str() {
-                "global" => AgentScope::Global,
-                _ => AgentScope::Tenant,
-            };
-
-            let manifest: AgentManifest = serde_json::from_value(manifest_val).map_err(|e| {
-                RepositoryError::Serialization(format!("Failed to deserialize manifest: {e}"))
-            })?;
-
-            agents.push(Agent {
-                id: AgentId(id),
-                tenant_id,
-                scope,
-                name,
-                manifest,
-                status,
-                created_at,
-                updated_at,
-            });
+    async fn list_by_status(
+        &self,
+        listing: AgentListing<'_>,
+        filter: StatusFilter,
+    ) -> Result<Vec<Agent>, RepositoryError> {
+        let status = filter.as_db_str();
+        match listing {
+            AgentListing::All => {
+                self.fetch_all(
+                    &format!(
+                        "SELECT {AGENT_COLUMNS} FROM agents WHERE {} \
+                         ORDER BY tenant_id ASC, name ASC, created_at DESC",
+                        agent_status_predicate(1)
+                    ),
+                    &[status],
+                )
+                .await
+            }
+            AgentListing::Tenant(tenant_id) => {
+                self.fetch_all(
+                    &format!(
+                        "SELECT {AGENT_COLUMNS} FROM agents WHERE tenant_id = $1 AND {} \
+                         ORDER BY name ASC, created_at DESC",
+                        agent_status_predicate(2)
+                    ),
+                    &[tenant_id.as_str(), status],
+                )
+                .await
+            }
+            AgentListing::Visible(tenant_id) => {
+                self.fetch_all(
+                    &format!(
+                        "SELECT {AGENT_COLUMNS} FROM agents \
+                         WHERE (tenant_id = $1 OR (scope = 'global' AND tenant_id = 'aegis-system')) \
+                         AND {} ORDER BY name ASC, created_at DESC",
+                        agent_status_predicate(2)
+                    ),
+                    &[tenant_id.as_str(), status],
+                )
+                .await
+            }
         }
-        Ok(agents)
+    }
+
+    async fn set_status_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: AgentId,
+        status: AgentStatus,
+    ) -> Result<(), RepositoryError> {
+        let result = sqlx::query(
+            "UPDATE agents SET status = $3, updated_at = NOW() WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id.as_str())
+        .bind(id.0)
+        .bind(agent_status_str(&status))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(format!("Failed to set agent status: {e}")))?;
+        if result.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound(format!(
+                "Agent {} not found",
+                id.0
+            )));
+        }
+        Ok(())
     }
 
     async fn delete_for_tenant(
@@ -467,62 +416,8 @@ impl AgentRepository for PostgresAgentRepository {
         &self,
         tenant_id: &TenantId,
     ) -> Result<Vec<Agent>, RepositoryError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                id, name, manifest_json, status, scope, tenant_id,
-                created_at, updated_at
-            FROM agents
-            WHERE tenant_id = $1
-               OR (scope = 'global' AND tenant_id = 'aegis-system')
-            ORDER BY name ASC
-            "#,
-        )
-        .bind(tenant_id.as_str())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let mut agents = Vec::new();
-        for row in rows {
-            let id: uuid::Uuid = row.get("id");
-            let name: String = row.get("name");
-            let manifest_val: serde_json::Value = row.get("manifest_json");
-            let status_str: String = row.get("status");
-            let scope_str: String = row.get("scope");
-            let row_tenant_id: String = row.get("tenant_id");
-            let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
-            let updated_at: chrono::DateTime<chrono::Utc> = row.get("updated_at");
-
-            let status = match status_str.as_str() {
-                "active" => AgentStatus::Active,
-                "paused" => AgentStatus::Paused,
-                "archived" => AgentStatus::Archived,
-                _ => AgentStatus::Active,
-            };
-
-            let scope = match scope_str.as_str() {
-                "global" => AgentScope::Global,
-                _ => AgentScope::Tenant,
-            };
-
-            let manifest: AgentManifest = serde_json::from_value(manifest_val).map_err(|e| {
-                RepositoryError::Serialization(format!("Failed to deserialize manifest: {e}"))
-            })?;
-
-            agents.push(Agent {
-                id: AgentId(id),
-                tenant_id: TenantId::from_realm_slug(&row_tenant_id)
-                    .unwrap_or_else(|_| tenant_id.clone()),
-                scope,
-                name,
-                manifest,
-                status,
-                created_at,
-                updated_at,
-            });
-        }
-        Ok(agents)
+        self.list_by_status(AgentListing::Visible(tenant_id), StatusFilter::Active)
+            .await
     }
 
     async fn update_scope(
@@ -577,69 +472,27 @@ impl AgentRepository for PostgresAgentRepository {
         Ok(count.max(0) as u64)
     }
 
+    /// The live row of the name: the tenant's before a global one, newest by
+    /// `created_at` (AEGIS ADR-148).
     async fn resolve_by_name(
         &self,
         tenant_id: &TenantId,
         name: &str,
     ) -> Result<Option<Agent>, RepositoryError> {
-        let row = sqlx::query(
-            r#"
-            SELECT
-                id, name, manifest_json, status, scope, tenant_id,
-                created_at, updated_at
-            FROM agents
-            WHERE name = $2
-              AND ((scope = 'tenant' AND tenant_id = $1)
-                OR (scope = 'global' AND tenant_id = 'aegis-system'))
-            ORDER BY CASE WHEN scope='tenant' THEN 0 ELSE 1 END
-            LIMIT 1
-            "#,
+        self.fetch_one(
+            &format!(
+                r#"
+                SELECT {AGENT_COLUMNS}
+                FROM agents
+                WHERE name = $2 AND status <> 'archived'
+                  AND ((scope = 'tenant' AND tenant_id = $1)
+                    OR (scope = 'global' AND tenant_id = 'aegis-system'))
+                ORDER BY CASE WHEN scope='tenant' THEN 0 ELSE 1 END, created_at DESC
+                LIMIT 1
+                "#
+            ),
+            &[tenant_id.as_str(), name],
         )
-        .bind(tenant_id.as_str())
-        .bind(name)
-        .fetch_optional(&self.pool)
         .await
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        if let Some(row) = row {
-            let id: uuid::Uuid = row.get("id");
-            let name: String = row.get("name");
-            let manifest_val: serde_json::Value = row.get("manifest_json");
-            let status_str: String = row.get("status");
-            let scope_str: String = row.get("scope");
-            let row_tenant_id: String = row.get("tenant_id");
-            let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
-            let updated_at: chrono::DateTime<chrono::Utc> = row.get("updated_at");
-
-            let status = match status_str.as_str() {
-                "active" => AgentStatus::Active,
-                "paused" => AgentStatus::Paused,
-                "archived" => AgentStatus::Archived,
-                _ => AgentStatus::Active,
-            };
-
-            let scope = match scope_str.as_str() {
-                "global" => AgentScope::Global,
-                _ => AgentScope::Tenant,
-            };
-
-            let manifest: AgentManifest = serde_json::from_value(manifest_val).map_err(|e| {
-                RepositoryError::Serialization(format!("Failed to deserialize manifest: {e}"))
-            })?;
-
-            Ok(Some(Agent {
-                id: AgentId(id),
-                tenant_id: TenantId::from_realm_slug(&row_tenant_id)
-                    .unwrap_or_else(|_| tenant_id.clone()),
-                scope,
-                name,
-                manifest,
-                status,
-                created_at,
-                updated_at,
-            }))
-        } else {
-            Ok(None)
-        }
     }
 }

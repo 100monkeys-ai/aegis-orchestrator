@@ -43,9 +43,11 @@
 //! let workflow = repo.find_by_id(workflow_id).await?;
 //! ```
 
-use crate::domain::repository::{RepositoryError, WorkflowRepository};
+use crate::domain::repository::{
+    RepositoryError, StatusFilter, WorkflowListing, WorkflowRepository,
+};
 use crate::domain::tenant::TenantId;
-use crate::domain::workflow::{Workflow, WorkflowId, WorkflowScope};
+use crate::domain::workflow::{Workflow, WorkflowId, WorkflowScope, WorkflowStatus};
 use crate::infrastructure::workflow_parser::WorkflowParser;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -95,6 +97,65 @@ impl PostgresWorkflowRepository {
             let _ = write!(hex_string, "{byte:02x}");
         }
         hex_string
+    }
+}
+
+/// The columns every workflow read selects: the aggregate's JSON, and the
+/// columns that win over it (AEGIS ADR-148: `status` is the
+/// column's, never the JSON's).
+const WORKFLOW_COLUMNS: &str = "domain_json, updated_at, status";
+
+/// A workflow from a row of [`WORKFLOW_COLUMNS`].
+fn workflow_of_row(row: &sqlx::postgres::PgRow) -> Result<Workflow, RepositoryError> {
+    let domain_json: serde_json::Value = row
+        .try_get("domain_json")
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+    let workflow: Workflow = serde_json::from_value(domain_json)
+        .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
+    let updated_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("updated_at").ok();
+    let status = row
+        .try_get::<String, _>("status")
+        .ok()
+        .and_then(|s| WorkflowStatus::from_db_str(&s))
+        .unwrap_or_default();
+    Ok(Workflow {
+        updated_at,
+        status,
+        ..workflow
+    })
+}
+
+fn workflows_of_rows(rows: &[sqlx::postgres::PgRow]) -> Result<Vec<Workflow>, RepositoryError> {
+    rows.iter().map(workflow_of_row).collect()
+}
+
+impl PostgresWorkflowRepository {
+    async fn fetch_one(
+        &self,
+        sql: &str,
+        binds: &[&str],
+    ) -> Result<Option<Workflow>, RepositoryError> {
+        let mut query = sqlx::query(sql);
+        for bind in binds {
+            query = query.bind(*bind);
+        }
+        let row = query
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        row.as_ref().map(workflow_of_row).transpose()
+    }
+
+    async fn fetch_all(&self, sql: &str, binds: &[&str]) -> Result<Vec<Workflow>, RepositoryError> {
+        let mut query = sqlx::query(sql);
+        for bind in binds {
+            query = query.bind(*bind);
+        }
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        workflows_of_rows(&rows)
     }
 }
 
@@ -154,17 +215,47 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         let description = workflow.metadata.description.clone();
 
         let scope_str = workflow.scope.as_db_str();
+        let status_str = workflow.status.as_db_str();
+
+        let mut tx =
+            self.pool.begin().await.map_err(|e| {
+                RepositoryError::Database(format!("Failed to begin transaction: {e}"))
+            })?;
+
+        // The builtin status ADR, A9: a global name keeps one active row. An
+        // active global row saved here archives the name's other active
+        // global rows first, in the same transaction, so the partial unique
+        // index `idx_workflows_one_active_global` holds throughout.
+        if workflow.scope == WorkflowScope::Global && workflow.status == WorkflowStatus::Active {
+            sqlx::query(
+                r#"
+                UPDATE workflows
+                SET status = 'archived', updated_at = NOW()
+                WHERE tenant_id = $1 AND name = $2 AND scope = 'global'
+                  AND status = 'active' AND id <> $3
+                "#,
+            )
+            .bind(tenant_id.as_str())
+            .bind(&workflow.metadata.name)
+            .bind(persisted_workflow.id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                RepositoryError::Database(format!("Failed to archive older global rows: {e}"))
+            })?;
+        }
 
         sqlx::query(
             r#"
-            INSERT INTO workflows (id, tenant_id, name, version, scope, description, yaml_source, domain_json, temporal_def_json, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+            INSERT INTO workflows (id, tenant_id, name, version, scope, description, yaml_source, domain_json, temporal_def_json, status, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
             ON CONFLICT (id) DO UPDATE SET
                 description = EXCLUDED.description,
                 yaml_source = EXCLUDED.yaml_source,
                 domain_json = EXCLUDED.domain_json,
                 temporal_def_json = EXCLUDED.temporal_def_json,
                 scope = EXCLUDED.scope,
+                status = EXCLUDED.status,
                 updated_at = NOW()
             "#
         )
@@ -177,7 +268,8 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         .bind(yaml_source)
         .bind(&definition_json)
         .bind(&temporal_def_json)
-        .execute(&self.pool)
+        .bind(status_str)
+        .execute(&mut *tx)
         .await
         .map_err(|e| RepositoryError::Database(format!("Failed to save to workflows: {e}")))?;
 
@@ -203,376 +295,290 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         .bind(scope_str)
         .bind(&temporal_def_json)
         .bind(def_hash)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| RepositoryError::Database(format!("Failed to save to workflow_definitions: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| RepositoryError::Database(format!("Failed to commit workflow: {e}")))?;
 
         Ok(())
     }
 
+    /// Any status: an archived row is read by its id (A10).
     async fn find_by_id_for_tenant(
         &self,
         tenant_id: &TenantId,
         id: WorkflowId,
     ) -> Result<Option<Workflow>, RepositoryError> {
-        let row = sqlx::query(
+        let row = sqlx::query(&format!(
             r#"
-            SELECT domain_json, updated_at
+            SELECT {WORKFLOW_COLUMNS}
             FROM workflows
             WHERE id = $2
               AND (tenant_id = $1 OR (scope = 'global' AND tenant_id = 'aegis-system'))
             ORDER BY CASE WHEN tenant_id = $1 THEN 0 ELSE 1 END
             LIMIT 1
-            "#,
-        )
+            "#
+        ))
         .bind(tenant_id.as_str())
         .bind(id.0)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        if let Some(row) = row {
-            let domain_json: serde_json::Value = row
-                .try_get("domain_json")
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            let workflow: Workflow = serde_json::from_value(domain_json)
-                .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-            let updated_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("updated_at").ok();
-            Ok(Some(Workflow {
-                updated_at,
-                ..workflow
-            }))
-        } else {
-            Ok(None)
-        }
+        row.as_ref().map(workflow_of_row).transpose()
     }
 
+    /// The newest active row of the name, the tenant's before a global one;
+    /// newest by `created_at`, never by version text.
     async fn find_by_name_for_tenant(
         &self,
         tenant_id: &TenantId,
         name: &str,
     ) -> Result<Option<Workflow>, RepositoryError> {
-        let row = sqlx::query(
-            r#"
-            SELECT domain_json, updated_at
-            FROM workflows
-            WHERE name = $2
-              AND (tenant_id = $1 OR (scope = 'global' AND tenant_id = 'aegis-system'))
-            ORDER BY
-              CASE WHEN tenant_id = $1 THEN 0 ELSE 1 END,
-              version DESC
-            LIMIT 1
-            "#,
+        self.fetch_one(
+            &format!(
+                r#"
+                SELECT {WORKFLOW_COLUMNS}
+                FROM workflows
+                WHERE name = $2 AND status = 'active'
+                  AND (tenant_id = $1 OR (scope = 'global' AND tenant_id = 'aegis-system'))
+                ORDER BY
+                  CASE WHEN tenant_id = $1 THEN 0 ELSE 1 END,
+                  created_at DESC
+                LIMIT 1
+                "#
+            ),
+            &[tenant_id.as_str(), name],
         )
-        .bind(tenant_id.as_str())
-        .bind(name)
-        .fetch_optional(&self.pool)
         .await
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        if let Some(row) = row {
-            let domain_json: serde_json::Value = row
-                .try_get("domain_json")
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            let workflow: Workflow = serde_json::from_value(domain_json)
-                .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-            let updated_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("updated_at").ok();
-            Ok(Some(Workflow {
-                updated_at,
-                ..workflow
-            }))
-        } else {
-            Ok(None)
-        }
     }
 
+    /// Any status: a version named exactly is read even when archived, and
+    /// a run of it is refused by the start (A10).
     async fn find_by_name_and_version_for_tenant(
         &self,
         tenant_id: &TenantId,
         name: &str,
         version: &str,
     ) -> Result<Option<Workflow>, RepositoryError> {
-        let row = sqlx::query(
-            r#"
-            SELECT domain_json, updated_at
-            FROM workflows
-            WHERE name = $2 AND version = $3
-              AND (tenant_id = $1 OR (scope = 'global' AND tenant_id = 'aegis-system'))
-            ORDER BY CASE WHEN tenant_id = $1 THEN 0 ELSE 1 END
-            LIMIT 1
-            "#,
+        self.fetch_one(
+            &format!(
+                r#"
+                SELECT {WORKFLOW_COLUMNS}
+                FROM workflows
+                WHERE name = $2 AND version = $3
+                  AND (tenant_id = $1 OR (scope = 'global' AND tenant_id = 'aegis-system'))
+                ORDER BY CASE WHEN tenant_id = $1 THEN 0 ELSE 1 END
+                LIMIT 1
+                "#
+            ),
+            &[tenant_id.as_str(), name, version],
         )
-        .bind(tenant_id.as_str())
-        .bind(name)
-        .bind(version)
-        .fetch_optional(&self.pool)
         .await
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        if let Some(row) = row {
-            let domain_json: serde_json::Value = row
-                .try_get("domain_json")
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            let workflow: Workflow = serde_json::from_value(domain_json)
-                .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-            let updated_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("updated_at").ok();
-            Ok(Some(Workflow {
-                updated_at,
-                ..workflow
-            }))
-        } else {
-            Ok(None)
-        }
     }
 
+    /// Every version of the name, any status, newest first.
     async fn list_by_name_for_tenant(
         &self,
         tenant_id: &TenantId,
         name: &str,
     ) -> Result<Vec<Workflow>, RepositoryError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT domain_json, updated_at
-            FROM workflows
-            WHERE name = $2
-              AND (tenant_id = $1 OR (scope = 'global' AND tenant_id = 'aegis-system'))
-            ORDER BY updated_at DESC
-            "#,
+        self.fetch_all(
+            &format!(
+                r#"
+                SELECT {WORKFLOW_COLUMNS}
+                FROM workflows
+                WHERE name = $2
+                  AND (tenant_id = $1 OR (scope = 'global' AND tenant_id = 'aegis-system'))
+                ORDER BY created_at DESC
+                "#
+            ),
+            &[tenant_id.as_str(), name],
         )
-        .bind(tenant_id.as_str())
-        .bind(name)
-        .fetch_all(&self.pool)
         .await
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let mut workflows = Vec::new();
-        for row in rows {
-            let domain_json: serde_json::Value = row
-                .try_get("domain_json")
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            let workflow: Workflow = serde_json::from_value(domain_json)
-                .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-            let updated_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("updated_at").ok();
-            workflows.push(Workflow {
-                updated_at,
-                ..workflow
-            });
-        }
-        Ok(workflows)
     }
 
     async fn list_all_for_tenant(
         &self,
         tenant_id: &TenantId,
     ) -> Result<Vec<Workflow>, RepositoryError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT domain_json, updated_at
-            FROM workflows
-            WHERE tenant_id = $1
-            ORDER BY name ASC
-            "#,
-        )
-        .bind(tenant_id.as_str())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let mut workflows = Vec::new();
-        for row in rows {
-            let domain_json: serde_json::Value = row
-                .try_get("domain_json")
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            let workflow: Workflow = serde_json::from_value(domain_json)
-                .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-            let updated_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("updated_at").ok();
-            workflows.push(Workflow {
-                updated_at,
-                ..workflow
-            });
-        }
-        Ok(workflows)
+        self.list_by_status(WorkflowListing::Tenant(tenant_id), StatusFilter::Active)
+            .await
     }
 
     async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT domain_json, updated_at
-            FROM workflows
-            ORDER BY tenant_id ASC, name ASC
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let mut workflows = Vec::new();
-        for row in rows {
-            let domain_json: serde_json::Value = row
-                .try_get("domain_json")
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            let workflow: Workflow = serde_json::from_value(domain_json)
-                .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-            let updated_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("updated_at").ok();
-            workflows.push(Workflow {
-                updated_at,
-                ..workflow
-            });
-        }
-        Ok(workflows)
+        self.list_by_status(WorkflowListing::All, StatusFilter::Active)
+            .await
     }
 
+    async fn list_by_status(
+        &self,
+        listing: WorkflowListing<'_>,
+        filter: StatusFilter,
+    ) -> Result<Vec<Workflow>, RepositoryError> {
+        let status = filter.as_db_str();
+        match listing {
+            WorkflowListing::All => {
+                self.fetch_all(
+                    &format!(
+                        r#"
+                        SELECT {WORKFLOW_COLUMNS}
+                        FROM workflows
+                        WHERE ($1 = 'all' OR status = $1)
+                        ORDER BY tenant_id ASC, name ASC, created_at DESC
+                        "#
+                    ),
+                    &[status],
+                )
+                .await
+            }
+            WorkflowListing::Global => {
+                self.fetch_all(
+                    &format!(
+                        r#"
+                        SELECT {WORKFLOW_COLUMNS}
+                        FROM workflows
+                        WHERE scope = 'global' AND ($1 = 'all' OR status = $1)
+                        ORDER BY name ASC, created_at DESC
+                        "#
+                    ),
+                    &[status],
+                )
+                .await
+            }
+            WorkflowListing::Visible(tenant_id) => {
+                self.fetch_all(
+                    &format!(
+                        r#"
+                        SELECT {WORKFLOW_COLUMNS}
+                        FROM workflows
+                        WHERE ((tenant_id = $1)
+                               OR (scope = 'global' AND tenant_id = 'aegis-system'))
+                          AND ($2 = 'all' OR status = $2)
+                        ORDER BY name ASC, created_at DESC
+                        "#
+                    ),
+                    &[tenant_id.as_str(), status],
+                )
+                .await
+            }
+            WorkflowListing::Tenant(tenant_id) => {
+                self.fetch_all(
+                    &format!(
+                        r#"
+                        SELECT {WORKFLOW_COLUMNS}
+                        FROM workflows
+                        WHERE tenant_id = $1 AND ($2 = 'all' OR status = $2)
+                        ORDER BY name ASC, created_at DESC
+                        "#
+                    ),
+                    &[tenant_id.as_str(), status],
+                )
+                .await
+            }
+        }
+    }
+
+    async fn set_status_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: WorkflowId,
+        status: WorkflowStatus,
+    ) -> Result<(), RepositoryError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE workflows
+            SET status = $3, updated_at = NOW()
+            WHERE tenant_id = $1 AND id = $2
+            "#,
+        )
+        .bind(tenant_id.as_str())
+        .bind(id.0)
+        .bind(status.as_db_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(format!("Failed to set workflow status: {e}")))?;
+        if result.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound(format!(
+                "Workflow {} not found",
+                id.0
+            )));
+        }
+        Ok(())
+    }
+
+    /// The live row of the name: active, the tenant's before a global one,
+    /// newest by `created_at`.
     async fn resolve_by_name(
         &self,
         tenant_id: &TenantId,
         name: &str,
     ) -> Result<Option<Workflow>, RepositoryError> {
         // Two-level scope resolution: tenant (0) > global (1)
-        let row = sqlx::query(
-            r#"
-            SELECT domain_json, updated_at
-            FROM workflows
-            WHERE name = $1
-              AND (
-                  (scope = 'tenant' AND tenant_id = $2)
-                  OR (scope = 'global' AND tenant_id = 'aegis-system')
-              )
-            ORDER BY
-                CASE scope
-                    WHEN 'tenant' THEN 0
-                    WHEN 'global' THEN 1
-                END,
-                version DESC
-            LIMIT 1
-            "#,
+        self.fetch_one(
+            &format!(
+                r#"
+                SELECT {WORKFLOW_COLUMNS}
+                FROM workflows
+                WHERE name = $1 AND status = 'active'
+                  AND (
+                      (scope = 'tenant' AND tenant_id = $2)
+                      OR (scope = 'global' AND tenant_id = 'aegis-system')
+                  )
+                ORDER BY
+                    CASE scope
+                        WHEN 'tenant' THEN 0
+                        WHEN 'global' THEN 1
+                    END,
+                    created_at DESC
+                LIMIT 1
+                "#
+            ),
+            &[name, tenant_id.as_str()],
         )
-        .bind(name)
-        .bind(tenant_id.as_str())
-        .fetch_optional(&self.pool)
         .await
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        if let Some(row) = row {
-            let domain_json: serde_json::Value = row
-                .try_get("domain_json")
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            let workflow: Workflow = serde_json::from_value(domain_json)
-                .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-            let updated_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("updated_at").ok();
-            Ok(Some(Workflow {
-                updated_at,
-                ..workflow
-            }))
-        } else {
-            Ok(None)
-        }
     }
 
+    /// Any status: the start refuses an archived version named exactly (A10).
     async fn resolve_by_name_and_version(
         &self,
         tenant_id: &TenantId,
         name: &str,
         version: &str,
     ) -> Result<Option<Workflow>, RepositoryError> {
-        let row = sqlx::query(
-            r#"
-            SELECT domain_json, updated_at
-            FROM workflows
-            WHERE name = $1 AND version = $2
-              AND (
-                  (scope = 'tenant' AND tenant_id = $3)
-                  OR (scope = 'global' AND tenant_id = 'aegis-system')
-              )
-            ORDER BY
-                CASE scope
-                    WHEN 'tenant' THEN 0
-                    WHEN 'global' THEN 1
-                END
-            LIMIT 1
-            "#,
+        self.fetch_one(
+            &format!(
+                r#"
+                SELECT {WORKFLOW_COLUMNS}
+                FROM workflows
+                WHERE name = $1 AND version = $2
+                  AND (
+                      (scope = 'tenant' AND tenant_id = $3)
+                      OR (scope = 'global' AND tenant_id = 'aegis-system')
+                  )
+                ORDER BY
+                    CASE scope
+                        WHEN 'tenant' THEN 0
+                        WHEN 'global' THEN 1
+                    END
+                LIMIT 1
+                "#
+            ),
+            &[name, version, tenant_id.as_str()],
         )
-        .bind(name)
-        .bind(version)
-        .bind(tenant_id.as_str())
-        .fetch_optional(&self.pool)
         .await
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        if let Some(row) = row {
-            let domain_json: serde_json::Value = row
-                .try_get("domain_json")
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            let workflow: Workflow = serde_json::from_value(domain_json)
-                .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-            let updated_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("updated_at").ok();
-            Ok(Some(Workflow {
-                updated_at,
-                ..workflow
-            }))
-        } else {
-            Ok(None)
-        }
     }
 
     async fn list_visible(&self, tenant_id: &TenantId) -> Result<Vec<Workflow>, RepositoryError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT domain_json, updated_at
-            FROM workflows
-            WHERE
-                (tenant_id = $1)
-                OR (scope = 'global' AND tenant_id = 'aegis-system')
-            ORDER BY name ASC, version DESC
-            "#,
-        )
-        .bind(tenant_id.as_str())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let mut workflows = Vec::new();
-        for row in rows {
-            let domain_json: serde_json::Value = row
-                .try_get("domain_json")
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            let workflow: Workflow = serde_json::from_value(domain_json)
-                .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-            let updated_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("updated_at").ok();
-            workflows.push(Workflow {
-                updated_at,
-                ..workflow
-            });
-        }
-        Ok(workflows)
+        self.list_by_status(WorkflowListing::Visible(tenant_id), StatusFilter::Active)
+            .await
     }
 
     async fn list_global(&self) -> Result<Vec<Workflow>, RepositoryError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT domain_json, updated_at
-            FROM workflows
-            WHERE scope = 'global'
-            ORDER BY name ASC, version DESC
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let mut workflows = Vec::new();
-        for row in rows {
-            let domain_json: serde_json::Value = row
-                .try_get("domain_json")
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            let workflow: Workflow = serde_json::from_value(domain_json)
-                .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-            let updated_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("updated_at").ok();
-            workflows.push(Workflow {
-                updated_at,
-                ..workflow
-            });
-        }
-        Ok(workflows)
+        self.list_by_status(WorkflowListing::Global, StatusFilter::Active)
+            .await
     }
 
     async fn update_scope(
@@ -587,6 +593,28 @@ impl WorkflowRepository for PostgresWorkflowRepository {
             self.pool.begin().await.map_err(|e| {
                 RepositoryError::Database(format!("Failed to begin transaction: {e}"))
             })?;
+
+        // AEGIS ADR-148, A9: a row promoted to global while active becomes
+        // its name's one active global row; the name's other active global
+        // rows are archived first, in the same transaction.
+        if new_scope == WorkflowScope::Global {
+            sqlx::query(
+                r#"
+                UPDATE workflows
+                SET status = 'archived', updated_at = NOW()
+                WHERE tenant_id = $1 AND scope = 'global' AND status = 'active'
+                  AND id <> $2
+                  AND name = (SELECT name FROM workflows WHERE id = $2 AND status = 'active')
+                "#,
+            )
+            .bind(new_tenant_id.as_str())
+            .bind(id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                RepositoryError::Database(format!("Failed to archive older global rows: {e}"))
+            })?;
+        }
 
         sqlx::query(
             r#"

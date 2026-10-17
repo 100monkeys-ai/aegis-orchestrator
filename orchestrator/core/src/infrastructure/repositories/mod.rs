@@ -77,14 +77,16 @@ pub use postgres_team::{PgMembershipRepository, PgTeamInvitationRepository, PgTe
 pub mod postgres_workflow;
 pub mod postgres_workflow_execution;
 
+use crate::domain::agent::AgentStatus;
 use crate::domain::agent::{Agent, AgentId, AgentScope};
 use crate::domain::execution::{Execution, ExecutionId};
+use crate::domain::repository::{AgentListing, StatusFilter, WorkflowListing};
 use crate::domain::repository::{
     AgentRepository, ExecutionRepository, RepositoryError, StorageEventRepository,
     WorkflowRepository,
 };
 use crate::domain::tenant::TenantId;
-use crate::domain::workflow::{Workflow, WorkflowId, WorkflowScope};
+use crate::domain::workflow::{Workflow, WorkflowId, WorkflowScope, WorkflowStatus};
 use async_trait::async_trait;
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -141,17 +143,14 @@ impl AgentRepository for InMemoryAgentRepository {
         tenant_id: &TenantId,
         name: &str,
     ) -> Result<Option<Agent>, RepositoryError> {
+        // AEGIS ADR-148: the newest live row of the name by `created_at`,
+        // never the greatest version text.
         let agents = self.agents.read().unwrap();
         Ok(agents.get(tenant_id).and_then(|tenant_agents| {
             tenant_agents
                 .values()
-                .filter(|a| a.name == name)
-                .max_by(|a, b| {
-                    a.manifest
-                        .metadata
-                        .version
-                        .cmp(&b.manifest.metadata.version)
-                })
+                .filter(|a| a.name == name && a.status != AgentStatus::Archived)
+                .max_by_key(|a| a.created_at)
                 .cloned()
         }))
     }
@@ -175,22 +174,57 @@ impl AgentRepository for InMemoryAgentRepository {
         &self,
         tenant_id: &TenantId,
     ) -> Result<Vec<Agent>, RepositoryError> {
-        let agents = self.agents.read().unwrap();
-        Ok(agents
-            .get(tenant_id)
-            .map(|tenant_agents| tenant_agents.values().cloned().collect())
-            .unwrap_or_default())
+        self.list_by_status(AgentListing::Tenant(tenant_id), StatusFilter::Active)
+            .await
     }
 
     async fn list_all(&self) -> Result<Vec<Agent>, RepositoryError> {
+        self.list_by_status(AgentListing::All, StatusFilter::Active)
+            .await
+    }
+
+    async fn list_by_name_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+    ) -> Result<Vec<Agent>, RepositoryError> {
         let agents = self.agents.read().unwrap();
-        let mut all = Vec::new();
-        for tenant_agents in agents.values() {
+        let mut rows: Vec<Agent> = agents
+            .get(tenant_id)
+            .into_iter()
+            .flat_map(|tenant_agents| tenant_agents.values())
+            .filter(|a| a.name == name)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|a| Reverse(a.created_at));
+        Ok(rows)
+    }
+
+    async fn list_by_status(
+        &self,
+        listing: AgentListing<'_>,
+        filter: StatusFilter,
+    ) -> Result<Vec<Agent>, RepositoryError> {
+        let agents = self.agents.read().unwrap();
+        let system_tid = TenantId::system();
+        let mut result: Vec<Agent> = Vec::new();
+        for (tid, tenant_agents) in agents.iter() {
             for a in tenant_agents.values() {
-                all.push(a.clone());
+                let listed = match listing {
+                    AgentListing::All => true,
+                    AgentListing::Tenant(tenant_id) => tid == tenant_id,
+                    AgentListing::Visible(tenant_id) => match &a.scope {
+                        AgentScope::Tenant => tid == tenant_id,
+                        AgentScope::Global => tid == &system_tid,
+                    },
+                };
+                if listed && filter.admits_agent(&a.status) {
+                    result.push(a.clone());
+                }
             }
         }
-        Ok(all)
+        result.sort_by(|a, b| a.name.cmp(&b.name).then(b.created_at.cmp(&a.created_at)));
+        Ok(result)
     }
 
     async fn delete_for_tenant(
@@ -218,22 +252,8 @@ impl AgentRepository for InMemoryAgentRepository {
         &self,
         tenant_id: &TenantId,
     ) -> Result<Vec<Agent>, RepositoryError> {
-        let agents = self.agents.read().unwrap();
-        let system_tid = TenantId::system();
-        let mut result: Vec<Agent> = Vec::new();
-        for (tid, tenant_agents) in agents.iter() {
-            for a in tenant_agents.values() {
-                let visible = match &a.scope {
-                    AgentScope::Tenant => tid == tenant_id,
-                    AgentScope::Global => tid == &system_tid,
-                };
-                if visible {
-                    result.push(a.clone());
-                }
-            }
-        }
-        result.sort_by_key(|a| a.name.clone());
-        Ok(result)
+        self.list_by_status(AgentListing::Visible(tenant_id), StatusFilter::Active)
+            .await
     }
 
     async fn update_scope(
@@ -274,16 +294,25 @@ impl AgentRepository for InMemoryAgentRepository {
         let mut tenant_match: Option<Agent> = None;
         let mut global_match: Option<Agent> = None;
 
+        // AEGIS ADR-148: live rows only, the newest by `created_at`.
+        let newer = |current: &Option<Agent>, agent: &Agent| {
+            current
+                .as_ref()
+                .is_none_or(|c| agent.created_at > c.created_at)
+        };
         for (tid, tenant_agents) in agents.iter() {
-            for agent in tenant_agents.values().filter(|a| a.name == name) {
+            for agent in tenant_agents
+                .values()
+                .filter(|a| a.name == name && a.status != AgentStatus::Archived)
+            {
                 match &agent.scope {
                     AgentScope::Tenant => {
-                        if tid == tenant_id && tenant_match.is_none() {
+                        if tid == tenant_id && newer(&tenant_match, agent) {
                             tenant_match = Some(agent.clone());
                         }
                     }
                     AgentScope::Global => {
-                        if tid == &system_tid && global_match.is_none() {
+                        if tid == &system_tid && newer(&global_match, agent) {
                             global_match = Some(agent.clone());
                         }
                     }
@@ -747,10 +776,12 @@ impl WorkflowRepository for InMemoryWorkflowRepository {
     ) -> Result<Option<Workflow>, RepositoryError> {
         let workflows = self.workflows.read().unwrap();
         Ok(workflows.get(tenant_id).and_then(|tenant_workflows| {
+            // AEGIS ADR-148: the newest active row of the name by
+            // `created_at`, never the greatest version text.
             tenant_workflows
                 .values()
-                .filter(|w| w.metadata.name == name)
-                .max_by(|a, b| a.metadata.version.cmp(&b.metadata.version))
+                .filter(|w| w.metadata.name == name && w.status == WorkflowStatus::Active)
+                .max_by_key(|w| w.created_at)
                 .cloned()
         }))
     }
@@ -791,22 +822,48 @@ impl WorkflowRepository for InMemoryWorkflowRepository {
         &self,
         tenant_id: &TenantId,
     ) -> Result<Vec<Workflow>, RepositoryError> {
-        let workflows = self.workflows.read().unwrap();
-        Ok(workflows
-            .get(tenant_id)
-            .map(|tenant_workflows| tenant_workflows.values().cloned().collect())
-            .unwrap_or_default())
+        self.list_by_status(WorkflowListing::Tenant(tenant_id), StatusFilter::Active)
+            .await
     }
 
     async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError> {
+        self.list_by_status(WorkflowListing::All, StatusFilter::Active)
+            .await
+    }
+
+    async fn list_by_status(
+        &self,
+        listing: WorkflowListing<'_>,
+        filter: StatusFilter,
+    ) -> Result<Vec<Workflow>, RepositoryError> {
         let workflows = self.workflows.read().unwrap();
-        let mut all = Vec::new();
-        for tenant_workflows in workflows.values() {
-            for w in tenant_workflows.values() {
-                all.push(w.clone());
+        let system_tenant = TenantId::system();
+        let mut result: Vec<Workflow> = Vec::new();
+        for (tid, tenant_wfs) in workflows.iter() {
+            for w in tenant_wfs.values() {
+                let listed = match listing {
+                    WorkflowListing::All => true,
+                    WorkflowListing::Global => {
+                        tid == &system_tenant && w.scope == WorkflowScope::Global
+                    }
+                    WorkflowListing::Tenant(tenant_id) => tid == tenant_id,
+                    WorkflowListing::Visible(tenant_id) => {
+                        (tid == tenant_id && w.scope == WorkflowScope::Tenant)
+                            || (tid == &system_tenant && w.scope == WorkflowScope::Global)
+                    }
+                };
+                if listed && filter.admits_workflow(w.status) {
+                    result.push(w.clone());
+                }
             }
         }
-        Ok(all)
+        result.sort_by(|a, b| {
+            a.metadata
+                .name
+                .cmp(&b.metadata.name)
+                .then(b.created_at.cmp(&a.created_at))
+        });
+        Ok(result)
     }
 
     async fn resolve_by_name(
@@ -830,7 +887,10 @@ impl WorkflowRepository for InMemoryWorkflowRepository {
         // Tenant scope
         if let Some(tenant_wfs) = workflows.get(tenant_id) {
             for w in tenant_wfs.values() {
-                if w.metadata.name == name && w.scope == WorkflowScope::Tenant {
+                if w.metadata.name == name
+                    && w.scope == WorkflowScope::Tenant
+                    && w.status == WorkflowStatus::Active
+                {
                     candidates.push(w);
                 }
             }
@@ -839,17 +899,21 @@ impl WorkflowRepository for InMemoryWorkflowRepository {
         // Global scope
         if let Some(global_wfs) = workflows.get(&system_tenant) {
             for w in global_wfs.values() {
-                if w.metadata.name == name && w.scope == WorkflowScope::Global {
+                if w.metadata.name == name
+                    && w.scope == WorkflowScope::Global
+                    && w.status == WorkflowStatus::Active
+                {
                     candidates.push(w);
                 }
             }
         }
 
-        // Sort by priority (ascending), then by version (descending)
+        // Sort by priority (ascending), then the newest by `created_at`
+        // (AEGIS ADR-148), never the greatest version text.
         candidates.sort_by(|a, b| {
             scope_priority(a)
                 .cmp(&scope_priority(b))
-                .then_with(|| b.metadata.version.cmp(&a.metadata.version))
+                .then_with(|| b.created_at.cmp(&a.created_at))
         });
 
         Ok(candidates.first().cloned().cloned())
@@ -892,47 +956,13 @@ impl WorkflowRepository for InMemoryWorkflowRepository {
     }
 
     async fn list_visible(&self, tenant_id: &TenantId) -> Result<Vec<Workflow>, RepositoryError> {
-        let workflows = self.workflows.read().unwrap();
-        let system_tenant = TenantId::system();
-        let mut result = Vec::new();
-
-        // Tenant-scoped workflows
-        if let Some(tenant_wfs) = workflows.get(tenant_id) {
-            for w in tenant_wfs.values() {
-                if w.scope == WorkflowScope::Tenant {
-                    result.push(w.clone());
-                }
-            }
-        }
-
-        // Global-scoped workflows
-        if let Some(global_wfs) = workflows.get(&system_tenant) {
-            for w in global_wfs.values() {
-                if w.scope == WorkflowScope::Global {
-                    result.push(w.clone());
-                }
-            }
-        }
-
-        result.sort_by_key(|a| a.metadata.name.clone());
-        Ok(result)
+        self.list_by_status(WorkflowListing::Visible(tenant_id), StatusFilter::Active)
+            .await
     }
 
     async fn list_global(&self) -> Result<Vec<Workflow>, RepositoryError> {
-        let workflows = self.workflows.read().unwrap();
-        let system_tenant = TenantId::system();
-        let mut result = Vec::new();
-
-        if let Some(global_wfs) = workflows.get(&system_tenant) {
-            for w in global_wfs.values() {
-                if w.scope == WorkflowScope::Global {
-                    result.push(w.clone());
-                }
-            }
-        }
-
-        result.sort_by_key(|a| a.metadata.name.clone());
-        Ok(result)
+        self.list_by_status(WorkflowListing::Global, StatusFilter::Active)
+            .await
     }
 
     async fn update_scope(
