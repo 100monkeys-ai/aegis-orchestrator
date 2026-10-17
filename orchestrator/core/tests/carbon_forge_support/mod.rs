@@ -452,7 +452,8 @@ impl AgentLifecycleService for NoAgents {
 /// run's remote tools: dialling the gateway at `url` (its certificate in
 /// `ca`), knowing `nuclear-notes` as a remote server, resolving the
 /// person's binding through [`OneBinding`], reading runs from
-/// `executions`, gating through `approvals`.
+/// `executions`, gating through `approvals`, and making a run's tree volume
+/// on `fsal`'s own storage (`local_host`, as a single node keeps it).
 pub fn tool_service(
     url: String,
     ca: &std::path::Path,
@@ -461,6 +462,24 @@ pub fn tool_service(
     executions: Arc<dyn WorkflowExecutionRepository>,
     approvals: Arc<ToolApprovalService>,
 ) -> Arc<ToolInvocationService> {
+    let event_bus = Arc::new(EventBus::new(256));
+    let volume_service =
+        aegis_orchestrator_core::application::volume_manager::StandardVolumeService::new(
+            fsal.volume_repository().clone(),
+            fsal.storage_provider().clone(),
+            event_bus.clone(),
+            "http://localhost:8888".to_string(),
+            "local_host",
+        )
+        .expect("the volume service");
+    let user_volumes = Arc::new(
+        aegis_orchestrator_core::application::user_volume_service::UserVolumeService::new(
+            fsal.volume_repository().clone(),
+            Arc::new(volume_service),
+            event_bus.clone(),
+            aegis_orchestrator_core::domain::volume::StorageTierLimits::default(),
+        ),
+    );
     Arc::new(
         ToolInvocationService::new(
             Arc::new(InMemorySealSessionRepository::new()),
@@ -474,7 +493,7 @@ pub fn tool_service(
             Arc::new(
                 aegis_orchestrator_core::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured(),
             ),
-            Arc::new(EventBus::new(256)),
+            event_bus,
             Some(url),
         )
         .with_seal_gateway_ca_cert(ca)
@@ -482,7 +501,8 @@ pub fn tool_service(
         .with_remote_tool_servers(vec![SERVER.to_string()])
         .with_tool_credentials(Arc::new(OneBinding))
         .with_workflow_execution_repo(executions)
-        .with_tool_approvals(approvals),
+        .with_tool_approvals(approvals)
+        .with_user_volume_service(user_volumes),
     )
 }
 

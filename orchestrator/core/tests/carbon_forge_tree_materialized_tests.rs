@@ -173,20 +173,36 @@ async fn start(bytes: &str) -> Started {
     // AEGIS ADR-147 C4: the start is given its tree service.
     use_case.set_trees(service);
 
+    // The run's person starts it: the gateway acts for them alone.
+    let person = aegis_orchestrator_core::domain::iam::UserIdentity {
+        sub: PERSON.to_string(),
+        realm_slug: "zaru-consumer".to_string(),
+        email: None,
+        email_verified: false,
+        name: None,
+        identity_kind: aegis_orchestrator_core::domain::iam::IdentityKind::ConsumerUser {
+            zaru_tier: aegis_orchestrator_core::domain::iam::ZaruTier::Free,
+            tenant_id: tenant.clone(),
+        },
+    };
     let answer = use_case
-        .start_execution(StartWorkflowExecutionRequest {
-            workflow_id: workflow.metadata.name.clone(),
-            input: json!({
-                "task": "the task",
-                "trees": [{ "workspace": WORKSPACE, "path": TREE_PATH, "revision": REVISION }],
-                "contexts": { SERVER: BINDING }
-            }),
-            blackboard: None,
-            version: None,
-            tenant_id: Some(tenant.clone()),
-            security_context_name: None,
-            intent: None,
-        })
+        .start_execution_for_tenant(
+            &tenant,
+            StartWorkflowExecutionRequest {
+                workflow_id: workflow.metadata.name.clone(),
+                input: json!({
+                    "task": "the task",
+                    "trees": [{ "workspace": WORKSPACE, "path": TREE_PATH, "revision": REVISION }],
+                    "contexts": { SERVER: BINDING }
+                }),
+                blackboard: None,
+                version: None,
+                tenant_id: Some(tenant.clone()),
+                security_context_name: None,
+                intent: None,
+            },
+            Some(&person),
+        )
         .await
         .map(|s| s.execution_id);
     let temporal = engine.inputs.lock().unwrap().clone();

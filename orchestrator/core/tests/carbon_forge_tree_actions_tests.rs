@@ -133,14 +133,20 @@ async fn fixture_answering(
     let tenant = TenantId::consumer();
     let event_bus = Arc::new(EventBus::new(256));
     let volume_repo = Arc::new(InMemoryVolumeRepository::new());
-    let tree = dirs.path().join("tree");
+    // The volume's path is its storage provider's, as a local_host volume's
+    // is: under the provider's root on disk.
+    let volume_path = PathBuf::from(format!("/aegis/volumes/{}/tree-of-the-run", tenant));
+    let tree = dirs
+        .path()
+        .join("fsal")
+        .join(volume_path.strip_prefix("/").unwrap());
     std::fs::create_dir_all(&tree).unwrap();
     std::fs::write(tree.join("README.md"), README_AFTER).unwrap();
     let volume = Volume::new(
         "tree".to_string(),
         tenant.clone(),
         StorageClass::persistent(),
-        VolumeBackend::HostPath { path: tree.clone() },
+        VolumeBackend::HostPath { path: volume_path },
         64 * 1024 * 1024,
         VolumeOwnership::persistent(PERSON),
     )
