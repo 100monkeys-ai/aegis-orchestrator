@@ -80,6 +80,25 @@ impl ApprovedCallRunner for ToolInvocationService {
             user_sub = %request.user_sub,
             "Running a stored tool call on its user's approval"
         );
+        // AEGIS ADR-147 C5: a run's tree landing is answered here, for the
+        // workflow's own landing step and its person only.
+        if request.tool_name == crate::infrastructure::tool_router::TREE_LAND_TOOL {
+            if !security_context.permits_tool_name(&request.tool_name) {
+                return Err(format!(
+                    "security context '{}' does not permit tool '{}'",
+                    security_context.name, request.tool_name
+                ));
+            }
+            return self
+                .tree_land_for_interpreter(
+                    &request.tenant_id,
+                    request.execution_id,
+                    &request.user_sub,
+                    &request.arguments,
+                )
+                .await
+                .map_err(|e| e.to_string());
+        }
         match self
             .dispatch_after_gate(
                 &request.agent_id,

@@ -1253,6 +1253,15 @@ fn step_sentence(e: &GitRepoError) -> Option<String> {
     }
 }
 
+/// What a workflow's landing at the approval gate came to (AEGIS ADR-141
+/// F8, ADR-147 C5).
+pub(super) enum GatedLanding {
+    /// The landing ran, ungated, allowed or approved: what it answered.
+    Landed(Value),
+    /// The person did not approve it: the gate's sentence; nothing landed.
+    NotApproved(String),
+}
+
 impl ToolInvocationService {
     /// The repository the workflow run `run` holds, read from its record in
     /// `tenant_id`; `Err` of `Ok` a refusal's sentence.
@@ -1331,6 +1340,11 @@ impl ToolInvocationService {
         action: &str,
         message: Option<&str>,
     ) -> Result<RepositoryActionAnswer, RepositoryActionError> {
+        // AEGIS ADR-147 C3: carbon-forge's steps on the run's Nuclear Notes
+        // tree ride the same step.
+        if matches!(action, "tree_diff" | "tree_write" | "tree_land") {
+            return self.run_tree_action(tenant_id, run, action, message).await;
+        }
         if !matches!(action, "diff" | "commit" | "land") {
             return Err(RepositoryActionError::UnknownAction(action.to_string()));
         }
@@ -1417,34 +1431,85 @@ impl ToolInvocationService {
         repository: WorkflowRunRepository,
         answer: RepositoryActionAnswer,
     ) -> Result<RepositoryActionAnswer, RepositoryActionError> {
-        use crate::application::tool_approval_service::{GateOutcome, GatedCall};
-        use crate::domain::tool_approval::ToolApprovalStatus;
-
         if let Err(e) = crate::application::git_repo_service::landing_ref(&repository.binding_ref) {
             return Ok(RepositoryActionAnswer {
                 sentence: Some(e.to_string()),
                 ..answer
             });
         }
-        let land_tool = crate::infrastructure::tool_router::LAND_TOOL;
-        let arguments = json!({ "repository": repository.label });
         let execution_id = crate::domain::execution::ExecutionId(repository.run);
+        let landed = match self
+            .land_at_gate(
+                tenant_id,
+                execution_id,
+                &repository.person,
+                crate::infrastructure::tool_router::LAND_TOOL,
+                json!({ "repository": repository.label }),
+                || self.land_for_interpreter(tenant_id, execution_id, &repository.person),
+            )
+            .await?
+        {
+            GatedLanding::Landed(landed) => landed,
+            GatedLanding::NotApproved(sentence) => {
+                return Ok(RepositoryActionAnswer {
+                    sentence: Some(sentence),
+                    ..answer
+                })
+            }
+        };
+        Ok(RepositoryActionAnswer {
+            commit_sha: landed
+                .get("commit_sha")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            sentence: landed
+                .get("sentence")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            ..answer
+        })
+    }
+
+    /// A workflow's own landing step at the approval gate (AEGIS ADR-141
+    /// F8, ADR-147 C5): the call `tool` with `arguments` asked of the run's
+    /// person `person` in the run's own execution `execution_id`; `land` run
+    /// at once when the node has no gate or the tool is not gated, or the
+    /// gate allowed it by the person's standing choice; else waited for until
+    /// the person answers, the approved call then run by the gate. Answers
+    /// what the landing returned, or the gate's refusal's sentence when the
+    /// person did not approve, nothing landed.
+    pub(super) async fn land_at_gate<F, Fut>(
+        &self,
+        tenant_id: &crate::domain::tenant::TenantId,
+        execution_id: crate::domain::execution::ExecutionId,
+        person: &str,
+        tool: &'static str,
+        arguments: Value,
+        land: F,
+    ) -> Result<GatedLanding, RepositoryActionError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Value, SealSessionError>>,
+    {
+        use crate::application::tool_approval_service::{GateOutcome, GatedCall};
+        use crate::domain::tool_approval::ToolApprovalStatus;
+
         let outcome = match &self.tool_approval_service {
             None => None,
-            Some(approvals) if self.tool_router.requires_approval(land_tool) => Some(
+            Some(approvals) if self.tool_router.requires_approval(tool) => Some(
                 approvals
                     .gate(GatedCall {
                         tenant_id,
-                        user_sub: Some(repository.person.as_str()).filter(|p| !p.is_empty()),
+                        user_sub: Some(person).filter(|p| !p.is_empty()),
                         execution_id,
                         agent_id: crate::domain::agent::AgentId(uuid::Uuid::nil()),
-                        tool_name: land_tool,
+                        tool_name: tool,
                         arguments: &arguments,
                         security_context_name: LANDING_SECURITY_CONTEXT,
                         conversation_id: None,
                         profile_id: None,
                         contexts: None,
-                        contract: self.tool_router.approval_contract(land_tool),
+                        contract: self.tool_router.approval_contract(tool),
                     })
                     .await
                     .map_err(|e| RepositoryActionError::Failed(e.to_string()))?,
@@ -1454,14 +1519,9 @@ impl ToolInvocationService {
         let landed = match outcome {
             // No gate on this node, or the tool is not gated: the landing
             // runs at once, as an ungated push does.
-            None => {
-                self.land_for_interpreter(tenant_id, execution_id, &repository.person)
-                    .await
-            }
+            None => land().await,
             Some(GateOutcome::Proceed { approval_id }) => {
-                let landed = self
-                    .land_for_interpreter(tenant_id, execution_id, &repository.person)
-                    .await;
+                let landed = land().await;
                 if let Some(approvals) = &self.tool_approval_service {
                     let recorded = landed.clone().map_err(|e| e.to_string());
                     if let Err(e) = approvals.record_outcome(approval_id, &recorded).await {
@@ -1471,10 +1531,9 @@ impl ToolInvocationService {
                 landed
             }
             Some(GateOutcome::Denied { .. }) => {
-                return Ok(RepositoryActionAnswer {
-                    sentence: Some(landing_not_approved(ToolApprovalStatus::AutoDenied)),
-                    ..answer
-                })
+                return Ok(GatedLanding::NotApproved(landing_not_approved(
+                    ToolApprovalStatus::AutoDenied,
+                )))
             }
             Some(GateOutcome::Pending { result }) => {
                 let approval_id = result
@@ -1494,7 +1553,7 @@ impl ToolInvocationService {
                     .ok_or(RepositoryActionError::NotConfigured("the approval gate"))?;
                 loop {
                     let request = approvals
-                        .get_for_user(approval_id, tenant_id, &repository.person)
+                        .get_for_user(approval_id, tenant_id, person)
                         .await
                         .map_err(|e| RepositoryActionError::Failed(e.to_string()))?;
                     match request.status {
@@ -1510,10 +1569,7 @@ impl ToolInvocationService {
                             }
                         }
                         status => {
-                            return Ok(RepositoryActionAnswer {
-                                sentence: Some(landing_not_approved(status)),
-                                ..answer
-                            })
+                            return Ok(GatedLanding::NotApproved(landing_not_approved(status)))
                         }
                     }
                     tokio::time::sleep(LANDING_POLL).await;
@@ -1521,18 +1577,9 @@ impl ToolInvocationService {
                 .map(Ok)?
             }
         };
-        let landed = landed.map_err(|e| RepositoryActionError::Failed(e.to_string()))?;
-        Ok(RepositoryActionAnswer {
-            commit_sha: landed
-                .get("commit_sha")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            sentence: landed
-                .get("sentence")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            ..answer
-        })
+        landed
+            .map(GatedLanding::Landed)
+            .map_err(|e| RepositoryActionError::Failed(e.to_string()))
     }
 
     /// The landing itself, for the workflow execution `execution_id`'s own

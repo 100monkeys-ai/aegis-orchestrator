@@ -538,6 +538,10 @@ pub struct StandardExecutionService {
     /// refused.
     run_repositories:
         std::sync::OnceLock<Arc<dyn crate::application::git_repo_service::RunRepositories>>,
+    /// Where a workflow run's Nuclear Notes tree is mounted for its agent
+    /// states (AEGIS ADR-147 C4). Set once at the composition root via
+    /// `set_trees()`; unset, a workflow's agent state mounts no tree.
+    run_trees: std::sync::OnceLock<Arc<dyn crate::domain::run_tree::RunTrees>>,
     /// Optional ToolRouter used to validate that an agent's requested tools actually exist
     /// before spawning the container (Safety & Polish).
     tool_router: Option<Arc<crate::infrastructure::tool_router::ToolRouter>>,
@@ -881,6 +885,7 @@ impl StandardExecutionService {
             context_bindings: std::sync::OnceLock::new(),
             run_profiles: std::sync::OnceLock::new(),
             run_repositories: std::sync::OnceLock::new(),
+            run_trees: std::sync::OnceLock::new(),
             tool_router: None,
             cortex_client: None,
             rate_limit_enforcer: None,
@@ -1048,6 +1053,14 @@ impl StandardExecutionService {
     ) {
         // OnceLock silently ignores a second set; the service is wired once at startup.
         let _ = self.run_repositories.set(repositories);
+    }
+
+    /// Mount a workflow run's tree in its agent states through `trees`
+    /// (AEGIS ADR-147 C4). Wired once at startup, after the tool invocation
+    /// service exists.
+    pub fn set_trees(&self, trees: Arc<dyn crate::domain::run_tree::RunTrees>) {
+        // OnceLock silently ignores a second set; the service is wired once at startup.
+        let _ = self.run_trees.set(trees);
     }
 
     /// Attach a StandardRuntime registry for validated language+version → image resolution (ADR-043).
@@ -8150,11 +8163,52 @@ impl StandardExecutionService {
                 remote_path,
             )
         });
+        // AEGIS ADR-147 C4: a workflow run's tree, at /workspace in each of
+        // its agent states, registered as the run's own volume; a manifest
+        // volume at the same path yields to it as to the workflow workspace.
+        let tree_mount = match (workflow_execution_id, self.run_trees.get()) {
+            (Some(run), Some(trees)) => trees
+                .mount_for_execution(
+                    &tenant_id,
+                    run,
+                    execution_id,
+                    crate::domain::run_tree::RUN_TREE_MOUNT,
+                    false,
+                )
+                .await
+                .map_err(|e| -> anyhow::Error {
+                    match e {
+                        crate::domain::run_tree::RunTreeError::Refused(sentence) => {
+                            ExecutionError::Refused(sentence).into()
+                        }
+                        crate::domain::run_tree::RunTreeError::Failed(e) => {
+                            anyhow!("mounting the run's tree failed: {e}")
+                        }
+                    }
+                })?,
+            _ => None,
+        };
         let manifest_volume_specs = agent
             .manifest
             .spec
             .volumes
             .iter()
+            .filter(|spec| match &tree_mount {
+                Some(tree)
+                    if spec.mount_path.trim_end_matches('/')
+                        == tree.mount_point.to_string_lossy().trim_end_matches('/') =>
+                {
+                    tracing::info!(
+                        "Volume '{}' at {} yields to the run's tree {} for execution {}",
+                        spec.name,
+                        spec.mount_path,
+                        tree.volume_id,
+                        execution_id.0
+                    );
+                    false
+                }
+                _ => true,
+            })
             .filter(|spec| match &workflow_workspace {
                 Some(workspace) => {
                     let declared = spec.mount_path.trim_end_matches('/');
@@ -8245,6 +8299,9 @@ impl StandardExecutionService {
                 std::collections::HashMap::new()
             };
         volume_mounts.extend(repository_mounts.into_iter().map(|m| m.mount));
+        // The tree's registration, as its run's, was made with its mount.
+        let tree_volume = tree_mount.as_ref().map(|tree| tree.volume_id);
+        volume_mounts.extend(tree_mount);
 
         // Mount policy: all mount points must live under /workspace, and must not overlap.
         if !volume_mounts.is_empty() || workflow_workspace.is_some() {
@@ -8285,7 +8342,10 @@ impl StandardExecutionService {
         // Register each volume with the NFS gateway BEFORE the container mounts it (ADR-036)
         // This populates the in-memory volume_registry so the NFS server can authorize requests.
         if let Some(ref gw) = self.nfs_gateway {
-            for mount in &volume_mounts {
+            for mount in volume_mounts
+                .iter()
+                .filter(|mount| Some(mount.volume_id) != tree_volume)
+            {
                 let policy = FsalAccessPolicy {
                     read: vec!["/*".to_string()],
                     write: vec!["/*".to_string()],

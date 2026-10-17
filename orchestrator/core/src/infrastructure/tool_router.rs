@@ -130,6 +130,11 @@ impl BuiltinToolDefinition {
 /// listed to no agent.
 pub const LAND_TOOL: &str = "aegis.git.land";
 
+/// The builtin tool a carbon-forge run's landing is dispatched as (AEGIS
+/// ADR-147 C5): gated by the person's approval as `aegis.git.land` is, and
+/// listed to no agent.
+pub const TREE_LAND_TOOL: &str = "aegis.tree.land";
+
 /// Canonical registry of all builtin tool dispatchers. Single source of
 /// truth — the daemon startup and every other consumer derives its data
 /// from this slice.
@@ -171,6 +176,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("aegis.git.commit", "Stages every change in one of your run's repositories and commits it on the run's work branch."),
     BuiltinToolDefinition::new("aegis.git.push", "Pushes the run's work branch of one of your run's repositories to its origin, never with force. Only that branch is pushed."),
     BuiltinToolDefinition::new("aegis.git.land", "Lands a workflow run's work branch on its repository's branch as a fast-forward: pushes the work branch to its origin, then the branch, never with force. Answered only for a workflow's own landing step, after the person's approval.").requires_approval(),
+    BuiltinToolDefinition::new("aegis.tree.land", "Lands a carbon-forge run's lane on its Nuclear Notes tree as one changeset. Answered only for a workflow's own landing step, after the person's approval.").requires_approval(),
     BuiltinToolDefinition::new("aegis.schema.get", "Returns the canonical JSON Schema for a manifest kind (agent or workflow).").skip_judge(),
     BuiltinToolDefinition::new("aegis.schema.validate", "Validates a manifest YAML string against its canonical JSON Schema.").skip_judge(),
     BuiltinToolDefinition::new("aegis.agent.create", "Parses, validates, and deploys an Agent manifest to the registry.").skip_judge(),
@@ -277,7 +283,7 @@ impl ToolRouter {
     fn should_advertise_builtin_tool(tool_name: &str) -> bool {
         // AEGIS ADR-141 F8: a landing is a workflow's own step, listed to
         // no agent.
-        if tool_name == LAND_TOOL {
+        if tool_name == LAND_TOOL || tool_name == TREE_LAND_TOOL {
             return false;
         }
         if tool_name.starts_with("aegis.workflow.") || tool_name.starts_with("aegis.execute.") {
@@ -396,6 +402,7 @@ impl ToolRouter {
             "aegis.git.commit" => Self::schema_aegis_git(true, false),
             "aegis.git.push" => Self::schema_aegis_git(false, false),
             "aegis.git.land" => Self::schema_aegis_git(false, false),
+            "aegis.tree.land" => Self::schema_aegis_tree_land(),
             "aegis.schema.get" => Self::schema_aegis_schema_get(),
             "aegis.schema.validate" => Self::schema_aegis_schema_validate(),
             "aegis.agent.create" => Self::schema_aegis_agent_create(),
@@ -1344,6 +1351,19 @@ impl ToolRouter {
     /// `aegis.git.commit` adds `message`, `aegis.git.diff` adds `staged`.
     /// JSON schema for the `aegis.git.list` builtin tool: no arguments; the
     /// caller is the person whose bindings are listed.
+    /// AEGIS ADR-147 C5: what the person approves of a tree's landing.
+    fn schema_aegis_tree_land() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "tree": {"type": "string", "description": "The path of the run's Nuclear Notes tree."},
+                "lane": {"type": "string", "description": "The run's lane, landed as one changeset."},
+                "intent": {"type": "string", "description": "The changeset's intent."}
+            },
+            "required": ["tree", "lane", "intent"]
+        })
+    }
+
     fn schema_aegis_git_list() -> Value {
         json!({
             "type": "object",
@@ -3627,8 +3647,9 @@ mod tests {
     /// 2026-10-07 (3) clause 12), `mail.delete` (its Update of 2026-10-08
     /// (4) clause 20), `mail.archive` and `mail.forward` (its Update of
     /// 2026-10-08 (5) clauses 29 and 35), the four calendar writes (AEGIS ADR-138 K7) and a
-    /// workflow's landing, `aegis.git.land` (AEGIS ADR-141 F8), are gated, and
-    /// an entry without the flag does not gate.
+    /// workflow's landing, `aegis.git.land` (AEGIS ADR-141 F8) and
+    /// `aegis.tree.land` (AEGIS ADR-147 C5), are gated, and an entry without
+    /// the flag does not gate.
     #[test]
     fn requires_approval_follows_capability_entries_of_the_node_configuration() {
         let plain = ToolRouter::new(ToolRouter::builtin_dispatchers());
@@ -3645,6 +3666,7 @@ mod tests {
                     | "calendar.delete"
                     | "calendar.respond"
                     | "aegis.git.land"
+                    | "aegis.tree.land"
             );
             assert_eq!(
                 plain.requires_approval(def.name),

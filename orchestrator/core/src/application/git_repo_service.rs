@@ -2091,7 +2091,7 @@ impl RepositoryActionAnswer {
 /// Why a repository step could not be answered at all.
 #[derive(Debug, thiserror::Error)]
 pub enum RepositoryActionError {
-    #[error("unknown repository action '{0}': expected diff, commit or land")]
+    #[error("unknown repository action '{0}': expected diff, commit, land, tree_diff, tree_write or tree_land")]
     UnknownAction(String),
     #[error("a commit message needs a subject line")]
     NoMessage,

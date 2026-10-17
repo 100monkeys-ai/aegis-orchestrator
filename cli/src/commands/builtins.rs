@@ -174,6 +174,10 @@ pub const BUILTIN_WORKFLOWS: &[(&str, &str)] = &[
         include_str!("../../templates/workflows/the-forge.yaml"),
     ),
     (
+        "carbon-forge",
+        include_str!("../../templates/workflows/carbon-forge.yaml"),
+    ),
+    (
         "transcribe-audio",
         include_str!("../../templates/workflows/transcribe-audio.yaml"),
     ),

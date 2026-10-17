@@ -406,10 +406,11 @@ impl Workflow {
                 };
 
                 for mount_name in mounts {
-                    // The run's repository and its attachments are the
-                    // run's, never declared volumes (AEGIS ADR-141 F6,
-                    // ADR-143 S4).
+                    // The run's repository, its tree and its attachments
+                    // are the run's, never declared volumes (AEGIS ADR-141
+                    // F6, ADR-147 C4, ADR-143 S4).
                     if run_repository_volume(mount_name).is_some()
+                        || mount_name == crate::domain::run_tree::RUN_TREE_VOLUME
                         || mount_name == RUN_ATTACHMENTS_VOLUME
                     {
                         continue;
@@ -1160,6 +1161,15 @@ pub enum ActionName {
     /// image generation models and writes each as a file into the run's
     /// workspace volume (AEGIS ADR-143 I5).
     ImageGenerate,
+    /// The diff of the run's Nuclear Notes tree against the revision it was
+    /// materialized from (AEGIS ADR-147 C3).
+    TreeDiff,
+    /// Writes the run's tree, with the argument `message` as its intent, to
+    /// a lane of the run's own (AEGIS ADR-147 C5); lands nothing.
+    TreeWrite,
+    /// Lands the run's lane as one changeset, with the argument `message`
+    /// as its intent; gated (AEGIS ADR-147 C5).
+    TreeLand,
 }
 
 /// Where `image_generate` writes its files when a state names no `path`.
@@ -1191,16 +1201,23 @@ pub enum ActionNeed {
     /// manifest cannot say whether the node has one, so a workflow's
     /// registration on the node checks it, never the parse.
     ImageGenerationModel,
+    /// The run's Nuclear Notes tree, named at its start by `trees` (AEGIS
+    /// ADR-147 C2). The manifest cannot say what a run names, so a run
+    /// holding none is refused by the step, never the parse.
+    RunTree,
 }
 
 impl ActionName {
     /// Every action, in the order the refusal lists them.
-    pub const ALL: [ActionName; 5] = [
+    pub const ALL: [ActionName; 8] = [
         ActionName::UpdateBlackboard,
         ActionName::RepositoryDiff,
         ActionName::RepositoryCommit,
         ActionName::RepositoryLand,
         ActionName::ImageGenerate,
+        ActionName::TreeDiff,
+        ActionName::TreeWrite,
+        ActionName::TreeLand,
     ];
 
     /// The literal a manifest writes.
@@ -1211,6 +1228,9 @@ impl ActionName {
             ActionName::RepositoryCommit => "repository_commit",
             ActionName::RepositoryLand => "repository_land",
             ActionName::ImageGenerate => "image_generate",
+            ActionName::TreeDiff => "tree_diff",
+            ActionName::TreeWrite => "tree_write",
+            ActionName::TreeLand => "tree_land",
         }
     }
 
@@ -1232,10 +1252,12 @@ impl ActionName {
     pub fn arguments(&self) -> ActionArguments {
         match self {
             ActionName::UpdateBlackboard => ActionArguments::Any,
-            ActionName::RepositoryDiff | ActionName::RepositoryLand => {
+            ActionName::RepositoryDiff | ActionName::RepositoryLand | ActionName::TreeDiff => {
                 ActionArguments::Required(&[])
             }
-            ActionName::RepositoryCommit => ActionArguments::Required(&["message"]),
+            ActionName::RepositoryCommit | ActionName::TreeWrite | ActionName::TreeLand => {
+                ActionArguments::Required(&["message"])
+            }
             ActionName::ImageGenerate => ActionArguments::Declared {
                 required: &["prompt"],
                 optional: &["alias", "size", "count", "path"],
@@ -1251,13 +1273,16 @@ impl ActionName {
             | ActionName::RepositoryCommit
             | ActionName::RepositoryLand => ActionNeed::RunRepository,
             ActionName::ImageGenerate => ActionNeed::ImageGenerationModel,
+            ActionName::TreeDiff | ActionName::TreeWrite | ActionName::TreeLand => {
+                ActionNeed::RunTree
+            }
         }
     }
 
     /// Whether this action touches the world, and so waits at the approval
     /// gate.
     pub fn touches_the_world(&self) -> bool {
-        matches!(self, ActionName::RepositoryLand)
+        matches!(self, ActionName::RepositoryLand | ActionName::TreeLand)
     }
 
     /// Checks a state's `args` against the declared arguments: an argument

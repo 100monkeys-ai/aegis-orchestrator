@@ -2595,6 +2595,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         );
         service.clone().release_runs_on_end();
     }
+    // AEGIS ADR-147 C4: a run's Nuclear Notes tree is materialized, mounted at /workspace and written back through the SEAL gateway.
+    start_workflow_execution_use_case.set_trees(tool_invocation_service.clone());
+    execution_service.set_trees(tool_invocation_service.clone());
+    run_container_step_use_case.set_run_trees(tool_invocation_service.clone());
     // A step mounts a copy of its run's attachments (AEGIS ADR-143 S4).
     run_container_step_use_case.set_run_attachments(
         Arc::new(

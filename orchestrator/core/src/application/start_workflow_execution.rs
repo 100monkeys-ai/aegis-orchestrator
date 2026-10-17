@@ -146,6 +146,10 @@ pub struct StandardStartWorkflowExecutionUseCase {
     /// Set once at the composition root via `set_profiles()`; unset, a
     /// start that names a profile is refused.
     run_profiles: std::sync::OnceLock<Arc<dyn crate::application::profile_service::RunProfiles>>,
+    /// Where a workflow run's Nuclear Notes trees are materialized (AEGIS
+    /// ADR-147 C4). Set once at the composition root via `set_trees()`;
+    /// unset, a start that names trees is refused.
+    run_trees: std::sync::OnceLock<Arc<dyn crate::domain::run_tree::RunTrees>>,
 }
 
 impl StandardStartWorkflowExecutionUseCase {
@@ -173,7 +177,62 @@ impl StandardStartWorkflowExecutionUseCase {
             rate_limit_resolver: None,
             run_repositories: std::sync::OnceLock::new(),
             run_profiles: std::sync::OnceLock::new(),
+            run_trees: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Materialize a workflow run's trees through `trees` (AEGIS ADR-147
+    /// C4). Wired once at startup, after the tool invocation service exists.
+    pub fn set_trees(&self, trees: Arc<dyn crate::domain::run_tree::RunTrees>) {
+        // OnceLock silently ignores a second set; the service is wired once at startup.
+        let _ = self.run_trees.set(trees);
+    }
+
+    /// AEGIS ADR-147 C2, C4: the trees a start names, by
+    /// `[{workspace, path, revision}]`, each materialized into the run's
+    /// volume `tree` before its first agent, as the run's person, through
+    /// the binding the run's `contexts` chose for Nuclear Notes. The
+    /// persisted input keeps each tree with its volume and the blob refs
+    /// its files were verified against.
+    async fn prepare_trees(
+        &self,
+        tenant_id: &TenantId,
+        identity: Option<&UserIdentity>,
+        run: ExecutionId,
+        input: &mut serde_json::Value,
+    ) -> Result<()> {
+        use crate::domain::execution::ExecutionError;
+        use crate::domain::run_tree::{
+            parse_requested_trees, RunTreeError, NO_TREE_SERVICE, TREES_INPUT_KEY,
+        };
+        let requested = match input.get(TREES_INPUT_KEY) {
+            None => return Ok(()),
+            Some(value) => parse_requested_trees(value)
+                .map_err(|sentence| anyhow::Error::new(ExecutionError::Refused(sentence)))?,
+        };
+        if requested.is_empty() {
+            return Ok(());
+        }
+        let Some(trees) = self.run_trees.get() else {
+            return Err(ExecutionError::Refused(NO_TREE_SERVICE.to_string()).into());
+        };
+        let person = crate::application::execution::person_sub(identity);
+        let contexts = crate::domain::execution::ExecutionContexts::from_value(
+            input.get(crate::domain::execution::CONTEXTS_INPUT_KEY),
+        );
+        let filled = trees
+            .materialize_for_run(tenant_id, person.as_deref(), run.0, &contexts, requested)
+            .await
+            .map_err(|e| match e {
+                RunTreeError::Refused(sentence) => {
+                    anyhow::Error::new(ExecutionError::Refused(sentence))
+                }
+                RunTreeError::Failed(e) => anyhow::anyhow!("{e}"),
+            })?;
+        if let serde_json::Value::Object(map) = input {
+            map.insert(TREES_INPUT_KEY.to_string(), serde_json::to_value(&filled)?);
+        }
+        Ok(())
     }
 
     /// Prepare a workflow run's repositories through `repositories` (AEGIS
@@ -541,19 +600,22 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
         // them; the persisted execution keeps them for its agent states.
         // So are the run's repositories (AEGIS ADR-136 G3), the
         // conversation it was started from (AEGIS ADR-126, Update of
-        // 2026-10-07 (2), clause 3) and its profile (AEGIS ADR-140 D6).
+        // 2026-10-07 (2), clause 3), its profile (AEGIS ADR-140 D6) and its
+        // trees (AEGIS ADR-147 C2).
         let input_without_contexts = match &request.input {
             serde_json::Value::Object(map)
                 if map.contains_key(crate::domain::execution::CONTEXTS_INPUT_KEY)
                     || map.contains_key(crate::domain::git_repo::REPOSITORIES_INPUT_KEY)
                     || map.contains_key(crate::domain::execution::CONVERSATION_INPUT_KEY)
-                    || map.contains_key(crate::domain::execution::PROFILE_INPUT_KEY) =>
+                    || map.contains_key(crate::domain::execution::PROFILE_INPUT_KEY)
+                    || map.contains_key(crate::domain::run_tree::TREES_INPUT_KEY) =>
             {
                 let mut map = map.clone();
                 map.remove(crate::domain::execution::CONTEXTS_INPUT_KEY);
                 map.remove(crate::domain::git_repo::REPOSITORIES_INPUT_KEY);
                 map.remove(crate::domain::execution::CONVERSATION_INPUT_KEY);
                 map.remove(crate::domain::execution::PROFILE_INPUT_KEY);
+                map.remove(crate::domain::run_tree::TREES_INPUT_KEY);
                 serde_json::Value::Object(map)
             }
             other => other.clone(),
@@ -597,6 +659,8 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
                 &mut persisted_input,
                 workflow.metadata.input_schema.as_ref(),
             )
+            .await?;
+        self.prepare_trees(tenant_id, identity, execution_id, &mut persisted_input)
             .await?;
         let mut workflow_execution =
             WorkflowExecution::new(&workflow, execution_id, persisted_input);

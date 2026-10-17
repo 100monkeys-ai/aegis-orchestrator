@@ -1271,6 +1271,52 @@ impl ToolInvocationService {
         }
     }
 
+    /// Who a workflow run's own step acts for when it calls a remote
+    /// server (AEGIS ADR-147 C4, C5): the run's person, no agent, the
+    /// workflow the run is of, and the run's own choices of a binding per
+    /// server, read from its record (Zaru ADR-0055 D15); the run has a
+    /// record, so a server it chose nothing for reaches none of its
+    /// person's bindings.
+    pub(super) fn run_acting(
+        person: Option<&str>,
+        workflow_id: Option<uuid::Uuid>,
+        contexts: crate::domain::execution::ExecutionContexts,
+    ) -> GatewayActing {
+        GatewayActing {
+            user_id: person.filter(|p| !p.is_empty()).map(str::to_string),
+            agent_id: AgentId(uuid::Uuid::nil()),
+            workflow_id,
+            contexts,
+            has_execution_record: true,
+        }
+    }
+
+    /// A workflow run's own call of `tool` on the remote server `server`
+    /// (AEGIS ADR-147 C4, C5): through the gateway's `InvokeTool` with the
+    /// credential of the binding the run's `contexts` chose for the server,
+    /// as an agent's call of a remote tool goes (AEGIS ADR-132 H1 to H8),
+    /// never by any other path.
+    pub(super) async fn invoke_remote_tool_for_run(
+        &self,
+        run: uuid::Uuid,
+        tenant_id: &TenantId,
+        acting: &GatewayActing,
+        server: &str,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, SealSessionError> {
+        self.invoke_remote_tool(
+            crate::domain::execution::ExecutionId(run),
+            tenant_id,
+            acting,
+            server,
+            tool,
+            args,
+            None,
+        )
+        .await
+    }
+
     /// The tools of each remote server a conversation chose a binding for
     /// (AEGIS ADR-132 S8), for `POST /v1/seal/context-tools`: the envelope
     /// is a `tools/list` request verified as a tool call's is (the session

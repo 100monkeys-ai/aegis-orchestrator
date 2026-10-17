@@ -30,6 +30,7 @@ mod system;
 mod tasks;
 #[cfg(test)]
 mod tests;
+mod trees;
 mod workflows;
 
 pub use facade::{GeneratedImageFile, ImageGenerateAnswer, ImageGenerateError, ImageGenerateStep};

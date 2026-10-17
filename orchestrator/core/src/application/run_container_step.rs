@@ -79,6 +79,9 @@ pub struct RunContainerStepUseCase {
     /// The runs' attachments a step may mount, and the gateway's registry it
     /// mounts their copy through (AEGIS ADR-143 S4). Unset: no step may.
     attachments: std::sync::OnceLock<(Arc<dyn StepAttachments>, NfsVolumeRegistry)>,
+    /// The runs' Nuclear Notes trees a step may mount (AEGIS ADR-147 C4).
+    /// Unset: no step may.
+    trees: std::sync::OnceLock<Arc<dyn crate::domain::run_tree::RunTrees>>,
     /// The node's network for steps that reach public hosts (core's
     /// `spec.storage.git.step_network`, AEGIS ADR-141 F7, ADR-136 G12).
     egress_network: Option<String>,
@@ -432,6 +435,7 @@ impl RunContainerStepUseCase {
             runner,
             repositories: std::sync::OnceLock::new(),
             attachments: std::sync::OnceLock::new(),
+            trees: std::sync::OnceLock::new(),
             egress_network: None,
         }
     }
@@ -459,6 +463,13 @@ impl RunContainerStepUseCase {
         let _ = self.attachments.set((attachments, registry));
     }
 
+    /// Let a step mount its run's tree (AEGIS ADR-147 C4), registered by
+    /// `trees` with the gateway agent states mount through. Wired once at
+    /// startup; a second call is ignored.
+    pub fn set_run_trees(&self, trees: Arc<dyn crate::domain::run_tree::RunTrees>) {
+        let _ = self.trees.set(trees);
+    }
+
     /// The node's network for `network_mode: egress` steps (AEGIS ADR-141
     /// F7); `None` refuses them.
     pub fn with_egress_network(mut self, network: Option<String>) -> Self {
@@ -484,6 +495,10 @@ impl RunContainerStepUseCase {
         }
         let step = input.execution_id;
         self.mount_run_repositories(&mut input).await?;
+        if let Err(refused) = self.mount_run_tree(&mut input).await {
+            self.put_back(step);
+            return Err(refused);
+        }
         let staged = match self.mount_run_attachments(&mut input).await {
             Ok(staged) => staged,
             Err(refused) => {
@@ -501,10 +516,78 @@ impl RunContainerStepUseCase {
     /// removed, and only its own; an agent state of the run holding the
     /// same volume keeps its registration.
     fn put_back(&self, step: ExecutionId) {
+        if let Some(trees) = self.trees.get() {
+            trees.release_execution(step);
+        }
         let Some((_, registry)) = self.repositories.get() else {
             return;
         };
         registry.deregister_execution(step);
+    }
+
+    /// Each volume entry named `tree` (AEGIS ADR-147 C4) becomes its run's
+    /// tree volume, registered as the run's with the gateway agent states
+    /// mount through at the entry's `mount_path`, for the step's length.
+    /// Refused before any container when the run holds no tree.
+    async fn mount_run_tree(
+        &self,
+        input: &mut RunContainerStepInput,
+    ) -> Result<(), RunContainerStepError> {
+        use crate::domain::run_tree::{
+            RunTreeError, NO_TREE_SERVICE, RUN_HOLDS_NO_TREE, RUN_TREE_VOLUME,
+        };
+        let entries: Vec<usize> = input
+            .volumes
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.name == RUN_TREE_VOLUME)
+            .map(|(index, _)| index)
+            .collect();
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let Some(trees) = self.trees.get() else {
+            return Err(RunContainerStepError::Refused(NO_TREE_SERVICE.to_string()));
+        };
+        let Some(run) = input.workflow_execution_id else {
+            return Err(RunContainerStepError::Refused(
+                RUN_HOLDS_NO_TREE.to_string(),
+            ));
+        };
+        for index in entries {
+            let (mount_path, read_only) = {
+                let volume = &input.volumes[index];
+                (volume.mount_path.clone(), volume.read_only)
+            };
+            let mount = trees
+                .mount_for_execution(
+                    &input.tenant_id,
+                    run,
+                    input.execution_id,
+                    &mount_path,
+                    read_only,
+                )
+                .await
+                .map_err(|e| match e {
+                    RunTreeError::Refused(sentence) => RunContainerStepError::Refused(sentence),
+                    RunTreeError::Failed(e) => {
+                        RunContainerStepError::Step(ContainerStepError::VolumeMountFailed {
+                            volume: RUN_TREE_VOLUME.to_string(),
+                            error: e,
+                        })
+                    }
+                })?
+                .ok_or_else(|| RunContainerStepError::Refused(RUN_HOLDS_NO_TREE.to_string()))?;
+            info!(
+                execution_id = %input.execution_id,
+                step_name = %input.name,
+                volume_id = %mount.volume_id,
+                mount_path = %mount_path,
+                "A step mounts its run's tree"
+            );
+            input.volumes[index].name = mount.volume_id.0.to_string();
+        }
+        Ok(())
     }
 
     /// Each volume entry naming the run's attachments (AEGIS ADR-143 S4)
