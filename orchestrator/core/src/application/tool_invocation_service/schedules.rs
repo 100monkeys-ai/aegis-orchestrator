@@ -282,6 +282,7 @@ fn sentence(e: ScheduleError) -> String {
         ScheduleError::NotFound => NOT_FOUND.to_string(),
         ScheduleError::Unavailable => UNAVAILABLE_REFUSAL.to_string(),
         ScheduleError::Overlap => OVERLAP_REFUSAL.to_string(),
+        ScheduleError::Archived(target) => target.to_string(),
         ScheduleError::Repository(detail) => {
             tracing::error!(error = %detail, "Schedule store failed");
             "Schedule store failed".to_string()

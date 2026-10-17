@@ -26,7 +26,7 @@ use crate::application::start_workflow_execution::{
 };
 use crate::domain::execution::{ExecutionError, ExecutionId, ExecutionInput, ExecutionStatus};
 use crate::domain::iam::UserIdentity;
-use crate::domain::repository::{RepositoryError, WorkflowExecutionRepository};
+use crate::domain::repository::{ArchivedTarget, RepositoryError, WorkflowExecutionRepository};
 use crate::domain::schedule::{
     count_refusal, paused_after_refusals, FireClaim, FireOutcome, Schedule, ScheduleDraft,
     ScheduleFire, ScheduleId, SchedulePatch, ScheduleRepository, ScheduleState, TargetKind,
@@ -55,6 +55,10 @@ pub enum ScheduleError {
     Overlap,
     #[error("Schedule store failed: {0}")]
     Repository(String),
+    /// The schedule names an archived version; the refusal names the
+    /// active one (AEGIS ADR-148, A10).
+    #[error("{0}")]
+    Archived(ArchivedTarget),
 }
 
 impl From<RepositoryError> for ScheduleError {
@@ -78,6 +82,16 @@ pub trait ScheduledRunPort: Send + Sync {
         tenant: &TenantId,
         execution_id: ExecutionId,
     ) -> anyhow::Result<Option<ExecutionStatus>>;
+
+    /// The refusal a new schedule naming an archived version is answered
+    /// with, its target resolved as a run's is (AEGIS ADR-148, A10);
+    /// `None` when the target resolves to an active row or to none.
+    async fn archived_target(
+        &self,
+        _schedule: &Schedule,
+    ) -> anyhow::Result<Option<ArchivedTarget>> {
+        Ok(None)
+    }
 }
 
 /// Who reads a schedule.
@@ -208,6 +222,14 @@ impl ScheduleService {
         let held = self.repo.list_for_owner(&schedule.owner.sub).await?;
         if held.len() >= MAX_SCHEDULES_PER_OWNER {
             return Err(ScheduleError::Refused(count_refusal()));
+        }
+        if let Some(target) = self
+            .runs
+            .archived_target(&schedule)
+            .await
+            .map_err(|e| ScheduleError::Repository(e.to_string()))?
+        {
+            return Err(ScheduleError::Archived(target));
         }
         self.repo.insert(&schedule).await?;
         if let Err(e) = self.engine.create_schedule(&engine_spec(&schedule)).await {
@@ -622,6 +644,21 @@ impl ServiceRunStarter {
         schedule: &Schedule,
         owner: &UserIdentity,
     ) -> Result<ExecutionId, String> {
+        let agent_id = self.resolve_agent(schedule).await?;
+        let tenant = &schedule.tenant_id;
+        let mut input = schedule.start_input();
+        if let Some(map) = input.as_object_mut() {
+            map.entry("tenant_id")
+                .or_insert_with(|| serde_json::Value::String(tenant.to_string()));
+        }
+        self.start_agent_run(schedule, owner, agent_id, input).await
+    }
+
+    /// The agent a schedule names, resolved as the starting tool resolves it.
+    async fn resolve_agent(
+        &self,
+        schedule: &Schedule,
+    ) -> Result<crate::domain::agent::AgentId, String> {
         let tenant = &schedule.tenant_id;
         let target = &schedule.target;
         let agent_id = if let Ok(uuid) = uuid::Uuid::parse_str(target) {
@@ -651,11 +688,16 @@ impl ServiceRunStarter {
                 _ => return Err(format!("Agent '{target}' not found")),
             }
         };
-        let mut input = schedule.start_input();
-        if let Some(map) = input.as_object_mut() {
-            map.entry("tenant_id")
-                .or_insert_with(|| serde_json::Value::String(tenant.to_string()));
-        }
+        Ok(agent_id)
+    }
+
+    async fn start_agent_run(
+        &self,
+        schedule: &Schedule,
+        owner: &UserIdentity,
+        agent_id: crate::domain::agent::AgentId,
+        input: serde_json::Value,
+    ) -> Result<ExecutionId, String> {
         self.execution_service
             .start_execution(
                 agent_id,
@@ -711,6 +753,57 @@ impl ServiceRunStarter {
 
 #[async_trait]
 impl ScheduledRunPort for ServiceRunStarter {
+    async fn archived_target(&self, schedule: &Schedule) -> anyhow::Result<Option<ArchivedTarget>> {
+        let tenant = &schedule.tenant_id;
+        match schedule.target_kind {
+            TargetKind::Workflow => match &self.workflow_start {
+                Some(start) => {
+                    start
+                        .archived_target(
+                            tenant,
+                            &schedule.target,
+                            schedule.target_version.as_deref(),
+                        )
+                        .await
+                }
+                None => Ok(None),
+            },
+            TargetKind::Agent => {
+                // A target the starting tool cannot resolve is the run's to
+                // refuse, as before.
+                let Ok(agent_id) = self.resolve_agent(schedule).await else {
+                    return Ok(None);
+                };
+                let Ok(agent) = self
+                    .agent_lifecycle
+                    .get_agent_visible(tenant, agent_id)
+                    .await
+                else {
+                    return Ok(None);
+                };
+                if agent.status != crate::domain::agent::AgentStatus::Archived {
+                    return Ok(None);
+                }
+                let active_version = match self
+                    .agent_lifecycle
+                    .lookup_agent_visible_for_tenant(tenant, &agent.name)
+                    .await?
+                {
+                    Some(id) => Some(
+                        self.agent_lifecycle
+                            .get_agent_visible(tenant, id)
+                            .await?
+                            .manifest
+                            .metadata
+                            .version,
+                    ),
+                    None => None,
+                };
+                Ok(Some(ArchivedTarget::agent(&agent, active_version)))
+            }
+        }
+    }
+
     async fn start(
         &self,
         schedule: &Schedule,

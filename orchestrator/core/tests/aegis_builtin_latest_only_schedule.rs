@@ -179,7 +179,7 @@ fn draft(target: &str, version: Option<&str>) -> ScheduleDraft {
         target_kind: Some("workflow".into()),
         target: Some(target.into()),
         version: version.map(str::to_string),
-        at: Some("2030-01-01T00:00:00Z".into()),
+        at: Some((chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339()),
         ..Default::default()
     }
 }

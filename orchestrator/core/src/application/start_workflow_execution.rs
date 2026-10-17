@@ -89,6 +89,19 @@ pub trait StartWorkflowExecutionUseCase: Send + Sync {
         identity: Option<&UserIdentity>,
     ) -> Result<StartedWorkflowExecution>;
 
+    /// The refusal a new run or schedule naming `workflow_id` (and
+    /// `version`) would be answered with when the row it resolves to is
+    /// archived (AEGIS ADR-148, A10); `None` when it resolves to an active
+    /// row or to none.
+    async fn archived_target(
+        &self,
+        _tenant_id: &TenantId,
+        _workflow_id: &str,
+        _version: Option<&str>,
+    ) -> Result<Option<ArchivedTarget>> {
+        Ok(None)
+    }
+
     /// Start a workflow execution
     ///
     /// # Arguments
@@ -155,6 +168,55 @@ pub struct StandardStartWorkflowExecutionUseCase {
 }
 
 impl StandardStartWorkflowExecutionUseCase {
+    /// The row a run naming `workflow_id` (and `version`) resolves to: a
+    /// UUID names the tenant's row or a built-in's global row, as the
+    /// Postgres repository reads it; a name and version name that row in any
+    /// status; a name alone names the active row (AEGIS ADR-148).
+    async fn resolve_workflow(
+        &self,
+        tenant_id: &TenantId,
+        workflow_id: &str,
+        version: Option<&str>,
+    ) -> Result<Option<Workflow>> {
+        if let Ok(uuid) = uuid::Uuid::parse_str(workflow_id) {
+            let id = WorkflowId::from_uuid(uuid);
+            self.workflow_repository
+                .find_by_id_visible(tenant_id, id)
+                .await
+                .map(|found| {
+                    found.filter(|w| w.tenant_id == *tenant_id || w.scope == WorkflowScope::Global)
+                })
+        } else if let Some(version) = version {
+            self.workflow_repository
+                .resolve_by_name_and_version(tenant_id, workflow_id, version)
+                .await
+        } else {
+            self.workflow_repository
+                .resolve_by_name(tenant_id, workflow_id)
+                .await
+        }
+        .context("Failed to query workflow repository")
+    }
+
+    /// The refusal of an archived `workflow`, naming its name's active
+    /// version (AEGIS ADR-148, A10); `None` for an active row.
+    async fn archived_refusal(
+        &self,
+        tenant_id: &TenantId,
+        workflow: &Workflow,
+    ) -> Result<Option<ArchivedTarget>> {
+        if workflow.status != WorkflowStatus::Archived {
+            return Ok(None);
+        }
+        let active_version = self
+            .workflow_repository
+            .resolve_by_name(tenant_id, &workflow.metadata.name)
+            .await
+            .context("Failed to query workflow repository")?
+            .and_then(|w| w.metadata.version.clone());
+        Ok(Some(ArchivedTarget::workflow(workflow, active_version)))
+    }
+
     const RESERVED_BLACKBOARD_KEYS: [&'static str; 6] = [
         "instruction",
         "input",
@@ -452,6 +514,21 @@ impl StandardStartWorkflowExecutionUseCase {
 
 #[async_trait]
 impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
+    async fn archived_target(
+        &self,
+        tenant_id: &TenantId,
+        workflow_id: &str,
+        version: Option<&str>,
+    ) -> Result<Option<ArchivedTarget>> {
+        match self
+            .resolve_workflow(tenant_id, workflow_id, version)
+            .await?
+        {
+            Some(workflow) => self.archived_refusal(tenant_id, &workflow).await,
+            None => Ok(None),
+        }
+    }
+
     async fn start_execution_for_tenant(
         &self,
         tenant_id: &TenantId,
@@ -574,38 +651,15 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
         }
 
         // Step 1: Load workflow from repository
-        let workflow = if let Ok(uuid) = uuid::Uuid::parse_str(&request.workflow_id) {
-            // A UUID names the tenant's row or a built-in's global row, as
-            // the Postgres repository reads it (AEGIS ADR-148).
-            let id = WorkflowId::from_uuid(uuid);
-            self.workflow_repository
-                .find_by_id_visible(tenant_id, id)
-                .await
-                .map(|found| {
-                    found.filter(|w| w.tenant_id == *tenant_id || w.scope == WorkflowScope::Global)
-                })
-        } else if let Some(ref version) = request.version {
-            self.workflow_repository
-                .resolve_by_name_and_version(tenant_id, &request.workflow_id, version)
-                .await
-        } else {
-            self.workflow_repository
-                .resolve_by_name(tenant_id, &request.workflow_id)
-                .await
-        }
-        .context("Failed to query workflow repository")?
-        .ok_or_else(|| anyhow::anyhow!("Workflow not found: {}", request.workflow_id))?;
+        let workflow = self
+            .resolve_workflow(tenant_id, &request.workflow_id, request.version.as_deref())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Workflow not found: {}", request.workflow_id))?;
 
         // AEGIS ADR-148, A10: an archived version stays readable, and a new
         // run naming it is refused with the name's active version.
-        if workflow.status == WorkflowStatus::Archived {
-            let active_version = self
-                .workflow_repository
-                .resolve_by_name(tenant_id, &workflow.metadata.name)
-                .await
-                .context("Failed to query workflow repository")?
-                .and_then(|w| w.metadata.version.clone());
-            return Err(ArchivedTarget::workflow(&workflow, active_version).into());
+        if let Some(refusal) = self.archived_refusal(tenant_id, &workflow).await? {
+            return Err(refusal.into());
         }
 
         // AEGIS ADR-141 F2: a workflow that works on a fixed number of

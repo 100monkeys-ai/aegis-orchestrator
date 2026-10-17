@@ -104,6 +104,8 @@ fn service(state: &SchedulesState) -> Result<&Arc<ScheduleService>, Refusal> {
 fn from_service_error(e: ScheduleError) -> Refusal {
     match e {
         ScheduleError::Refused(sentence) => refusal(StatusCode::BAD_REQUEST, &sentence),
+        // AEGIS ADR-148, A10: a schedule naming an archived version.
+        ScheduleError::Archived(target) => refusal(StatusCode::CONFLICT, &target.to_string()),
         ScheduleError::NotFound => refusal(StatusCode::NOT_FOUND, "Not found"),
         ScheduleError::Forbidden(sentence) => refusal(StatusCode::FORBIDDEN, &sentence),
         ScheduleError::Unavailable => refusal(StatusCode::SERVICE_UNAVAILABLE, UNAVAILABLE_REFUSAL),
