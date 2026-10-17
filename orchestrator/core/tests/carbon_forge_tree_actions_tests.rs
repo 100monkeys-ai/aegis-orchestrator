@@ -74,16 +74,19 @@ fn landing_context() -> SecurityContext {
     SecurityContext {
         name: LANDING_CONTEXT.to_string(),
         description: "the landing's context".to_string(),
-        capabilities: vec![Capability {
-            tool_pattern: "aegis.tree.*".to_string(),
-            path_allowlist: None,
-            command_allowlist: None,
-            subcommand_allowlist: None,
-            domain_allowlist: None,
-            max_response_size: None,
-            rate_limit: None,
-            max_concurrent: None,
-        }],
+        capabilities: ["aegis.tree.*", "aegis.archive.*"]
+            .into_iter()
+            .map(|pattern| Capability {
+                tool_pattern: pattern.to_string(),
+                path_allowlist: None,
+                command_allowlist: None,
+                subcommand_allowlist: None,
+                domain_allowlist: None,
+                max_response_size: None,
+                rate_limit: None,
+                max_concurrent: None,
+            })
+            .collect(),
         deny_list: vec![],
         metadata: SecurityContextMetadata {
             created_at: chrono::Utc::now(),
@@ -122,6 +125,16 @@ async fn fixture() -> Fixture {
 /// The fixture, its Nuclear Notes answering as `answers` changes it.
 async fn fixture_answering(
     answers: impl FnOnce(uuid::Uuid, &mut HashMap<String, Answer>),
+) -> Fixture {
+    fixture_of(answers, true).await
+}
+
+/// The fixture; with `materialized` false, the run's `trees` entry names
+/// the tree and no volume, as a start of a workflow whose every state is an
+/// Action needing only the tree's name leaves it (AEGIS ADR-149 C2).
+async fn fixture_of(
+    answers: impl FnOnce(uuid::Uuid, &mut HashMap<String, Answer>),
+    materialized: bool,
 ) -> Fixture {
     let dirs = tempfile::tempdir().unwrap();
     let run = ExecutionId::new();
@@ -194,14 +207,18 @@ spec:
 "#,
     )
     .unwrap();
+    let mut named = json!({
+        "workspace": WORKSPACE,
+        "path": TREE_PATH,
+        "revision": REVISION,
+        "volume_id": volume.id.0.to_string()
+    });
+    if !materialized {
+        named.as_object_mut().unwrap().remove("volume_id");
+    }
     let input = json!({
         "task": "the task",
-        "trees": [{
-            "workspace": WORKSPACE,
-            "path": TREE_PATH,
-            "revision": REVISION,
-            "volume_id": volume.id.0.to_string()
-        }],
+        "trees": [named],
         "contexts": { SERVER: BINDING }
     });
     let mut execution = WorkflowExecution::new(&workflow, run, input);
@@ -512,5 +529,304 @@ async fn a_conflicting_landing_answers_nuclear_notes_own_sentence() {
     assert_eq!(
         answer.commit_sha, None,
         "a refused landing answers a changeset"
+    );
+}
+
+// ===========================================================================
+// AEGIS ADR-149: a deploy keys to a cut (C1, C2)
+// ===========================================================================
+
+/// The push's gated tool (AEGIS ADR-149 C2), as `tool_router.rs` names it.
+const ARCHIVE_PUSH_TOOL: &str = "aegis.archive.push";
+
+/// The snapshot Nuclear Notes answers a cut with (`catalog-snapshots.ts`
+/// 145 to 162 at `4569806`: the snapshot's header and `cut`).
+const SNAPSHOT_ID: &str = "5a9c0e11-0000-4000-8000-000000000004";
+
+fn snapshot_answer(cut: &str) -> Answer {
+    Answer::Result(json!({
+        "snapshot_id": SNAPSHOT_ID,
+        "predecessor_id": null,
+        "entry_count": 4,
+        "cut": cut
+    }))
+}
+
+/// A run of `action` as the interpreter runs it, waiting on the gate when
+/// the action is gated.
+fn run_action(
+    fx: &Fixture,
+    action: &'static str,
+    message: Option<&'static str>,
+) -> tokio::task::JoinHandle<RepositoryActionAnswer> {
+    let service = fx.service.clone();
+    let tenant = fx.tenant.clone();
+    let run = fx.run;
+    tokio::spawn(async move {
+        service
+            .run_repository_action(&tenant, run, action, message)
+            .await
+            .unwrap_or_else(|e| panic!("AEGIS ADR-149: {action} was not answered: {e}"))
+    })
+}
+
+#[test]
+fn the_deploy_actions_are_actions_naming_the_tree_and_only_the_push_touches_the_world() {
+    for (literal, touches) in [
+        ("tree_cut", false),
+        ("archive_render", false),
+        ("archive_push", true),
+    ] {
+        let action = ActionName::from_literal(literal)
+            .unwrap_or_else(|e| panic!("AEGIS ADR-149 C1, C2: {literal} is not an action: {e}"));
+        assert_eq!(action.as_str(), literal);
+        assert!(
+            ActionName::ALL.contains(&action),
+            "AEGIS ADR-149: {literal} is missing from ActionName::ALL"
+        );
+        assert_eq!(
+            action.touches_the_world(),
+            touches,
+            "AEGIS ADR-149 C1, C2: {literal} touches the world: {}",
+            action.touches_the_world()
+        );
+        assert_eq!(
+            format!("{:?}", action.needs()),
+            "RunTreeRef",
+            "AEGIS ADR-149 C2: {literal} needs the run's tree materialized, not only named"
+        );
+    }
+    let no_args = HashMap::new();
+    let cut = HashMap::from([("cut".to_string(), "v1.2".to_string())]);
+    let tree_cut = ActionName::from_literal("tree_cut").unwrap();
+    assert!(tree_cut.check_args(&no_args).is_ok() && tree_cut.check_args(&cut).is_ok());
+    let render = ActionName::from_literal("archive_render").unwrap();
+    assert!(
+        render.check_args(&no_args).is_err() && render.check_args(&cut).is_ok(),
+        "AEGIS ADR-149 C2: archive_render requires its cut"
+    );
+    let push = ActionName::from_literal("archive_push").unwrap();
+    assert!(push.check_args(&no_args).is_ok() && push.check_args(&cut).is_err());
+}
+
+#[tokio::test]
+async fn tree_cut_names_the_landed_run_with_the_given_cut_or_forge_and_its_execution_id() {
+    // Given: the state's `cut` argument, carried as the step's message.
+    let fx = fixture_answering(|_, answers| {
+        answers.insert("snapshots.cut".to_string(), snapshot_answer("v1.2"));
+    })
+    .await;
+    let answer = answered(run_action(&fx, "tree_cut", Some("v1.2"))).await;
+    assert_eq!(answer.sentence, None, "AEGIS ADR-149 C1: {answer:?}");
+    let cuts: Vec<Value> = fx
+        .calls()
+        .into_iter()
+        .filter(|(t, _)| t == "snapshots.cut")
+        .map(|(_, a)| a)
+        .collect();
+    assert_eq!(
+        cuts.len(),
+        1,
+        "AEGIS ADR-149 C1: tree_cut did not cut one snapshot: Nuclear Notes received {:?}",
+        fx.calls().into_iter().map(|(t, _)| t).collect::<Vec<_>>()
+    );
+    assert_eq!(cuts[0]["name"].as_str(), Some("v1.2"));
+    assert_eq!(
+        (answer.git_ref.as_str(), answer.commit_sha.as_deref()),
+        ("v1.2", Some(SNAPSHOT_ID)),
+        "AEGIS ADR-149 C1: the cut rides `ref` and the snapshot `commit_sha`: {answer:?}"
+    );
+    fx.assert_each_call_is_the_persons_in_the_workspace();
+
+    // Default: forge-<execution id>, a name Nuclear Notes' cut pattern
+    // admits (snapshot.ts:240 at 4569806: no slash).
+    let fx = fixture_answering(|run, answers| {
+        answers.insert(
+            "snapshots.cut".to_string(),
+            snapshot_answer(&format!("forge-{run}")),
+        );
+    })
+    .await;
+    let answer = answered(run_action(&fx, "tree_cut", None)).await;
+    let default = format!("forge-{}", fx.run);
+    let named = fx
+        .calls()
+        .into_iter()
+        .find(|(t, _)| t == "snapshots.cut")
+        .map(|(_, a)| a["name"].clone());
+    assert_eq!(
+        named,
+        Some(json!(default)),
+        "AEGIS ADR-149 C1: a cut with no name is not forge-<execution id>"
+    );
+    assert_eq!(default.len(), 42);
+    assert!(default
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')));
+    assert_eq!(answer.git_ref, default, "{answer:?}");
+}
+
+#[tokio::test]
+async fn archive_render_renders_the_cut_of_a_tree_named_and_not_materialized() {
+    let fx = fixture_of(
+        |_, answers| {
+            answers.insert(
+                "archives.render".to_string(),
+                Answer::Result(json!({
+                    "tree_id": "8a1f3b2c-0000-4000-8000-000000000001",
+                    "tree_revision_id": 4243,
+                    "commit_sha1": "0123456789abcdef0123456789abcdef01234567",
+                    "tree_sha1": "89abcdef0123456789abcdef0123456789abcdef",
+                    "parent_sha1": null,
+                    "cut": "v1.2",
+                    "snapshot_id": SNAPSHOT_ID,
+                    "ref": { "name": "refs/heads/main", "previous_sha1": null, "moved": true },
+                    "tag": { "name": "refs/tags/nn/v1.2", "sha1": "fedcba9876543210fedcba9876543210fedcba98" },
+                    "held": { "commit": false, "blob_ids": 1, "blobs": 1 }
+                })),
+            );
+        },
+        false,
+    )
+    .await;
+    let answer = answered(run_action(&fx, "archive_render", Some("v1.2"))).await;
+    assert_eq!(answer.sentence, None, "AEGIS ADR-149 C2: {answer:?}");
+    let calls = fx.calls();
+    let tools: Vec<&str> = calls.iter().map(|(t, _)| t.as_str()).collect();
+    let renders: Vec<&Value> = calls
+        .iter()
+        .filter(|(t, _)| t == "archives.render")
+        .map(|(_, a)| a)
+        .collect();
+    assert_eq!(
+        renders.len(),
+        1,
+        "AEGIS ADR-149 C2: archive_render did not render once: Nuclear Notes received {tools:?}"
+    );
+    assert_eq!(renders[0]["tree"].as_str(), Some(TREE_PATH));
+    assert_eq!(renders[0]["cut"].as_str(), Some("v1.2"));
+    assert!(
+        !tools
+            .iter()
+            .any(|t| *t == "trees.materialize" || t.starts_with("blobs.")),
+        "AEGIS ADR-149 C2: the render read the tree's files: {tools:?}"
+    );
+    assert_eq!(
+        answer.commit_sha.as_deref(),
+        Some("0123456789abcdef0123456789abcdef01234567"),
+        "AEGIS ADR-149 C2: the render does not answer its commit_sha1: {answer:?}"
+    );
+    assert_eq!(answer.git_ref, "refs/tags/nn/v1.2", "the tag rides `ref`");
+    assert_eq!(answer.branch, SNAPSHOT_ID, "the snapshot rides `branch`");
+    let rendered: Value =
+        serde_json::from_str(answer.diff.as_deref().unwrap_or("null")).unwrap_or_default();
+    assert_eq!(
+        rendered["tree_revision_id"],
+        json!(4243),
+        "the render's own answer rides `diff`: {answer:?}"
+    );
+    fx.assert_each_call_is_the_persons_in_the_workspace();
+}
+
+#[tokio::test]
+async fn the_archive_push_is_gated_and_listed_to_no_agent() {
+    let router = ToolRouter::new(ToolRouter::builtin_dispatchers());
+    assert!(
+        router.requires_approval(ARCHIVE_PUSH_TOOL),
+        "AEGIS ADR-149 C2: {ARCHIVE_PUSH_TOOL} does not wait at the approval gate"
+    );
+    let listed = router.list_tools().await.unwrap();
+    assert!(
+        !listed.iter().any(|t| t.name == ARCHIVE_PUSH_TOOL),
+        "AEGIS ADR-149 C2: {ARCHIVE_PUSH_TOOL} is listed to agents"
+    );
+}
+
+#[tokio::test]
+async fn archive_push_queues_the_push_only_after_the_persons_approval() {
+    let fx = fixture_of(
+        |_, answers| {
+            answers.insert(
+                "archives.push".to_string(),
+                Answer::Result(json!({
+                    "tree_id": "8a1f3b2c-0000-4000-8000-000000000001",
+                    "path": TREE_PATH,
+                    "remote": "https://github.com/100monkeys-ai/aegis-platform-deployment.git",
+                    "job_id": "7b0b0b0b-0000-4000-8000-000000000005",
+                    "queued": true
+                })),
+            );
+        },
+        false,
+    )
+    .await;
+    let pushing = run_action(&fx, "archive_push", None);
+    let request = fx.pending().await;
+    assert_eq!(
+        request.tool_name, ARCHIVE_PUSH_TOOL,
+        "AEGIS ADR-149 C2: the push waits at the gate as {}",
+        request.tool_name
+    );
+    assert!(
+        !fx.calls().iter().any(|(t, _)| t == "archives.push"),
+        "AEGIS ADR-149 C2: the archive was pushed before the person answered"
+    );
+    let decided = fx
+        .approvals
+        .decide(
+            request.id,
+            &fx.tenant,
+            PERSON,
+            ToolApprovalDecision::Once,
+            fx.service.as_ref(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the approval was not taken: {e}"));
+    assert_eq!(decided.error, None, "the approved push was not run");
+    let answer = answered(pushing).await;
+    assert_eq!(answer.sentence, None, "AEGIS ADR-149 C2: {answer:?}");
+    let pushes: Vec<Value> = fx
+        .calls()
+        .into_iter()
+        .filter(|(t, _)| t == "archives.push")
+        .map(|(_, a)| a)
+        .collect();
+    assert_eq!(pushes.len(), 1, "AEGIS ADR-149 C2: one push");
+    assert_eq!(pushes[0]["tree"].as_str(), Some(TREE_PATH));
+    assert_eq!(
+        answer.commit_sha.as_deref(),
+        Some("7b0b0b0b-0000-4000-8000-000000000005"),
+        "AEGIS ADR-149 C2: the push does not answer its job id: {answer:?}"
+    );
+    assert_eq!(
+        answer.git_ref, "https://github.com/100monkeys-ai/aegis-platform-deployment.git",
+        "the remote rides `ref`"
+    );
+    assert_eq!(answer.branch, "queued", "whether it queued rides `branch`");
+    fx.assert_each_call_is_the_persons_in_the_workspace();
+}
+
+#[tokio::test]
+async fn a_tree_named_and_not_materialized_has_no_files_to_diff_or_write() {
+    let fx = fixture_of(|_, _| {}, false).await;
+    for action in ["tree_diff", "tree_write"] {
+        let answer = answered(run_action(&fx, action, Some("carbon-forge: the task"))).await;
+        assert_eq!(
+            answer.sentence.as_deref(),
+            Some("this run holds no tree"),
+            "AEGIS ADR-149 C2: {action} of a run holding no volume: {answer:?}"
+        );
+    }
+    let answer = fx
+        .service
+        .run_repository_action(&fx.tenant, fx.run, "tree_unknown", None)
+        .await;
+    assert!(
+        matches!(&answer, Ok(a) if a.sentence.is_some()) || answer.is_err(),
+        "an unknown tree action landed: {answer:?}"
+    );
+    assert!(
+        !fx.calls().iter().any(|(t, _)| t == "lanes.land"),
+        "AEGIS ADR-149 C1: an unknown tree action reached the landing"
     );
 }

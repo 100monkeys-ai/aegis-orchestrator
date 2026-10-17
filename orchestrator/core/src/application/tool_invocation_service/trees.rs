@@ -41,7 +41,7 @@ use crate::domain::shared_kernel::VolumeId;
 use crate::domain::storage::{FileType, OpenMode, StorageProvider};
 use crate::domain::tenant::TenantId;
 use crate::domain::volume::{AccessMode, StorageClass, Volume, VolumeBackend, VolumeMount};
-use crate::infrastructure::tool_router::TREE_LAND_TOOL;
+use crate::infrastructure::tool_router::{ARCHIVE_PUSH_TOOL, TREE_LAND_TOOL};
 
 /// The most a blob read or a `blobs.put` carries: Nuclear Notes' part.
 const PART: usize = 4 * 1024 * 1024;
@@ -71,6 +71,16 @@ const NOTHING_TO_WRITE: &str =
 /// landing step.
 const TREE_LAND_IS_THE_WORKFLOWS: &str =
     "aegis.tree.land is answered only for a workflow's own landing step";
+
+/// The refusal of `aegis.archive.push` called by anything but a workflow's
+/// own push step (AEGIS ADR-149 C2).
+const ARCHIVE_PUSH_IS_THE_WORKFLOWS: &str =
+    "aegis.archive.push is answered only for a workflow's own push step";
+
+/// A run's cut is named `forge-<execution id>` when its state names none
+/// (AEGIS ADR-149 C1): a cut name admits no slash (Nuclear Notes
+/// `snapshot.ts` CUT_NAME_PATTERN).
+const CUT_NAME_DEFAULT_PREFIX: &str = "forge-";
 
 /// One entry of a tree's revision, as `trees.materialize` answers it.
 #[derive(Debug, Clone, Deserialize)]
@@ -117,7 +127,9 @@ struct TreeOfRun {
     person: String,
     acting: GatewayActing,
     tree: RunTree,
-    volume_id: VolumeId,
+    /// The volume the tree was materialized into; `None` for a tree named
+    /// and not materialized (AEGIS ADR-149 C2).
+    volume_id: Option<VolumeId>,
 }
 
 /// The sentence a tree step answers for a refusal its person can act on:
@@ -583,16 +595,23 @@ impl ToolInvocationService {
                 Err(sentence) => return Ok(Err(sentence)),
             },
         };
-        let Some((tree, volume_id)) = trees.into_iter().find_map(|tree| {
-            let volume_id = tree
-                .volume_id
+        // The first tree materialized into a volume, else the first named
+        // (AEGIS ADR-149 C2: a tree bound by its name alone).
+        let volume_of = |tree: &RunTree| {
+            tree.volume_id
                 .as_deref()
                 .and_then(|id| uuid::Uuid::parse_str(id).ok())
-                .map(VolumeId)?;
-            Some((tree, volume_id))
-        }) else {
+                .map(VolumeId)
+        };
+        let Some(tree) = trees
+            .iter()
+            .find(|tree| volume_of(tree).is_some())
+            .or_else(|| trees.first())
+            .cloned()
+        else {
             return Ok(Err(RUN_HOLDS_NO_TREE.to_string()));
         };
+        let volume_id = volume_of(&tree);
         let person = execution.initiating_user_sub.clone().unwrap_or_default();
         let contexts = ExecutionContexts::from_value(execution.input.get(CONTEXTS_INPUT_KEY));
         Ok(Ok(TreeOfRun {
@@ -608,21 +627,28 @@ impl ToolInvocationService {
         }))
     }
 
+    /// The volume the run's tree was materialized into: a tree named and not
+    /// materialized has no files (AEGIS ADR-149 C2).
+    fn volume_of(tree: &TreeOfRun) -> Result<VolumeId, RepositoryActionError> {
+        tree.volume_id
+            .ok_or_else(|| RepositoryActionError::Failed(RUN_HOLDS_NO_TREE.to_string()))
+    }
+
     /// The run's tree volume's files, and the root they were read under.
     async fn files_of(
         &self,
-        tree: &TreeOfRun,
+        volume_id: VolumeId,
     ) -> Result<BTreeMap<String, Vec<u8>>, RepositoryActionError> {
         let volume = self
             .fsal
             .volume_repository()
-            .find_by_id(tree.volume_id)
+            .find_by_id(volume_id)
             .await
             .map_err(|e| RepositoryActionError::Failed(e.to_string()))?
             .ok_or_else(|| {
                 RepositoryActionError::Failed(format!(
                     "the run's tree volume {} was not found",
-                    tree.volume_id
+                    volume_id
                 ))
             })?;
         let root = volume_root(&volume).map_err(RepositoryActionError::Failed)?;
@@ -662,6 +688,14 @@ impl ToolInvocationService {
                 }),
                 None => Err(RepositoryActionError::Failed(e.to_string())),
             };
+        if matches!(action, "tree_diff" | "tree_write") && tree.volume_id.is_none() {
+            return Ok(RepositoryActionAnswer {
+                sentence: Some(RUN_HOLDS_NO_TREE.to_string()),
+                ..answer
+            });
+        }
+        let string_of =
+            |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
         match action {
             "tree_diff" => match self.tree_diff(tenant_id, &tree).await? {
                 Ok(diff) if diff.len() > TREE_DIFF_MAX_BYTES => Ok(RepositoryActionAnswer {
@@ -687,7 +721,95 @@ impl ToolInvocationService {
                     Err(e) => refused_or_failed(e, answer),
                 }
             }
-            _ => {
+            // AEGIS ADR-149 C1: the landed run becomes a cut, named by the
+            // state's `cut` (the step's message) or `forge-<execution id>`;
+            // the cut rides `git_ref` and its snapshot `commit_sha`.
+            "tree_cut" => {
+                let name = message
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("{CUT_NAME_DEFAULT_PREFIX}{run}"));
+                match self.tree_cut(tenant_id, &tree, &name).await {
+                    Ok(cut) => Ok(RepositoryActionAnswer {
+                        commit_sha: string_of(&cut, "snapshot_id"),
+                        git_ref: string_of(&cut, "cut").unwrap_or(name),
+                        ..answer
+                    }),
+                    Err(e) => refused_or_failed(e, answer),
+                }
+            }
+            // AEGIS ADR-149 C2: the cut rendered into the tree's git archive
+            // and tagged; its commit rides `commit_sha`, its tag `git_ref`,
+            // its snapshot `branch`, and the render's own answer `diff`.
+            "archive_render" => {
+                let cut = message
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                    .ok_or(RepositoryActionError::NoMessage)?;
+                match self.archive_render(tenant_id, &tree, cut).await {
+                    Ok(rendered) => Ok(RepositoryActionAnswer {
+                        commit_sha: string_of(&rendered, "commit_sha1"),
+                        branch: string_of(&rendered, "snapshot_id").unwrap_or_default(),
+                        git_ref: rendered
+                            .get("tag")
+                            .and_then(|tag| string_of(tag, "name"))
+                            .unwrap_or_default(),
+                        diff: Some(rendered.to_string()),
+                        ..answer
+                    }),
+                    Err(e) => refused_or_failed(e, answer),
+                }
+            }
+            // AEGIS ADR-149 C2: the archive's push, a crossing of the
+            // boundary, after the person's approval; its job rides
+            // `commit_sha`, its remote `git_ref`, whether it queued `branch`.
+            "archive_push" => {
+                let execution_id = ExecutionId(run);
+                let arguments = json!({ "tree": tree.tree.path });
+                let pushed = match self
+                    .land_at_gate(
+                        tenant_id,
+                        execution_id,
+                        &tree.person,
+                        ARCHIVE_PUSH_TOOL,
+                        arguments.clone(),
+                        || {
+                            self.archive_push_for_interpreter(
+                                tenant_id,
+                                execution_id,
+                                &tree.person,
+                                &arguments,
+                            )
+                        },
+                    )
+                    .await?
+                {
+                    GatedLanding::Landed(pushed) => pushed,
+                    GatedLanding::NotApproved(sentence) => {
+                        return Ok(RepositoryActionAnswer {
+                            sentence: Some(sentence),
+                            ..answer
+                        })
+                    }
+                };
+                let queued = pushed.get("queued").and_then(Value::as_bool);
+                Ok(RepositoryActionAnswer {
+                    commit_sha: string_of(&pushed, "job_id"),
+                    git_ref: string_of(&pushed, "remote").unwrap_or_default(),
+                    branch: match queued {
+                        Some(true) => "queued".to_string(),
+                        Some(false) => "not queued".to_string(),
+                        None => String::new(),
+                    },
+                    diff: pushed
+                        .get("sentence")
+                        .is_none()
+                        .then(|| pushed.to_string()),
+                    sentence: string_of(&pushed, "sentence"),
+                })
+            }
+            "tree_land" => {
                 let message = message
                     .filter(|m| !m.trim().is_empty())
                     .ok_or(RepositoryActionError::NoMessage)?;
@@ -735,6 +857,12 @@ impl ToolInvocationService {
                     ..answer
                 })
             }
+            other => Ok(RepositoryActionAnswer {
+                sentence: Some(format!(
+                    "unknown tree action '{other}': expected tree_diff, tree_write, tree_land, tree_cut, archive_render or archive_push"
+                )),
+                ..answer
+            }),
         }
     }
 
@@ -752,7 +880,7 @@ impl ToolInvocationService {
             Ok(manifest) => manifest,
             Err(e) => return Ok(Err(e)),
         };
-        let files = self.files_of(tree).await?;
+        let files = self.files_of(Self::volume_of(tree)?).await?;
         let before: BTreeMap<&str, &ManifestEntry> = manifest
             .iter()
             .filter(|e| e.is_file())
@@ -810,7 +938,7 @@ impl ToolInvocationService {
             Ok(manifest) => manifest,
             Err(e) => return Ok(Err(e)),
         };
-        let files = self.files_of(tree).await?;
+        let files = self.files_of(Self::volume_of(tree)?).await?;
         let by_path: BTreeMap<&str, &ManifestEntry> =
             manifest.iter().map(|e| (e.path.as_str(), e)).collect();
         let mut entries: BTreeMap<String, Value> = BTreeMap::new();
@@ -965,6 +1093,123 @@ impl ToolInvocationService {
     }
 }
 
+impl ToolInvocationService {
+    /// The cut of the run's tree's workspace (AEGIS ADR-149 C1): a snapshot
+    /// of its every entity's current revision, named `name`. Answers
+    /// Nuclear Notes' own answer, the snapshot's header and its `cut`.
+    async fn tree_cut(
+        &self,
+        tenant_id: &TenantId,
+        tree: &TreeOfRun,
+        name: &str,
+    ) -> Result<Value, SealSessionError> {
+        let cut = self
+            .nuclear_notes(
+                tree.run,
+                tenant_id,
+                &tree.acting,
+                &tree.tree.workspace,
+                "snapshots.cut",
+                json!({ "name": name }),
+            )
+            .await?;
+        tracing::info!(
+            workflow_execution_id = %tree.run,
+            tree = %tree.tree.path,
+            cut = %name,
+            snapshot_id = %cut.get("snapshot_id").cloned().unwrap_or_default(),
+            "A run's workspace was cut"
+        );
+        Ok(cut)
+    }
+
+    /// The render of the cut `cut` of the run's tree into its git archive
+    /// (AEGIS ADR-149 C2): the cut's revision rendered, main moved to it
+    /// fast-forward only and tagged `nn/<cut>`. Answers Nuclear Notes' own
+    /// answer.
+    async fn archive_render(
+        &self,
+        tenant_id: &TenantId,
+        tree: &TreeOfRun,
+        cut: &str,
+    ) -> Result<Value, SealSessionError> {
+        let rendered = self
+            .nuclear_notes(
+                tree.run,
+                tenant_id,
+                &tree.acting,
+                &tree.tree.workspace,
+                "archives.render",
+                json!({ "tree": tree.tree.path, "cut": cut }),
+            )
+            .await?;
+        tracing::info!(
+            workflow_execution_id = %tree.run,
+            tree = %tree.tree.path,
+            cut = %cut,
+            commit_sha1 = %rendered.get("commit_sha1").cloned().unwrap_or_default(),
+            "A run's cut was rendered into its tree's git archive"
+        );
+        Ok(rendered)
+    }
+
+    /// The push itself, for the workflow execution `execution_id`'s own step
+    /// and its person `person` only (AEGIS ADR-149 C2): what
+    /// `aegis.archive.push` runs once the person approved. Queues the push
+    /// of the run's tree's git archive to its remote and answers the job;
+    /// Nuclear Notes' refusal (no remote, no rendered cut, a role short of
+    /// the workspace's admin) is answered in its own words under
+    /// `sentence`, nothing queued.
+    pub(super) async fn archive_push_for_interpreter(
+        &self,
+        tenant_id: &TenantId,
+        execution_id: ExecutionId,
+        person: &str,
+        arguments: &Value,
+    ) -> Result<Value, SealSessionError> {
+        let not_the_workflows =
+            || SealSessionError::InvalidArguments(ARCHIVE_PUSH_IS_THE_WORKFLOWS.to_string());
+        let tree = match self.tree_of_run(tenant_id, execution_id.0).await {
+            Ok(Ok(tree)) => tree,
+            Ok(Err(sentence)) => return Ok(json!({ "sentence": sentence })),
+            Err(RepositoryActionError::RunNotFound(_)) => return Err(not_the_workflows()),
+            Err(e) => return Err(SealSessionError::InternalError(e.to_string())),
+        };
+        if tree.person.is_empty() || tree.person != person {
+            return Err(not_the_workflows());
+        }
+        if arguments.get("tree").and_then(Value::as_str) != Some(tree.tree.path.as_str()) {
+            return Err(not_the_workflows());
+        }
+        match self
+            .nuclear_notes(
+                tree.run,
+                tenant_id,
+                &tree.acting,
+                &tree.tree.workspace,
+                "archives.push",
+                json!({ "tree": tree.tree.path }),
+            )
+            .await
+        {
+            Ok(pushed) => {
+                tracing::info!(
+                    workflow_execution_id = %tree.run,
+                    tree = %tree.tree.path,
+                    job_id = %pushed.get("job_id").cloned().unwrap_or_default(),
+                    queued = %pushed.get("queued").cloned().unwrap_or_default(),
+                    "A run's tree's git archive push was queued"
+                );
+                Ok(pushed)
+            }
+            Err(e) => match step_refusal(&e) {
+                Some(sentence) => Ok(json!({ "sentence": sentence, "tree": tree.tree.path })),
+                None => Err(e),
+            },
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl RunTrees for ToolInvocationService {
     async fn materialize_for_run(
@@ -1005,17 +1250,17 @@ impl RunTrees for ToolInvocationService {
             Ok(Err(_)) | Err(RepositoryActionError::RunNotFound(_)) => return Ok(None),
             Err(e) => return Err(RunTreeError::Failed(e.to_string())),
         };
+        let Some(volume_id) = tree.volume_id else {
+            return Ok(None);
+        };
         let volume = self
             .fsal
             .volume_repository()
-            .find_by_id(tree.volume_id)
+            .find_by_id(volume_id)
             .await
             .map_err(|e| RunTreeError::Failed(e.to_string()))?
             .ok_or_else(|| {
-                RunTreeError::Failed(format!(
-                    "the run's tree volume {} was not found",
-                    tree.volume_id
-                ))
+                RunTreeError::Failed(format!("the run's tree volume {} was not found", volume_id))
             })?;
         let access = if read_only {
             AccessMode::ReadOnly

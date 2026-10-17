@@ -1225,6 +1225,15 @@ pub enum ActionName {
     /// Lands the run's lane as one changeset, with the argument `message`
     /// as its intent; gated (AEGIS ADR-147 C5).
     TreeLand,
+    /// Cuts a snapshot of the run's tree's workspace and names it with the
+    /// argument `cut`, else `forge-<execution id>` (AEGIS ADR-149 C1).
+    TreeCut,
+    /// Renders the cut `cut` of the run's tree into its git archive and tags
+    /// it (AEGIS ADR-149 C2).
+    ArchiveRender,
+    /// Queues the push of the run's tree's git archive to its remote; gated
+    /// (AEGIS ADR-149 C2).
+    ArchivePush,
 }
 
 /// Where `image_generate` writes its files when a state names no `path`.
@@ -1260,11 +1269,15 @@ pub enum ActionNeed {
     /// ADR-147 C2). The manifest cannot say what a run names, so a run
     /// holding none is refused by the step, never the parse.
     RunTree,
+    /// The run's Nuclear Notes tree named by `trees`, never materialized: a
+    /// workflow whose every state is an Action needing only this binds the
+    /// tree with no volume (AEGIS ADR-149 C2).
+    RunTreeRef,
 }
 
 impl ActionName {
     /// Every action, in the order the refusal lists them.
-    pub const ALL: [ActionName; 8] = [
+    pub const ALL: [ActionName; 11] = [
         ActionName::UpdateBlackboard,
         ActionName::RepositoryDiff,
         ActionName::RepositoryCommit,
@@ -1273,6 +1286,9 @@ impl ActionName {
         ActionName::TreeDiff,
         ActionName::TreeWrite,
         ActionName::TreeLand,
+        ActionName::TreeCut,
+        ActionName::ArchiveRender,
+        ActionName::ArchivePush,
     ];
 
     /// The literal a manifest writes.
@@ -1286,6 +1302,9 @@ impl ActionName {
             ActionName::TreeDiff => "tree_diff",
             ActionName::TreeWrite => "tree_write",
             ActionName::TreeLand => "tree_land",
+            ActionName::TreeCut => "tree_cut",
+            ActionName::ArchiveRender => "archive_render",
+            ActionName::ArchivePush => "archive_push",
         }
     }
 
@@ -1317,6 +1336,18 @@ impl ActionName {
                 required: &["prompt"],
                 optional: &["alias", "size", "count", "path"],
             },
+            ActionName::TreeCut => ActionArguments::Declared {
+                required: &[],
+                optional: &["cut"],
+            },
+            ActionName::ArchiveRender => ActionArguments::Declared {
+                required: &["cut"],
+                optional: &[],
+            },
+            ActionName::ArchivePush => ActionArguments::Declared {
+                required: &[],
+                optional: &[],
+            },
         }
     }
 
@@ -1331,13 +1362,19 @@ impl ActionName {
             ActionName::TreeDiff | ActionName::TreeWrite | ActionName::TreeLand => {
                 ActionNeed::RunTree
             }
+            ActionName::TreeCut | ActionName::ArchiveRender | ActionName::ArchivePush => {
+                ActionNeed::RunTreeRef
+            }
         }
     }
 
     /// Whether this action touches the world, and so waits at the approval
     /// gate.
     pub fn touches_the_world(&self) -> bool {
-        matches!(self, ActionName::RepositoryLand | ActionName::TreeLand)
+        matches!(
+            self,
+            ActionName::RepositoryLand | ActionName::TreeLand | ActionName::ArchivePush
+        )
     }
 
     /// Checks a state's `args` against the declared arguments: an argument

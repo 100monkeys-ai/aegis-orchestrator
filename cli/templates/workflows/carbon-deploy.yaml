@@ -1,0 +1,130 @@
+# Copyright (c) 2026 100monkeys.ai
+# SPDX-License-Identifier: AGPL-3.0
+#
+# Carbon Deploy: a deploy keyed to a cut (AEGIS ADR-149).
+#
+#   RENDER (archive_render) ─► PUSH (archive_push, your approval) ─► COMPLETE
+#      │ refused                  │ refused or not approved
+#      ▼                          ▼
+#   RENDER_REFUSED             PUSH_REFUSED
+#
+# The run names its tree by the dispatch key `trees`, [{workspace, path,
+# revision}], beside its `contexts`, as carbon-forge's does; every state is
+# an Action needing only the tree's name, so nothing is materialized and the
+# revision is recorded, not read (C2). RENDER renders the cut `cut` of the
+# tree into its git archive, moves main to it fast-forward only and tags it
+# nn/<cut>; PUSH queues the archive's push to its remote after your
+# approval, a crossing of the boundary gated as every landing is. Each
+# step's answer rides the fields every repository step answers: RENDER's
+# commit sha1 in `commit_sha`, its tag in `ref`, its snapshot id in
+# `branch` and Nuclear Notes' whole answer in `diff`; PUSH's job id in
+# `commit_sha`, its remote in `ref` and whether it queued in `branch`.
+# COMPLETE records the deploy on the blackboard (C3): cut, environment,
+# snapshot_id, commit_sha1 and push_job_id. The run ends when the push is
+# queued; the deploy run on the remote is not waited for.
+
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+
+metadata:
+  name: "carbon-deploy"
+  version: "1.0.0"
+  description: |-
+    Deploys one cut of one of your Nuclear Notes trees: the cut is rendered
+    into the tree's git archive and tagged, then, after your approval, the
+    archive is pushed to its remote, whose own pipeline deploys it. The run
+    records the cut, the environment, the snapshot, the commit and the push
+    job. A revert is a carbon-deploy of an earlier cut.
+  labels:
+    builtin: "true"
+    category: "deployment"
+  input_schema:
+    type: object
+    properties:
+      cut:
+        type: string
+        description: "The cut to deploy, as Nuclear Notes names it (stable, v0.9, forge-<execution id>)."
+      environment:
+        type: string
+        description: "The environment the deploy is for. Recorded, not interpreted."
+      trees:
+        type: array
+        description: "The tree whose archive is deployed: one entry of {workspace, path, revision}. The revision is recorded, not read."
+        items:
+          type: object
+          properties:
+            workspace:
+              type: string
+            path:
+              type: string
+            revision:
+              type: integer
+          required:
+            - workspace
+            - path
+            - revision
+    required:
+      - cut
+      - environment
+
+spec:
+  # The run names exactly one tree by the dispatch key `trees`.
+
+  initial_state: RENDER
+
+  states:
+
+    RENDER:
+      kind: Action
+      action: archive_render
+      args:
+        cut: "{{input.cut}}"
+      transitions:
+        - condition: on_success
+          target: PUSH
+        - condition: on_failure
+          target: RENDER_REFUSED
+
+    PUSH:
+      kind: Action
+      action: archive_push
+      transitions:
+        - condition: on_success
+          target: COMPLETE
+        - condition: on_failure
+          target: PUSH_REFUSED
+
+    COMPLETE:
+      kind: Action
+      action: update_blackboard
+      args:
+        outcome: "complete"
+        cut: "{{input.cut}}"
+        environment: "{{input.environment}}"
+        snapshot_id: "{{RENDER.output.branch}}"
+        commit_sha1: "{{RENDER.output.commit_sha}}"
+        push_job_id: "{{PUSH.output.commit_sha}}"
+        sentence: ""
+      transitions: []
+
+    RENDER_REFUSED:
+      kind: Action
+      action: update_blackboard
+      args:
+        outcome: "render_refused"
+        cut: "{{input.cut}}"
+        environment: "{{input.environment}}"
+        sentence: "{{{RENDER.output.sentence}}}"
+      transitions: []
+
+    PUSH_REFUSED:
+      kind: Action
+      action: update_blackboard
+      args:
+        outcome: "push_refused"
+        cut: "{{input.cut}}"
+        environment: "{{input.environment}}"
+        snapshot_id: "{{RENDER.output.branch}}"
+        commit_sha1: "{{RENDER.output.commit_sha}}"
+        sentence: "{{{PUSH.output.sentence}}}"
+      transitions: []

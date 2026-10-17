@@ -99,6 +99,25 @@ impl ApprovedCallRunner for ToolInvocationService {
                 .await
                 .map_err(|e| e.to_string());
         }
+        // AEGIS ADR-149 C2: a run's archive push is answered here, for the
+        // workflow's own push step and its person only.
+        if request.tool_name == crate::infrastructure::tool_router::ARCHIVE_PUSH_TOOL {
+            if !security_context.permits_tool_name(&request.tool_name) {
+                return Err(format!(
+                    "security context '{}' does not permit tool '{}'",
+                    security_context.name, request.tool_name
+                ));
+            }
+            return self
+                .archive_push_for_interpreter(
+                    &request.tenant_id,
+                    request.execution_id,
+                    &request.user_sub,
+                    &request.arguments,
+                )
+                .await
+                .map_err(|e| e.to_string());
+        }
         match self
             .dispatch_after_gate(
                 &request.agent_id,

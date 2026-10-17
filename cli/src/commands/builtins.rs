@@ -178,6 +178,10 @@ pub const BUILTIN_WORKFLOWS: &[(&str, &str)] = &[
         include_str!("../../templates/workflows/carbon-forge.yaml"),
     ),
     (
+        "carbon-deploy",
+        include_str!("../../templates/workflows/carbon-deploy.yaml"),
+    ),
+    (
         "transcribe-audio",
         include_str!("../../templates/workflows/transcribe-audio.yaml"),
     ),
@@ -2715,6 +2719,206 @@ mod tests {
         assert!(
             complaints.is_empty(),
             "AEGIS ADR-147: carbon-forge is not the template the clauses name:\n{}",
+            complaints.join("\n")
+        );
+    }
+
+    /// AEGIS ADR-149 C1 (deploys key to cuts, Proposed, page revision
+    /// 55895): a landed carbon-forge run becomes a cut. LAND goes on to the
+    /// Action state CUT (`tree_cut`, its name the dispatch's `cut`), CUT to
+    /// COMPLETE or CUT_REFUSED with the cut's own sentence, and COMPLETE
+    /// records the cut (riding `ref`) and its snapshot (riding `commit_sha`).
+    #[test]
+    fn carbon_forge_cuts_the_landed_run() {
+        let carbon_yaml = BUILTIN_WORKFLOWS
+            .iter()
+            .find(|(n, _)| *n == "carbon-forge")
+            .map(|(_, y)| *y)
+            .expect("carbon-forge is a built-in");
+        aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(
+            carbon_yaml,
+        )
+        .unwrap_or_else(|e| panic!("AEGIS ADR-149 C1: carbon-forge does not parse: {e}"));
+        let carbon: serde_yaml::Value = serde_yaml::from_str(carbon_yaml).unwrap();
+        let states = &carbon["spec"]["states"];
+        let target = |state: &str, condition: &str| -> Option<String> {
+            states[state]["transitions"].as_sequence().and_then(|ts| {
+                ts.iter()
+                    .find(|t| t["condition"].as_str() == Some(condition))
+                    .and_then(|t| t["target"].as_str().map(str::to_string))
+            })
+        };
+        let mut complaints = Vec::new();
+        if states["CUT"]["kind"].as_str() != Some("Action")
+            || states["CUT"]["action"].as_str() != Some("tree_cut")
+        {
+            complaints.push(format!(
+                "C1: CUT is kind {:?} action {:?}, not the Action tree_cut",
+                states["CUT"]["kind"], states["CUT"]["action"]
+            ));
+        }
+        if states["CUT"]["args"]["cut"].as_str() != Some("{{input.cut}}") {
+            complaints.push(format!(
+                "C1: CUT names its cut {:?}, not the dispatch's",
+                states["CUT"]["args"]["cut"]
+            ));
+        }
+        for (state, condition, to) in [
+            ("LAND", "on_success", "CUT"),
+            ("CUT", "on_success", "COMPLETE"),
+            ("CUT", "on_failure", "CUT_REFUSED"),
+        ] {
+            if target(state, condition).as_deref() != Some(to) {
+                complaints.push(format!(
+                    "C1: {state} {condition} goes to {:?}, not {to}",
+                    target(state, condition)
+                ));
+            }
+        }
+        if states["CUT_REFUSED"]["args"]["sentence"].as_str() != Some("{{{CUT.output.sentence}}}") {
+            complaints.push(format!(
+                "C1: CUT_REFUSED does not carry the cut's own sentence: {:?}",
+                states["CUT_REFUSED"]["args"]["sentence"]
+            ));
+        }
+        for (key, value) in [
+            ("cut", "{{CUT.output.ref}}"),
+            ("snapshot_id", "{{CUT.output.commit_sha}}"),
+        ] {
+            if states["COMPLETE"]["args"][key].as_str() != Some(value) {
+                complaints.push(format!(
+                    "C1: COMPLETE's {key} is {:?}, not {value}",
+                    states["COMPLETE"]["args"][key]
+                ));
+            }
+        }
+        let cut = &carbon["metadata"]["input_schema"]["properties"]["cut"];
+        if cut["type"].as_str() != Some("string") {
+            complaints.push(format!("C1: input_schema has no string cut: {cut:?}"));
+        }
+        if carbon["metadata"]["version"].as_str() == Some("1.0.0") {
+            complaints.push("C1: the template's version did not bump".to_string());
+        }
+        assert!(
+            complaints.is_empty(),
+            "AEGIS ADR-149: carbon-forge does not cut the landed run:\n{}",
+            complaints.join("\n")
+        );
+    }
+
+    /// AEGIS ADR-149 C2, C3, C4: `carbon-deploy` is a built-in registered
+    /// after carbon-forge; it takes `cut`, `environment` and `trees`; RENDER
+    /// (`archive_render`), PUSH (`archive_push`) and COMPLETE, with
+    /// RENDER_REFUSED and PUSH_REFUSED carrying the sentence; COMPLETE's
+    /// blackboard keys are the deploy's record; every state is an Action
+    /// needing only the tree's name, so a start materializes nothing; its
+    /// description says a revert is a deploy of an earlier cut.
+    #[test]
+    fn carbon_deploy_is_a_builtin_rendering_and_pushing_a_cut() {
+        use aegis_orchestrator_core::domain::workflow::{ActionNeed, StateKind};
+        let names: Vec<&str> = BUILTIN_WORKFLOWS.iter().map(|(n, _)| *n).collect();
+        let carbon_at = names.iter().position(|n| *n == "carbon-forge").unwrap();
+        let Some(deploy_at) = names.iter().position(|n| *n == "carbon-deploy") else {
+            panic!(
+                "AEGIS ADR-149 C2: carbon-deploy is not registered; the built-in workflows are {names:?}"
+            );
+        };
+        assert_eq!(
+            deploy_at,
+            carbon_at + 1,
+            "AEGIS ADR-149 C2: carbon-deploy is not registered after carbon-forge"
+        );
+        let deploy_yaml = BUILTIN_WORKFLOWS[deploy_at].1;
+        let parsed =
+            aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(
+                deploy_yaml,
+            )
+            .unwrap_or_else(|e| panic!("AEGIS ADR-149 C2: carbon-deploy does not parse: {e}"));
+        let deploy: serde_yaml::Value = serde_yaml::from_str(deploy_yaml).unwrap();
+        let states = &deploy["spec"]["states"];
+        let mut complaints = Vec::new();
+        if deploy["metadata"]["name"].as_str() != Some("carbon-deploy") {
+            complaints.push(format!(
+                "C2: metadata.name is {:?}",
+                deploy["metadata"]["name"]
+            ));
+        }
+        let schema = &deploy["metadata"]["input_schema"];
+        let required: Vec<&str> = schema["required"]
+            .as_sequence()
+            .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        for key in ["cut", "environment"] {
+            if schema["properties"][key]["type"].as_str() != Some("string")
+                || !required.contains(&key)
+            {
+                complaints.push(format!("C2: input {key} is not a required string"));
+            }
+        }
+        if schema["properties"]["trees"].is_null() {
+            complaints.push("C2: input trees is not taken".to_string());
+        }
+        for (state, action, refused) in [
+            ("RENDER", "archive_render", "RENDER_REFUSED"),
+            ("PUSH", "archive_push", "PUSH_REFUSED"),
+        ] {
+            if states[state]["kind"].as_str() != Some("Action")
+                || states[state]["action"].as_str() != Some(action)
+            {
+                complaints.push(format!("C2: {state} is not the Action {action}"));
+            }
+            let fails_to = states[state]["transitions"].as_sequence().and_then(|ts| {
+                ts.iter()
+                    .find(|t| t["condition"].as_str() == Some("on_failure"))
+                    .and_then(|t| t["target"].as_str())
+            });
+            if fails_to != Some(refused) {
+                complaints.push(format!("C2: {state} on_failure goes to {fails_to:?}"));
+            }
+            let sentence = format!("{{{{{{{state}.output.sentence}}}}}}");
+            if states[refused]["args"]["sentence"].as_str() != Some(sentence.as_str()) {
+                complaints.push(format!(
+                    "C2: {refused} does not carry {state}'s sentence: {:?}",
+                    states[refused]["args"]["sentence"]
+                ));
+            }
+        }
+        if states["RENDER"]["args"]["cut"].as_str() != Some("{{input.cut}}") {
+            complaints.push("C2: RENDER does not render the input's cut".to_string());
+        }
+        for (key, value) in [
+            ("outcome", "complete"),
+            ("cut", "{{input.cut}}"),
+            ("environment", "{{input.environment}}"),
+            ("snapshot_id", "{{RENDER.output.branch}}"),
+            ("commit_sha1", "{{RENDER.output.commit_sha}}"),
+            ("push_job_id", "{{PUSH.output.commit_sha}}"),
+        ] {
+            if states["COMPLETE"]["args"][key].as_str() != Some(value) {
+                complaints.push(format!(
+                    "C3: COMPLETE's {key} is {:?}, not {value}",
+                    states["COMPLETE"]["args"][key]
+                ));
+            }
+        }
+        for (name, state) in &parsed.spec.states {
+            match &state.kind {
+                StateKind::Action { action, .. } if action.needs() != ActionNeed::RunTree => {}
+                _ => complaints.push(format!(
+                    "C2: {} would have its tree materialized at the start",
+                    name.as_str()
+                )),
+            }
+        }
+        let description = deploy["metadata"]["description"].as_str().unwrap_or("");
+        if !description.contains("revert is a carbon-deploy of an earlier cut") {
+            complaints.push(format!(
+                "C4: the description does not say a revert is a carbon-deploy of an earlier cut: {description:?}"
+            ));
+        }
+        assert!(
+            complaints.is_empty(),
+            "AEGIS ADR-149: carbon-deploy is not the template the clauses name:\n{}",
             complaints.join("\n")
         );
     }

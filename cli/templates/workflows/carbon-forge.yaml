@@ -17,7 +17,7 @@
 #                               COMMIT (tree_write) ─ draft_only (default) ─► COMPLETE
 #                                  │ draft_only false
 #                                  ▼
-#                                LAND (tree_land) ─► COMPLETE, or LAND_REFUSED
+#                                LAND (tree_land) ─► CUT (tree_cut) ─► COMPLETE, or LAND_REFUSED / CUT_REFUSED
 #
 # The Forge's states, kept as they are (C3). The run names its tree by the
 # dispatch key `trees`, [{workspace, path, revision}], beside its `contexts`
@@ -30,13 +30,20 @@
 # sentence (C5). draft_only (the default) ends at COMPLETE with the change
 # on the lane (C6). Every path in the prompts and in tests is written
 # relative to the tree's root, never absolute.
+#
+# A landed run becomes a cut (AEGIS ADR-149 C1): CUT names a snapshot of the
+# tree's workspace with the dispatch's `cut`, else forge-<execution id>, and
+# a refusal ends in CUT_REFUSED with Nuclear Notes' own sentence. The step's
+# answer carries the cut name in `ref` and the snapshot id in `commit_sha`,
+# which COMPLETE records as `cut` and `snapshot_id`. A draft_only run never
+# reaches LAND, and so never cuts.
 
 apiVersion: 100monkeys.ai/v1
 kind: Workflow
 
 metadata:
   name: "carbon-forge"
-  version: "1.0.0"
+  version: "1.1.0"
   description: |-
     Develops one change in one of your Nuclear Notes trees: requirements and a
     design, each approved by you, then tests written first, the implementation,
@@ -65,6 +72,9 @@ metadata:
         type: boolean
         default: true
         description: "True (the default) ends the run with the change on the run's lane and the trunk untouched; false lands the lane on the trunk as one changeset after your approval."
+      cut:
+        type: string
+        description: "Name the cut the landed run becomes; default forge-<execution id>"
     required:
       - task
       - test_command
@@ -499,9 +509,22 @@ spec:
         message: "carbon-forge: {{{first_line input.task}}}"
       transitions:
         - condition: on_success
-          target: COMPLETE
+          target: CUT
         - condition: on_failure
           target: LAND_REFUSED
+
+    # The landed run becomes a cut (AEGIS ADR-149 C1): the cut name rides
+    # the step's `ref`, the snapshot id its `commit_sha`.
+    CUT:
+      kind: Action
+      action: tree_cut
+      args:
+        cut: "{{input.cut}}"
+      transitions:
+        - condition: on_success
+          target: COMPLETE
+        - condition: on_failure
+          target: CUT_REFUSED
 
     COMPLETE:
       kind: Action
@@ -511,6 +534,9 @@ spec:
         # The landed changeset, when the run landed; empty for a draft.
         commit_sha: "{{LAND.output.commit_sha}}"
         branch: "{{COMMIT.output.branch}}"
+        # The cut the landed run became and its snapshot; empty for a draft.
+        cut: "{{CUT.output.ref}}"
+        snapshot_id: "{{CUT.output.commit_sha}}"
         sentence: ""
       transitions: []
 
@@ -535,4 +561,15 @@ spec:
         commit_sha: "{{COMMIT.output.commit_sha}}"
         branch: "{{COMMIT.output.branch}}"
         sentence: "{{{LAND.output.sentence}}}"
+      transitions: []
+
+    # The run landed and its cut was refused: Nuclear Notes' own sentence.
+    CUT_REFUSED:
+      kind: Action
+      action: update_blackboard
+      args:
+        outcome: "cut_refused"
+        commit_sha: "{{LAND.output.commit_sha}}"
+        branch: "{{COMMIT.output.branch}}"
+        sentence: "{{{CUT.output.sentence}}}"
       transitions: []

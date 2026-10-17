@@ -1341,8 +1341,17 @@ impl ToolInvocationService {
         message: Option<&str>,
     ) -> Result<RepositoryActionAnswer, RepositoryActionError> {
         // AEGIS ADR-147 C3: carbon-forge's steps on the run's Nuclear Notes
-        // tree ride the same step.
-        if matches!(action, "tree_diff" | "tree_write" | "tree_land") {
+        // tree ride the same step, as do the cut, the render and the push of
+        // AEGIS ADR-149 C1, C2.
+        if matches!(
+            action,
+            "tree_diff"
+                | "tree_write"
+                | "tree_land"
+                | "tree_cut"
+                | "archive_render"
+                | "archive_push"
+        ) {
             return self.run_tree_action(tenant_id, run, action, message).await;
         }
         if !matches!(action, "diff" | "commit" | "land") {

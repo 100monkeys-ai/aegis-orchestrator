@@ -257,9 +257,13 @@ impl StandardStartWorkflowExecutionUseCase {
     /// volume `tree` before its first agent, as the run's person, through
     /// the binding the run's `contexts` chose for Nuclear Notes. The
     /// persisted input keeps each tree with its volume and the blob refs
-    /// its files were verified against.
+    /// its files were verified against. A workflow whose every state is an
+    /// Action needing only the tree's name (AEGIS ADR-149 C2,
+    /// `ActionNeed::RunTreeRef`) has nothing materialized: each tree is kept
+    /// as named, with no volume.
     async fn prepare_trees(
         &self,
+        workflow: &Workflow,
         tenant_id: &TenantId,
         identity: Option<&UserIdentity>,
         run: ExecutionId,
@@ -269,12 +273,30 @@ impl StandardStartWorkflowExecutionUseCase {
         use crate::domain::run_tree::{
             parse_requested_trees, RunTreeError, NO_TREE_SERVICE, TREES_INPUT_KEY,
         };
+        use crate::domain::workflow::{ActionNeed, StateKind};
         let requested = match input.get(TREES_INPUT_KEY) {
             None => return Ok(()),
             Some(value) => parse_requested_trees(value)
                 .map_err(|sentence| anyhow::Error::new(ExecutionError::Refused(sentence)))?,
         };
         if requested.is_empty() {
+            return Ok(());
+        }
+        let materializes = workflow
+            .spec
+            .states
+            .values()
+            .any(|state| match &state.kind {
+                StateKind::Action { action, .. } => action.needs() == ActionNeed::RunTree,
+                _ => true,
+            });
+        if !materializes {
+            if let serde_json::Value::Object(map) = input {
+                map.insert(
+                    TREES_INPUT_KEY.to_string(),
+                    serde_json::to_value(&requested)?,
+                );
+            }
             return Ok(());
         }
         let Some(trees) = self.run_trees.get() else {
@@ -733,8 +755,14 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
                 workflow.metadata.input_schema.as_ref(),
             )
             .await?;
-        self.prepare_trees(tenant_id, identity, execution_id, &mut persisted_input)
-            .await?;
+        self.prepare_trees(
+            &workflow,
+            tenant_id,
+            identity,
+            execution_id,
+            &mut persisted_input,
+        )
+        .await?;
         let mut workflow_execution =
             WorkflowExecution::new(&workflow, execution_id, persisted_input);
         // The person who started it, never a service account: the agents its

@@ -135,6 +135,11 @@ pub const LAND_TOOL: &str = "aegis.git.land";
 /// listed to no agent.
 pub const TREE_LAND_TOOL: &str = "aegis.tree.land";
 
+/// The builtin tool a carbon-deploy run's push of its tree's git archive is
+/// dispatched as (AEGIS ADR-149 C2): a crossing of the boundary, gated by
+/// the person's approval as `aegis.tree.land` is, and listed to no agent.
+pub const ARCHIVE_PUSH_TOOL: &str = "aegis.archive.push";
+
 /// Canonical registry of all builtin tool dispatchers. Single source of
 /// truth — the daemon startup and every other consumer derives its data
 /// from this slice.
@@ -177,6 +182,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("aegis.git.push", "Pushes the run's work branch of one of your run's repositories to its origin, never with force. Only that branch is pushed."),
     BuiltinToolDefinition::new("aegis.git.land", "Lands a workflow run's work branch on its repository's branch as a fast-forward: pushes the work branch to its origin, then the branch, never with force. Answered only for a workflow's own landing step, after the person's approval.").requires_approval(),
     BuiltinToolDefinition::new("aegis.tree.land", "Lands a carbon-forge run's lane on its Nuclear Notes tree as one changeset. Answered only for a workflow's own landing step, after the person's approval.").requires_approval(),
+    BuiltinToolDefinition::new("aegis.archive.push", "Queues the push of a carbon-deploy run's Nuclear Notes tree's git archive to its remote. Answered only for a workflow's own push step, after the person's approval.").requires_approval(),
     BuiltinToolDefinition::new("aegis.schema.get", "Returns the canonical JSON Schema for a manifest kind (agent or workflow).").skip_judge(),
     BuiltinToolDefinition::new("aegis.schema.validate", "Validates a manifest YAML string against its canonical JSON Schema.").skip_judge(),
     BuiltinToolDefinition::new("aegis.agent.create", "Parses, validates, and deploys an Agent manifest to the registry.").skip_judge(),
@@ -283,7 +289,7 @@ impl ToolRouter {
     fn should_advertise_builtin_tool(tool_name: &str) -> bool {
         // AEGIS ADR-141 F8: a landing is a workflow's own step, listed to
         // no agent.
-        if tool_name == LAND_TOOL || tool_name == TREE_LAND_TOOL {
+        if tool_name == LAND_TOOL || tool_name == TREE_LAND_TOOL || tool_name == ARCHIVE_PUSH_TOOL {
             return false;
         }
         if tool_name.starts_with("aegis.workflow.") || tool_name.starts_with("aegis.execute.") {
@@ -403,6 +409,7 @@ impl ToolRouter {
             "aegis.git.push" => Self::schema_aegis_git(false, false),
             "aegis.git.land" => Self::schema_aegis_git(false, false),
             "aegis.tree.land" => Self::schema_aegis_tree_land(),
+            "aegis.archive.push" => Self::schema_aegis_archive_push(),
             "aegis.schema.get" => Self::schema_aegis_schema_get(),
             "aegis.schema.validate" => Self::schema_aegis_schema_validate(),
             "aegis.agent.create" => Self::schema_aegis_agent_create(),
@@ -1361,6 +1368,17 @@ impl ToolRouter {
                 "intent": {"type": "string", "description": "The changeset's intent."}
             },
             "required": ["tree", "lane", "intent"]
+        })
+    }
+
+    /// AEGIS ADR-149 C2: what the person approves of an archive's push.
+    fn schema_aegis_archive_push() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "tree": {"type": "string", "description": "The path of the run's Nuclear Notes tree, whose git archive is pushed to its remote."}
+            },
+            "required": ["tree"]
         })
     }
 
@@ -3667,6 +3685,7 @@ mod tests {
                     | "calendar.respond"
                     | "aegis.git.land"
                     | "aegis.tree.land"
+                    | "aegis.archive.push"
             );
             assert_eq!(
                 plain.requires_approval(def.name),
