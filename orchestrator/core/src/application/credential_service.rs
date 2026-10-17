@@ -32,6 +32,7 @@ use crate::domain::credential::{
     UserCredentialBinding,
 };
 use crate::domain::events::CredentialEvent;
+use crate::domain::execution_token::ExecutionToken;
 use crate::domain::node_config::{resolve_env_value, OAuthProviderEntry, RemoteServer};
 use crate::domain::secrets::{AccessContext, SecretPath, SensitiveString, SensitiveUrl};
 use crate::domain::team::{MembershipRepository, MembershipStatus, TeamId};
@@ -822,6 +823,46 @@ pub trait ToolCredentialSource: Send + Sync {
     ) -> anyhow::Result<Option<SensitiveString>> {
         Ok(None)
     }
+
+    /// Keep the execution token minted for the workflow execution
+    /// `execution_id` of `user_id` in the secret store, keyed by the
+    /// execution id (AEGIS ADR-147 Update `execution-token-2026-10-17`
+    /// X3), never in the execution record, an event or a log. The default
+    /// keeps none and refuses, so a run on a source that cannot keep it is
+    /// refused at its start.
+    async fn store_execution_token(
+        &self,
+        _tenant_id: &TenantId,
+        _user_id: &str,
+        _execution_id: uuid::Uuid,
+        _token: &ExecutionToken,
+    ) -> anyhow::Result<()> {
+        Err(anyhow!(
+            "this node's credential source keeps no execution token"
+        ))
+    }
+
+    /// The execution token kept for `execution_id` of `user_id` (X3), or
+    /// `Ok(None)` when it holds none. The default holds none.
+    async fn execution_token(
+        &self,
+        _tenant_id: &TenantId,
+        _user_id: &str,
+        _execution_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<ExecutionToken>> {
+        Ok(None)
+    }
+
+    /// Delete the execution token kept for `execution_id` of `user_id`
+    /// (X4); a token already gone is no failure. The default holds none.
+    async fn delete_execution_token(
+        &self,
+        _tenant_id: &TenantId,
+        _user_id: &str,
+        _execution_id: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// The binding key a tool's connection family is chosen and connected under
@@ -1170,6 +1211,93 @@ impl ToolCredentialSource for StandardCredentialManagementService {
         match own.into_iter().next() {
             Some(binding) => self.binding_secret(binding).await,
             None => Ok(None),
+        }
+    }
+
+    async fn store_execution_token(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &str,
+        execution_id: uuid::Uuid,
+        token: &ExecutionToken,
+    ) -> anyhow::Result<()> {
+        let path = execution_token_path(tenant_id, user_id, execution_id);
+        let mut fields = HashMap::new();
+        fields.insert(
+            EXECUTION_TOKEN_SECRET_FIELD.to_string(),
+            token.secret.clone(),
+        );
+        fields.insert(
+            EXECUTION_TOKEN_ID_FIELD.to_string(),
+            SensitiveString::new(token.token_id.clone()),
+        );
+        fields.insert(
+            EXECUTION_TOKEN_USER_FIELD.to_string(),
+            SensitiveString::new(token.user_id.clone()),
+        );
+        self.secrets
+            .write_secret(
+                &path.effective_mount(),
+                &path.path,
+                fields,
+                &AccessContext::system("aegis-credential-service"),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn execution_token(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &str,
+        execution_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<ExecutionToken>> {
+        let path = execution_token_path(tenant_id, user_id, execution_id);
+        let mut fields = match self
+            .secrets
+            .read_secret(
+                &path.effective_mount(),
+                &path.path,
+                &AccessContext::system("aegis-credential-service"),
+            )
+            .await
+        {
+            Ok(fields) => fields,
+            Err(crate::domain::secrets::SecretsError::SecretNotFound { .. }) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let (Some(secret), Some(token_id), Some(user)) = (
+            fields.remove(EXECUTION_TOKEN_SECRET_FIELD),
+            fields.remove(EXECUTION_TOKEN_ID_FIELD),
+            fields.remove(EXECUTION_TOKEN_USER_FIELD),
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(ExecutionToken {
+            token_id: token_id.expose_owned(),
+            secret,
+            user_id: user.expose_owned(),
+        }))
+    }
+
+    async fn delete_execution_token(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &str,
+        execution_id: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        let path = execution_token_path(tenant_id, user_id, execution_id);
+        match self
+            .secrets
+            .delete_secret(
+                &path.effective_mount(),
+                &path.path,
+                &AccessContext::system("aegis-credential-service"),
+            )
+            .await
+        {
+            Ok(()) | Err(crate::domain::secrets::SecretsError::SecretNotFound { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
         }
     }
 }
@@ -1613,6 +1741,32 @@ fn user_credential_path(
             tenant_id.as_str(),
             owner_user_id,
             binding_id.0
+        ),
+    )
+}
+
+/// The fields an execution token is kept under (AEGIS ADR-147 Update
+/// `execution-token-2026-10-17` X3).
+const EXECUTION_TOKEN_SECRET_FIELD: &str = "token";
+const EXECUTION_TOKEN_ID_FIELD: &str = "token_id";
+const EXECUTION_TOKEN_USER_FIELD: &str = "user_id";
+
+/// Where the execution token of the workflow execution `execution_id` of
+/// `owner_user_id` is kept: keyed by the execution id, under its person's
+/// own path (X3).
+pub(crate) fn execution_token_path(
+    tenant_id: &TenantId,
+    owner_user_id: &str,
+    execution_id: uuid::Uuid,
+) -> SecretPath {
+    SecretPath::for_tenant(
+        tenant_id.clone(),
+        "kv",
+        format!(
+            "users/{}/{}/executions/{}",
+            tenant_id.as_str(),
+            owner_user_id,
+            execution_id
         ),
     )
 }
@@ -3326,5 +3480,218 @@ mod context_name_tests {
                 "Solo",
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod execution_token_tests {
+    use super::*;
+    use crate::domain::credential::{CredentialGrant, GrantTarget, OAuthPendingState};
+    use crate::domain::secrets::{DomainDynamicSecret, SecretStore, SecretsError};
+    use std::time::Duration;
+
+    /// No binding: an execution token is kept in the secret store alone.
+    struct NoBindings;
+
+    #[async_trait]
+    impl CredentialBindingRepository for NoBindings {
+        async fn save(&self, _: &UserCredentialBinding) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn find_by_id(
+            &self,
+            _: &CredentialBindingId,
+        ) -> anyhow::Result<Option<UserCredentialBinding>> {
+            Ok(None)
+        }
+        async fn find_by_owner(
+            &self,
+            _: &TenantId,
+            _: &str,
+        ) -> anyhow::Result<Vec<UserCredentialBinding>> {
+            Ok(Vec::new())
+        }
+        async fn find_active_grants_for_target(
+            &self,
+            _: &TenantId,
+            _: &str,
+            _: &CredentialProvider,
+            _: &GrantTarget,
+        ) -> anyhow::Result<Vec<CredentialGrant>> {
+            Ok(Vec::new())
+        }
+        async fn delete(&self, _: &CredentialBindingId) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn save_oauth_state(
+            &self,
+            _: &str,
+            _: &CredentialBindingId,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn find_oauth_state(&self, _: &str) -> anyhow::Result<Option<OAuthPendingState>> {
+            Ok(None)
+        }
+        async fn delete_oauth_state(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_expired_oauth_states(
+            &self,
+            _: chrono::DateTime<Utc>,
+        ) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+    }
+
+    /// A KV store that keeps, reads and deletes by `engine/path`.
+    #[derive(Default)]
+    struct Kv(std::sync::Mutex<HashMap<String, HashMap<String, SensitiveString>>>);
+
+    #[async_trait]
+    impl SecretStore for Kv {
+        async fn read(
+            &self,
+            engine: &str,
+            path: &str,
+        ) -> Result<HashMap<String, SensitiveString>, SecretsError> {
+            let key = format!("{engine}/{path}");
+            self.0
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .ok_or(SecretsError::SecretNotFound { path: key })
+        }
+        async fn write(
+            &self,
+            engine: &str,
+            path: &str,
+            secret: HashMap<String, SensitiveString>,
+        ) -> Result<(), SecretsError> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(format!("{engine}/{path}"), secret);
+            Ok(())
+        }
+        async fn delete(&self, engine: &str, path: &str) -> Result<(), SecretsError> {
+            self.0.lock().unwrap().remove(&format!("{engine}/{path}"));
+            Ok(())
+        }
+        async fn generate_dynamic(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<DomainDynamicSecret, SecretsError> {
+            Err(SecretsError::DynamicSecretError("not kept".into()))
+        }
+        async fn renew_lease(&self, _: &str, _: Duration) -> Result<Duration, SecretsError> {
+            Err(SecretsError::DynamicSecretError("not kept".into()))
+        }
+        async fn revoke_lease(&self, _: &str) -> Result<(), SecretsError> {
+            Ok(())
+        }
+        async fn transit_sign(&self, _: &str, _: &[u8]) -> Result<String, SecretsError> {
+            Err(SecretsError::TransitError("not kept".into()))
+        }
+        async fn transit_verify(&self, _: &str, _: &[u8], _: &str) -> Result<bool, SecretsError> {
+            Err(SecretsError::TransitError("not kept".into()))
+        }
+        async fn transit_encrypt(&self, _: &str, _: &[u8]) -> Result<String, SecretsError> {
+            Err(SecretsError::TransitError("not kept".into()))
+        }
+        async fn transit_decrypt(&self, _: &str, _: &str) -> Result<Vec<u8>, SecretsError> {
+            Err(SecretsError::TransitError("not kept".into()))
+        }
+    }
+
+    /// AEGIS ADR-147 Update `execution-token-2026-10-17` X3, X4: the child's
+    /// secret is kept in the secret store under its person's path keyed by
+    /// the execution id, read back for that execution and person only, and
+    /// gone once deleted.
+    #[tokio::test]
+    async fn execution_token_is_kept_by_execution_id_read_back_and_deleted() {
+        let kv = Arc::new(Kv::default());
+        let event_bus = Arc::new(EventBus::new(16));
+        let mut events = event_bus.subscribe();
+        let secrets = Arc::new(SecretsManager::from_store(kv.clone(), event_bus.clone()));
+        let service = StandardCredentialManagementService::new(
+            Arc::new(NoBindings),
+            secrets,
+            event_bus,
+            Arc::new(OAuthProviderRegistry::new()),
+        );
+        let tenant = TenantId::consumer();
+        let run = uuid::Uuid::new_v4();
+        let token = ExecutionToken {
+            token_id: "7d1e0c4a-0000-4000-8000-00000000000a".to_string(),
+            secret: SensitiveString::new("child-secret-of-the-run"),
+            user_id: "5a5a5a5a-0000-4000-8000-00000000000b".to_string(),
+        };
+        service
+            .store_execution_token(&tenant, "the-person", run, &token)
+            .await
+            .expect("the child's secret is kept");
+        let keys: Vec<String> = kv.0.lock().unwrap().keys().cloned().collect();
+        let path = execution_token_path(&tenant, "the-person", run);
+        assert_eq!(
+            path.path,
+            format!("users/{}/the-person/executions/{run}", tenant.as_str()),
+            "the child's secret is not kept keyed by the execution id"
+        );
+        assert_eq!(
+            keys,
+            vec![format!("{}/{}", path.effective_mount(), path.path)],
+            "the child's secret is not kept at its path"
+        );
+        let kept = service
+            .execution_token(&tenant, "the-person", run)
+            .await
+            .unwrap()
+            .expect("the run's child is read back");
+        assert_eq!(kept.secret.expose(), "child-secret-of-the-run");
+        assert_eq!(kept.token_id, token.token_id);
+        assert_eq!(kept.user_id, token.user_id);
+        // The secret store's own events name the path, never the secret.
+        let mut seen = 0;
+        while let Ok(event) = events.try_recv() {
+            seen += 1;
+            assert!(
+                !format!("{event:?}").contains("child-secret-of-the-run"),
+                "an event carries the child's secret: {event:?}"
+            );
+        }
+        assert!(seen > 0, "the secret store published no event");
+        assert!(service
+            .execution_token(&tenant, "another-person", run)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(service
+            .execution_token(&tenant, "the-person", uuid::Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none());
+        service
+            .delete_execution_token(&tenant, "the-person", run)
+            .await
+            .unwrap();
+        assert!(
+            kv.0.lock().unwrap().is_empty(),
+            "the child's secret was not deleted"
+        );
+        assert!(service
+            .execution_token(&tenant, "the-person", run)
+            .await
+            .unwrap()
+            .is_none());
+        // Deleting a child already gone is no failure.
+        service
+            .delete_execution_token(&tenant, "the-person", run)
+            .await
+            .unwrap();
     }
 }

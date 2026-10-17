@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::domain::execution::ExecutionContexts;
 use crate::domain::tenant::TenantId;
 use crate::domain::volume::VolumeMount;
+use crate::domain::workflow::ActionName;
 
 /// The reserved input key by which a start names its run's tree (C2).
 pub const TREES_INPUT_KEY: &str = "trees";
@@ -36,6 +37,42 @@ pub const RUN_TREE_MOUNT: &str = "/workspace";
 
 /// The remote MCP server a tree lives on.
 pub const NUCLEAR_NOTES_SERVER: &str = "nuclear-notes";
+
+/// The Carbon Forge tool a run's execution token always holds (NN ADR-0179
+/// D4, AEGIS ADR-147 Update `execution-token-2026-10-17` X1).
+pub const CARBON_FORGE_GROUND_TOOL: &str = "cortex.ground";
+
+/// The Carbon Forge tools a run's start calls to materialize its tree into
+/// its volume (C4), when any of its states needs the tree's files (X1).
+pub const CARBON_FORGE_MATERIALIZE_TOOLS: &[&str] = &["trees.materialize", "blobs.get"];
+
+/// The Carbon Forge tools each Action state calls (AEGIS ADR-147 Update
+/// `execution-token-2026-10-17` X1): the run's declared reach is the union,
+/// over the Action states its workflow names, of these rows, with
+/// [`CARBON_FORGE_MATERIALIZE_TOOLS`] when it materializes and
+/// [`CARBON_FORGE_GROUND_TOOL`]. Deny by default: an action with no row
+/// reaches no Carbon Forge tool. The table is this constant, never read from
+/// the agent or from the workflow's free text.
+pub const CARBON_FORGE_ACTION_TOOLS: &[(ActionName, &[&str])] = &[
+    (ActionName::TreeDiff, &["trees.materialize", "blobs.get"]),
+    (
+        ActionName::TreeWrite,
+        &[
+            "trees.materialize",
+            "lanes.create",
+            "trees.put",
+            "blobs.put",
+            "blobs.upload_begin",
+            "blobs.upload_part",
+            "blobs.upload_complete",
+        ],
+    ),
+    (ActionName::TreeLand, &["lanes.land"]),
+    (ActionName::TreeCut, &["snapshots.cut"]),
+    (ActionName::ArchiveRender, &["archives.render"]),
+    (ActionName::ArchivePush, &["archives.push"]),
+    (ActionName::ArchiveDeployWait, &["archives.deploy_status"]),
+];
 
 /// The refusal of a start naming a tree on a node that cannot materialize
 /// one.
@@ -385,6 +422,68 @@ mod tests {
         ] {
             let refusal = parse_requested_trees(&refused).unwrap_err();
             assert!(refusal.contains(TREES_SHAPE), "{refused}: {refusal}");
+        }
+    }
+
+    /// AEGIS ADR-147 Update `execution-token-2026-10-17` X1: the run's
+    /// Carbon Forge reach is the constant table's union over the Action
+    /// states its workflow names, and nothing else.
+    #[test]
+    fn execution_token_reach_is_the_table_union_for_carbon_forge_and_carbon_deploy() {
+        use crate::domain::execution_token::{action_tools, declared_reach};
+        use crate::infrastructure::workflow_parser::WorkflowParser;
+        use std::collections::BTreeSet;
+        let forge = WorkflowParser::parse_yaml(include_str!(
+            "../../../../cli/templates/workflows/carbon-forge.yaml"
+        ))
+        .unwrap();
+        let deploy = WorkflowParser::parse_yaml(include_str!(
+            "../../../../cli/templates/workflows/carbon-deploy.yaml"
+        ))
+        .unwrap();
+        let forge_tools: BTreeSet<&str> = [
+            "cortex.ground",
+            "trees.materialize",
+            "blobs.get",
+            "lanes.create",
+            "trees.put",
+            "blobs.put",
+            "blobs.upload_begin",
+            "blobs.upload_part",
+            "blobs.upload_complete",
+            "lanes.land",
+            "snapshots.cut",
+        ]
+        .into();
+        assert_eq!(
+            declared_reach(&forge),
+            forge_tools,
+            "carbon-forge 1.1.0's declared reach is not the table's union over its Action states"
+        );
+        let deploy_tools: BTreeSet<&str> = [
+            "cortex.ground",
+            "archives.render",
+            "archives.push",
+            "archives.deploy_status",
+        ]
+        .into();
+        assert_eq!(
+            declared_reach(&deploy),
+            deploy_tools,
+            "carbon-deploy 1.1.0's declared reach is not the table's union over its Action states"
+        );
+        // Deny by default: an action with no row reaches no Carbon Forge tool.
+        for action in [
+            ActionName::UpdateBlackboard,
+            ActionName::RepositoryDiff,
+            ActionName::RepositoryCommit,
+            ActionName::RepositoryLand,
+            ActionName::ImageGenerate,
+        ] {
+            assert!(
+                action_tools(action).is_empty(),
+                "{action:?} reaches Carbon Forge"
+            );
         }
     }
 

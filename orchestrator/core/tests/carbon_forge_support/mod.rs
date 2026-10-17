@@ -33,6 +33,7 @@ use aegis_orchestrator_core::domain::execution::{
 };
 use aegis_orchestrator_core::domain::fsal::{AegisFSAL, EventPublisher};
 use aegis_orchestrator_core::domain::repository::{AgentVersion, WorkflowExecutionRepository};
+use aegis_orchestrator_core::domain::execution_token::ExecutionToken;
 use aegis_orchestrator_core::domain::secrets::SensitiveString;
 use aegis_orchestrator_core::domain::security_context::SecurityContextRepository;
 use aegis_orchestrator_core::domain::shared_kernel::TenantId;
@@ -55,6 +56,15 @@ pub const PERSON: &str = "the-person";
 pub const BINDING: &str = "4f6b1c1e-2d3a-4b5c-8d7e-9f0a1b2c3d4e";
 /// The bearer token that binding resolves to (a fake).
 pub const TOKEN: &str = "nn-test-token";
+/// The secret of the run's execution token, minted from that binding (a
+/// fake; AEGIS ADR-147 Update `execution-token-2026-10-17` X2).
+pub const CHILD_TOKEN: &str = "nn-child-token-of-the-run";
+/// The execution token's id in Carbon Forge.
+pub const CHILD_TOKEN_ID: &str = "7d1e0c4a-0000-4000-8000-00000000000a";
+/// The Carbon Forge instance the run's workspace lives in.
+pub const INSTANCE_ID: &str = "1b2c3d4e-0000-4000-8000-00000000000c";
+/// The person as a Carbon Forge user: the owner of the run's lane.
+pub const NN_USER_ID: &str = "5a5a5a5a-0000-4000-8000-00000000000b";
 /// The remote server's name, as `seal_gateway.remote_servers` names it.
 pub const SERVER: &str = "nuclear-notes";
 /// The Nuclear Notes workspace the run's tree lives in.
@@ -246,6 +256,43 @@ pub fn nuclear_notes(run: uuid::Uuid) -> StubGateway {
             "removals": 0
         })),
     );
+    // AEGIS ADR-147 Update `execution-token-2026-10-17` X2, X4: the
+    // workspace's grounding, the mint and the revoke, as `cortex.server.ts`
+    // and `catalog-tokens.ts` at nuclear-notes 86d8d4ef answer them.
+    answers.insert(
+        "cortex.ground".to_string(),
+        Answer::Result(json!({
+            "instance": { "id": INSTANCE_ID, "slug": "main" },
+            "you": {
+                "userId": NN_USER_ID,
+                "currentWorkspace": { "id": WORKSPACE, "slug": "aegis-architecture" }
+            }
+        })),
+    );
+    answers.insert(
+        "tokens.mint_execution".to_string(),
+        Answer::Result(json!({
+            "token_id": CHILD_TOKEN_ID,
+            "parent_token_id": "0f0f0f0f-0000-4000-8000-00000000000d",
+            "execution_id": run,
+            "instance_id": INSTANCE_ID,
+            "workspace_id": WORKSPACE,
+            "tree_path": TREE_PATH,
+            "lane_label": lane_of(run),
+            "role_cap": "inherit",
+            "tools": [],
+            "expires_at": "2026-10-18T00:00:00.000Z",
+            "secret": CHILD_TOKEN
+        })),
+    );
+    answers.insert(
+        "tokens.revoke_execution".to_string(),
+        Answer::Result(json!({
+            "token_id": CHILD_TOKEN_ID,
+            "revoked": true,
+            "already_revoked": false
+        })),
+    );
     answers.insert(
         "lanes.land".to_string(),
         Answer::Result(json!({
@@ -268,8 +315,37 @@ pub fn nuclear_notes(run: uuid::Uuid) -> StubGateway {
 // ===========================================================================
 
 /// The person's Nuclear Notes binding, resolved only for the binding the
-/// run chose.
-pub struct OneBinding;
+/// run chose; and the runs' execution tokens, kept by person and execution
+/// id as the secret store keeps them (X3).
+#[derive(Default)]
+pub struct OneBinding {
+    pub children: Mutex<HashMap<(String, uuid::Uuid), ExecutionToken>>,
+}
+
+impl OneBinding {
+    /// The binding, with `run` of `PERSON` holding its execution token, as a
+    /// start that minted it leaves it.
+    pub fn holding_child(run: uuid::Uuid) -> Self {
+        let binding = Self::default();
+        binding.children.lock().unwrap().insert(
+            (PERSON.to_string(), run),
+            ExecutionToken {
+                token_id: CHILD_TOKEN_ID.to_string(),
+                secret: SensitiveString::new(CHILD_TOKEN.to_string()),
+                user_id: NN_USER_ID.to_string(),
+            },
+        );
+        binding
+    }
+
+    /// Whether `run` of `PERSON` holds an execution token.
+    pub fn holds_child(&self, run: uuid::Uuid) -> bool {
+        self.children
+            .lock()
+            .unwrap()
+            .contains_key(&(PERSON.to_string(), run))
+    }
+}
 
 #[async_trait]
 impl ToolCredentialSource for OneBinding {
@@ -282,6 +358,47 @@ impl ToolCredentialSource for OneBinding {
             matches!(actor.context, ContextChoice::Binding(id) if id.0.to_string() == BINDING);
         Ok((server == SERVER && actor.user_id == PERSON && chosen)
             .then(|| SensitiveString::new(TOKEN.to_string())))
+    }
+
+    async fn store_execution_token(
+        &self,
+        _tenant_id: &TenantId,
+        user_id: &str,
+        execution_id: uuid::Uuid,
+        token: &ExecutionToken,
+    ) -> anyhow::Result<()> {
+        self.children
+            .lock()
+            .unwrap()
+            .insert((user_id.to_string(), execution_id), token.clone());
+        Ok(())
+    }
+
+    async fn execution_token(
+        &self,
+        _tenant_id: &TenantId,
+        user_id: &str,
+        execution_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<ExecutionToken>> {
+        Ok(self
+            .children
+            .lock()
+            .unwrap()
+            .get(&(user_id.to_string(), execution_id))
+            .cloned())
+    }
+
+    async fn delete_execution_token(
+        &self,
+        _tenant_id: &TenantId,
+        user_id: &str,
+        execution_id: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        self.children
+            .lock()
+            .unwrap()
+            .remove(&(user_id.to_string(), execution_id));
+        Ok(())
     }
 }
 
@@ -462,6 +579,29 @@ pub fn tool_service(
     executions: Arc<dyn WorkflowExecutionRepository>,
     approvals: Arc<ToolApprovalService>,
 ) -> Arc<ToolInvocationService> {
+    tool_service_with(
+        url,
+        ca,
+        fsal,
+        contexts,
+        executions,
+        approvals,
+        Arc::new(OneBinding::default()),
+    )
+}
+
+/// [`tool_service`], resolving credentials and keeping execution tokens
+/// through `binding`.
+#[allow(clippy::too_many_arguments)]
+pub fn tool_service_with(
+    url: String,
+    ca: &std::path::Path,
+    fsal: Arc<AegisFSAL>,
+    contexts: Arc<dyn SecurityContextRepository>,
+    executions: Arc<dyn WorkflowExecutionRepository>,
+    approvals: Arc<ToolApprovalService>,
+    binding: Arc<OneBinding>,
+) -> Arc<ToolInvocationService> {
     let event_bus = Arc::new(EventBus::new(256));
     let volume_service =
         aegis_orchestrator_core::application::volume_manager::StandardVolumeService::new(
@@ -499,7 +639,7 @@ pub fn tool_service(
         .with_seal_gateway_ca_cert(ca)
         .expect("the CA file reads")
         .with_remote_tool_servers(vec![SERVER.to_string()])
-        .with_tool_credentials(Arc::new(OneBinding))
+        .with_tool_credentials(binding)
         .with_workflow_execution_repo(executions)
         .with_tool_approvals(approvals)
         .with_user_volume_service(user_volumes),

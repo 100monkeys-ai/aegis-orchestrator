@@ -165,6 +165,10 @@ pub struct StandardStartWorkflowExecutionUseCase {
     /// ADR-147 C4). Set once at the composition root via `set_trees()`;
     /// unset, a start that names trees is refused.
     run_trees: std::sync::OnceLock<Arc<dyn crate::domain::run_tree::RunTrees>>,
+    /// Mints a run's execution token at its start (AEGIS ADR-147 Update
+    /// `execution-token-2026-10-17` X2): the same service as `run_trees`,
+    /// set with it by `set_trees()`.
+    execution_tokens: std::sync::OnceLock<Arc<dyn crate::domain::execution_token::ExecutionTokens>>,
 }
 
 impl StandardStartWorkflowExecutionUseCase {
@@ -242,14 +246,84 @@ impl StandardStartWorkflowExecutionUseCase {
             run_repositories: std::sync::OnceLock::new(),
             run_profiles: std::sync::OnceLock::new(),
             run_trees: std::sync::OnceLock::new(),
+            execution_tokens: std::sync::OnceLock::new(),
         }
     }
 
     /// Materialize a workflow run's trees through `trees` (AEGIS ADR-147
     /// C4). Wired once at startup, after the tool invocation service exists.
-    pub fn set_trees(&self, trees: Arc<dyn crate::domain::run_tree::RunTrees>) {
+    /// The same service mints and releases a run's execution token (AEGIS
+    /// ADR-147 Update `execution-token-2026-10-17` X2).
+    pub fn set_trees<T>(&self, trees: Arc<T>)
+    where
+        T: crate::domain::run_tree::RunTrees
+            + crate::domain::execution_token::ExecutionTokens
+            + 'static,
+    {
         // OnceLock silently ignores a second set; the service is wired once at startup.
+        let _ = self.execution_tokens.set(trees.clone());
         let _ = self.run_trees.set(trees);
+    }
+
+    /// AEGIS ADR-147 Update `execution-token-2026-10-17` X2: a run naming a
+    /// tree whose workflow declares a Carbon Forge reach (X1) is given its
+    /// execution token before its tree is prepared, minted with the binding
+    /// its `contexts` chose for Carbon Forge, for the tree's workspace and
+    /// path, its own lane, the declared tools and a day. A refusal refuses
+    /// the run with Carbon Forge's sentence, before anything is persisted;
+    /// the run never starts on the binding's wider reach. The guard releases
+    /// the token if the start fails after the mint.
+    async fn mint_execution_token(
+        &self,
+        workflow: &Workflow,
+        tenant_id: &TenantId,
+        identity: Option<&UserIdentity>,
+        run: ExecutionId,
+        input: &serde_json::Value,
+    ) -> Result<ExecutionTokenGuard> {
+        use crate::domain::execution::ExecutionError;
+        use crate::domain::execution_token::declared_reach;
+        use crate::domain::run_tree::{
+            parse_requested_trees, RunTreeError, NO_TREE_SERVICE, TREES_INPUT_KEY,
+        };
+        let unarmed = ExecutionTokenGuard { armed: None };
+        let requested = match input.get(TREES_INPUT_KEY) {
+            None => return Ok(unarmed),
+            Some(value) => parse_requested_trees(value)
+                .map_err(|sentence| anyhow::Error::new(ExecutionError::Refused(sentence)))?,
+        };
+        let Some(tree) = requested.first() else {
+            return Ok(unarmed);
+        };
+        let reach: Vec<&'static str> = declared_reach(workflow).into_iter().collect();
+        if reach.is_empty() {
+            return Ok(unarmed);
+        }
+        let Some(tokens) = self.execution_tokens.get() else {
+            return Err(ExecutionError::Refused(NO_TREE_SERVICE.to_string()).into());
+        };
+        let person = crate::application::execution::person_sub(identity);
+        let contexts = crate::domain::execution::ExecutionContexts::from_value(
+            input.get(crate::domain::execution::CONTEXTS_INPUT_KEY),
+        );
+        tokens
+            .mint_for_run(tenant_id, person.as_deref(), run.0, &contexts, tree, &reach)
+            .await
+            .map_err(|e| match e {
+                RunTreeError::Refused(sentence) => {
+                    anyhow::Error::new(ExecutionError::Refused(sentence))
+                }
+                RunTreeError::Failed(e) => anyhow::anyhow!("{e}"),
+            })?;
+        Ok(ExecutionTokenGuard {
+            armed: Some(ArmedExecutionToken {
+                tokens: tokens.clone(),
+                tenant_id: tenant_id.clone(),
+                person,
+                run: run.0,
+                contexts,
+            }),
+        })
     }
 
     /// AEGIS ADR-147 C2, C4: the trees a start names, by
@@ -755,6 +829,18 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
                 workflow.metadata.input_schema.as_ref(),
             )
             .await?;
+        // AEGIS ADR-147 Update `execution-token-2026-10-17` X2: the run's
+        // `tokens.mint_execution`, once, after its execution id is made and
+        // before its trees are prepared.
+        let execution_token = self
+            .mint_execution_token(
+                &workflow,
+                tenant_id,
+                identity,
+                execution_id,
+                &persisted_input,
+            )
+            .await?;
         self.prepare_trees(
             &workflow,
             tenant_id,
@@ -852,8 +938,10 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
             })
             .context("Failed to persist Temporal linkage for workflow execution")?;
 
-        // The workflow has started: its end releases its repositories.
+        // The workflow has started: its end releases its repositories, and
+        // its terminal event its execution token.
         hold.disarm();
+        execution_token.disarm();
 
         // Step 7: Publish domain event
         self.event_bus.publish_workflow_event(
@@ -875,6 +963,49 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
             status: "running".to_string(),
             started_at: Utc::now(),
         })
+    }
+}
+
+/// A run's execution token minted at its start, released when dropped
+/// unless the run started (AEGIS ADR-147 Update `execution-token-2026-10-17`
+/// X2, X4): every early return of a start after the mint drops it.
+struct ExecutionTokenGuard {
+    armed: Option<ArmedExecutionToken>,
+}
+
+struct ArmedExecutionToken {
+    tokens: Arc<dyn crate::domain::execution_token::ExecutionTokens>,
+    tenant_id: TenantId,
+    person: Option<String>,
+    run: uuid::Uuid,
+    contexts: crate::domain::execution::ExecutionContexts,
+}
+
+impl ExecutionTokenGuard {
+    /// Keep the token: the run has started and its terminal event releases it.
+    fn disarm(mut self) {
+        self.armed = None;
+    }
+}
+
+impl Drop for ExecutionTokenGuard {
+    fn drop(&mut self) {
+        let Some(armed) = self.armed.take() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                armed
+                    .tokens
+                    .release_for_run(
+                        &armed.tenant_id,
+                        armed.person.as_deref(),
+                        armed.run,
+                        &armed.contexts,
+                    )
+                    .await;
+            });
+        }
     }
 }
 

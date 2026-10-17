@@ -31,6 +31,9 @@
 //! | C5, C6: the write goes to a lane of the run's own | `tree_write_puts_the_runs_change_on_a_lane_of_its_own_and_lands_nothing` |
 //! | C5: the landing after approval, one changeset | `tree_land_lands_the_lane_as_one_changeset_after_the_persons_approval` |
 //! | C5: a conflict, in Nuclear Notes' own words | `a_conflicting_landing_answers_nuclear_notes_own_sentence` |
+//! | Update `execution-token-2026-10-17` X3: the child, never the binding | `execution_token_carries_every_carbon_forge_call_of_the_run_never_the_binding` |
+//! | X3: a run with no child is refused | `execution_token_absent_refuses_every_carbon_forge_call_of_the_run` |
+//! | X5: the lane's owner is the run's person | `execution_token_run_lane_is_created_owned_by_the_runs_person` |
 
 mod carbon_forge_support;
 
@@ -102,6 +105,9 @@ fn landing_context() -> SecurityContext {
 
 struct Fixture {
     service: Arc<ToolInvocationService>,
+    /// The person's binding and the run's execution token, as the secret
+    /// store keeps it.
+    binding: Arc<OneBinding>,
     approvals: Arc<ToolApprovalService>,
     calls: Arc<Mutex<Vec<InvokeToolRequest>>>,
     tenant: TenantId,
@@ -136,8 +142,24 @@ async fn fixture_of(
     answers: impl FnOnce(uuid::Uuid, &mut HashMap<String, Answer>),
     materialized: bool,
 ) -> Fixture {
+    fixture_holding(answers, materialized, true).await
+}
+
+/// The fixture; with `child` false, the run holds no execution token, as a
+/// run whose start minted none (AEGIS ADR-147 Update
+/// `execution-token-2026-10-17` X3).
+async fn fixture_holding(
+    answers: impl FnOnce(uuid::Uuid, &mut HashMap<String, Answer>),
+    materialized: bool,
+    child: bool,
+) -> Fixture {
     let dirs = tempfile::tempdir().unwrap();
     let run = ExecutionId::new();
+    let binding = Arc::new(if child {
+        OneBinding::holding_child(run.0)
+    } else {
+        OneBinding::default()
+    });
     let mut stub = nuclear_notes(run.0);
     answers(run.0, &mut stub.answers);
     let calls = stub.calls.clone();
@@ -183,13 +205,14 @@ async fn fixture_of(
         Arc::new(InMemoryToolApprovalRepository::new()),
         event_bus.clone(),
     ));
-    let service = tool_service(
+    let service = tool_service_with(
         url,
         &ca,
         fsal,
         contexts,
         executions.clone(),
         approvals.clone(),
+        binding.clone(),
     );
 
     let workflow = WorkflowParser::parse_yaml(
@@ -231,6 +254,7 @@ spec:
 
     Fixture {
         service,
+        binding,
         approvals,
         calls,
         tenant,
@@ -248,7 +272,8 @@ impl Fixture {
     }
 
     /// Every call went to Nuclear Notes, in the run's workspace, with the
-    /// person's credential for the binding the run chose.
+    /// run's execution token, minted from the person's binding the run
+    /// chose (AEGIS ADR-147 Update `execution-token-2026-10-17` X3).
     fn assert_each_call_is_the_persons_in_the_workspace(&self) {
         for call in self.calls.lock().unwrap().iter() {
             assert_eq!(call.server, SERVER, "{} went to {}", call.tool, call.server);
@@ -261,8 +286,8 @@ impl Fixture {
             );
             assert_eq!(
                 call.credential.as_ref().map(|c| c.value.as_str()),
-                Some(TOKEN),
-                "{} did not carry the chosen binding's credential",
+                Some(CHILD_TOKEN),
+                "{} did not carry the run's execution token",
                 call.tool
             );
         }
@@ -461,6 +486,99 @@ async fn tree_write_puts_the_runs_change_on_a_lane_of_its_own_and_lands_nothing(
         "the write changed the run's volume"
     );
     fx.assert_each_call_is_the_persons_in_the_workspace();
+}
+
+// ===========================================================================
+// AEGIS ADR-147 Update `execution-token-2026-10-17` X3, X5: the run's own
+// token
+// ===========================================================================
+
+#[tokio::test]
+async fn execution_token_carries_every_carbon_forge_call_of_the_run_never_the_binding() {
+    let fx = fixture().await;
+    let answer = fx
+        .service
+        .run_repository_action(
+            &fx.tenant,
+            fx.run,
+            "tree_write",
+            Some("carbon-forge: the task"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(answer.sentence, None, "{answer:?}");
+    let calls = fx.calls.lock().unwrap().clone();
+    assert!(!calls.is_empty(), "tree_write reached no Carbon Forge tool");
+    for call in &calls {
+        let credential = call.credential.as_ref().map(|c| c.value.as_str());
+        assert_eq!(
+            credential,
+            Some(CHILD_TOKEN),
+            "X3: the run's call of {} did not carry its execution token",
+            call.tool
+        );
+        assert_ne!(
+            credential,
+            Some(TOKEN),
+            "X3: the run's call of {} carried the binding",
+            call.tool
+        );
+    }
+}
+
+#[tokio::test]
+async fn execution_token_absent_refuses_every_carbon_forge_call_of_the_run() {
+    let fx = fixture_holding(|_, _| {}, true, false).await;
+    for (action, message) in [
+        ("tree_diff", None),
+        ("tree_write", Some("carbon-forge: the task")),
+    ] {
+        let answer = fx
+            .service
+            .run_repository_action(&fx.tenant, fx.run, action, message)
+            .await
+            .unwrap();
+        assert_eq!(
+            answer.sentence.as_deref(),
+            Some(aegis_orchestrator_core::domain::execution_token::RUN_HOLDS_NO_EXECUTION_TOKEN),
+            "X3: {action} of a run holding no execution token was not refused: {answer:?}"
+        );
+    }
+    assert!(
+        fx.calls().is_empty(),
+        "X3: a run holding no execution token reached Carbon Forge: {:?}",
+        fx.calls()
+    );
+}
+
+#[tokio::test]
+async fn execution_token_run_lane_is_created_owned_by_the_runs_person() {
+    let fx = fixture().await;
+    let answer = fx
+        .service
+        .run_repository_action(
+            &fx.tenant,
+            fx.run,
+            "tree_write",
+            Some("carbon-forge: the task"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(answer.sentence, None, "{answer:?}");
+    let created: Vec<Value> = fx
+        .calls()
+        .into_iter()
+        .filter(|(t, _)| t == "lanes.create")
+        .map(|(_, a)| a)
+        .collect();
+    assert_eq!(created.len(), 1, "one lane was created: {created:?}");
+    assert_eq!(
+        created[0]["owner"].as_str(),
+        Some(NN_USER_ID),
+        "X5, NN ADR-0193 L7: the run's lane is not owned by its person: {}",
+        created[0]
+    );
+    assert!(fx.binding.holds_child(fx.run));
 }
 
 // ===========================================================================

@@ -29,6 +29,18 @@ pub(crate) struct GatewayActing {
     pub(crate) has_execution_record: bool,
 }
 
+/// Which credential a remote tool call carries (AEGIS ADR-147 Update
+/// `execution-token-2026-10-17` X3): the binding the execution's `contexts`
+/// chose, or, for a workflow run's own Carbon Forge call, the run's
+/// execution token and never the binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CallCredential {
+    /// The chosen binding (an agent's call; a run's mint and revoke).
+    Binding,
+    /// The run's execution token, keyed by its execution id.
+    ExecutionToken,
+}
+
 impl GatewayActing {
     /// The wire's form: an absent person or workflow is the empty string.
     fn to_proto(&self) -> ActingIdentity {
@@ -1292,10 +1304,11 @@ impl ToolInvocationService {
     }
 
     /// A workflow run's own call of `tool` on the remote server `server`
-    /// (AEGIS ADR-147 C4, C5): through the gateway's `InvokeTool` with the
-    /// credential of the binding the run's `contexts` chose for the server,
-    /// as an agent's call of a remote tool goes (AEGIS ADR-132 H1 to H8),
-    /// never by any other path.
+    /// (AEGIS ADR-147 C4, C5): through the gateway's `InvokeTool`, as an
+    /// agent's call of a remote tool goes (AEGIS ADR-132 H1 to H8), never by
+    /// any other path. A Carbon Forge call carries the run's execution
+    /// token, never the binding, and is refused when the run holds none
+    /// (ADR-147 Update `execution-token-2026-10-17` X3).
     pub(super) async fn invoke_remote_tool_for_run(
         &self,
         run: uuid::Uuid,
@@ -1313,6 +1326,32 @@ impl ToolInvocationService {
             tool,
             args,
             None,
+            CallCredential::ExecutionToken,
+        )
+        .await
+    }
+
+    /// A workflow run's call of `tool` with the credential of the binding
+    /// its `contexts` chose: only to ground, mint and revoke the run's
+    /// execution token (ADR-147 Update `execution-token-2026-10-17` X2, X4).
+    pub(super) async fn invoke_remote_tool_with_binding_for_run(
+        &self,
+        run: uuid::Uuid,
+        tenant_id: &TenantId,
+        acting: &GatewayActing,
+        server: &str,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, SealSessionError> {
+        self.invoke_remote_tool(
+            crate::domain::execution::ExecutionId(run),
+            tenant_id,
+            acting,
+            server,
+            tool,
+            args,
+            None,
+            CallCredential::Binding,
         )
         .await
     }
@@ -1523,12 +1562,19 @@ impl ToolInvocationService {
     /// own active one for it (Zaru ADR-0055 D15). With a chosen set, the
     /// call's `_context` picks the binding (ADR-132 Update (13) S11e). No
     /// other credential path is tried.
+    ///
+    /// A workflow run's own Carbon Forge call (`carries` the execution
+    /// token) resolves the run's execution token kept for `execution_id`,
+    /// never the binding, and is refused when the run holds none (AEGIS
+    /// ADR-147 Update `execution-token-2026-10-17` X3).
     async fn credential_for(
         &self,
         tenant_id: &TenantId,
         acting: &GatewayActing,
         server: &str,
         context_argument: Option<&Value>,
+        execution_id: crate::domain::execution::ExecutionId,
+        carries: CallCredential,
     ) -> Result<SensitiveString, SealSessionError> {
         let Some(user_id) = acting.user_id.as_deref() else {
             return Err(binding_required(format!(
@@ -1541,6 +1587,23 @@ impl ToolInvocationService {
             ))
             .answered(CallerAnswer::Internal(InternalFailure::Unavailable))
         })?;
+        if carries == CallCredential::ExecutionToken
+            && server == crate::domain::run_tree::NUCLEAR_NOTES_SERVER
+        {
+            return match source
+                .execution_token(tenant_id, user_id, execution_id.0)
+                .await
+            {
+                Ok(Some(token)) => Ok(token.secret),
+                Ok(None) => Err(binding_required(
+                    crate::domain::execution_token::RUN_HOLDS_NO_EXECUTION_TOKEN.to_string(),
+                    None,
+                )),
+                Err(e) => Err(SealSessionError::InternalError(format!(
+                    "resolving the execution token of the run for '{server}' failed: {e}"
+                ))),
+            };
+        }
         let context = match acting.contexts.server(server) {
             // Zaru ADR-0069 D4: a call that belongs to no execution and chose
             // nothing (a remote client acting as its person) carries the
@@ -1693,10 +1756,18 @@ impl ToolInvocationService {
         tool: &str,
         args: serde_json::Value,
         context_argument: Option<serde_json::Value>,
+        carries: CallCredential,
     ) -> Result<serde_json::Value, SealSessionError> {
         let tool_name = format!("{server}.{tool}");
         let credential = self
-            .credential_for(tenant_id, acting, server, context_argument.as_ref())
+            .credential_for(
+                tenant_id,
+                acting,
+                server,
+                context_argument.as_ref(),
+                execution_id,
+                carries,
+            )
             .await?;
         if !self.gateway_channel_is_confidential() {
             tracing::error!(
@@ -1772,6 +1843,7 @@ impl ToolInvocationService {
                     tool,
                     args,
                     context_argument,
+                    CallCredential::Binding,
                 )
                 .await;
         }

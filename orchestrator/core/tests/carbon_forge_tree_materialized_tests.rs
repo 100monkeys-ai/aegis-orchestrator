@@ -22,6 +22,10 @@
 //! |---|---|
 //! | C4: the revision, verified, before ANALYZE | `a_run_reaches_analyze_with_its_tree_materialized_from_the_recorded_revision` |
 //! | C4: a blob that does not hash to its entry | `a_blob_that_does_not_hash_to_its_entry_refuses_the_start` |
+//! | ADR-147 Update `execution-token-2026-10-17` X2, X3: minted with the binding before the tree, carrying its calls | `execution_token_is_minted_with_the_binding_before_the_tree_and_carries_its_calls` |
+//! | X2: a refused mint refuses the run before it is persisted | `execution_token_refused_mint_refuses_the_run_before_it_is_persisted` |
+//! | X4: the terminal event revokes the child and deletes its secret | `execution_token_terminal_event_revokes_the_child_and_deletes_its_secret` |
+//! | X3: the child's secret is in no record or event | `execution_token_secret_is_in_no_serialized_execution_record_or_event` |
 
 mod carbon_forge_support;
 
@@ -101,6 +105,11 @@ spec:
 
 struct Started {
     answer: anyhow::Result<String>,
+    service:
+        Arc<aegis_orchestrator_core::application::tool_invocation_service::ToolInvocationService>,
+    binding: Arc<OneBinding>,
+    event_bus: Arc<EventBus>,
+    events: aegis_orchestrator_core::infrastructure::event_bus::EventReceiver,
     temporal: Vec<HashMap<String, Value>>,
     calls: Arc<
         Mutex<Vec<aegis_orchestrator_core::infrastructure::seal_gateway_proto::InvokeToolRequest>>,
@@ -115,6 +124,14 @@ struct Started {
 /// Start carbon-forge on `TREE_PATH` at `REVISION`, Nuclear Notes answering
 /// `blobs.get` with `bytes`.
 async fn start(bytes: &str) -> Started {
+    start_answering(bytes, |_| {}).await
+}
+
+/// [`start`], Nuclear Notes' answers changed by `answers`.
+async fn start_answering(
+    bytes: &str,
+    answers: impl FnOnce(&mut HashMap<String, Answer>),
+) -> Started {
     let dirs = tempfile::tempdir().unwrap();
     let mut stub = nuclear_notes(uuid::Uuid::nil());
     stub.answers.insert(
@@ -128,11 +145,13 @@ async fn start(bytes: &str) -> Started {
             "content_base64": base64::engine::general_purpose::STANDARD.encode(bytes)
         })),
     );
+    answers(&mut stub.answers);
     let calls = stub.calls.clone();
     let (url, ca, shutdown) = serve_tls(stub, dirs.path()).await;
 
     let tenant = TenantId::consumer();
-    let event_bus = Arc::new(EventBus::new(64));
+    let event_bus = Arc::new(EventBus::new(256));
+    let events = event_bus.subscribe();
     let volumes = Arc::new(InMemoryVolumeRepository::new());
     let fsal = Arc::new(AegisFSAL::new(
         Arc::new(
@@ -146,7 +165,8 @@ async fn start(bytes: &str) -> Started {
         Arc::new(NoEvents),
     ));
     let executions = Arc::new(InMemoryWorkflowExecutionRepository::new());
-    let service = tool_service(
+    let binding = Arc::new(OneBinding::default());
+    let service = tool_service_with(
         url,
         &ca,
         fsal,
@@ -156,6 +176,7 @@ async fn start(bytes: &str) -> Started {
             Arc::new(InMemoryToolApprovalRepository::new()),
             event_bus.clone(),
         )),
+        binding.clone(),
     );
 
     let workflow = workflow();
@@ -168,10 +189,10 @@ async fn start(bytes: &str) -> Started {
         Arc::new(tokio::sync::RwLock::new(Some(
             engine.clone() as Arc<dyn WorkflowEnginePort>
         ))),
-        event_bus,
+        event_bus.clone(),
     );
     // AEGIS ADR-147 C4: the start is given its tree service.
-    use_case.set_trees(service);
+    use_case.set_trees(service.clone());
 
     // The run's person starts it: the gateway acts for them alone.
     let person = aegis_orchestrator_core::domain::iam::UserIdentity {
@@ -208,6 +229,10 @@ async fn start(bytes: &str) -> Started {
     let temporal = engine.inputs.lock().unwrap().clone();
     Started {
         answer,
+        service,
+        binding,
+        event_bus,
+        events,
         temporal,
         calls,
         executions,
@@ -302,4 +327,220 @@ async fn a_blob_that_does_not_hash_to_its_entry_refuses_the_start() {
         started.temporal.is_empty(),
         "a refused start reached Temporal"
     );
+}
+
+// ===========================================================================
+// AEGIS ADR-147 Update `execution-token-2026-10-17`: the run's own token
+// ===========================================================================
+
+/// The run a start answered.
+fn run_of(started: &Started) -> uuid::Uuid {
+    let id = started
+        .answer
+        .as_ref()
+        .unwrap_or_else(|e| panic!("the run did not start: {e:#}"));
+    uuid::Uuid::parse_str(id).unwrap()
+}
+
+/// The run's terminal event, as the worker sends it.
+async fn complete(started: &Started, run: uuid::Uuid) {
+    let listener = aegis_orchestrator_core::infrastructure::TemporalEventListener::new(
+        started.event_bus.clone(),
+        started.executions.clone(),
+    );
+    listener.set_execution_tokens(started.service.clone());
+    listener
+        .handle_event(
+            aegis_orchestrator_core::infrastructure::TemporalEventPayload {
+                event_type: "WorkflowExecutionCompleted".to_string(),
+                execution_id: run.to_string(),
+                temporal_sequence_number: 100,
+                final_blackboard: Some(json!({ "result": "done" })),
+                timestamp: "2026-10-17T12:00:00Z".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn execution_token_is_minted_with_the_binding_before_the_tree_and_carries_its_calls() {
+    let started = start(README_BEFORE).await;
+    let run = run_of(&started);
+    let calls = started.calls.lock().unwrap().clone();
+    let tools: Vec<&str> = calls.iter().map(|c| c.tool.as_str()).collect();
+    assert_eq!(
+        tools,
+        vec![
+            "cortex.ground",
+            "tokens.mint_execution",
+            "trees.materialize",
+            "blobs.get"
+        ],
+        "X2: the run's token was not minted once, after its workspace was grounded and before its tree"
+    );
+    let credential = |i: usize| calls[i].credential.as_ref().map(|c| c.value.clone());
+    assert_eq!(
+        credential(0).as_deref(),
+        Some(TOKEN),
+        "X2: the grounding is the binding's"
+    );
+    assert_eq!(
+        credential(1).as_deref(),
+        Some(TOKEN),
+        "X2: the mint is the binding's"
+    );
+    for call in &calls[2..] {
+        assert_eq!(
+            call.credential.as_ref().map(|c| c.value.as_str()),
+            Some(CHILD_TOKEN),
+            "X3: {} carried the binding, not the run's execution token",
+            call.tool
+        );
+    }
+    let mint: Value = serde_json::from_str(&calls[1].arguments_json).unwrap();
+    assert_eq!(
+        mint,
+        json!({
+            "execution_id": run,
+            "instance_id": INSTANCE_ID,
+            "workspace_id": WORKSPACE,
+            "tree_path": TREE_PATH,
+            "lane_label": lane_of(run),
+            "tools": ["blobs.get", "cortex.ground", "trees.materialize"],
+            "lifetime_seconds": 86400
+        }),
+        "X2: the mint does not name the run, its tree, its lane, its declared tools and a day"
+    );
+    assert!(
+        started.binding.holds_child(run),
+        "X3: the child's secret was not kept"
+    );
+}
+
+#[tokio::test]
+async fn execution_token_refused_mint_refuses_the_run_before_it_is_persisted() {
+    const REFUSAL: &str =
+        "This token may not mint execution tokens: its owner has not allowed it in the token form.";
+    let started = start_answering(README_BEFORE, |answers| {
+        answers.insert(
+            "tokens.mint_execution".to_string(),
+            Answer::RemoteError(REFUSAL.to_string()),
+        );
+    })
+    .await;
+    let Err(refusal) = &started.answer else {
+        panic!("X2: a refused mint started the run");
+    };
+    assert!(
+        refusal.to_string().contains(REFUSAL),
+        "X2: the run was not refused with Carbon Forge's sentence: {refusal:#}"
+    );
+    assert!(
+        started
+            .executions
+            .find_active_for_tenant(&started.tenant)
+            .await
+            .unwrap()
+            .is_empty(),
+        "X2: a run whose mint was refused was persisted"
+    );
+    assert!(
+        started.temporal.is_empty(),
+        "X2: a refused run reached Temporal"
+    );
+    let tools: Vec<String> = calls_of(&started.calls)
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect();
+    assert_eq!(
+        tools,
+        vec!["cortex.ground", "tokens.mint_execution"],
+        "X2: a run whose mint was refused reached its tree on the binding"
+    );
+}
+
+#[tokio::test]
+async fn execution_token_terminal_event_revokes_the_child_and_deletes_its_secret() {
+    let started = start(README_BEFORE).await;
+    let run = run_of(&started);
+    assert!(started.binding.holds_child(run));
+    complete(&started, run).await;
+    let calls = started.calls.lock().unwrap().clone();
+    let revokes: Vec<_> = calls
+        .iter()
+        .filter(|c| c.tool == "tokens.revoke_execution")
+        .collect();
+    assert_eq!(
+        revokes.len(),
+        1,
+        "X4: the terminal event did not revoke the child once"
+    );
+    let args: Value = serde_json::from_str(&revokes[0].arguments_json).unwrap();
+    assert_eq!(
+        args,
+        json!({ "token_id": CHILD_TOKEN_ID }),
+        "X4: the revoke names another token"
+    );
+    assert_eq!(
+        revokes[0].credential.as_ref().map(|c| c.value.as_str()),
+        Some(TOKEN),
+        "X4: the revoke is the binding's, the child's parent"
+    );
+    assert!(
+        !started.binding.holds_child(run),
+        "X4: the child's secret was not deleted on the terminal event"
+    );
+    // A second terminal event finds nothing to release.
+    complete(&started, run).await;
+    assert_eq!(
+        calls_of(&started.calls)
+            .iter()
+            .filter(|(t, _)| t == "tokens.revoke_execution")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn execution_token_secret_is_in_no_serialized_execution_record_or_event() {
+    let mut started = start(README_BEFORE).await;
+    let run = run_of(&started);
+    let record = started
+        .executions
+        .find_by_id_for_tenant(&started.tenant, ExecutionId(run))
+        .await
+        .unwrap()
+        .expect("the run was persisted");
+    let serialized = serde_json::to_string(&record).unwrap();
+    assert!(
+        !serialized.contains(CHILD_TOKEN) && !format!("{record:?}").contains(CHILD_TOKEN),
+        "X3: the execution record carries the child's secret"
+    );
+    complete(&started, run).await;
+    let record = started
+        .executions
+        .find_by_id_for_tenant(&started.tenant, ExecutionId(run))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!serde_json::to_string(&record)
+        .unwrap()
+        .contains(CHILD_TOKEN));
+    let mut seen = 0;
+    while let Ok(event) = started.events.try_recv() {
+        seen += 1;
+        assert!(
+            !format!("{event:?}").contains(CHILD_TOKEN),
+            "X3: an event carries the child's secret: {event:?}"
+        );
+    }
+    assert!(seen > 0, "the run published no event");
+    for (tool, args) in calls_of(&started.calls) {
+        assert!(
+            !args.to_string().contains(CHILD_TOKEN),
+            "X3: {tool}'s arguments carry the child's secret"
+        );
+    }
 }

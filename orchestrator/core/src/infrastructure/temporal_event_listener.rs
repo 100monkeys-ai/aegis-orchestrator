@@ -651,6 +651,10 @@ impl TemporalEventMapper {
 pub struct TemporalEventListener {
     event_bus: Arc<EventBus>,
     execution_repository: Arc<dyn WorkflowExecutionRepository>,
+    /// Releases a run's execution token on its terminal event (AEGIS
+    /// ADR-147 Update `execution-token-2026-10-17` X4); unset, the token's
+    /// expiry ends it.
+    execution_tokens: std::sync::OnceLock<Arc<dyn crate::domain::execution_token::ExecutionTokens>>,
 }
 
 impl TemporalEventListener {
@@ -661,7 +665,19 @@ impl TemporalEventListener {
         Self {
             event_bus,
             execution_repository,
+            execution_tokens: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Release a run's execution token through `tokens` on its terminal
+    /// event (X4). Wired once at startup, after the tool invocation service
+    /// exists.
+    pub fn set_execution_tokens(
+        &self,
+        tokens: Arc<dyn crate::domain::execution_token::ExecutionTokens>,
+    ) {
+        // OnceLock silently ignores a second set; the service is wired once at startup.
+        let _ = self.execution_tokens.set(tokens);
     }
 
     /// Persist an execution-scoped event to the repository and publish it to the event bus.
@@ -750,6 +766,28 @@ impl TemporalEventListener {
             .await
             .context("Failed to load workflow execution")?
             .ok_or_else(|| anyhow!("Workflow execution not found: {}", execution_id.0))?;
+        // AEGIS ADR-147 Update `execution-token-2026-10-17` X4: the run's
+        // end revokes its execution token (`tokens.revoke_execution`, with
+        // the binding that minted it) and deletes its secret, whichever
+        // terminal event comes first; a run that holds none has nothing to
+        // release.
+        if let (Some(tokens), Some(_)) = (
+            self.execution_tokens.get(),
+            current.input.get(crate::domain::run_tree::TREES_INPUT_KEY),
+        ) {
+            tokens
+                .release_for_run(
+                    &tenant_id,
+                    current.initiating_user_sub.as_deref(),
+                    execution_id.0,
+                    &crate::domain::execution::ExecutionContexts::from_value(
+                        current
+                            .input
+                            .get(crate::domain::execution::CONTEXTS_INPUT_KEY),
+                    ),
+                )
+                .await;
+        }
         if matches!(
             current.status,
             ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Cancelled
@@ -1603,6 +1641,111 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    /// One release: the tenant, the person, the run and its Carbon Forge
+    /// choice.
+    type Release = (TenantId, Option<String>, uuid::Uuid, String);
+
+    /// Records each release of a run's execution token.
+    #[derive(Default)]
+    struct RecordingTokens {
+        released: std::sync::Mutex<Vec<Release>>,
+    }
+
+    #[async_trait]
+    impl crate::domain::execution_token::ExecutionTokens for RecordingTokens {
+        async fn mint_for_run(
+            &self,
+            _: &TenantId,
+            _: Option<&str>,
+            _: uuid::Uuid,
+            _: &crate::domain::execution::ExecutionContexts,
+            _: &crate::domain::run_tree::RunTree,
+            _: &[&'static str],
+        ) -> Result<(), crate::domain::run_tree::RunTreeError> {
+            Ok(())
+        }
+
+        async fn release_for_run(
+            &self,
+            tenant_id: &TenantId,
+            person: Option<&str>,
+            run: uuid::Uuid,
+            contexts: &crate::domain::execution::ExecutionContexts,
+        ) {
+            self.released.lock().unwrap().push((
+                tenant_id.clone(),
+                person.map(str::to_string),
+                run,
+                format!("{:?}", contexts.server("nuclear-notes")),
+            ));
+        }
+    }
+
+    /// AEGIS ADR-147 Update `execution-token-2026-10-17` X4: a run's
+    /// terminal event releases its execution token, as its person, with its
+    /// own `contexts`; a second terminal event of a run already ended
+    /// releases again (finding nothing), and a run naming no tree releases
+    /// nothing.
+    #[tokio::test]
+    async fn execution_token_released_on_the_terminal_event_of_a_run_naming_a_tree() {
+        let tenant_id = TenantId::from_string("tenant-blue").unwrap();
+        let workflow = build_test_workflow("listener-token");
+        let run = ExecutionId::new();
+        let mut execution = WorkflowExecution::new(
+            &workflow,
+            run,
+            json!({
+                "task": "ship",
+                "trees": [{ "workspace": "w", "path": "code/x", "revision": 1 }],
+                "contexts": { "nuclear-notes": "4f6b1c1e-2d3a-4b5c-8d7e-9f0a1b2c3d4e" }
+            }),
+        );
+        execution.initiating_user_sub = Some("the-person".to_string());
+        let treeless = ExecutionId::new();
+        let mut plain = WorkflowExecution::new(&workflow, treeless, json!({ "task": "ship" }));
+        plain.initiating_user_sub = Some("the-person".to_string());
+        let repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
+        repo.save_for_tenant(&tenant_id, &execution).await.unwrap();
+        repo.save_for_tenant(&tenant_id, &plain).await.unwrap();
+
+        let listener = TemporalEventListener::new(Arc::new(EventBus::new(16)), repo.clone());
+        let tokens = Arc::new(RecordingTokens::default());
+        listener.set_execution_tokens(tokens.clone());
+        let terminal = |id: ExecutionId, event_type: &str| TemporalEventPayload {
+            event_type: event_type.to_string(),
+            execution_id: id.to_string(),
+            temporal_sequence_number: 100,
+            workflow_id: Some(workflow.id.to_string()),
+            error: Some("it failed".to_string()),
+            timestamp: "2026-10-17T12:00:00Z".to_string(),
+            ..Default::default()
+        };
+        listener
+            .handle_event(terminal(run, "WorkflowExecutionCompleted"))
+            .await
+            .unwrap();
+        listener
+            .handle_event(terminal(run, "WorkflowExecutionFailed"))
+            .await
+            .unwrap();
+        listener
+            .handle_event(terminal(treeless, "WorkflowExecutionCompleted"))
+            .await
+            .unwrap();
+        let released = tokens.released.lock().unwrap().clone();
+        assert_eq!(
+            released.len(),
+            2,
+            "X4: the run's terminal events did not release its execution token: {released:?}"
+        );
+        for (tenant, person, released_run, contexts) in released {
+            assert_eq!(tenant, tenant_id);
+            assert_eq!(person.as_deref(), Some("the-person"));
+            assert_eq!(released_run, run.0);
+            assert!(contexts.contains("4f6b1c1e"), "{contexts}");
+        }
     }
 
     #[tokio::test]

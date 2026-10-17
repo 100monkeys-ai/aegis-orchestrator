@@ -60,6 +60,7 @@ pub mod edge_fleet;
 pub mod env_guard;
 pub mod events;
 pub mod execution;
+pub mod execution_token;
 pub mod fsal;
 pub mod git_host_keys;
 pub mod git_repo;

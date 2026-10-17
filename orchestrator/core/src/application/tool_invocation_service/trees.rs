@@ -31,12 +31,17 @@ use super::ToolInvocationService;
 use crate::application::git_repo_service::{RepositoryActionAnswer, RepositoryActionError};
 use crate::application::nfs_gateway::VolumeRegistration;
 use crate::domain::execution::{ExecutionContexts, ExecutionId, CONTEXTS_INPUT_KEY};
+use crate::domain::execution_token::{
+    ExecutionToken, ExecutionTokens, EXECUTION_TOKEN_LIFETIME_SECONDS, MINT_EXECUTION_TOOL,
+    REVOKE_EXECUTION_TOOL,
+};
 use crate::domain::fsal::FsalAccessPolicy;
 use crate::domain::run_tree::{
     blob_mismatch, parse_run_trees, sha256_hex, tree_lane, unified_diff, FileChange, RunTree,
     RunTreeError, RunTrees, TreeBlob, NUCLEAR_NOTES_SERVER, RUN_HOLDS_NO_TREE, TREES_INPUT_KEY,
 };
 use crate::domain::seal_session::{CallerAnswer, SealSessionError};
+use crate::domain::secrets::SensitiveString;
 use crate::domain::shared_kernel::VolumeId;
 use crate::domain::storage::{FileType, OpenMode, StorageProvider};
 use crate::domain::tenant::TenantId;
@@ -508,6 +513,85 @@ impl ToolInvocationService {
             .invoke_remote_tool_for_run(run, tenant_id, acting, NUCLEAR_NOTES_SERVER, tool, args)
             .await?;
         tool_answer(result)
+    }
+
+    /// The Carbon Forge user the run's execution token acts as: the owner
+    /// of the run's lane (X5). `None` when the run holds no token, whose
+    /// call is then refused.
+    async fn run_lane_owner(&self, tenant_id: &TenantId, tree: &TreeOfRun) -> Option<String> {
+        let source = self.tool_credentials.as_ref()?;
+        match source
+            .execution_token(tenant_id, &tree.person, tree.run)
+            .await
+        {
+            Ok(token) => token.map(|token| token.user_id),
+            Err(e) => {
+                tracing::warn!(
+                    workflow_execution_id = %tree.run,
+                    error = %e,
+                    "The run's execution token could not be read for its lane's owner"
+                );
+                None
+            }
+        }
+    }
+
+    /// Call `tool` of Carbon Forge for the run `run` with the binding its
+    /// `contexts` chose: only to ground, mint and revoke its execution token
+    /// (ADR-147 Update `execution-token-2026-10-17` X2, X4).
+    async fn carbon_forge_with_binding(
+        &self,
+        run: uuid::Uuid,
+        tenant_id: &TenantId,
+        acting: &GatewayActing,
+        tool: &str,
+        args: Value,
+    ) -> Result<Value, SealSessionError> {
+        let result = self
+            .invoke_remote_tool_with_binding_for_run(
+                run,
+                tenant_id,
+                acting,
+                NUCLEAR_NOTES_SERVER,
+                tool,
+                args,
+            )
+            .await?;
+        tool_answer(result)
+    }
+
+    /// Revoke the execution token `token_id` of the run `run` with its
+    /// binding (X4): a child holds only its declared tools, and
+    /// `tokens.revoke_execution` is not one of them.
+    async fn revoke_execution_token(
+        &self,
+        run: uuid::Uuid,
+        tenant_id: &TenantId,
+        acting: &GatewayActing,
+        token_id: &str,
+    ) {
+        match self
+            .carbon_forge_with_binding(
+                run,
+                tenant_id,
+                acting,
+                REVOKE_EXECUTION_TOOL,
+                json!({ "token_id": token_id }),
+            )
+            .await
+        {
+            Ok(_) => tracing::info!(
+                workflow_execution_id = %run,
+                token_id = %token_id,
+                "A run's execution token was revoked"
+            ),
+            Err(e) => tracing::warn!(
+                workflow_execution_id = %run,
+                token_id = %token_id,
+                error = %e,
+                "A run's execution token could not be revoked; its expiry ends it"
+            ),
+        }
     }
 
     /// The entries of `tree`'s revision, every page of them.
@@ -1193,6 +1277,13 @@ impl ToolInvocationService {
             return Ok(Ok(Some(NOTHING_TO_WRITE.to_string())));
         }
         let lane = tree_lane(tree.run);
+        // NN ADR-0193 L7, ADR-147 Update `execution-token-2026-10-17` X5:
+        // lanes.create names the run's lane's owner, its person, the Carbon
+        // Forge user its execution token acts as.
+        let mut create = json!({ "label": lane });
+        if let Some(owner) = self.run_lane_owner(tenant_id, tree).await {
+            create["owner"] = json!(owner);
+        }
         if let Err(e) = self
             .nuclear_notes(
                 tree.run,
@@ -1200,7 +1291,7 @@ impl ToolInvocationService {
                 &tree.acting,
                 &tree.tree.workspace,
                 "lanes.create",
-                json!({ "label": lane }),
+                create,
             )
             .await
         {
@@ -1453,6 +1544,157 @@ impl ToolInvocationService {
                 Some(sentence) => Ok(json!({ "sentence": sentence, "tree": tree.tree.path })),
                 None => Err(e),
             },
+        }
+    }
+}
+
+/// What a run's mint needs from Carbon Forge's grounding of the run's
+/// workspace: its instance, the workspace's id and the person's user id.
+fn grounded_ids(ground: &Value) -> Option<(String, String, String)> {
+    let id = |value: &Value| value.as_str().map(str::to_string);
+    Some((
+        id(&ground["instance"]["id"])?,
+        id(&ground["you"]["currentWorkspace"]["id"])?,
+        id(&ground["you"]["userId"])?,
+    ))
+}
+
+#[async_trait::async_trait]
+impl ExecutionTokens for ToolInvocationService {
+    /// X2, X3: ground the run's workspace and mint its execution token with
+    /// the binding its `contexts` chose, then keep the child's secret in the
+    /// secret store keyed by the run. A child that cannot be kept is
+    /// revoked at once.
+    async fn mint_for_run(
+        &self,
+        tenant_id: &TenantId,
+        person: Option<&str>,
+        run: uuid::Uuid,
+        contexts: &ExecutionContexts,
+        tree: &RunTree,
+        tools: &[&'static str],
+    ) -> Result<(), RunTreeError> {
+        let Some(person) = person.filter(|p| !p.is_empty()) else {
+            return Err(RunTreeError::Refused(
+                "This run has no recorded person, so it cannot be given an execution token for Carbon Forge."
+                    .to_string(),
+            ));
+        };
+        let source = self.tool_credentials.as_ref().ok_or_else(|| {
+            RunTreeError::Failed(
+                "this node has no credential source to keep a run's execution token".to_string(),
+            )
+        })?;
+        let refused_or_failed = |what: &'static str| {
+            move |e: SealSessionError| match step_refusal(&e) {
+                Some(sentence) => RunTreeError::Refused(sentence),
+                None => RunTreeError::Failed(format!("{what} failed: {e}")),
+            }
+        };
+        let acting = Self::run_acting(Some(person), None, contexts.clone());
+        let ground = self
+            .carbon_forge_with_binding(
+                run,
+                tenant_id,
+                &acting,
+                crate::domain::run_tree::CARBON_FORGE_GROUND_TOOL,
+                json!({ "workspace": tree.workspace }),
+            )
+            .await
+            .map_err(refused_or_failed("grounding the run's workspace"))?;
+        let Some((instance_id, workspace_id, user_id)) = grounded_ids(&ground) else {
+            return Err(RunTreeError::Failed(format!(
+                "Carbon Forge's grounding of the workspace '{}' named no instance, workspace or user",
+                tree.workspace
+            )));
+        };
+        let minted = self
+            .carbon_forge_with_binding(
+                run,
+                tenant_id,
+                &acting,
+                MINT_EXECUTION_TOOL,
+                json!({
+                    "execution_id": run,
+                    "instance_id": instance_id,
+                    "workspace_id": workspace_id,
+                    "tree_path": tree.path,
+                    "lane_label": tree_lane(run),
+                    "tools": tools,
+                    "lifetime_seconds": EXECUTION_TOKEN_LIFETIME_SECONDS,
+                }),
+            )
+            .await
+            .map_err(refused_or_failed("minting the run's execution token"))?;
+        let (Some(token_id), Some(secret)) = (
+            minted.get("token_id").and_then(Value::as_str),
+            minted.get("secret").and_then(Value::as_str),
+        ) else {
+            return Err(RunTreeError::Failed(
+                "Carbon Forge's mint answered no token id or secret".to_string(),
+            ));
+        };
+        let token = ExecutionToken {
+            token_id: token_id.to_string(),
+            secret: SensitiveString::new(secret),
+            user_id,
+        };
+        drop(minted);
+        if let Err(e) = source
+            .store_execution_token(tenant_id, person, run, &token)
+            .await
+        {
+            self.revoke_execution_token(run, tenant_id, &acting, &token.token_id)
+                .await;
+            return Err(RunTreeError::Failed(format!(
+                "keeping the run's execution token failed: {e}"
+            )));
+        }
+        tracing::info!(
+            workflow_execution_id = %run,
+            token_id = %token.token_id,
+            tools = tools.len(),
+            "A run's execution token was minted"
+        );
+        Ok(())
+    }
+
+    /// X4: revoke the run's execution token with its binding and delete its
+    /// secret; a run that holds none has nothing to release.
+    async fn release_for_run(
+        &self,
+        tenant_id: &TenantId,
+        person: Option<&str>,
+        run: uuid::Uuid,
+        contexts: &ExecutionContexts,
+    ) {
+        let (Some(person), Some(source)) = (
+            person.filter(|p| !p.is_empty()),
+            self.tool_credentials.as_ref(),
+        ) else {
+            return;
+        };
+        let token = match source.execution_token(tenant_id, person, run).await {
+            Ok(Some(token)) => token,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(
+                    workflow_execution_id = %run,
+                    error = %e,
+                    "A run's execution token could not be read to release it; its expiry ends it"
+                );
+                return;
+            }
+        };
+        let acting = Self::run_acting(Some(person), None, contexts.clone());
+        self.revoke_execution_token(run, tenant_id, &acting, &token.token_id)
+            .await;
+        if let Err(e) = source.delete_execution_token(tenant_id, person, run).await {
+            tracing::warn!(
+                workflow_execution_id = %run,
+                error = %e,
+                "A run's execution token's secret could not be deleted"
+            );
         }
     }
 }
