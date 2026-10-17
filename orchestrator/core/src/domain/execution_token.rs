@@ -40,13 +40,21 @@ pub const RUN_HOLDS_NO_EXECUTION_TOKEN: &str = "This run holds no execution toke
 
 /// A run's execution token as the secret store keeps it: its id in Carbon
 /// Forge, its secret, and the Carbon Forge user it acts as (its person,
-/// the owner of the run's lane, NN ADR-0193 L7). `Debug` never shows the
-/// secret.
-#[derive(Debug, Clone)]
+/// the owner of the run's lane, NN ADR-0193 L7). `Debug` shows its user
+/// only, never its id or its secret (X7).
+#[derive(Clone)]
 pub struct ExecutionToken {
     pub token_id: String,
     pub secret: SensitiveString,
     pub user_id: String,
+}
+
+impl std::fmt::Debug for ExecutionToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutionToken")
+            .field("user_id", &self.user_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The Carbon Forge tools `action` calls: its row of
