@@ -891,7 +891,7 @@ pub fn not_connected_sentence(key: &str) -> String {
         CredentialProvider::IMAP => "a mailbox",
         CALENDAR_CHOICE_KEY => "a calendar",
         "github" => "GitHub",
-        "nuclear-notes" => "Nuclear Notes",
+        "nuclear-notes" => "Carbon Forge",
         server => server,
     };
     format!(
@@ -907,7 +907,7 @@ fn your_family(key: &str) -> &str {
         CredentialProvider::IMAP => "mailbox",
         CALENDAR_CHOICE_KEY => "calendar",
         "github" => "GitHub",
-        "nuclear-notes" => "Nuclear Notes",
+        "nuclear-notes" => "Carbon Forge",
         server => server,
     }
 }
