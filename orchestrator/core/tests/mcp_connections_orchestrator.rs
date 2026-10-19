@@ -228,7 +228,7 @@ async fn f_every_not_connected_sentence_names_the_connections_page_and_no_record
             json!({ "calendar_id": "personal" }),
         ),
         ("GitHub", "github.list_issues", json!({})),
-        ("Nuclear Notes", "nuclear-notes.pages.read", json!({})),
+        ("Carbon Forge", "nuclear-notes.pages.read", json!({})),
         ("notes-own", "notes-own.search", json!({})),
     ];
     let mut wrong = Vec::new();

@@ -67,7 +67,7 @@ pub const INSTANCE_ID: &str = "1b2c3d4e-0000-4000-8000-00000000000c";
 pub const NN_USER_ID: &str = "5a5a5a5a-0000-4000-8000-00000000000b";
 /// The remote server's name, as `seal_gateway.remote_servers` names it.
 pub const SERVER: &str = "nuclear-notes";
-/// The Nuclear Notes workspace the run's tree lives in.
+/// The Carbon Forge workspace the run's tree lives in.
 pub const WORKSPACE: &str = "c8b0fadf-176c-418a-a8a4-a148dcf9fd1d";
 /// The tree's path in that workspace.
 pub const TREE_PATH: &str = "code/aegis-platform-deployment";
