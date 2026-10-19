@@ -380,7 +380,7 @@ fn the_not_chosen_sentences_are_as_written_and_name_no_record() {
         ("imap", "mailbox"),
         ("caldav", "calendar"),
         ("github", "GitHub"),
-        ("nuclear-notes", "Nuclear Notes"),
+        ("nuclear-notes", "Carbon Forge"),
         ("notes-own", "notes-own"),
     ] {
         let sentence = not_chosen_sentence(key);

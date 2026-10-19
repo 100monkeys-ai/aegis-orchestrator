@@ -243,7 +243,7 @@ fn g_the_refusal_sentences_are_as_written_and_name_no_record() {
         ("imap", "mailbox"),
         ("caldav", "calendar"),
         ("github", "GitHub"),
-        ("nuclear-notes", "Nuclear Notes"),
+        ("nuclear-notes", "Carbon Forge"),
         ("notes-own", "notes-own"),
     ] {
         let said = no_profile_names_sentence(key);

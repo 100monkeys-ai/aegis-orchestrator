@@ -1913,7 +1913,7 @@ pub struct RemoteServer {
     /// The name the gateway registers the server under.
     pub name: String,
     /// The server's tool a token is grounded with (`cortex.ground` for
-    /// Nuclear Notes, `get_me` for GitHub); `None`: no grounding, and a
+    /// Carbon Forge, `get_me` for GitHub); `None`: no grounding, and a
     /// binding to the server is stored with no reach.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grounding_tool: Option<String>,
