@@ -1936,6 +1936,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .await;
     }
 
+    // AEGIS ADR-141, Update of 2026-10-21, clause 13: with the schema
+    // migrations applied, the data step `two_tries_bound_floor` raises every
+    // stored agent bound under two whole tries, once (recorded in
+    // `data_steps`), one log line per row.
+    if let Some(pool) = db_pool.as_ref() {
+        crate::daemon::two_tries_bound_floor::run_at_start(pool).await;
+    }
+
     // ─── Credential Management Service (BC-11, ADR-078) ────────────────────────
     // The same store answers a remote tool call's credential (AEGIS ADR-132
     // H1), wired into the tool invocation service with `seal_gateway`.

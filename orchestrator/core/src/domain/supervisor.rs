@@ -193,6 +193,136 @@ pub fn two_tries_bound(execution: &crate::domain::agent::ExecutionStrategy) -> D
     2 * whole_try(execution) + failed_execution_backoff(1) + TRY_START_ALLOWANCE
 }
 
+// The built-ins whose clocks a record decides, each with the record that sets
+// it (AEGIS ADR-141, Update of 2026-10-21, clause 12 moved this list here from
+// the registry test in `cli/src/commands/builtins.rs`):
+// - aegis-code-validator-agent: ADR-124, Update of 2026-10-04;
+// - goal-judge: ADR-131 D3;
+// - the four judges: ADR-052, Update of 2026-10-04, and ADR-124;
+// - the three executors: ADR-087; the output formatter: ADR-103;
+// - aegis-document-renderer-agent: ADR-135 D1;
+// - the three generators: ADR-052, Update of 2026-10-04.
+// A clock here moves only by an Update of its record.
+/// The built-in agents exempt from [`two_tries_bound`], each with the reason
+/// its clock is its own. The exemption holds for the system tenant's rows,
+/// where the built-ins are registered; a tenant's agent of the same name is
+/// held to the bound.
+pub const TWO_TRIES_EXEMPT: &[(&str, &str)] = &[
+    (
+        "aegis-code-validator-agent",
+        "the code validator's clock: llm_timeout_seconds 300, resources.timeout 300s",
+    ),
+    (
+        "goal-judge",
+        "the goal judge's clock: resources.timeout 300s",
+    ),
+    ("code-quality-judge", "a judge keeps 300 s"),
+    ("tool-call-policy-judge", "a judge keeps 300 s"),
+    ("agent-generator-judge", "a judge keeps 300 s"),
+    ("workflow-generator-judge", "a judge keeps 300 s"),
+    (
+        "aegis-python-executor-agent",
+        "an executor of the intent-to-execution pipeline",
+    ),
+    (
+        "aegis-javascript-executor-agent",
+        "an executor of the intent-to-execution pipeline",
+    ),
+    (
+        "aegis-bash-executor-agent",
+        "an executor of the intent-to-execution pipeline",
+    ),
+    (
+        "aegis-output-formatter-agent",
+        "the output handler's formatter",
+    ),
+    (
+        "aegis-document-renderer-agent",
+        "one fixed program, max_iterations 1",
+    ),
+    (
+        "agent-creator-agent",
+        "a generator's clock: resources.timeout 600s",
+    ),
+    (
+        "workflow-creator-validator-agent",
+        "a generator's clock: resources.timeout 600s",
+    ),
+    (
+        "workflow-generator-planner-agent",
+        "a generator's clock: resources.timeout 600s",
+    ),
+];
+
+/// The stable code of [`TwoTriesRefusal`].
+pub const TWO_TRIES_REFUSAL_CODE: &str = "execution-bound/two-tries";
+
+/// An agent that may retry whose execution bound does not fit two whole
+/// tries (AEGIS ADR-141, Update of 2026-10-21, clause 12): refused on create
+/// and on update. Its `Display` is the refusal sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TwoTriesRefusal {
+    /// The agent's name.
+    pub name: String,
+    /// Its bound: `resources.timeout`, or
+    /// [`DEFAULT_EXECUTION_TIMEOUT_SECONDS`] when unset.
+    pub bound: u64,
+    /// What two whole tries need: [`two_tries_bound`].
+    pub need: u64,
+    /// Its [`iteration_timeout`], in seconds.
+    pub iteration: u64,
+    /// Its [`judges_timeout`], in seconds.
+    pub judges: u64,
+}
+
+impl std::fmt::Display for TwoTriesRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Agent '{}' is refused ({TWO_TRIES_REFUSAL_CODE}): resources.timeout {} s is under \
+             the {} s that two whole tries need (iteration_timeout {} s and its judges' {} s \
+             each, the wait between them and the start). Set resources.timeout to {}s or more, \
+             or max_retries to 1.",
+            self.name, self.bound, self.need, self.iteration, self.judges, self.need
+        )
+    }
+}
+
+impl std::error::Error for TwoTriesRefusal {}
+
+/// The refusal of a manifest whose `max_retries` is 2 or more and whose
+/// bound is under [`two_tries_bound`], or `None` when it fits (AEGIS
+/// ADR-141, Update of 2026-10-21, clause 12). A manifest with no
+/// `spec.execution` is read with the default strategy. `built_in` is true for
+/// the system tenant's rows, where a name on [`TWO_TRIES_EXEMPT`] is exempt.
+pub fn two_tries_refusal(
+    manifest: &crate::domain::agent::AgentManifest,
+    built_in: bool,
+) -> Option<TwoTriesRefusal> {
+    let execution = manifest.spec.execution.clone().unwrap_or_default();
+    if execution.max_retries < 2 {
+        return None;
+    }
+    let name = manifest.metadata.name.as_str();
+    if built_in && TWO_TRIES_EXEMPT.iter().any(|(exempt, _)| *exempt == name) {
+        return None;
+    }
+    let bound = manifest
+        .spec
+        .security
+        .as_ref()
+        .and_then(|security| security.resources.parse_timeout_seconds())
+        .unwrap_or(DEFAULT_EXECUTION_TIMEOUT_SECONDS);
+    let need = two_tries_bound(&execution).as_secs();
+    (bound < need).then(|| TwoTriesRefusal {
+        name: name.to_string(),
+        bound,
+        need,
+        iteration: iteration_timeout(&execution).as_secs(),
+        judges: judges_timeout(&execution).as_secs(),
+    })
+}
+
 /// The execution's overall bound, as the loop sees it before each try.
 #[derive(Debug, Clone, Copy)]
 struct TryBound {
