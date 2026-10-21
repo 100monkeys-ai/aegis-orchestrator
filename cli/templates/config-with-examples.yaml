@@ -396,7 +396,7 @@ spec:
   # knows of such a tool is declared here by tool name pattern: an exact
   # name, "<prefix>.*" for every tool under "<prefix>.", or "*".
   # tool_capabilities:
-  #   - tool_pattern: "nuclear-notes.pages.*"
+  #   - tool_pattern: "carbon-forge.pages.*"
   #     # AEGIS ADR-126: an agent's call waits for its user's answer
   #     # (approve once, always allow, deny) at the approval gate; it
   #     # returns approval_pending and the tool runs only on approval.
@@ -639,7 +639,7 @@ spec:
   #   # <name>, granted to the agent, its workflow or all their agents (AEGIS
   #   # ADR-132 H1, H4). Lowercase letters, digits and hyphens. Omit for none.
   #   remote_servers:
-  #     - nuclear-notes
+  #     - carbon-forge
 
   # --------------------------------------------------------------------------
   # OAuth Providers (Optional, ADR-078, AEGIS ADR-125 D2)

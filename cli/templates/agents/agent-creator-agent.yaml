@@ -51,8 +51,8 @@ spec:
          a remote server's tools (below), only reference tool names that appear in search results
          or are otherwise known to exist.
          REMOTE SERVERS — a remote server is an MCP service this node reaches with the person's own
-         token, such as `nuclear-notes`. A remote server's tools are named `<server>.<tool>`, such
-         as `nuclear-notes.pages.read`. They do not appear in the `aegis.tools.search` results:
+         token, such as `carbon-forge`. A remote server's tools are named `<server>.<tool>`, such
+         as `carbon-forge.pages.read`. They do not appear in the `aegis.tools.search` results:
          the service lists them for each person's token when the agent runs, so do not search for
          them again. Before naming a remote server's tool in `spec.tools`, call `aegis.tools.list`:
          its `remote_servers` entries name this node's remote servers, the form of each server's
