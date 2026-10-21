@@ -183,9 +183,24 @@ pub(crate) async fn deploy_agent_handler(
     {
         Ok(id) => Ok((StatusCode::OK, Json(serde_json::json!({"agent_id": id.0})))),
         Err(e) => Ok((
-            StatusCode::INTERNAL_SERVER_ERROR,
+            agent_write_refusal_status(&e),
             Json(serde_json::json!({"error": e.to_string()})),
         )),
+    }
+}
+
+/// The status an agent create or update answers when the lifecycle refuses
+/// it: 400 for a bound under two whole tries (AEGIS ADR-141, Update of
+/// 2026-10-21, clause 12), whose `error` is the refusal's sentence; 500
+/// otherwise.
+fn agent_write_refusal_status(error: &anyhow::Error) -> StatusCode {
+    if error
+        .downcast_ref::<aegis_orchestrator_core::domain::supervisor::TwoTriesRefusal>()
+        .is_some()
+    {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
     }
 }
 
@@ -825,7 +840,7 @@ pub(crate) async fn update_agent_handler(
                     (StatusCode::OK, Json(serde_json::json!({"success": true}))).into_response()
                 ),
                 Err(e) => Ok((
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    agent_write_refusal_status(&e),
                     Json(serde_json::json!({"error": e.to_string()})),
                 )
                     .into_response()),

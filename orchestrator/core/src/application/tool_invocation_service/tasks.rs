@@ -1,6 +1,20 @@
 use super::attachment_args::parse_attachments;
 use super::*;
 
+/// Whether the execution's last try answered and a judge rejected the
+/// answer (AEGIS ADR-141, Update of 2026-10-21, clause 15): the status stays
+/// `failed` and `last_output` the answer, and `answer_rejected` says why.
+fn answer_rejected(exec: &crate::domain::execution::Execution) -> bool {
+    exec.iterations().last().is_some_and(|last| {
+        last.output.is_some()
+            && last
+                .validation_results
+                .as_ref()
+                .and_then(|results| results.semantic.as_ref())
+                .is_some_and(|semantic| !semantic.success)
+    })
+}
+
 impl ToolInvocationService {
     /// Whether this read reaches every tenant: an active operator
     /// escalation and no `tenant_id` named (AEGIS ADR-129 D17). A named
@@ -212,7 +226,9 @@ impl ToolInvocationService {
                     "iteration_count": exec.iterations().len(),
                     "last_output": last_iter.and_then(|i| i.output.as_ref()),
                     "produced_files": exec.produced_files(),
-                    "last_error": last_iter.and_then(|i| i.error.as_ref().map(|e| format!("{e:?}")))
+                    "last_error": last_iter.and_then(|i| i.error.as_ref().map(|e| format!("{e:?}"))),
+                    "error": exec.error,
+                    "answer_rejected": answer_rejected(&exec)
                 })))
             }
             Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -288,7 +304,9 @@ impl ToolInvocationService {
                             "iteration_count": exec.iterations().len(),
                             "last_output": last_iter.and_then(|i| i.output.as_ref()),
                             "produced_files": exec.produced_files(),
-                            "last_error": last_iter.and_then(|i| i.error.as_ref().map(|e| format!("{e:?}")))
+                            "last_error": last_iter.and_then(|i| i.error.as_ref().map(|e| format!("{e:?}"))),
+                            "error": exec.error,
+                            "answer_rejected": answer_rejected(&exec)
                         })));
                     }
 

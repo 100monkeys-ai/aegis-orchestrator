@@ -181,6 +181,18 @@ impl StandardAgentLifecycleService {
     }
 }
 
+/// Refuse a manifest whose `max_retries` is 2 or more and whose bound is
+/// under two whole tries, with the domain's
+/// [`TwoTriesRefusal`](crate::domain::supervisor::TwoTriesRefusal) as the
+/// error (AEGIS ADR-141, Update of 2026-10-21, clause 12). The built-ins are
+/// the system tenant's rows, where the exemption list holds.
+fn refuse_a_bound_under_two_tries(tenant_id: &TenantId, manifest: &AgentManifest) -> Result<()> {
+    match crate::domain::supervisor::two_tries_refusal(manifest, tenant_id.is_system()) {
+        Some(refusal) => Err(refusal.into()),
+        None => Ok(()),
+    }
+}
+
 #[async_trait]
 impl AgentLifecycleService for StandardAgentLifecycleService {
     async fn deploy_agent_for_tenant(
@@ -195,6 +207,9 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
         manifest.validate().map_err(|e| anyhow::anyhow!(e))?;
         // AEGIS ADR-005 O4 and O5: refuse an agent whose declarations cannot do its work.
         crate::domain::tool_requirement::check(&manifest)?;
+        // AEGIS ADR-141, Update of 2026-10-21, clause 12: refuse an agent
+        // that may retry whose bound does not fit two whole tries.
+        refuse_a_bound_under_two_tries(tenant_id, &manifest)?;
 
         // Quota check: ensure the tenant has not exceeded its max_agents limit (ADR-056).
         if let Some(quota_svc) = &self.quota_service {
@@ -336,6 +351,8 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
     ) -> Result<()> {
         // AEGIS ADR-005 O4 and O5: refuse an agent whose declarations cannot do its work.
         crate::domain::tool_requirement::check(&manifest)?;
+        // AEGIS ADR-141, Update of 2026-10-21, clause 12.
+        refuse_a_bound_under_two_tries(tenant_id, &manifest)?;
         let mut agent = self.get_agent_for_tenant(tenant_id, id).await?;
         let old_version = agent.manifest.metadata.version.clone();
         let new_version = manifest.metadata.version.clone();

@@ -127,6 +127,20 @@ impl ToolInvocationService {
                 Ok(ToolInvocationResult::Direct(answer))
             }
             Err(e) => {
+                // AEGIS ADR-141, Update of 2026-10-21, clause 12: a bound
+                // under two whole tries is refused with its sentence as it is.
+                if let Some(refusal) =
+                    e.downcast_ref::<crate::domain::supervisor::TwoTriesRefusal>()
+                {
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.agent.create",
+                        "validated": false,
+                        "deployed": false,
+                        "name": manifest.metadata.name,
+                        "version": manifest.metadata.version,
+                        "errors": [refusal.to_string()]
+                    })));
+                }
                 let err_str = e.to_string();
                 if err_str.contains("is already deployed") {
                     Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -496,14 +510,26 @@ impl ToolInvocationService {
                 }
                 Ok(ToolInvocationResult::Direct(answer))
             }
-            Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
-                "tool": "aegis.agent.update",
-                "validated": true,
-                "updated": false,
-                "name": manifest.metadata.name,
-                "version": manifest.metadata.version,
-                "errors": [format!("Agent update failed: {}", e)]
-            }))),
+            // AEGIS ADR-141, Update of 2026-10-21, clause 12: a bound under
+            // two whole tries is refused with its sentence as it is.
+            Err(e) => match e.downcast_ref::<crate::domain::supervisor::TwoTriesRefusal>() {
+                Some(refusal) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.agent.update",
+                    "validated": false,
+                    "updated": false,
+                    "name": manifest.metadata.name,
+                    "version": manifest.metadata.version,
+                    "errors": [refusal.to_string()]
+                }))),
+                None => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.agent.update",
+                    "validated": true,
+                    "updated": false,
+                    "name": manifest.metadata.name,
+                    "version": manifest.metadata.version,
+                    "errors": [format!("Agent update failed: {}", e)]
+                }))),
+            },
         }
     }
 
