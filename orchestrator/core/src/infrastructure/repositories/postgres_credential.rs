@@ -39,6 +39,44 @@ impl PostgresCredentialBindingRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    /// Every binding whose provider is a former server name, its provider
+    /// rewritten to the server's own name (Carbon Forge ADR-0198, Update of
+    /// 2026-10-21, R3 step 6; the rule is
+    /// [`former_names_migration::provider`](super::former_names_migration::provider)).
+    /// Only a row still naming a former name is read, and it is written only
+    /// while it still does, so a second run rewrites nothing.
+    pub async fn rewrite_former_names(
+        &self,
+        former: &crate::domain::node_config::FormerNames,
+    ) -> Result<
+        super::former_names_migration::TableRewrite,
+        crate::domain::repository::RepositoryError,
+    > {
+        let rows =
+            sqlx::query("SELECT id, provider FROM credential_bindings WHERE provider = ANY($1)")
+                .bind(former.formers())
+                .fetch_all(&self.pool)
+                .await?;
+        let mut done = super::former_names_migration::TableRewrite::default();
+        for row in rows {
+            let id: Uuid = row.try_get("id")?;
+            let stored: String = row.try_get("provider")?;
+            let Some(provider) = super::former_names_migration::provider(former, &stored) else {
+                continue;
+            };
+            let written = sqlx::query(
+                "UPDATE credential_bindings SET provider = $2 WHERE id = $1 AND provider = $3",
+            )
+            .bind(id)
+            .bind(&provider)
+            .bind(&stored)
+            .execute(&self.pool)
+            .await?;
+            done.rewritten += written.rows_affected();
+        }
+        Ok(done)
+    }
 }
 
 // ============================================================================

@@ -39,6 +39,45 @@ impl PostgresProfileRepository {
         Self { pool }
     }
 
+    /// Every profile whose `tools` holds a pattern of a former server name
+    /// (`<former>.<tool>`, `<former>.*`), each such pattern rewritten to the
+    /// server's own name in its place (Carbon Forge ADR-0198, Update of
+    /// 2026-10-21, R3 step 6; the rule is
+    /// [`former_names_migration::tools`](super::former_names_migration::tools)).
+    /// A row is written only while it still holds what was read, so a second
+    /// run rewrites nothing.
+    pub async fn rewrite_former_names(
+        &self,
+        former: &crate::domain::node_config::FormerNames,
+    ) -> Result<super::former_names_migration::TableRewrite, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT id, tools FROM profiles WHERE EXISTS \
+             (SELECT 1 FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(tools) = 'array' \
+              THEN tools ELSE '[]'::jsonb END) AS pattern(value) \
+              WHERE split_part(pattern.value, '.', 1) = ANY($1))",
+        )
+        .bind(former.formers())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut done = super::former_names_migration::TableRewrite::default();
+        for row in rows {
+            let id: Uuid = column(&row, "id")?;
+            let stored: serde_json::Value = column(&row, "tools")?;
+            let Some(tools) = super::former_names_migration::tools(former, &stored) else {
+                continue;
+            };
+            let written =
+                sqlx::query("UPDATE profiles SET tools = $2 WHERE id = $1 AND tools = $3")
+                    .bind(id)
+                    .bind(&tools)
+                    .bind(&stored)
+                    .execute(&self.pool)
+                    .await?;
+            done.rewritten += written.rows_affected();
+        }
+        Ok(done)
+    }
+
     async fn bindings_of(&self, ids: &[Uuid]) -> Result<HashMap<Uuid, Vec<Uuid>>, RepositoryError> {
         let rows = sqlx::query(
             "SELECT profile_id, binding_id FROM profile_bindings \

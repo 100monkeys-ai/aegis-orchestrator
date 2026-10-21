@@ -2211,6 +2211,16 @@ impl FormerNames {
             .map(|(former, _)| former.as_str())
     }
 
+    /// Every former name, in the order the configuration gives them: what a
+    /// stored row is searched for when the former names are rewritten to
+    /// their servers' own names at the daemon's start.
+    pub fn formers(&self) -> Vec<String> {
+        self.renames
+            .iter()
+            .map(|(former, _)| former.clone())
+            .collect()
+    }
+
     /// `tool` (or a tool pattern) with its server, the part before its first
     /// dot, read as the server's own name: `<former>.<rest>` becomes
     /// `<current>.<rest>`, `<former>.*` becomes `<current>.*`; anything

@@ -120,6 +120,161 @@ impl PostgresToolApprovalRepository {
         Self { pool, secrets }
     }
 
+    /// Every policy whose tool names a former server name, its tool
+    /// rewritten to the server's own name (Carbon Forge ADR-0198, Update of
+    /// 2026-10-21, R3 step 6; the rule is
+    /// [`former_names_migration::tool_name`](super::former_names_migration::tool_name)).
+    ///
+    /// One standing choice per key (this module's header): the gate reads a
+    /// tool by its server's own name first and by a former name only when
+    /// that finds none. So an unrevoked policy under a former name whose key
+    /// already has an unrevoked policy under the server's own name is left as
+    /// it was and logged: rewritten, it would stand beside that one, and the
+    /// newer of the two would be answered instead of the one the gate reads
+    /// today. Revoked policies are rewritten freely. A row is written only
+    /// while it still names a former name, so a second run rewrites nothing.
+    pub async fn rewrite_former_names_in_policies(
+        &self,
+        former: &crate::domain::node_config::FormerNames,
+    ) -> Result<super::former_names_migration::TableRewrite, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT id, tool_name FROM tool_approval_policies \
+             WHERE split_part(tool_name, '.', 1) = ANY($1)",
+        )
+        .bind(former.formers())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut done = super::former_names_migration::TableRewrite::default();
+        for row in rows {
+            let id: Uuid = column(&row, "id")?;
+            let stored: String = column(&row, "tool_name")?;
+            let Some(tool_name) = super::former_names_migration::tool_name(former, &stored) else {
+                continue;
+            };
+            let written = sqlx::query(
+                "UPDATE tool_approval_policies AS p SET tool_name = $2 \
+                 WHERE p.id = $1 AND p.tool_name = $3 \
+                 AND NOT (p.revoked_at IS NULL AND EXISTS \
+                   (SELECT 1 FROM tool_approval_policies AS o \
+                    WHERE o.tenant_id = p.tenant_id AND o.user_sub = p.user_sub \
+                    AND o.tool_name = $2 AND o.binding_id IS NOT DISTINCT FROM p.binding_id \
+                    AND o.profile_id IS NOT DISTINCT FROM p.profile_id \
+                    AND o.revoked_at IS NULL))",
+            )
+            .bind(id)
+            .bind(&tool_name)
+            .bind(&stored)
+            .execute(&self.pool)
+            .await?;
+            if written.rows_affected() == 0 {
+                tracing::warn!(
+                    table = "tool_approval_policies",
+                    id = %id,
+                    reason = %format!(
+                        "an unrevoked policy for '{tool_name}' with the same binding and profile \
+                         already stands, or the row changed since it was read"
+                    ),
+                    "A stored former server name was left as it was"
+                );
+                done.left += 1;
+            }
+            done.rewritten += written.rows_affected();
+        }
+        Ok(done)
+    }
+
+    /// Every open (`pending`) request naming a former server name, in its
+    /// tool or as a key of its `contexts`, rewritten to the server's own name
+    /// (Carbon Forge ADR-0198, Update of 2026-10-21, R3 step 6; the rules are
+    /// [`former_names_migration::tool_name`](super::former_names_migration::tool_name)
+    /// and
+    /// [`former_names_migration::contexts`](super::former_names_migration::contexts)).
+    /// A sealed row's `contexts` is opened under its tenant's Transit key,
+    /// rewritten and sealed again. Decided requests are history and stay. A
+    /// row whose `contexts` cannot be opened or would be refused by the
+    /// readers is left as it was and logged. A row is written only while it
+    /// is still pending and holds what was read, so a second run rewrites
+    /// nothing.
+    pub async fn rewrite_former_names_in_pending_requests(
+        &self,
+        former: &crate::domain::node_config::FormerNames,
+    ) -> Result<super::former_names_migration::TableRewrite, RepositoryError> {
+        // A sealed `contexts` cannot be searched, so every pending row with
+        // one is opened.
+        let rows = sqlx::query(
+            "SELECT id, tenant_id, tool_name, contexts, sealed FROM tool_approval_requests \
+             WHERE status = 'pending' \
+             AND (split_part(tool_name, '.', 1) = ANY($1) OR contexts IS NOT NULL)",
+        )
+        .bind(former.formers())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut done = super::former_names_migration::TableRewrite::default();
+        for row in rows {
+            let id: Uuid = column(&row, "id")?;
+            let tenant_id = tenant(column(&row, "tenant_id")?)?;
+            let stored_tool: String = column(&row, "tool_name")?;
+            let stored_contexts: Option<Value> = column(&row, "contexts")?;
+            let sealed: bool = column(&row, "sealed")?;
+            let left = |reason: String| {
+                tracing::warn!(
+                    table = "tool_approval_requests",
+                    id = %id,
+                    reason = %reason,
+                    "A stored former server name was left as it was"
+                );
+            };
+            let tool_name = super::former_names_migration::tool_name(former, &stored_tool);
+            let mut contexts = stored_contexts.clone();
+            if let Some(stored) = &stored_contexts {
+                let open = if sealed {
+                    match self.unseal_json(&tenant_id, "contexts", stored).await {
+                        Ok(open) => open,
+                        Err(e) => {
+                            left(format!("its contexts could not be opened: {e}"));
+                            done.left += 1;
+                            continue;
+                        }
+                    }
+                } else {
+                    stored.clone()
+                };
+                match super::former_names_migration::contexts(former, &open) {
+                    Ok(Some(rewritten)) => {
+                        contexts = Some(if sealed {
+                            self.seal_json(&tenant_id, &rewritten).await?
+                        } else {
+                            rewritten
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(reason) => {
+                        left(reason);
+                        done.left += 1;
+                        continue;
+                    }
+                }
+            }
+            if tool_name.is_none() && contexts == stored_contexts {
+                continue;
+            }
+            let written = sqlx::query(
+                "UPDATE tool_approval_requests SET tool_name = $2, contexts = $3 \
+                 WHERE id = $1 AND status = 'pending' AND tool_name = $4 \
+                 AND contexts IS NOT DISTINCT FROM $5",
+            )
+            .bind(id)
+            .bind(tool_name.as_deref().unwrap_or(&stored_tool))
+            .bind(&contexts)
+            .bind(&stored_tool)
+            .bind(&stored_contexts)
+            .execute(&self.pool)
+            .await?;
+            done.rewritten += written.rows_affected();
+        }
+        Ok(done)
+    }
+
     async fn seal(
         &self,
         tenant_id: &TenantId,

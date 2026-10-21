@@ -26,6 +26,73 @@ impl PostgresAgentRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    /// Every agent whose stored manifest names a former server name, its
+    /// `manifest_json` and `manifest_yaml` rewritten in
+    /// `spec.contexts[].service` and the `spec.tools` entries only, row by
+    /// row (Carbon Forge ADR-0198, Update of 2026-10-21, R3 step 6; the rule
+    /// is [`former_names_migration::manifest`](super::former_names_migration::manifest)):
+    /// the YAML is rewritten token by token and parsed again, and a row whose
+    /// parse is not the manifest the rewritten JSON holds is left as it was
+    /// and logged. The version history in `agent_versions` is not touched. A
+    /// row is written only while it still holds what was read, so a second
+    /// run rewrites nothing.
+    pub async fn rewrite_former_names(
+        &self,
+        former: &crate::domain::node_config::FormerNames,
+    ) -> Result<super::former_names_migration::TableRewrite, RepositoryError> {
+        use super::former_names_migration::{manifest, ManifestRewrite, TableRewrite};
+        let rows = sqlx::query(
+            "SELECT id, manifest_yaml, manifest_json FROM agents WHERE EXISTS \
+             (SELECT 1 FROM unnest($1::text[]) AS former(name) \
+              WHERE strpos(agents.manifest_json::text, former.name) > 0 \
+              OR strpos(agents.manifest_yaml, former.name) > 0)",
+        )
+        .bind(former.formers())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let mut done = TableRewrite::default();
+        for row in rows {
+            let id: uuid::Uuid = row
+                .try_get("id")
+                .map_err(|e| RepositoryError::Serialization(format!("id: {e}")))?;
+            let stored_yaml: String = row
+                .try_get("manifest_yaml")
+                .map_err(|e| RepositoryError::Serialization(format!("manifest_yaml: {e}")))?;
+            let stored_json: serde_json::Value = row
+                .try_get("manifest_json")
+                .map_err(|e| RepositoryError::Serialization(format!("manifest_json: {e}")))?;
+            let (yaml, json) = match manifest(former, &stored_yaml, &stored_json) {
+                ManifestRewrite::Unchanged => continue,
+                ManifestRewrite::Rewritten { yaml, json } => (yaml, json),
+                ManifestRewrite::Left { reason } => {
+                    tracing::warn!(
+                        table = "agents",
+                        id = %id,
+                        reason = %reason,
+                        "A stored former server name was left as it was"
+                    );
+                    done.left += 1;
+                    continue;
+                }
+            };
+            let written = sqlx::query(
+                "UPDATE agents SET manifest_yaml = $2, manifest_json = $3 \
+                 WHERE id = $1 AND manifest_yaml = $4 AND manifest_json = $5",
+            )
+            .bind(id)
+            .bind(&yaml)
+            .bind(&json)
+            .bind(&stored_yaml)
+            .bind(&stored_json)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            done.rewritten += written.rows_affected();
+        }
+        Ok(done)
+    }
 }
 
 /// The columns every agent read selects.

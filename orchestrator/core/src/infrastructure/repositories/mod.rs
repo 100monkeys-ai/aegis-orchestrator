@@ -48,6 +48,7 @@
 //! 3. **Error Mapping**: Infrastructure errors mapped to domain RepositoryError
 //! 4. **Connection Pooling**: Efficient database connection management
 
+pub mod former_names_migration;
 pub mod postgres_agent;
 pub mod postgres_api_key;
 pub mod postgres_billing;

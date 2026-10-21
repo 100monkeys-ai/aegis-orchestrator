@@ -44,6 +44,55 @@ impl PostgresScheduleRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    /// Every schedule whose `contexts` has a key that is a former server
+    /// name, the key rewritten to the server's own name (Carbon Forge
+    /// ADR-0198, Update of 2026-10-21, R3 step 6; the rule is
+    /// [`former_names_migration::contexts`](super::former_names_migration::contexts)).
+    /// A map the readers would refuse (the server chosen twice, once with no
+    /// binding) is left as it was and logged. A row is written only while it
+    /// still holds what was read, so a second run rewrites nothing.
+    pub async fn rewrite_former_names(
+        &self,
+        former: &crate::domain::node_config::FormerNames,
+    ) -> Result<super::former_names_migration::TableRewrite, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT id, contexts FROM schedules WHERE EXISTS \
+             (SELECT 1 FROM unnest($1::text[]) AS former(name) \
+              WHERE schedules.contexts -> former.name IS NOT NULL)",
+        )
+        .bind(former.formers())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut done = super::former_names_migration::TableRewrite::default();
+        for row in rows {
+            let id: Uuid = column(&row, "id")?;
+            let stored: serde_json::Value = column(&row, "contexts")?;
+            let contexts = match super::former_names_migration::contexts(former, &stored) {
+                Ok(Some(contexts)) => contexts,
+                Ok(None) => continue,
+                Err(reason) => {
+                    tracing::warn!(
+                        table = "schedules",
+                        id = %id,
+                        reason = %reason,
+                        "A stored former server name was left as it was"
+                    );
+                    done.left += 1;
+                    continue;
+                }
+            };
+            let written =
+                sqlx::query("UPDATE schedules SET contexts = $2 WHERE id = $1 AND contexts = $3")
+                    .bind(id)
+                    .bind(&contexts)
+                    .bind(&stored)
+                    .execute(&self.pool)
+                    .await?;
+            done.rewritten += written.rows_affected();
+        }
+        Ok(done)
+    }
 }
 
 fn column<'r, T>(row: &'r PgRow, name: &str) -> Result<T, RepositoryError>

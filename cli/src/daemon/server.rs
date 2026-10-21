@@ -588,6 +588,44 @@ pub(crate) fn daemon_former_names(
         .unwrap_or_default()
 }
 
+/// Rewrite the stored former server names to their servers' own names
+/// (Carbon Forge ADR-0198, Update of 2026-10-21, R3 step 6) and log one line
+/// per table naming how many rows it rewrote and how many it left. A table
+/// that fails is logged and the daemon starts: every reader still resolves a
+/// former name when it reads (step 1), so an unrewritten row keeps working.
+pub(crate) async fn rewrite_stored_former_names(
+    pool: &PgPool,
+    secrets: Arc<aegis_orchestrator_core::infrastructure::secrets_manager::SecretsManager>,
+    former: &aegis_orchestrator_core::domain::node_config::FormerNames,
+) {
+    for outcome in
+        aegis_orchestrator_core::infrastructure::repositories::former_names_migration::run(
+            pool, secrets, former,
+        )
+        .await
+    {
+        match outcome.result {
+            Ok(done) => info!(
+                table = outcome.table,
+                rewritten = done.rewritten,
+                left = done.left,
+                "Rewrote {} stored former server names in {} to their servers' own names; {} left \
+                 as they were",
+                done.rewritten,
+                outcome.table,
+                done.left
+            ),
+            Err(e) => error!(
+                table = outcome.table,
+                error = %e,
+                "Rewrote no stored former server names in {}; its rows still read by their \
+                 former names",
+                outcome.table
+            ),
+        }
+    }
+}
+
 /// Hand the credential service the grounding of remote servers' tokens and
 /// `seal_gateway.remote_servers` with each server's grounding tool (AEGIS
 /// ADR-132 (7a) S2, ADR-136 G14): a server named with `grounding_tool` has
@@ -1884,6 +1922,19 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 ))
             }
         };
+
+    // Carbon Forge ADR-0198, Update of 2026-10-21, R3 step 6: with the schema
+    // migrations applied (`connect_postgres`) and the secrets manager that
+    // opens a sealed approval request built, the stored former server names
+    // are rewritten to their servers' own names, one log line per table.
+    if let Some(pool) = db_pool.as_ref() {
+        rewrite_stored_former_names(
+            pool,
+            secrets_manager.clone(),
+            &daemon_former_names(config.spec.seal_gateway.as_ref()),
+        )
+        .await;
+    }
 
     // ─── Credential Management Service (BC-11, ADR-078) ────────────────────────
     // The same store answers a remote tool call's credential (AEGIS ADR-132
