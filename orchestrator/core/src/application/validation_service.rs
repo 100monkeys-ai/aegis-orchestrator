@@ -39,7 +39,10 @@
 //! [`crate::domain::events::ValidationEvent::JudgeFault`], and a second fault is
 //! returned as the error, a `JudgeFault` saying the judge faulted twice (ADR-017's
 //! Update of 2026-10-01). The supervisor ends the execution on it rather than
-//! handing it to the worker as feedback.
+//! handing it to the worker as feedback. A judge's `timeout_seconds` bounds its
+//! run and its re-run together: the re-run is given the time the first run
+//! left, and is not started when none is left (AEGIS ADR-141, Update of
+//! 2026-10-16 `tries-end-names-their-cause-2026-10-16`, clause 11).
 //!
 //! # Example
 //!
@@ -372,13 +375,25 @@ impl ValidationService {
     }
 }
 
-fn calculate_max_attempts(timeout_seconds: u64, poll_interval_ms: u64) -> Result<u64> {
+/// The wait between two reads of a judge's execution; zero is refused.
+fn judge_poll_interval(poll_interval_ms: u64) -> Result<Duration> {
     if poll_interval_ms == 0 {
         return Err(anyhow!("poll_interval_ms must be greater than 0"));
     }
+    Ok(Duration::from_millis(poll_interval_ms))
+}
 
-    let timeout_ms = timeout_seconds.saturating_mul(1000);
-    Ok(timeout_ms.saturating_add(poll_interval_ms - 1) / poll_interval_ms)
+/// A judge's time as its timed-out sentence states it: whole seconds when it
+/// is whole, otherwise seconds to the millisecond with no trailing zero.
+fn judge_seconds(time: Duration) -> String {
+    let millis = time.as_millis();
+    if millis.is_multiple_of(1000) {
+        format!("{}", millis / 1000)
+    } else {
+        format!("{}.{:03}", millis / 1000, millis % 1000)
+            .trim_end_matches('0')
+            .to_string()
+    }
 }
 
 // ── Running a judge (ADR-016) and its one re-run on a fault (ADR-017) ─────────
@@ -393,6 +408,8 @@ struct JudgeRun<'a> {
     /// The prompt the judge's model holds (U19).
     bound: JudgeBound,
     parent_execution_id: ExecutionId,
+    /// Bounds the judge's run and its one re-run together: the re-run is
+    /// given what the first run left of it.
     timeout_seconds: u64,
     poll_interval_ms: u64,
     /// Where each [`JudgeFault`] is published; `None` publishes nothing.
@@ -454,10 +471,11 @@ async fn judge_bound(
 /// (`aegis.agent.generate`), unless the judge's manifest names its own.
 const TOP_LEVEL_JUDGE_SECURITY_CONTEXT: &str = "aegis-system-agent-runtime";
 
-/// Start the judge as a fresh execution with `input`, wait for it, and read
-/// its last output as a verdict. The outer error is the run itself failing
-/// (start, poll, timeout, the judge failed or cancelled); the inner is a verdict
-/// that cannot be read.
+/// Start the judge as a fresh execution with `input`, wait for it up to
+/// `budget` from this call, and read its last output as a verdict. The outer
+/// error is the run itself failing (start, poll, the budget spent, the judge
+/// failed or cancelled), the timed-out sentence naming `budget`; the inner is
+/// a verdict that cannot be read.
 ///
 /// The judge is a child of the execution it validates when that execution is
 /// stored. When it is stored nowhere, as a Zaru chat session's execution id
@@ -467,17 +485,22 @@ const TOP_LEVEL_JUDGE_SECURITY_CONTEXT: &str = "aegis-system-agent-runtime";
 async fn run_judge_once(
     run: &JudgeRun<'_>,
     input: ExecutionInput,
+    budget: Duration,
 ) -> Result<std::result::Result<GradientResult, JudgeFault>> {
+    let poll_interval = judge_poll_interval(run.poll_interval_ms)?;
+    let now = tokio::time::Instant::now();
+    // A budget past what the clock can hold waits as long as a year does.
+    let deadline = now
+        .checked_add(budget)
+        .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 60 * 60));
     let exec_id = start_judge(run, input).await?;
 
-    let max_attempts = calculate_max_attempts(run.timeout_seconds, run.poll_interval_ms)?;
-    let mut attempts = 0;
     loop {
-        if attempts >= max_attempts {
+        if tokio::time::Instant::now() >= deadline {
             return Err(anyhow!(
                 "Judge '{}' timed out after {} seconds",
                 run.judge_name,
-                run.timeout_seconds
+                judge_seconds(budget)
             ));
         }
         let exec = run
@@ -497,8 +520,8 @@ async fn run_judge_once(
                 return Err(anyhow!(judge_ended_error(run.judge_name, &exec)));
             }
             _ => {
-                tokio::time::sleep(Duration::from_millis(run.poll_interval_ms)).await;
-                attempts += 1;
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                tokio::time::sleep(poll_interval.min(left)).await;
             }
         }
     }
@@ -607,6 +630,13 @@ fn in_tenant(mut input: ExecutionInput, tenant_id: &TenantId) -> ExecutionInput 
 /// second fault is returned as the error: a [`JudgeFault`] naming the judge and
 /// saying it faulted twice, which the supervisor ends the execution on.
 ///
+/// The judge's `timeout_seconds` bounds both runs together, its clock started
+/// before the first (AEGIS ADR-141, Update of 2026-10-16
+/// `tries-end-names-their-cause-2026-10-16`, clause 11): the re-run is given
+/// what the first run left, to the millisecond, and its timed-out sentence
+/// names that time. With nothing left the re-run is not started, and the
+/// first fault is returned, its reason saying no time was left for a re-run.
+///
 /// A prompt the judge's model cannot hold is never sent and never cut (U19):
 /// no judge runs, and the error is a [`JudgeFault`] whose reason is the sizes
 /// in a sentence, which ends the iteration's validation with that reason.
@@ -631,18 +661,38 @@ async fn run_judge_with_one_rerun(run: JudgeRun<'_>) -> Result<GradientResult> {
             run.judge_name
         )));
     }
-    let first = match run_judge_once(&run, run.input.clone()).await? {
+    let timeout = Duration::from_secs(run.timeout_seconds);
+    let clock = tokio::time::Instant::now();
+    let first = match run_judge_once(&run, run.input.clone(), timeout).await? {
         Ok(verdict) => return Ok(verdict),
         Err(fault) => fault,
     };
     publish_judge_fault(&run, &first);
+    let left = timeout.saturating_sub(clock.elapsed());
+    let left = Duration::from_millis(u64::try_from(left.as_millis()).unwrap_or(u64::MAX));
+    if left.is_zero() {
+        tracing::warn!(
+            judge_agent = %first.judge_agent,
+            reason = %first.reason,
+            timeout_seconds = run.timeout_seconds,
+            "Judge verdict cannot be read and its timeout is spent — no re-run"
+        );
+        return Err(anyhow::Error::new(JudgeFault {
+            reason: format!(
+                "{}; no time was left of its {} s for a re-run",
+                first.reason, run.timeout_seconds
+            ),
+            judge_agent: first.judge_agent,
+            output: first.output,
+        }));
+    }
     tracing::warn!(
         judge_agent = %first.judge_agent,
         reason = %first.reason,
         "Judge verdict cannot be read — running the judge once more"
     );
 
-    match run_judge_once(&run, run.input.clone()).await? {
+    match run_judge_once(&run, run.input.clone(), left).await? {
         Ok(verdict) => Ok(verdict),
         Err(second) => {
             publish_judge_fault(&run, &second);
@@ -1389,7 +1439,8 @@ pub(crate) fn program_checks_of(
 #[cfg(test)]
 mod tests {
     use super::{
-        calculate_max_attempts, judge_ended_error, run_judge_with_one_rerun, JudgeBound, JudgeRun,
+        judge_ended_error, judge_poll_interval, judge_seconds, run_judge_with_one_rerun,
+        JudgeBound, JudgeRun,
     };
     use crate::application::execution::ExecutionService;
     use crate::domain::agent::AgentId;
@@ -1451,18 +1502,21 @@ mod tests {
     }
 
     #[test]
-    fn calculate_max_attempts_rejects_zero_poll_interval() {
-        let err = calculate_max_attempts(30, 0).expect_err("zero interval should fail");
+    fn judge_poll_interval_rejects_zero() {
+        let err = judge_poll_interval(0).expect_err("zero interval should fail");
         assert!(err
             .to_string()
             .contains("poll_interval_ms must be greater than 0"));
     }
 
+    /// A judge's time reads in whole seconds when whole, else to the
+    /// millisecond.
     #[test]
-    fn calculate_max_attempts_rounds_up() {
-        assert_eq!(calculate_max_attempts(1, 1000).unwrap(), 1);
-        assert_eq!(calculate_max_attempts(1, 600).unwrap(), 2);
-        assert_eq!(calculate_max_attempts(5, 2000).unwrap(), 3);
+    fn judge_seconds_reads_whole_seconds_and_milliseconds() {
+        assert_eq!(judge_seconds(Duration::from_secs(2)), "2");
+        assert_eq!(judge_seconds(Duration::from_millis(2450)), "2.45");
+        assert_eq!(judge_seconds(Duration::from_millis(400)), "0.4");
+        assert_eq!(judge_seconds(Duration::from_millis(1005)), "1.005");
     }
 
     /// A judge whose first run completes at `faults_at` with an answer that
