@@ -121,7 +121,9 @@ pub struct BindingAuditState {
     pub caller: VaultCaller,
     pub tenant_id: Option<String>,
     pub provider: Option<String>,
-    pub credential_type: Option<String>,
+    /// The binding's type, serialised as `credential_type`.
+    #[serde(rename = "credential_type")]
+    pub binding_type: Option<String>,
     /// The purpose the caller named; value reads only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub purpose: Option<String>,

@@ -280,7 +280,7 @@ fn the_rows_carry_v7s_and_v10s_fields_and_their_targets() {
         caller: VaultCaller::Session,
         tenant_id: Some("u-x".into()),
         provider: Some("openai".into()),
-        credential_type: Some("secret".into()),
+        binding_type: Some("secret".into()),
         purpose: Some("chat-turn".into()),
         outcome: "answered".into(),
         execution_id: None,
