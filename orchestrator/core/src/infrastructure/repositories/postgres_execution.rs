@@ -298,7 +298,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
         tenant_id: &TenantId,
         agent_id: AgentId,
         limit: usize,
-        _offset: usize,
+        offset: usize,
     ) -> Result<Vec<Execution>, RepositoryError> {
         let rows = sqlx::query(
             r#"
@@ -310,12 +310,13 @@ impl ExecutionRepository for PostgresExecutionRepository {
             FROM executions
             WHERE tenant_id = $1 AND agent_id = $2
             ORDER BY started_at DESC
-            LIMIT $3
+            LIMIT $3 OFFSET $4
             "#,
         )
         .bind(tenant_id.as_str())
         .bind(agent_id.0)
         .bind(limit as i64)
+        .bind(offset as i64)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -416,7 +417,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
         tenant_id: &TenantId,
         workflow_id: crate::domain::workflow::WorkflowId,
         limit: usize,
-        _offset: usize,
+        offset: usize,
     ) -> Result<Vec<Execution>, RepositoryError> {
         let rows = sqlx::query(
             r#"
@@ -429,12 +430,13 @@ impl ExecutionRepository for PostgresExecutionRepository {
             INNER JOIN workflow_executions we ON e.workflow_execution_id = we.id
             WHERE e.tenant_id = $1 AND we.workflow_id = $2
             ORDER BY e.started_at DESC
-            LIMIT $3
+            LIMIT $3 OFFSET $4
             "#,
         )
         .bind(tenant_id.as_str())
         .bind(workflow_id.0)
         .bind(limit as i64)
+        .bind(offset as i64)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -599,7 +601,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
         &self,
         tenant_id: &TenantId,
         limit: usize,
-        _offset: usize,
+        offset: usize,
     ) -> Result<Vec<Execution>, RepositoryError> {
         let rows = sqlx::query(
             r#"
@@ -611,11 +613,12 @@ impl ExecutionRepository for PostgresExecutionRepository {
             FROM executions
             WHERE tenant_id = $1
             ORDER BY started_at DESC
-            LIMIT $2
+            LIMIT $2 OFFSET $3
             "#,
         )
         .bind(tenant_id.as_str())
         .bind(limit as i64)
+        .bind(offset as i64)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;

@@ -40,6 +40,8 @@ pub(crate) struct ListExecutionsQuery {
     pub(crate) agent_id: Option<Uuid>,
     pub(crate) workflow_name: Option<String>,
     pub(crate) limit: Option<usize>,
+    /// Executions to skip before the page, newest first; 0 when absent.
+    pub(crate) offset: Option<usize>,
 }
 
 pub(crate) async fn get_execution_handler(
@@ -385,8 +387,9 @@ pub(crate) async fn list_executions_handler(
 }
 
 /// `GET /v1/executions`'s answer for `query` as `identity` sees it: an
-/// array of executions, newest first, at most `limit` (20 when absent,
-/// capped at `max_limit`), or `{"error": …}`.
+/// array of executions, newest first, the `limit` (20 when absent, capped
+/// at `max_limit`) after the first `offset` (0 when absent), or
+/// `{"error": …}`. A page shorter than `limit` is the last.
 pub(crate) async fn list_executions(
     execution_repo: &dyn ExecutionRepository,
     execution_service: &dyn ExecutionService,
@@ -397,6 +400,7 @@ pub(crate) async fn list_executions(
 ) -> serde_json::Value {
     let agent_id = query.agent_id.map(AgentId);
     let limit = query.limit.unwrap_or(20).min(max_limit);
+    let offset = query.offset.unwrap_or(0);
     let tenant_id = tenant_id_from_identity(identity);
 
     // Resolve workflow_name to a WorkflowId if provided
@@ -440,16 +444,16 @@ pub(crate) async fn list_executions(
     let executions_result = if is_operator(identity) && agent_id.is_none() && workflow_id.is_none()
     {
         execution_repo
-            .list_recent_all_paginated(limit, 0)
+            .list_recent_all_paginated(limit, offset)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))
     } else if workflow_ids.len() > 1 {
         execution_service
-            .list_executions_for_workflows_for_tenant(&tenant_id, &workflow_ids, limit, 0)
+            .list_executions_for_workflows_for_tenant(&tenant_id, &workflow_ids, limit, offset)
             .await
     } else {
         execution_service
-            .list_executions_for_tenant(&tenant_id, agent_id, workflow_id, limit, 0)
+            .list_executions_for_tenant(&tenant_id, agent_id, workflow_id, limit, offset)
             .await
     };
 

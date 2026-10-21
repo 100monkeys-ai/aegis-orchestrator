@@ -571,7 +571,7 @@ impl ExecutionRepository for InMemoryExecutionRepository {
         tenant_id: &TenantId,
         agent_id: AgentId,
         limit: usize,
-        _offset: usize,
+        offset: usize,
     ) -> Result<Vec<Execution>, RepositoryError> {
         let executions = self.executions.read().unwrap();
         let mut results: Vec<Execution> = executions
@@ -582,7 +582,7 @@ impl ExecutionRepository for InMemoryExecutionRepository {
             .cloned()
             .collect();
         results.sort_by_key(|e| Reverse(e.started_at));
-        Ok(results.into_iter().take(limit).collect())
+        Ok(results.into_iter().skip(offset).take(limit).collect())
     }
 
     async fn find_by_workflow_for_tenant(
@@ -617,7 +617,7 @@ impl ExecutionRepository for InMemoryExecutionRepository {
         &self,
         tenant_id: &TenantId,
         limit: usize,
-        _offset: usize,
+        offset: usize,
     ) -> Result<Vec<Execution>, RepositoryError> {
         let executions = self.executions.read().unwrap();
         let mut execution_list: Vec<Execution> = executions
@@ -626,7 +626,11 @@ impl ExecutionRepository for InMemoryExecutionRepository {
             .unwrap_or_default();
         // Sort by started_at desc
         execution_list.sort_by_key(|e| Reverse(e.started_at));
-        Ok(execution_list.into_iter().take(limit).collect())
+        Ok(execution_list
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect())
     }
 
     async fn list_recent_all_paginated(

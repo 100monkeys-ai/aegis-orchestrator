@@ -236,12 +236,15 @@ pub trait ExecutionService: Send + Sync {
         tenant_id: &TenantId,
         workflow_ids: &[crate::domain::workflow::WorkflowId],
         limit: usize,
-        _offset: usize,
+        offset: usize,
     ) -> Result<Vec<Execution>> {
+        // The merged page's rows are among each version's newest
+        // `offset + limit`, so each version is read that far from its start.
+        let reach = offset.saturating_add(limit);
         let mut rows: Vec<Execution> = Vec::new();
         for id in workflow_ids {
             for execution in self
-                .list_executions_for_tenant(tenant_id, None, Some(*id), limit, 0)
+                .list_executions_for_tenant(tenant_id, None, Some(*id), reach, 0)
                 .await?
             {
                 if !rows.iter().any(|e| e.id == execution.id) {
@@ -250,8 +253,7 @@ pub trait ExecutionService: Send + Sync {
             }
         }
         rows.sort_by_key(|e| std::cmp::Reverse(e.started_at));
-        rows.truncate(limit);
-        Ok(rows)
+        Ok(rows.into_iter().skip(offset).take(limit).collect())
     }
 
     /// Permanently delete an execution record and all its iterations within
