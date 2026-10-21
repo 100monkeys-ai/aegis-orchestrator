@@ -335,23 +335,49 @@ struct TryBound {
 }
 
 impl TryBound {
-    /// The sentence the execution ends with when the time left under the
-    /// bound is less than a try needs (AEGIS ADR-141, Update of 2026-10-15,
-    /// clause (1)); `None` when a try fits. A try needs its clock and its
-    /// judges' time (Update of 2026-10-16, clause 2).
-    fn refuses_a_try(&self) -> Option<String> {
-        let try_needs = self.try_needs;
+    /// The time left under the bound when it is less than a try needs
+    /// (AEGIS ADR-141, Update of 2026-10-15, clause (1)); `None` when a try
+    /// fits. A try needs its clock and its judges' time (Update of
+    /// 2026-10-16, clause 2).
+    fn refuses_a_try(&self) -> Option<Duration> {
         let left = self
             .deadline
             .saturating_duration_since(tokio::time::Instant::now());
-        (left < try_needs).then(|| {
-            format!(
-                "Execution ended: {} s left under the {} s bound, under the {} s a try needs",
-                left.as_secs(),
-                self.seconds,
-                try_needs.as_secs()
-            )
-        })
+        (left < self.try_needs).then_some(left)
+    }
+}
+
+/// The error an execution ends with when a later try does not fit under its
+/// bound: the tries it made and the last one's cause first, the time second
+/// (AEGIS ADR-141, Update of 2026-10-21, clause 14, amending the order of the
+/// Update of 2026-10-16, clause 10). The cause is `last_end` as
+/// [`max_retries_exceeded`] words it.
+fn try_does_not_fit(
+    attempts: u32,
+    last_end: Option<&AttemptEnd>,
+    left: Duration,
+    bound: &TryBound,
+) -> String {
+    let tries = if attempts == 1 {
+        "1 try".to_string()
+    } else {
+        format!("{attempts} tries")
+    };
+    let time = format!(
+        "a further try does not fit: {} s left under the {} s bound, under the {} s a try needs",
+        left.as_secs(),
+        bound.seconds,
+        bound.try_needs.as_secs()
+    );
+    match last_end {
+        Some(AttemptEnd::Cause(cause)) => {
+            format!("Execution ended after {tries}: {cause}; {time}")
+        }
+        Some(AttemptEnd::OutputsMissing(reason)) => format!(
+            "Execution ended after {tries}: the last attempt did not leave its declared \
+             outputs: {reason}; {time}"
+        ),
+        None => format!("Execution ended after {tries}; {time}"),
     }
 }
 
@@ -791,7 +817,8 @@ impl Supervisor {
             // 2026-10-15, clause (1)). The last try was recorded exhausted
             // where it ended (R2).
             if attempts > 0 {
-                if let Some(ended) = bound.refuses_a_try() {
+                if let Some(left) = bound.refuses_a_try() {
+                    let ended = try_does_not_fit(attempts, last_end.as_ref(), left, &bound);
                     warn!(iteration = attempts + 1, "{}", ended);
                     return Err(RuntimeError::ExecutionFailed(ended));
                 }
