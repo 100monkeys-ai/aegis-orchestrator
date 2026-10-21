@@ -392,10 +392,13 @@ impl ToolInvocationService {
                 contexts,
                 has_execution_record: execution.is_some(),
             };
+            // AEGIS ADR-150 V5: a run's listing reads its bindings' values
+            // for the run, and each use is recorded.
+            let run = execution.is_some().then_some(execution_id);
             let listing = ListToolsRequest {
                 tenant_id: tenant_id.as_str().to_string(),
                 acting: Some(acting.to_proto()),
-                bound_servers: self.bound_servers(tenant_id, &acting).await,
+                bound_servers: self.bound_servers(tenant_id, &acting, run).await,
             };
             match self
                 .list_gateway_tools(listing, GATEWAY_LIST_TOOLS_TIMEOUT)
@@ -407,7 +410,7 @@ impl ToolInvocationService {
                     "SEAL gateway tool enumeration for an agent's run failed; proceeding with built-in tools only"
                 ),
             }
-            tools.extend(self.listed_per_binding(tenant_id, &acting).await);
+            tools.extend(self.listed_per_binding(tenant_id, &acting, run).await);
         }
         let mut tools: Vec<_> = tools
             .into_iter()
@@ -568,6 +571,7 @@ impl ToolInvocationService {
         &self,
         tenant_id: &TenantId,
         acting: &GatewayActing,
+        run: Option<crate::domain::execution::ExecutionId>,
     ) -> Vec<crate::infrastructure::tool_router::ToolMetadata> {
         let (Some(user_id), Some(source)) = (acting.user_id.as_deref(), &self.tool_credentials)
         else {
@@ -604,6 +608,7 @@ impl ToolInvocationService {
                         acting,
                         server,
                         ContextChoice::Binding(*id),
+                        run,
                     )
                     .await
                 else {
@@ -720,6 +725,7 @@ impl ToolInvocationService {
         &self,
         tenant_id: &TenantId,
         acting: &GatewayActing,
+        run: Option<crate::domain::execution::ExecutionId>,
     ) -> Vec<crate::infrastructure::seal_gateway_proto::BoundServer> {
         let (Some(user_id), Some(_)) = (acting.user_id.as_deref(), &self.tool_credentials) else {
             return Vec::new();
@@ -741,7 +747,7 @@ impl ToolInvocationService {
                 continue;
             };
             if let Some(server) = self
-                .bound_server(tenant_id, user_id, acting, server, context)
+                .bound_server(tenant_id, user_id, acting, server, context, run)
                 .await
             {
                 bound.push(server);
@@ -752,7 +758,8 @@ impl ToolInvocationService {
 
     /// `server` bound with the acting person's credential as `context`
     /// selects it, or `None` when it resolves none (the reason logged when
-    /// it is a failure).
+    /// it is a failure). Inside the run `run`, the value is read for the run
+    /// and its use recorded (AEGIS ADR-150 V5).
     async fn bound_server(
         &self,
         tenant_id: &TenantId,
@@ -760,6 +767,7 @@ impl ToolInvocationService {
         acting: &GatewayActing,
         server: &str,
         context: ContextChoice,
+        run: Option<crate::domain::execution::ExecutionId>,
     ) -> Option<crate::infrastructure::seal_gateway_proto::BoundServer> {
         let source = self.tool_credentials.as_ref()?;
         let actor = ToolCallActor {
@@ -769,7 +777,15 @@ impl ToolInvocationService {
             workflow_id: acting.workflow_id,
             context,
         };
-        match source.tool_server_credential(&actor, server).await {
+        let resolved = match run {
+            Some(execution_id) => {
+                source
+                    .run_tool_server_credential(&actor, server, execution_id.0)
+                    .await
+            }
+            None => source.tool_server_credential(&actor, server).await,
+        };
+        match resolved {
             Ok(Some(credential)) => Some(crate::infrastructure::seal_gateway_proto::BoundServer {
                 server: server.to_string(),
                 credential: Some(ResolvedCredential {
@@ -1512,7 +1528,7 @@ impl ToolInvocationService {
             contexts,
             has_execution_record: false,
         };
-        let bound_servers = self.bound_servers(tenant_id, &acting).await;
+        let bound_servers = self.bound_servers(tenant_id, &acting, None).await;
         let mut listed = Vec::new();
         if !bound_servers.is_empty() {
             let listing = ListToolsRequest {
@@ -1527,7 +1543,7 @@ impl ToolInvocationService {
                     .map(Self::gateway_tool_metadata),
             );
         }
-        listed.extend(self.listed_per_binding(tenant_id, &acting).await);
+        listed.extend(self.listed_per_binding(tenant_id, &acting, None).await);
         let listed: Vec<_> = listed
             .into_iter()
             .filter(|tool| {
@@ -1683,7 +1699,16 @@ impl ToolInvocationService {
             workflow_id: acting.workflow_id,
             context,
         };
-        match source.tool_server_credential(&actor, server).await {
+        // AEGIS ADR-150 V5: a call inside a run reads the binding's value for
+        // the run's person and the execution, and its use is recorded.
+        let resolved = if acting.has_execution_record {
+            source
+                .run_tool_server_credential(&actor, server, execution_id.0)
+                .await
+        } else {
+            source.tool_server_credential(&actor, server).await
+        };
+        match resolved {
             Ok(Some(credential)) => Ok(credential),
             Ok(None) => Err(binding_required(
                 match context {

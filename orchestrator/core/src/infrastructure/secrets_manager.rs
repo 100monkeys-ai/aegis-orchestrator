@@ -22,7 +22,8 @@ use crate::domain::events::SecretEvent;
 use crate::domain::mcp::{CredentialRef, CredentialStoreType};
 use crate::domain::node_config::{resolve_env_value, SecretBackendConfig};
 use crate::domain::secrets::{
-    AccessContext, DomainDynamicSecret, SecretStore, SecretsError, SensitiveString,
+    kv_list_folder, kv_list_level, AccessContext, DomainDynamicSecret, SecretStore, SecretsError,
+    SensitiveString,
 };
 use crate::infrastructure::event_bus::EventBus;
 use anyhow::Result;
@@ -217,6 +218,25 @@ impl SecretStore for OpenBaoSecretStore {
             .collect();
         vaultrs::kv2::set(&*client, engine, path, &raw).await?;
         Ok(())
+    }
+
+    /// KV v2 metadata `LIST` of `<engine>/metadata/<prefix>` (AEGIS ADR-150
+    /// V8): the key names under the folder, never a value; a folder nothing
+    /// is under answers 404, which is an empty list.
+    async fn list(&self, engine: &str, prefix: &str) -> Result<Vec<String>, SecretsError> {
+        let folder = kv_list_folder(prefix);
+        let client = self.client.read().await;
+        let keys = match vaultrs::kv2::list(&*client, engine, &folder).await {
+            Ok(keys) => keys,
+            Err(vaultrs::error::ClientError::APIError { code: 404, .. }) => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        let mut paths: Vec<String> = keys
+            .into_iter()
+            .map(|key| format!("{folder}{key}"))
+            .collect();
+        paths.sort();
+        Ok(paths)
     }
 
     async fn generate_dynamic(
@@ -547,6 +567,17 @@ impl SecretStore for TestSecretStore {
         Ok(())
     }
 
+    async fn list(&self, engine: &str, prefix: &str) -> Result<Vec<String>, SecretsError> {
+        let store = self.kv_store.read().await;
+        let mount = format!("{engine}/");
+        Ok(kv_list_level(
+            store
+                .keys()
+                .filter_map(|key| key.strip_prefix(mount.as_str())),
+            prefix,
+        ))
+    }
+
     async fn generate_dynamic(
         &self,
         engine: &str,
@@ -827,6 +858,18 @@ impl SecretsManager {
         }
 
         result
+    }
+
+    /// The paths directly under `prefix` in the KV engine `engine` (AEGIS
+    /// ADR-150 V8), as [`SecretStore::list`] answers them: paths only, never
+    /// a value, read live and never cached.
+    pub async fn list_secrets(
+        &self,
+        engine: &str,
+        prefix: &str,
+        _context: &AccessContext,
+    ) -> Result<Vec<String>, SecretsError> {
+        self.store.list(engine, prefix).await
     }
 
     /// Delete a secret from the KV engine and invalidate the cache entry (ADR-078).

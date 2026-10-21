@@ -53,10 +53,10 @@ use crate::daemon::handlers::cortex::{
 use crate::daemon::handlers::credentials::{
     credentials_api_keys_router, credentials_by_id_router, credentials_calendars_router,
     credentials_mailboxes_router, credentials_oauth_providers_router, device_poll_handler,
-    get_secret_handler, list_credentials_handler, list_secrets_handler, oauth_callback_handler,
-    oauth_initiate_handler, secrets_by_path_router, CredentialsApiKeysState, CredentialsByIdState,
+    get_secret_handler, list_credentials_handler, oauth_callback_handler, oauth_initiate_handler,
+    secrets_by_path_router, secrets_list_router, CredentialsApiKeysState, CredentialsByIdState,
     CredentialsCalendarsState, CredentialsMailboxesState, CredentialsOAuthProvidersState,
-    SecretsByPathState,
+    SecretsByPathState, SecretsListState,
 };
 use crate::daemon::handlers::dispatch::{dispatch_gateway_handler, temporal_events_handler};
 use crate::daemon::handlers::executions::{
@@ -282,7 +282,6 @@ pub(crate) fn create_router(
             post(device_poll_handler),
         )
         // BC-11 Secrets admin (ADR-034)
-        .route("/v1/secrets", get(list_secrets_handler))
         .route("/v1/secrets/{path}", get(get_secret_handler))
         // User volume management (Gap 079)
         // Note: /v1/volumes/quota MUST be registered before /v1/volumes/{id} to avoid
@@ -463,6 +462,12 @@ pub(crate) fn create_router(
     let router = router.merge(secrets_by_path_router(SecretsByPathState {
         secrets_manager: app_state.secrets_manager.clone(),
         audit: vault_audit.clone(),
+    }));
+
+    // Listing the platform's secret paths (AEGIS ADR-150 V8), over its own
+    // narrow state beside `GET /v1/secrets/{path}`.
+    let router = router.merge(secrets_list_router(SecretsListState {
+        secrets_manager: app_state.secrets_manager.clone(),
     }));
 
     // Client secrets (AEGIS ADR-150 V10): a declared confidential client

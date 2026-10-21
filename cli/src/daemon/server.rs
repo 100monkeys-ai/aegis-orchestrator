@@ -1931,7 +1931,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     event_bus.clone(),
                     oauth_providers,
                 )
-                .with_membership_repo(memberships),
+                .with_membership_repo(memberships)
+                // A run's use of a binding's value is recorded in
+                // admin_audit_log (AEGIS ADR-150 V5, V7).
+                .with_vault_audit(Arc::new(
+                    aegis_orchestrator_core::infrastructure::repositories::postgres_vault_audit::PostgresVaultAuditSink::new(pool.clone()),
+                )),
             );
             tool_credentials = Some(service.clone() as Arc<dyn ToolCredentialSource>);
             mailbox_source = Some(service.clone() as Arc<dyn ToolMailboxSource>);

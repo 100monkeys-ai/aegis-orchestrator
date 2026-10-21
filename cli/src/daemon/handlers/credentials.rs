@@ -288,6 +288,22 @@ pub(crate) fn secrets_by_path_router(state: SecretsByPathState) -> Router {
         .with_state(state)
 }
 
+/// `GET /v1/secrets`'s state (AEGIS ADR-150 V8): the secret store whose
+/// platform paths it lists.
+#[derive(Clone)]
+pub(crate) struct SecretsListState {
+    pub(crate) secrets_manager: Arc<SecretsManager>,
+}
+
+/// `GET /v1/secrets`, over its own narrow state. Merged into the daemon
+/// router by `router::create_router` beside `GET /v1/secrets/{path}`,
+/// beneath the same authentication layers.
+pub(crate) fn secrets_list_router(state: SecretsListState) -> Router {
+    Router::new()
+        .route("/v1/secrets", get(list_secrets_handler))
+        .with_state(state)
+}
+
 /// The caller kind a lifecycle row names for `actor`.
 fn actor_caller(actor: &CredentialActor) -> VaultCaller {
     match actor {
@@ -1951,22 +1967,65 @@ pub(crate) async fn device_poll_handler(
 // Secrets Handlers
 // ============================================================================
 
-/// `GET /v1/secrets` — list secret paths.
-///
-/// `SecretsManager` does not expose a KV list operation; returns 501.
+/// `GET /v1/secrets?prefix=<prefix>`'s query: the folder to list, the
+/// engine's root when absent.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ListSecretsQuery {
+    #[serde(default)]
+    prefix: String,
+}
+
+/// Whether `prefix` names a folder of the engine: no leading `/` and no `.`
+/// or `..` segment, so a listing never leaves the engine it names.
+fn is_secret_prefix(prefix: &str) -> bool {
+    !prefix.starts_with('/')
+        && prefix
+            .split('/')
+            .all(|segment| segment != "." && segment != "..")
+}
+
+/// `GET /v1/secrets?prefix=<prefix>` — the platform's secret paths directly
+/// under `prefix` (AEGIS ADR-150 V8), in the engine the secret-path routes
+/// read and write: `{"paths": [...], "count": n}`, a path ending in `/`
+/// being a folder. Paths only: never a value or a field name. Answered to an
+/// `aegis:admin` or `aegis:operator` session; any other identity is refused.
 pub(crate) async fn list_secrets_handler(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<SecretsListState>,
+    Query(query): Query<ListSecretsQuery>,
     request: axum::extract::Request,
 ) -> Response {
-    if let Err(r) = require_operator_or_admin(request.extensions()) {
-        return r;
+    let identity = match require_operator_or_admin(request.extensions()) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    if !is_secret_prefix(&query.prefix) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "The prefix is not a secret path."})),
+        )
+            .into_response();
     }
 
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({"error": "Secret listing is not supported via this endpoint"})),
-    )
-        .into_response()
+    let ctx = AccessContext::system(&identity.sub);
+    match state
+        .secrets_manager
+        .list_secrets("kv", &query.prefix, &ctx)
+        .await
+    {
+        Ok(paths) => {
+            let count = paths.len();
+            (
+                StatusCode::OK,
+                Json(json!({"paths": paths, "count": count})),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 /// `GET /v1/secrets/{path}` — read a secret's field names by path.
@@ -3937,7 +3996,8 @@ mod vault_value_route_tests {
     use super::tests::{InMemoryBindings, InMemoryMemberships};
     use super::{
         credentials_api_keys_router, credentials_by_id_router, secrets_by_path_router,
-        CredentialsApiKeysState, CredentialsByIdState, SecretsByPathState,
+        secrets_list_router, CredentialsApiKeysState, CredentialsByIdState, SecretsByPathState,
+        SecretsListState,
     };
     use crate::daemon::handlers::test_support::{
         consumer, identity_provider, operator, send, send_with_headers, serve, service_account,
@@ -4666,5 +4726,138 @@ mod vault_value_route_tests {
             assert_eq!(row.after_state["caller"], json!("operator"));
             assert!(!format!("{row:?}").contains(VALUE));
         }
+    }
+
+    /// `GET /v1/secrets?prefix=` (AEGIS ADR-150 V8), merged the way
+    /// `create_router` merges it beside `GET /v1/secrets/{path}`: the paths
+    /// one level under the prefix and their count to an `aegis:admin` and an
+    /// `aegis:operator` session, the engine's root without a prefix, an empty
+    /// list under a prefix nothing is under; paths only, never a value or a
+    /// field name; no longer 501. A read-only operator, a consumer and a
+    /// service account are refused 403, an `aegis_` key 401, a prefix that
+    /// would leave the engine 400.
+    #[tokio::test]
+    async fn the_secret_listing_answers_paths_to_an_operator_and_refuses_everyone_else() {
+        let event_bus = Arc::new(EventBus::new(16));
+        let sm = Arc::new(SecretsManager::from_store(
+            Arc::new(TestSecretStore::new()),
+            event_bus,
+        ));
+        let ctx = aegis_orchestrator_core::domain::secrets::AccessContext::system("test");
+        for path in ["platform/stripe", "platform/hooks/github", "other"] {
+            let fields = std::collections::HashMap::from([(
+                "field".to_string(),
+                SensitiveString::new(VALUE),
+            )]);
+            sm.write_secret("kv", path, fields, &ctx)
+                .await
+                .expect("seed path");
+        }
+        let router = axum::Router::new()
+            .route(
+                "/v1/secrets/{path}",
+                get(|| async { (axum::http::StatusCode::OK, "the get route") }),
+            )
+            .merge(secrets_list_router(SecretsListState {
+                secrets_manager: sm,
+            }));
+        let rows: Vec<_> = tokens()
+            .into_iter()
+            .map(|(token, id)| (token, id, SCOPES))
+            .collect();
+        let base = serve(router, Some(identity_provider(&rows)), None).await;
+
+        for token in ["admin-token", "operator-token"] {
+            let (status, body) = send(
+                &base,
+                &Method::GET,
+                "/v1/secrets?prefix=platform",
+                &None,
+                Some(token),
+            )
+            .await;
+            assert_eq!(
+                (status, &body),
+                (
+                    200,
+                    &json!({"paths": ["platform/hooks/", "platform/stripe"], "count": 2})
+                ),
+                "{token}"
+            );
+            assert!(!body.to_string().contains(VALUE), "{token}: a value listed");
+            assert!(
+                !body.to_string().contains("field"),
+                "{token}: a field listed"
+            );
+        }
+        let (status, body) = send(
+            &base,
+            &Method::GET,
+            "/v1/secrets",
+            &None,
+            Some("admin-token"),
+        )
+        .await;
+        assert_eq!(
+            (status, body),
+            (200, json!({"paths": ["other", "platform/"], "count": 2}))
+        );
+        let (status, body) = send(
+            &base,
+            &Method::GET,
+            "/v1/secrets?prefix=absent",
+            &None,
+            Some("operator-token"),
+        )
+        .await;
+        assert_eq!((status, body), (200, json!({"paths": [], "count": 0})));
+        let (status, body) = send(
+            &base,
+            &Method::GET,
+            "/v1/secrets?prefix=platform/../other",
+            &None,
+            Some("admin-token"),
+        )
+        .await;
+        assert_eq!(
+            (status, body),
+            (400, json!({"error": "The prefix is not a secret path."}))
+        );
+
+        for token in ["readonly-token", "owner-token", "service-token"] {
+            let (status, body) = send(
+                &base,
+                &Method::GET,
+                "/v1/secrets?prefix=platform",
+                &None,
+                Some(token),
+            )
+            .await;
+            assert_eq!(
+                (status, body),
+                (403, json!({"error": "Operator or Admin role required"})),
+                "{token}"
+            );
+        }
+        let (status, body) = send(
+            &base,
+            &Method::GET,
+            "/v1/secrets?prefix=platform",
+            &None,
+            Some("aegis_live_0123456789abcdef"),
+        )
+        .await;
+        assert_eq!(status, 401, "{body}");
+        assert!(!body.to_string().contains("platform/"), "{body}");
+
+        let (status, _) = send(
+            &base,
+            &Method::GET,
+            "/v1/secrets/platform-key",
+            &None,
+            Some("admin-token"),
+        )
+        .await;
+        assert_eq!(status, 200, "the GET route was lost in the merge");
     }
 }

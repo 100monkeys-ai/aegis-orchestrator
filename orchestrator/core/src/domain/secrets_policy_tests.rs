@@ -164,6 +164,17 @@ impl SecretStore for PolicyEnforcingStore {
         self.require(&["delete"], engine, path)?;
         self.inner.delete(engine, path).await
     }
+    /// KV v2 `LIST` is a request on `engine/metadata/<folder>`.
+    async fn list(&self, engine: &str, prefix: &str) -> Result<Vec<String>, SecretsError> {
+        self.require_api(
+            &["list"],
+            &format!(
+                "{engine}/metadata/{}",
+                crate::domain::secrets::kv_list_folder(prefix)
+            ),
+        )?;
+        self.inner.list(engine, prefix).await
+    }
     async fn generate_dynamic(
         &self,
         engine: &str,
@@ -569,6 +580,51 @@ async fn secrets_policy_admits_a_declared_clients_secrets_in_the_realm_mount() {
         .is_none_or(|e| !e.contains("403"))
     {
         failures.push("tenant-u-x/kv/data/clients/anything was not refused 403".to_string());
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// The platform's secret paths are listed by a KV v2 metadata `LIST` (AEGIS
+/// ADR-150 V8): the policy admits one on the system mount `aegis-system/kv`,
+/// at its root and under a prefix, and answers the paths written there; it
+/// admits none on a bare `kv` mount, which no rule names.
+#[tokio::test]
+async fn secrets_policy_admits_listing_the_system_mount() {
+    let store = PolicyEnforcingStore::new();
+    let mut failures = Vec::new();
+    let mut secret = HashMap::new();
+    secret.insert("field".to_string(), SensitiveString::new("v"));
+    for path in ["platform/stripe", "platform/hooks/github", "other"] {
+        if let Err(e) = store.write("aegis-system/kv", path, secret.clone()).await {
+            failures.push(format!("write {path} refused: {e}"));
+        }
+    }
+    match store.list("aegis-system/kv", "platform").await {
+        Ok(paths) => {
+            if paths != vec!["platform/hooks/", "platform/stripe"] {
+                failures.push(format!("aegis-system/kv under platform listed {paths:?}"));
+            }
+        }
+        Err(e) => failures.push(format!(
+            "list aegis-system/kv/metadata/platform/ refused: {e}"
+        )),
+    }
+    match store.list("aegis-system/kv", "").await {
+        Ok(paths) => {
+            if paths != vec!["other", "platform/"] {
+                failures.push(format!("aegis-system/kv at its root listed {paths:?}"));
+            }
+        }
+        Err(e) => failures.push(format!("list aegis-system/kv/metadata/ refused: {e}")),
+    }
+    if store
+        .list("kv", "platform")
+        .await
+        .map_err(|e| e.to_string())
+        .err()
+        .is_none_or(|e| !e.contains("403"))
+    {
+        failures.push("kv/metadata/platform/ was not refused 403".to_string());
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }

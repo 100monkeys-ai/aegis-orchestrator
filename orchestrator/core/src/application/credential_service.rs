@@ -37,6 +37,10 @@ use crate::domain::node_config::{resolve_env_value, OAuthProviderEntry, RemoteSe
 use crate::domain::secrets::{AccessContext, SecretPath, SensitiveString, SensitiveUrl};
 use crate::domain::team::{MembershipRepository, MembershipStatus, TeamId};
 use crate::domain::tenant::TenantId;
+use crate::domain::vault_audit::{
+    append_after_act, BindingAuditState, VaultAction, VaultAuditRow, VaultAuditSink, VaultCaller,
+    OUTCOME_ANSWERED,
+};
 use crate::infrastructure::calendar::{
     grants_calendar_scope, oauth_calendar_settings, CalDavAuth, CalDavProbe, CalendarCheckFailure,
     CalendarProbe,
@@ -818,6 +822,45 @@ pub struct ToolCallActor<'a> {
     pub context: crate::domain::execution::ContextChoice,
 }
 
+/// For whom a binding's value is read inside the orchestrator (AEGIS ADR-150
+/// V5, V7).
+#[derive(Debug, Clone, Copy)]
+enum ValueReader<'a> {
+    /// A tool call inside a run: the read names the run's person, the
+    /// execution and the calling agent, and writes one `vault.tool_value_used`
+    /// row.
+    Run {
+        execution_id: uuid::Uuid,
+        user_id: &'a str,
+        agent_id: AgentId,
+    },
+    /// A read V5 does not cover (a call that belongs to no run, a mail or
+    /// calendar tool's account): under the platform's own context, with no
+    /// row.
+    Platform,
+}
+
+impl ValueReader<'_> {
+    /// The access context the secret store's read is made under.
+    fn access_context(&self) -> AccessContext {
+        match self {
+            ValueReader::Run {
+                execution_id,
+                user_id,
+                agent_id,
+            } => AccessContext::for_execution(
+                *user_id,
+                crate::domain::execution::ExecutionId(*execution_id),
+                *agent_id,
+            ),
+            ValueReader::Platform => AccessContext::system(CREDENTIAL_SERVICE),
+        }
+    }
+}
+
+/// The name the credential service's own secret-store reads are made under.
+const CREDENTIAL_SERVICE: &str = "aegis-credential-service";
+
 /// The credential a remote tool server's call carries (AEGIS ADR-132 H1):
 /// resolved by the orchestrator, which owns the bindings and the vault, and
 /// checked against the binding's grants where the secret is read.
@@ -840,6 +883,23 @@ pub trait ToolCredentialSource: Send + Sync {
         actor: &ToolCallActor<'_>,
         server: &str,
     ) -> anyhow::Result<Option<SensitiveString>>;
+
+    /// The credential for `server` of a call made inside the run
+    /// `execution_id`, chosen exactly as [`Self::tool_server_credential`]
+    /// chooses it, the binding's value read for the run's person and the
+    /// execution, and that use recorded as one `vault.tool_value_used` row
+    /// naming the execution (AEGIS ADR-150 V5, V7). The default answers as
+    /// [`Self::tool_server_credential`] does, for a source that keeps no
+    /// vault and so records no use.
+    async fn run_tool_server_credential(
+        &self,
+        actor: &ToolCallActor<'_>,
+        server: &str,
+        execution_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<SensitiveString>> {
+        let _ = execution_id;
+        self.tool_server_credential(actor, server).await
+    }
 
     /// The acting person's own Active bindings of the provider `server` in
     /// the tenant, each with its context name (AEGIS ADR-132 Update (13)
@@ -1186,32 +1246,32 @@ impl ToolCredentialSource for StandardCredentialManagementService {
         actor: &ToolCallActor<'_>,
         server: &str,
     ) -> anyhow::Result<Option<SensitiveString>> {
-        let provider = CredentialProvider::new(server);
-        let binding = match actor.context {
-            // Zaru ADR-0055 D2: `null` chose no credential for the server,
-            // whatever is granted.
-            crate::domain::execution::ContextChoice::None => return Ok(None),
-            // D15: the chosen binding, no grant needed, when it is the acting
-            // person's own active binding for this server in this tenant;
-            // nothing otherwise, another person's binding included.
-            crate::domain::execution::ContextChoice::Binding(id) => {
-                match self.repo.find_by_id(&id).await? {
-                    Some(binding)
-                        if binding.owner_user_id == actor.user_id
-                            && &binding.tenant_id == actor.tenant_id
-                            && self.same_server(&binding.provider, &provider)
-                            && binding.status == CredentialStatus::Active =>
-                    {
-                        binding
-                    }
-                    _ => return Ok(None),
-                }
+        match self.chosen_server_binding(actor, server).await? {
+            Some(binding) => self.binding_secret(binding, ValueReader::Platform).await,
+            None => Ok(None),
+        }
+    }
+
+    async fn run_tool_server_credential(
+        &self,
+        actor: &ToolCallActor<'_>,
+        server: &str,
+        execution_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<SensitiveString>> {
+        match self.chosen_server_binding(actor, server).await? {
+            Some(binding) => {
+                self.binding_secret(
+                    binding,
+                    ValueReader::Run {
+                        execution_id,
+                        user_id: actor.user_id,
+                        agent_id: actor.agent_id,
+                    },
+                )
+                .await
             }
-            // Zaru ADR-0071 D1 (b): a run that named nothing for the server
-            // reaches none of its person's bindings, whatever is granted.
-            crate::domain::execution::ContextChoice::NotGiven => return Ok(None),
-        };
-        self.binding_secret(binding).await
+            None => Ok(None),
+        }
     }
 
     async fn context_bindings(
@@ -1257,7 +1317,7 @@ impl ToolCredentialSource for StandardCredentialManagementService {
             .collect();
         own.sort_by_key(|binding| std::cmp::Reverse((binding.created_at, binding.id.0)));
         match own.into_iter().next() {
-            Some(binding) => self.binding_secret(binding).await,
+            Some(binding) => self.binding_secret(binding, ValueReader::Platform).await,
             None => Ok(None),
         }
     }
@@ -1378,7 +1438,7 @@ impl ToolMailboxSource for StandardCredentialManagementService {
             // Expired, and the mailbox is not an active one.
             let binding_id = binding.id;
             return Ok(self
-                .binding_secret(binding)
+                .binding_secret(binding, ValueReader::Platform)
                 .await?
                 .map(|token| ToolMailbox {
                     binding_id,
@@ -1465,7 +1525,7 @@ impl ToolCalendarSource for StandardCredentialManagementService {
         // margin; a token that can no longer be refreshed has set the binding
         // Expired, and the account is not an active one.
         Ok(self
-            .binding_secret(binding)
+            .binding_secret(binding, ValueReader::Platform)
             .await?
             .map(|token| ToolCalendar {
                 binding_id,
@@ -1578,14 +1638,217 @@ impl StandardCredentialManagementService {
         Ok(Self::named_contexts(&mut active))
     }
 
+    /// The binding's OAuth access token, as
+    /// [`CredentialManagementService::access_token_for`] answers it, its
+    /// secret read and written back under `ctx`.
+    async fn access_token_read(
+        &self,
+        binding_id: &CredentialBindingId,
+        ctx: &AccessContext,
+    ) -> anyhow::Result<SensitiveString> {
+        let binding = self
+            .repo
+            .find_by_id(binding_id)
+            .await?
+            .ok_or_else(|| anyhow!("Credential binding not found: {}", binding_id))?;
+        if binding.status != CredentialStatus::Active {
+            return Err(CredentialError::BindingNotActive {
+                binding_id: binding_id.to_string(),
+                status: format!("{:?}", binding.status).to_lowercase(),
+            }
+            .into());
+        }
+
+        let mount = binding.secret_path.effective_mount();
+        let mut stored = self
+            .secrets
+            .read_secret(&mount, &binding.secret_path.path, ctx)
+            .await?;
+        let access_token =
+            stored
+                .get("access_token")
+                .cloned()
+                .ok_or_else(|| CredentialError::NoAccessToken {
+                    binding_id: binding_id.to_string(),
+                })?;
+
+        // A token stored without `expires_at` was issued without
+        // `expires_in` and is used as it is.
+        let fresh = match stored.get("expires_at") {
+            None => true,
+            Some(at) => chrono::DateTime::parse_from_rfc3339(at.expose())
+                .map(|at| {
+                    at.with_timezone(&Utc)
+                        > Utc::now() + chrono::Duration::seconds(ACCESS_TOKEN_REFRESH_MARGIN_SECS)
+                })
+                .unwrap_or(false),
+        };
+        if fresh {
+            return Ok(access_token);
+        }
+
+        let Some(refresh_token) = stored.get("refresh_token").cloned() else {
+            // Nothing to refresh with: the user must reconnect.
+            self.expire(binding).await?;
+            return Err(CredentialError::OAuthExchangeFailed {
+                error: "invalid_grant".to_string(),
+                description: Some("no refresh token is held for this binding".to_string()),
+            }
+            .into());
+        };
+
+        let refreshed = match self
+            .refresh_access_token(&binding.provider, &refresh_token)
+            .await
+        {
+            Ok(token) => token,
+            Err(CredentialError::OAuthExchangeFailed { error, description })
+                if error == "invalid_grant" =>
+            {
+                self.expire(binding).await?;
+                return Err(CredentialError::OAuthExchangeFailed { error, description }.into());
+            }
+            Err(other) => return Err(other.into()),
+        };
+
+        stored.insert("access_token".to_string(), refreshed.access_token.clone());
+        match refreshed.expires_in {
+            Some(expires_in) => {
+                let expires_at = Utc::now() + chrono::Duration::seconds(expires_in as i64);
+                stored.insert(
+                    "expires_at".to_string(),
+                    SensitiveString::new(expires_at.to_rfc3339()),
+                );
+            }
+            None => {
+                stored.remove("expires_at");
+            }
+        }
+        if let Some(rotated) = refreshed.refresh_token {
+            stored.insert("refresh_token".to_string(), rotated);
+        }
+        if let Some(scope) = refreshed.scope {
+            stored.insert("scope".to_string(), SensitiveString::new(scope));
+        }
+        self.secrets
+            .write_secret(&mount, &binding.secret_path.path, stored, ctx)
+            .await?;
+        tracing::info!(
+            binding_id = %binding_id,
+            provider = %binding.provider,
+            "OAuth access token refreshed and stored"
+        );
+        Ok(refreshed.access_token)
+    }
+
+    /// The binding a remote tool server's call reaches for `server`, as the
+    /// execution's choice for the server names it (Zaru ADR-0055 D15, Zaru
+    /// ADR-0071 D1 (a), (b)): a chosen binding when it is the acting
+    /// person's own active binding for the server in the tenant, and none
+    /// otherwise; a choice of none, and a choice of nothing, reach none.
+    async fn chosen_server_binding(
+        &self,
+        actor: &ToolCallActor<'_>,
+        server: &str,
+    ) -> anyhow::Result<Option<UserCredentialBinding>> {
+        let provider = CredentialProvider::new(server);
+        Ok(match actor.context {
+            // Zaru ADR-0055 D2: `null` chose no credential for the server,
+            // whatever is granted.
+            crate::domain::execution::ContextChoice::None => None,
+            // D15: the chosen binding, no grant needed, when it is the acting
+            // person's own active binding for this server in this tenant;
+            // nothing otherwise, another person's binding included.
+            crate::domain::execution::ContextChoice::Binding(id) => {
+                match self.repo.find_by_id(&id).await? {
+                    Some(binding)
+                        if binding.owner_user_id == actor.user_id
+                            && &binding.tenant_id == actor.tenant_id
+                            && self.same_server(&binding.provider, &provider)
+                            && binding.status == CredentialStatus::Active =>
+                    {
+                        Some(binding)
+                    }
+                    _ => None,
+                }
+            }
+            // Zaru ADR-0071 D1 (b): a run that named nothing for the server
+            // reaches none of its person's bindings, whatever is granted.
+            crate::domain::execution::ContextChoice::NotGiven => None,
+        })
+    }
+
     /// The secret a remote tool server's call carries from `binding`: an
-    /// OAuth access token, refreshed as needed, or the stored token or value.
+    /// OAuth access token, refreshed as needed, or the stored token or value,
+    /// read for `reader`. A read for a run writes one `vault.tool_value_used`
+    /// row once the value is in hand (AEGIS ADR-150 V5, V7); a row that
+    /// cannot be written is logged at error and the read stands.
     async fn binding_secret(
         &self,
         binding: UserCredentialBinding,
+        reader: ValueReader<'_>,
+    ) -> anyhow::Result<Option<SensitiveString>> {
+        let used = self.binding_value(&binding, &reader).await?;
+        if let (
+            Some(_),
+            ValueReader::Run {
+                execution_id,
+                user_id,
+                ..
+            },
+        ) = (&used, reader)
+        {
+            self.record_tool_use(&binding, execution_id, user_id).await;
+        }
+        Ok(used)
+    }
+
+    /// The `vault.tool_value_used` row of a run's use of `binding`'s value:
+    /// actor the run's person, the binding as target, the execution's id,
+    /// and no value (AEGIS ADR-150 V7).
+    async fn record_tool_use(
+        &self,
+        binding: &UserCredentialBinding,
+        execution_id: uuid::Uuid,
+        user_id: &str,
+    ) {
+        let row = VaultAuditRow::binding(
+            user_id,
+            VaultAction::ToolValueUsed,
+            binding.id,
+            &BindingAuditState {
+                caller: VaultCaller::Execution,
+                tenant_id: Some(binding.tenant_id.as_str().to_string()),
+                provider: Some(binding.provider.to_string()),
+                binding_type: serde_json::to_value(&binding.credential_type)
+                    .ok()
+                    .and_then(|t| t.as_str().map(str::to_string)),
+                purpose: None,
+                outcome: OUTCOME_ANSWERED.to_string(),
+                execution_id: Some(execution_id.to_string()),
+            },
+        );
+        match &self.vault_audit {
+            Some(sink) => append_after_act(sink.as_ref(), row).await,
+            None => tracing::error!(
+                action = %row.action,
+                target = %row.target_resource,
+                "the vault audit row was not written: this credential service has no audit sink"
+            ),
+        }
+    }
+
+    /// `binding`'s value as a tool call carries it, read for `reader`.
+    async fn binding_value(
+        &self,
+        binding: &UserCredentialBinding,
+        reader: &ValueReader<'_>,
     ) -> anyhow::Result<Option<SensitiveString>> {
         if binding.credential_type == CredentialType::OAuth2 {
-            return match self.access_token_for(&binding.id).await {
+            return match self
+                .access_token_read(&binding.id, &reader.access_context())
+                .await
+            {
                 Ok(token) => Ok(Some(token)),
                 // The token can no longer be refreshed; the binding is now
                 // `Expired` and its user must connect it again.
@@ -1612,7 +1875,7 @@ impl StandardCredentialManagementService {
             .read_secret(
                 &binding.secret_path.effective_mount(),
                 &binding.secret_path.path,
-                &AccessContext::system("aegis-credential-service"),
+                &reader.access_context(),
             )
             .await?;
         stored
@@ -1852,6 +2115,10 @@ pub struct StandardCredentialManagementService {
     /// late, by [`Self::set_remote_grounding`]. Unset: no provider is a
     /// remote server and nothing is grounded.
     remote_grounding: std::sync::OnceLock<RemoteGroundingHandle>,
+    /// Where a run's use of a binding's value is recorded (AEGIS ADR-150 V5,
+    /// V7), set by [`Self::with_vault_audit`]. Unset, a use is logged at
+    /// error as a row not written.
+    vault_audit: Option<Arc<dyn VaultAuditSink>>,
 }
 
 impl StandardCredentialManagementService {
@@ -1884,6 +2151,7 @@ impl StandardCredentialManagementService {
             calendar_probe: Arc::new(CalDavProbe::https()),
             mail_userinfo_url: MAIL_USERINFO_URL.to_string(),
             remote_grounding: std::sync::OnceLock::new(),
+            vault_audit: None,
         }
     }
 
@@ -1908,6 +2176,7 @@ impl StandardCredentialManagementService {
             calendar_probe: Arc::new(CalDavProbe::https()),
             mail_userinfo_url: MAIL_USERINFO_URL.to_string(),
             remote_grounding: std::sync::OnceLock::new(),
+            vault_audit: None,
         }
     }
 
@@ -1927,6 +2196,13 @@ impl StandardCredentialManagementService {
     /// (tests point it at a loopback stand-in).
     pub fn with_mail_userinfo_url(mut self, url: impl Into<String>) -> Self {
         self.mail_userinfo_url = url.into();
+        self
+    }
+
+    /// Record each run's use of a binding's value in `sink` (AEGIS ADR-150
+    /// V5, V7): `admin_audit_log` in production.
+    pub fn with_vault_audit(mut self, sink: Arc<dyn VaultAuditSink>) -> Self {
+        self.vault_audit = Some(sink);
         self
     }
 
@@ -2754,100 +3030,8 @@ impl CredentialManagementService for StandardCredentialManagementService {
         &self,
         binding_id: &CredentialBindingId,
     ) -> anyhow::Result<SensitiveString> {
-        let binding = self
-            .repo
-            .find_by_id(binding_id)
-            .await?
-            .ok_or_else(|| anyhow!("Credential binding not found: {}", binding_id))?;
-        if binding.status != CredentialStatus::Active {
-            return Err(CredentialError::BindingNotActive {
-                binding_id: binding_id.to_string(),
-                status: format!("{:?}", binding.status).to_lowercase(),
-            }
-            .into());
-        }
-
-        let ctx = AccessContext::system("aegis-credential-service");
-        let mount = binding.secret_path.effective_mount();
-        let mut stored = self
-            .secrets
-            .read_secret(&mount, &binding.secret_path.path, &ctx)
-            .await?;
-        let access_token =
-            stored
-                .get("access_token")
-                .cloned()
-                .ok_or_else(|| CredentialError::NoAccessToken {
-                    binding_id: binding_id.to_string(),
-                })?;
-
-        // A token stored without `expires_at` was issued without
-        // `expires_in` and is used as it is.
-        let fresh = match stored.get("expires_at") {
-            None => true,
-            Some(at) => chrono::DateTime::parse_from_rfc3339(at.expose())
-                .map(|at| {
-                    at.with_timezone(&Utc)
-                        > Utc::now() + chrono::Duration::seconds(ACCESS_TOKEN_REFRESH_MARGIN_SECS)
-                })
-                .unwrap_or(false),
-        };
-        if fresh {
-            return Ok(access_token);
-        }
-
-        let Some(refresh_token) = stored.get("refresh_token").cloned() else {
-            // Nothing to refresh with: the user must reconnect.
-            self.expire(binding).await?;
-            return Err(CredentialError::OAuthExchangeFailed {
-                error: "invalid_grant".to_string(),
-                description: Some("no refresh token is held for this binding".to_string()),
-            }
-            .into());
-        };
-
-        let refreshed = match self
-            .refresh_access_token(&binding.provider, &refresh_token)
+        self.access_token_read(binding_id, &AccessContext::system(CREDENTIAL_SERVICE))
             .await
-        {
-            Ok(token) => token,
-            Err(CredentialError::OAuthExchangeFailed { error, description })
-                if error == "invalid_grant" =>
-            {
-                self.expire(binding).await?;
-                return Err(CredentialError::OAuthExchangeFailed { error, description }.into());
-            }
-            Err(other) => return Err(other.into()),
-        };
-
-        stored.insert("access_token".to_string(), refreshed.access_token.clone());
-        match refreshed.expires_in {
-            Some(expires_in) => {
-                let expires_at = Utc::now() + chrono::Duration::seconds(expires_in as i64);
-                stored.insert(
-                    "expires_at".to_string(),
-                    SensitiveString::new(expires_at.to_rfc3339()),
-                );
-            }
-            None => {
-                stored.remove("expires_at");
-            }
-        }
-        if let Some(rotated) = refreshed.refresh_token {
-            stored.insert("refresh_token".to_string(), rotated);
-        }
-        if let Some(scope) = refreshed.scope {
-            stored.insert("scope".to_string(), SensitiveString::new(scope));
-        }
-        self.secrets
-            .write_secret(&mount, &binding.secret_path.path, stored, &ctx)
-            .await?;
-        tracing::info!(
-            binding_id = %binding_id,
-            provider = %binding.provider,
-            "OAuth access token refreshed and stored"
-        );
-        Ok(refreshed.access_token)
     }
 
     // -----------------------------------------------------------------------

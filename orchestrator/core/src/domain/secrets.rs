@@ -812,6 +812,53 @@ pub trait SecretStore: Send + Sync {
         let _ = (engine, path);
         Ok(())
     }
+
+    /// The paths directly under `prefix` in the KV v2 engine `engine`, as
+    /// OpenBao's KV v2 metadata `LIST` answers them (AEGIS ADR-150 V8): each
+    /// is `prefix` (with a trailing `/` added when it is not empty and has
+    /// none) followed by one key, a key ending in `/` being a folder; sorted,
+    /// no value and no field name. A prefix nothing is under answers an
+    /// empty list.
+    ///
+    /// The default lists nothing and refuses, so a store that cannot list is
+    /// never read as an empty one. The production `OpenBaoSecretStore` and
+    /// the in-memory stores override it.
+    async fn list(&self, engine: &str, prefix: &str) -> Result<Vec<String>, SecretsError> {
+        let _ = (engine, prefix);
+        Err(SecretsError::ConfigError(
+            "this secret store does not list paths".to_string(),
+        ))
+    }
+}
+
+/// `prefix` as the folder a KV v2 `LIST` names: empty, or ending in `/`.
+pub fn kv_list_folder(prefix: &str) -> String {
+    if prefix.is_empty() || prefix.ends_with('/') {
+        prefix.to_string()
+    } else {
+        format!("{prefix}/")
+    }
+}
+
+/// The answer of a KV v2 `LIST` of `prefix` over a store holding `paths`
+/// (each a path within one engine), as [`SecretStore::list`] gives it: the
+/// folder followed by each key one level under it, a deeper path given as
+/// its first folder (ending in `/`), each once, sorted. In-memory stores
+/// list their maps with it.
+pub fn kv_list_level<'a>(paths: impl IntoIterator<Item = &'a str>, prefix: &str) -> Vec<String> {
+    let folder = kv_list_folder(prefix);
+    let mut listed: Vec<String> = paths
+        .into_iter()
+        .filter_map(|path| path.strip_prefix(folder.as_str()))
+        .filter(|rest| !rest.is_empty())
+        .map(|rest| match rest.find('/') {
+            Some(slash) => format!("{folder}{}", &rest[..=slash]),
+            None => format!("{folder}{rest}"),
+        })
+        .collect();
+    listed.sort();
+    listed.dedup();
+    listed
 }
 
 impl DomainDynamicSecret {
