@@ -243,6 +243,29 @@ pub struct NodeConfigSpec {
     /// thresholds its verdicts are read by. Absent, the record's values.
     #[serde(default)]
     pub goals: GoalsConfig,
+
+    /// `spec.vault` (AEGIS ADR-150 V10): which confidential clients may keep
+    /// the secrets of their own sessions in the vault. Absent, none may.
+    #[serde(default)]
+    pub vault: VaultConfig,
+}
+
+/// `spec.vault` (AEGIS ADR-150 V10). Node configuration, never a client id
+/// in code.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultConfig {
+    /// The Keycloak client ids whose service accounts may write, read and
+    /// delete client secrets under their own paths. Absent or empty, none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_secret_clients: Vec<String>,
+}
+
+impl VaultConfig {
+    /// Whether `client_id` is a declared client.
+    pub fn declares_client(&self, client_id: &str) -> bool {
+        !client_id.is_empty() && self.client_secret_clients.iter().any(|c| c == client_id)
+    }
 }
 
 /// One entry of `spec.oauth_providers` (AEGIS ADR-125 D2).
@@ -2655,6 +2678,7 @@ impl Default for NodeConfigSpec {
             zaru: None,
             oauth_providers: Vec::new(),
             goals: GoalsConfig::default(),
+            vault: VaultConfig::default(),
         }
     }
 }
@@ -3400,6 +3424,7 @@ mod tests {
                 zaru: None,
                 oauth_providers: Vec::new(),
                 goals: GoalsConfig::default(),
+                vault: VaultConfig::default(),
             },
         };
 
@@ -4327,6 +4352,34 @@ goals:
         );
         spec.goals.validate().unwrap();
         let misspelt = serde_yaml::from_str::<GoalsConfig>("max_rounds: 3\n");
+        assert!(misspelt.is_err(), "a misspelt key was accepted");
+    }
+
+    /// AEGIS ADR-150 V10: `spec.vault.client_secret_clients` parses to its
+    /// list of client ids; an absent block declares none; a misspelt key is
+    /// refused rather than ignored.
+    #[test]
+    fn vault_client_secret_clients_parse() {
+        #[derive(Deserialize)]
+        struct Spec {
+            #[serde(default)]
+            vault: VaultConfig,
+        }
+        let spec: Spec =
+            serde_yaml::from_str("vault:\n  client_secret_clients:\n    - zaru-web\n").unwrap();
+        assert_eq!(
+            spec.vault.client_secret_clients,
+            vec!["zaru-web".to_string()]
+        );
+        assert!(spec.vault.declares_client("zaru-web"));
+        assert!(!spec.vault.declares_client("aegis-temporal-worker"));
+        assert!(!spec.vault.declares_client(""));
+
+        let absent: Spec = serde_yaml::from_str("{}\n").unwrap();
+        assert!(absent.vault.client_secret_clients.is_empty());
+        assert!(!absent.vault.declares_client("zaru-web"));
+
+        let misspelt = serde_yaml::from_str::<VaultConfig>("client_secrets_clients: [zaru-web]\n");
         assert!(misspelt.is_err(), "a misspelt key was accepted");
     }
 

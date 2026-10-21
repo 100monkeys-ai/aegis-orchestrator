@@ -51,11 +51,12 @@ use crate::daemon::handlers::cortex::{
     get_cortex_metrics_handler, get_cortex_skills_handler, list_cortex_patterns_handler,
 };
 use crate::daemon::handlers::credentials::{
-    credentials_by_id_router, credentials_calendars_router, credentials_mailboxes_router,
-    credentials_oauth_providers_router, delete_secret_handler, device_poll_handler,
+    credentials_api_keys_router, credentials_by_id_router, credentials_calendars_router,
+    credentials_mailboxes_router, credentials_oauth_providers_router, device_poll_handler,
     get_secret_handler, list_credentials_handler, list_secrets_handler, oauth_callback_handler,
-    oauth_initiate_handler, store_api_key_handler, write_secret_handler, CredentialsByIdState,
+    oauth_initiate_handler, secrets_by_path_router, CredentialsApiKeysState, CredentialsByIdState,
     CredentialsCalendarsState, CredentialsMailboxesState, CredentialsOAuthProvidersState,
+    SecretsByPathState,
 };
 use crate::daemon::handlers::dispatch::{dispatch_gateway_handler, temporal_events_handler};
 use crate::daemon::handlers::executions::{
@@ -87,6 +88,9 @@ use crate::daemon::handlers::stimulus::{ingest_stimulus_handler, webhook_handler
 use crate::daemon::handlers::swarms::{get_swarm_handler, list_swarms_handler};
 use crate::daemon::handlers::tenant_provisioning::keycloak_event_handler;
 use crate::daemon::handlers::tool_approvals::{tool_approvals_router, ToolApprovalsState};
+use crate::daemon::handlers::vault_client_secrets::{
+    vault_client_secrets_router, VaultClientSecretsState,
+};
 use crate::daemon::handlers::volumes;
 use crate::daemon::handlers::workflow_executions::{
     cancel_workflow_execution_handler, get_workflow_execution_handler, get_workflow_logs_handler,
@@ -100,11 +104,14 @@ use crate::daemon::handlers::workflows::{
     run_workflow_legacy_handler, set_workflow_status_handler, update_workflow_scope_handler,
 };
 use crate::daemon::state::AppState;
+use aegis_orchestrator_core::domain::vault_audit::VaultAuditSink;
 
-/// Assemble the full HTTP router with all routes.
+/// Assemble the full HTTP router with all routes. `vault_audit` receives the
+/// vault's audit rows (AEGIS ADR-150 V7).
 pub(crate) fn create_router(
     app_state: Arc<AppState>,
     iam_service: Option<Arc<dyn IdentityProvider>>,
+    vault_audit: Arc<dyn VaultAuditSink>,
 ) -> Router {
     let router = Router::new()
         .route("/health", get(health_handler))
@@ -262,7 +269,6 @@ pub(crate) fn create_router(
         )
         // BC-11 Credential management (ADR-078) — static paths BEFORE parameterized
         .route("/v1/credentials", get(list_credentials_handler))
-        .route("/v1/credentials/api-keys", post(store_api_key_handler))
         .route(
             "/v1/credentials/oauth/initiate",
             post(oauth_initiate_handler),
@@ -277,12 +283,7 @@ pub(crate) fn create_router(
         )
         // BC-11 Secrets admin (ADR-034)
         .route("/v1/secrets", get(list_secrets_handler))
-        .route(
-            "/v1/secrets/{path}",
-            get(get_secret_handler)
-                .put(write_secret_handler)
-                .delete(delete_secret_handler),
-        )
+        .route("/v1/secrets/{path}", get(get_secret_handler))
         // User volume management (Gap 079)
         // Note: /v1/volumes/quota MUST be registered before /v1/volumes/{id} to avoid
         // axum routing ambiguity — "quota" would otherwise be matched as an id segment.
@@ -447,6 +448,29 @@ pub(crate) fn create_router(
     // through the real middleware stack by the handler tests.
     let router = router.merge(credentials_by_id_router(CredentialsByIdState {
         credential_service: app_state.credential_service.clone(),
+        audit: vault_audit.clone(),
+    }));
+
+    // Storing an API key, over its own narrow state so the store's audit row
+    // (AEGIS ADR-150 V7) has its sink; the answer is unchanged.
+    let router = router.merge(credentials_api_keys_router(CredentialsApiKeysState {
+        credential_service: app_state.credential_service.clone(),
+        audit: vault_audit.clone(),
+    }));
+
+    // Writing and deleting a platform secret path, over their own narrow
+    // state beside `GET /v1/secrets/{path}`, for their audit rows (V7).
+    let router = router.merge(secrets_by_path_router(SecretsByPathState {
+        secrets_manager: app_state.secrets_manager.clone(),
+        audit: vault_audit.clone(),
+    }));
+
+    // Client secrets (AEGIS ADR-150 V10): a declared confidential client
+    // keeps the tokens of its own sessions in the vault.
+    let router = router.merge(vault_client_secrets_router(VaultClientSecretsState {
+        secrets_manager: app_state.secrets_manager.clone(),
+        vault: app_state.config.spec.vault.clone(),
+        audit: vault_audit.clone(),
     }));
 
     // Mailbox connections by SMTP and IMAP (AEGIS ADR-125 D1), over their
@@ -454,6 +478,7 @@ pub(crate) fn create_router(
     // `/v1/credentials/api-keys`.
     let router = router.merge(credentials_mailboxes_router(CredentialsMailboxesState {
         credential_service: app_state.credential_service.clone(),
+        audit: vault_audit.clone(),
     }));
 
     // Calendar accounts by CalDAV password (AEGIS ADR-138 K10), over their
@@ -461,6 +486,7 @@ pub(crate) fn create_router(
     // `/v1/credentials/mailboxes`.
     let router = router.merge(credentials_calendars_router(CredentialsCalendarsState {
         credential_service: app_state.credential_service.clone(),
+        audit: vault_audit,
     }));
 
     // The OAuth providers the registry serves, by name and display name

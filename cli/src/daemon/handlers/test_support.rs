@@ -205,3 +205,30 @@ pub(crate) async fn send(
         serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
     )
 }
+
+/// Send one request and return its status, its headers and its JSON body
+/// (`Null` when the body is not JSON).
+pub(crate) async fn send_with_headers(
+    base: &str,
+    method: &reqwest::Method,
+    path: &str,
+    body: &Option<serde_json::Value>,
+    bearer: Option<&str>,
+) -> (u16, reqwest::header::HeaderMap, serde_json::Value) {
+    let mut req = reqwest::Client::new().request(method.clone(), format!("{base}{path}"));
+    if let Some(token) = bearer {
+        req = req.bearer_auth(token);
+    }
+    if let Some(json) = body {
+        req = req.json(json);
+    }
+    let resp = req.send().await.expect("loopback request");
+    let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
+    let text = resp.text().await.unwrap_or_default();
+    (
+        status,
+        headers,
+        serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
+    )
+}

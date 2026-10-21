@@ -36,7 +36,7 @@
 use crate::daemon::state::AppState;
 use aegis_orchestrator_core::application::credential_service::{
     CreateCalDavCalendarCommand, CreateImapMailboxCommand, CredentialActor, CredentialError,
-    CredentialManagementService, StoreApiKeyCommand,
+    CredentialManagementService, OwnerKeyValue, StoreApiKeyCommand,
 };
 use aegis_orchestrator_core::domain::api_scope::ApiScope;
 use aegis_orchestrator_core::domain::credential::{
@@ -46,11 +46,16 @@ use aegis_orchestrator_core::domain::credential::{
 use aegis_orchestrator_core::domain::iam::{AegisRole, IdentityKind, UserIdentity};
 use aegis_orchestrator_core::domain::secrets::{AccessContext, SensitiveString};
 use aegis_orchestrator_core::domain::tenant::TenantId;
+use aegis_orchestrator_core::domain::vault_audit::{
+    append_after_act, BindingAuditState, VaultAction, VaultAuditRow, VaultAuditSink, VaultCaller,
+    OUTCOME_ANSWERED,
+};
+use aegis_orchestrator_core::infrastructure::secrets_manager::SecretsManager;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use serde::Deserialize;
@@ -176,6 +181,8 @@ fn reach_refusal(e: &anyhow::Error) -> Option<Response> {
 #[derive(Clone)]
 pub(crate) struct CredentialsByIdState {
     pub(crate) credential_service: Option<Arc<dyn CredentialManagementService>>,
+    /// Where the vault's audit rows go (AEGIS ADR-150 V7).
+    pub(crate) audit: Arc<dyn VaultAuditSink>,
 }
 
 /// The `/v1/credentials/{id}*` routes (ADR-078). Merged into the daemon
@@ -190,6 +197,10 @@ pub(crate) fn credentials_by_id_router(state: CredentialsByIdState) -> Router {
         .route(
             "/v1/credentials/{id}/rotate",
             post(rotate_credential_handler),
+        )
+        .route(
+            "/v1/credentials/{id}/value",
+            post(read_credential_value_handler),
         )
         .route(
             "/v1/credentials/{id}/introspect",
@@ -210,6 +221,8 @@ pub(crate) fn credentials_by_id_router(state: CredentialsByIdState) -> Router {
 #[derive(Clone)]
 pub(crate) struct CredentialsMailboxesState {
     pub(crate) credential_service: Option<Arc<dyn CredentialManagementService>>,
+    /// Where the vault's audit rows go (AEGIS ADR-150 V7).
+    pub(crate) audit: Arc<dyn VaultAuditSink>,
 }
 
 /// `POST /v1/credentials/mailboxes`, over its own narrow state. Merged into
@@ -225,6 +238,8 @@ pub(crate) fn credentials_mailboxes_router(state: CredentialsMailboxesState) -> 
 #[derive(Clone)]
 pub(crate) struct CredentialsCalendarsState {
     pub(crate) credential_service: Option<Arc<dyn CredentialManagementService>>,
+    /// Where the vault's audit rows go (AEGIS ADR-150 V7).
+    pub(crate) audit: Arc<dyn VaultAuditSink>,
 }
 
 /// `POST /v1/credentials/calendars`, over its own narrow state. Merged into
@@ -234,6 +249,87 @@ pub(crate) fn credentials_calendars_router(state: CredentialsCalendarsState) -> 
     Router::new()
         .route("/v1/credentials/calendars", post(create_calendar_handler))
         .with_state(state)
+}
+
+/// The state of `POST /v1/credentials/api-keys`.
+#[derive(Clone)]
+pub(crate) struct CredentialsApiKeysState {
+    pub(crate) credential_service: Option<Arc<dyn CredentialManagementService>>,
+    /// Where the vault's audit rows go (AEGIS ADR-150 V7).
+    pub(crate) audit: Arc<dyn VaultAuditSink>,
+}
+
+/// `POST /v1/credentials/api-keys`, over its own narrow state. Merged into
+/// the daemon router by `router::create_router`, beneath the same
+/// authentication layers as `GET /v1/credentials`.
+pub(crate) fn credentials_api_keys_router(state: CredentialsApiKeysState) -> Router {
+    Router::new()
+        .route("/v1/credentials/api-keys", post(store_api_key_handler))
+        .with_state(state)
+}
+
+/// The state of `PUT` and `DELETE /v1/secrets/{path}`.
+#[derive(Clone)]
+pub(crate) struct SecretsByPathState {
+    pub(crate) secrets_manager: Arc<SecretsManager>,
+    /// Where the vault's audit rows go (AEGIS ADR-150 V7).
+    pub(crate) audit: Arc<dyn VaultAuditSink>,
+}
+
+/// `PUT` and `DELETE /v1/secrets/{path}`, over their own narrow state.
+/// Merged into the daemon router by `router::create_router` beside
+/// `GET /v1/secrets/{path}`, beneath the same authentication layers.
+pub(crate) fn secrets_by_path_router(state: SecretsByPathState) -> Router {
+    Router::new()
+        .route(
+            "/v1/secrets/{path}",
+            put(write_secret_handler).delete(delete_secret_handler),
+        )
+        .with_state(state)
+}
+
+/// The caller kind a lifecycle row names for `actor`.
+fn actor_caller(actor: &CredentialActor) -> VaultCaller {
+    match actor {
+        CredentialActor::User { .. } => VaultCaller::Session,
+        CredentialActor::Operator { .. } => VaultCaller::Operator,
+    }
+}
+
+/// The `after_state` of a lifecycle act on a binding that was carried out,
+/// from the binding as it was read before the act (`None` when it could not
+/// be read; the act itself decided who may reach it).
+fn lifecycle_state(
+    caller: VaultCaller,
+    binding: Option<&aegis_orchestrator_core::domain::credential::UserCredentialBinding>,
+) -> BindingAuditState {
+    BindingAuditState {
+        caller,
+        tenant_id: binding.map(|b| b.tenant_id.as_str().to_string()),
+        provider: binding.map(|b| b.provider.to_string()),
+        credential_type: binding.map(|b| credential_type_name(&b.credential_type)),
+        purpose: None,
+        outcome: OUTCOME_ANSWERED.to_string(),
+        execution_id: None,
+    }
+}
+
+/// A credential type as the API spells it.
+fn credential_type_name(t: &CredentialType) -> String {
+    serde_json::to_value(t)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// The binding `binding_id` as `actor` may read it, for an audit row; a
+/// binding that cannot be read gives a row with its fields null.
+async fn binding_for_audit(
+    svc: &Arc<dyn CredentialManagementService>,
+    actor: &CredentialActor,
+    binding_id: &CredentialBindingId,
+) -> Option<aegis_orchestrator_core::domain::credential::UserCredentialBinding> {
+    svc.get_binding(actor, binding_id).await.ok().flatten()
 }
 
 /// State of `GET /v1/credentials/oauth/providers`.
@@ -577,15 +673,22 @@ pub(crate) async fn list_credentials_handler(
 /// first and stored with its `reach`, or refused and not stored (AEGIS
 /// ADR-132 (7a) S2).
 pub(crate) async fn store_api_key_handler(
-    State(state): State<Arc<AppState>>,
+    State(state): State<CredentialsApiKeysState>,
     request: axum::extract::Request,
 ) -> Response {
-    store_api_key_answer(state.credential_service.clone(), request).await
+    store_api_key_answer(
+        state.credential_service.clone(),
+        state.audit.clone(),
+        request,
+    )
+    .await
 }
 
-/// The answer of `POST /v1/credentials/api-keys` over `credential_service`.
+/// The answer of `POST /v1/credentials/api-keys` over `credential_service`;
+/// a stored binding appends its `vault.binding_stored` row to `audit`.
 pub(crate) async fn store_api_key_answer(
     credential_service: Option<Arc<dyn CredentialManagementService>>,
+    audit: Arc<dyn VaultAuditSink>,
     request: axum::extract::Request,
 ) -> Response {
     let (user_id, tenant_id) =
@@ -642,6 +745,16 @@ pub(crate) async fn store_api_key_answer(
         }
     };
 
+    let row_state = BindingAuditState {
+        caller: VaultCaller::Session,
+        tenant_id: Some(tenant_id.as_str().to_string()),
+        provider: Some(provider.to_string()),
+        credential_type: Some(credential_type_name(&credential_type)),
+        purpose: None,
+        outcome: OUTCOME_ANSWERED.to_string(),
+        execution_id: None,
+    };
+    let actor_id = user_id.clone();
     match svc
         .store_api_key(StoreApiKeyCommand {
             owner_user_id: user_id,
@@ -654,11 +767,23 @@ pub(crate) async fn store_api_key_answer(
         })
         .await
     {
-        Ok(binding_id) => (
-            StatusCode::CREATED,
-            Json(json!({"id": binding_id.to_string()})),
-        )
-            .into_response(),
+        Ok(binding_id) => {
+            append_after_act(
+                audit.as_ref(),
+                VaultAuditRow::binding(
+                    actor_id,
+                    VaultAction::BindingStored,
+                    binding_id,
+                    &row_state,
+                ),
+            )
+            .await;
+            (
+                StatusCode::CREATED,
+                Json(json!({"id": binding_id.to_string()})),
+            )
+                .into_response()
+        }
         Err(e) => reach_refusal(&e).unwrap_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -752,11 +877,23 @@ pub(crate) async fn create_mailbox_handler(
     };
 
     match svc.create_imap_mailbox(command).await {
-        Ok(binding) => (
-            StatusCode::CREATED,
-            Json(json!({"id": binding.id.to_string(), "credential": binding})),
-        )
-            .into_response(),
+        Ok(binding) => {
+            append_after_act(
+                state.audit.as_ref(),
+                VaultAuditRow::binding(
+                    binding.owner_user_id.clone(),
+                    VaultAction::BindingStored,
+                    binding.id,
+                    &lifecycle_state(VaultCaller::Session, Some(&binding)),
+                ),
+            )
+            .await;
+            (
+                StatusCode::CREATED,
+                Json(json!({"id": binding.id.to_string(), "credential": binding})),
+            )
+                .into_response()
+        }
         Err(e) => match e.downcast_ref::<CredentialError>() {
             Some(CredentialError::MailboxUnreachable { protocol, reply }) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -865,11 +1002,23 @@ pub(crate) async fn create_calendar_handler(
     };
 
     match svc.create_caldav_calendar(command).await {
-        Ok(binding) => (
-            StatusCode::CREATED,
-            Json(json!({"id": binding.id.to_string(), "credential": binding})),
-        )
-            .into_response(),
+        Ok(binding) => {
+            append_after_act(
+                state.audit.as_ref(),
+                VaultAuditRow::binding(
+                    binding.owner_user_id.clone(),
+                    VaultAction::BindingStored,
+                    binding.id,
+                    &lifecycle_state(VaultCaller::Session, Some(&binding)),
+                ),
+            )
+            .await;
+            (
+                StatusCode::CREATED,
+                Json(json!({"id": binding.id.to_string(), "credential": binding})),
+            )
+                .into_response()
+        }
         Err(e) => match e.downcast_ref::<CredentialError>() {
             Some(CredentialError::CalendarUnreachable { status, reply }) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -951,7 +1100,7 @@ pub(crate) async fn revoke_credential_handler(
     Path(id): Path<String>,
     request: axum::extract::Request,
 ) -> Response {
-    let (actor, _sub) = match credential_actor(request.extensions()) {
+    let (actor, sub) = match credential_actor(request.extensions()) {
         Ok(v) => v,
         Err(r) => return r,
     };
@@ -972,8 +1121,22 @@ pub(crate) async fn revoke_credential_handler(
         }
     };
 
+    // Read before the act: a revoke deletes the binding's row.
+    let before = binding_for_audit(&svc, &actor, &binding_id).await;
     match svc.revoke_binding(&actor, &binding_id).await {
-        Ok(()) => (StatusCode::OK, Json(json!({"status": "revoked", "id": id}))).into_response(),
+        Ok(()) => {
+            append_after_act(
+                state.audit.as_ref(),
+                VaultAuditRow::binding(
+                    sub,
+                    VaultAction::BindingRevoked,
+                    binding_id,
+                    &lifecycle_state(actor_caller(&actor), before.as_ref()),
+                ),
+            )
+            .await;
+            (StatusCode::OK, Json(json!({"status": "revoked", "id": id}))).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
@@ -988,7 +1151,7 @@ pub(crate) async fn rotate_credential_handler(
     Path(id): Path<String>,
     request: axum::extract::Request,
 ) -> Response {
-    let (actor, _sub) = match credential_actor(request.extensions()) {
+    let (actor, sub) = match credential_actor(request.extensions()) {
         Ok(v) => v,
         Err(r) => return r,
     };
@@ -1031,11 +1194,24 @@ pub(crate) async fn rotate_credential_handler(
         }
     };
 
+    let before = binding_for_audit(&svc, &actor, &binding_id).await;
     match svc
         .rotate_credential(&actor, &binding_id, SensitiveString::new(&payload.value))
         .await
     {
-        Ok(()) => (StatusCode::OK, Json(json!({"status": "rotated", "id": id}))).into_response(),
+        Ok(()) => {
+            append_after_act(
+                state.audit.as_ref(),
+                VaultAuditRow::binding(
+                    sub,
+                    VaultAction::BindingRotated,
+                    binding_id,
+                    &lifecycle_state(actor_caller(&actor), before.as_ref()),
+                ),
+            )
+            .await;
+            (StatusCode::OK, Json(json!({"status": "rotated", "id": id}))).into_response()
+        }
         Err(e) => reach_refusal(&e).unwrap_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1043,6 +1219,250 @@ pub(crate) async fn rotate_credential_handler(
             )
                 .into_response()
         }),
+    }
+}
+
+// Refusal codes and sentences of the value reads (AEGIS ADR-150 V3, V10).
+// They name no decision record: they are text a person or a client reads.
+pub(crate) const VAULT_VALUE_OWNER_ONLY: &str = "vault_value_owner_only";
+const VAULT_VALUE_OWNER_ONLY_SENTENCE: &str =
+    "A key's value is answered only to the person who owns it.";
+pub(crate) const VAULT_VALUE_NOT_READABLE: &str = "vault_value_not_readable";
+const VAULT_VALUE_NOT_READABLE_SENTENCE: &str =
+    "This connection's value is not answered by the vault; it is used only inside the platform.";
+pub(crate) const VAULT_PURPOSE_REQUIRED: &str = "vault_purpose_required";
+const VAULT_PURPOSE_REQUIRED_SENTENCE: &str =
+    "Name the purpose of this read: lowercase letters, digits and dashes, at most 64 characters.";
+pub(crate) const VAULT_UNAVAILABLE: &str = "vault_unavailable";
+const VAULT_UNAVAILABLE_SENTENCE: &str =
+    "The vault could not be read right now. Try again in a moment.";
+/// The outcome a refused value read records for a binding that does not
+/// exist or is not the caller's own; its answer carries no code.
+const OUTCOME_NOT_FOUND: &str = "not_found";
+
+/// A refusal of a value read: its status, its code and its sentence.
+pub(crate) fn vault_refusal(status: StatusCode, code: &str) -> Response {
+    let message = match code {
+        VAULT_VALUE_OWNER_ONLY => VAULT_VALUE_OWNER_ONLY_SENTENCE,
+        VAULT_VALUE_NOT_READABLE => VAULT_VALUE_NOT_READABLE_SENTENCE,
+        VAULT_PURPOSE_REQUIRED => VAULT_PURPOSE_REQUIRED_SENTENCE,
+        _ => VAULT_UNAVAILABLE_SENTENCE,
+    };
+    (status, Json(json!({"error": code, "message": message}))).into_response()
+}
+
+/// The purpose a value read names (AEGIS ADR-150 V3): 1 to 64 characters of
+/// lowercase letters, digits and dashes, read from the body's `purpose`.
+/// `None` for a body that is not JSON, a missing purpose, or one outside
+/// the rule; an invalid purpose is never recorded.
+pub(crate) fn read_purpose(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let purpose = value.get("purpose")?.as_str()?;
+    let valid = (1..=64).contains(&purpose.len())
+        && purpose
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    valid.then(|| purpose.to_string())
+}
+
+/// `POST /v1/credentials/{id}/value` — answer a key binding's value to the
+/// person who owns it, from their own session, for a named purpose (AEGIS
+/// ADR-150 V3): 200 `{id, provider, value}` with `Cache-Control: no-store`
+/// for the caller's own personal, active `secret` binding with no reach;
+/// 403 `vault_value_owner_only` to an operator or any identity that is not
+/// a person; 400 `vault_purpose_required`; 404 as the by-id routes answer
+/// for a binding that does not exist, is another person's, or is a team
+/// binding of which the caller is a member; 422 `vault_value_not_readable`
+/// for the caller's own binding of another type, scope, status or with a
+/// reach; 503 `vault_unavailable` when the store cannot be read or the
+/// audit row cannot be written. Every answer writes one row (V7), the
+/// value's before it is answered; no row, log line or error carries the
+/// value.
+pub(crate) async fn read_credential_value_handler(
+    State(state): State<CredentialsByIdState>,
+    Path(id): Path<String>,
+    request: axum::extract::Request,
+) -> Response {
+    let Some(identity) = request.extensions().get::<UserIdentity>().cloned() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "Authentication required"})),
+        )
+            .into_response();
+    };
+    let audit = state.audit.clone();
+    let refuse =
+        |caller: VaultCaller,
+         tenant_id: Option<String>,
+         binding: Option<&aegis_orchestrator_core::domain::credential::UserCredentialBinding>,
+         purpose: Option<String>,
+         outcome: &str| {
+            VaultAuditRow::binding(
+                identity.sub.clone(),
+                VaultAction::ValueRefused,
+                &id,
+                &BindingAuditState {
+                    caller,
+                    tenant_id: binding
+                        .map(|b| b.tenant_id.as_str().to_string())
+                        .or(tenant_id),
+                    provider: binding.map(|b| b.provider.to_string()),
+                    credential_type: binding.map(|b| credential_type_name(&b.credential_type)),
+                    purpose,
+                    outcome: outcome.to_string(),
+                    execution_id: None,
+                },
+            )
+        };
+
+    // Only a person's own session: never an operator, a service account or
+    // any other identity.
+    let tenant_id = match &identity.identity_kind {
+        IdentityKind::ConsumerUser { tenant_id, .. } => tenant_id.clone(),
+        IdentityKind::TenantUser { tenant_slug } => match TenantId::from_realm_slug(tenant_slug) {
+            Ok(t) => t,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "Invalid tenant slug in identity"})),
+                )
+                    .into_response();
+            }
+        },
+        kind => {
+            let caller = if matches!(kind, IdentityKind::Operator { .. }) {
+                VaultCaller::Operator
+            } else {
+                VaultCaller::Other
+            };
+            append_after_act(
+                audit.as_ref(),
+                refuse(caller, None, None, None, VAULT_VALUE_OWNER_ONLY),
+            )
+            .await;
+            return vault_refusal(StatusCode::FORBIDDEN, VAULT_VALUE_OWNER_ONLY);
+        }
+    };
+    let tenant = Some(tenant_id.as_str().to_string());
+
+    let body = axum::body::to_bytes(request.into_body(), 1024 * 64)
+        .await
+        .unwrap_or_default();
+    let Some(purpose) = read_purpose(&body) else {
+        append_after_act(
+            audit.as_ref(),
+            refuse(
+                VaultCaller::Session,
+                tenant,
+                None,
+                None,
+                VAULT_PURPOSE_REQUIRED,
+            ),
+        )
+        .await;
+        return vault_refusal(StatusCode::BAD_REQUEST, VAULT_PURPOSE_REQUIRED);
+    };
+
+    let binding_id = match parse_binding_id(&id) {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    let unavailable =
+        |binding: Option<&aegis_orchestrator_core::domain::credential::UserCredentialBinding>| {
+            refuse(
+                VaultCaller::Session,
+                tenant.clone(),
+                binding,
+                Some(purpose.clone()),
+                VAULT_UNAVAILABLE,
+            )
+        };
+    let Some(svc) = state.credential_service.clone() else {
+        append_after_act(audit.as_ref(), unavailable(None)).await;
+        return vault_refusal(StatusCode::SERVICE_UNAVAILABLE, VAULT_UNAVAILABLE);
+    };
+
+    match svc
+        .owner_key_value(&identity.sub, &tenant_id, &binding_id)
+        .await
+    {
+        Ok(OwnerKeyValue::Value { binding, value }) => {
+            let row = VaultAuditRow::binding(
+                identity.sub.clone(),
+                VaultAction::ValueRead,
+                &id,
+                &BindingAuditState {
+                    caller: VaultCaller::Session,
+                    tenant_id: Some(binding.tenant_id.as_str().to_string()),
+                    provider: Some(binding.provider.to_string()),
+                    credential_type: Some(credential_type_name(&binding.credential_type)),
+                    purpose: Some(purpose.clone()),
+                    outcome: OUTCOME_ANSWERED.to_string(),
+                    execution_id: None,
+                },
+            );
+            // A value is never answered without its row.
+            if audit.append(&row).await.is_err() {
+                drop(value);
+                tracing::error!(
+                    action = %VaultAction::ValueRead,
+                    target = %row.target_resource,
+                    "the vault audit row was not written; the value read is refused"
+                );
+                return vault_refusal(StatusCode::SERVICE_UNAVAILABLE, VAULT_UNAVAILABLE);
+            }
+            (
+                StatusCode::OK,
+                [(axum::http::header::CACHE_CONTROL, "no-store")],
+                Json(json!({
+                    "id": binding.id.to_string(),
+                    "provider": binding.provider.to_string(),
+                    "value": value.expose(),
+                })),
+            )
+                .into_response()
+        }
+        Ok(OwnerKeyValue::NotReadable(binding)) => {
+            append_after_act(
+                audit.as_ref(),
+                refuse(
+                    VaultCaller::Session,
+                    tenant,
+                    Some(&binding),
+                    Some(purpose.clone()),
+                    VAULT_VALUE_NOT_READABLE,
+                ),
+            )
+            .await;
+            vault_refusal(StatusCode::UNPROCESSABLE_ENTITY, VAULT_VALUE_NOT_READABLE)
+        }
+        Ok(OwnerKeyValue::NotFound) => {
+            append_after_act(
+                audit.as_ref(),
+                refuse(
+                    VaultCaller::Session,
+                    tenant,
+                    None,
+                    Some(purpose.clone()),
+                    OUTCOME_NOT_FOUND,
+                ),
+            )
+            .await;
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "Credential binding not found"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(
+                target_binding = %binding_id,
+                error = %e,
+                "a key binding's value could not be read from the vault"
+            );
+            append_after_act(audit.as_ref(), unavailable(None)).await;
+            vault_refusal(StatusCode::SERVICE_UNAVAILABLE, VAULT_UNAVAILABLE)
+        }
     }
 }
 
@@ -1207,12 +1627,26 @@ pub(crate) async fn add_grant_handler(
         }
     };
 
+    let before = binding_for_audit(&svc, &actor, &binding_id).await;
+    let actor_id = user_id.clone();
     match svc.add_grant(&actor, &binding_id, target, user_id).await {
-        Ok(grant_id) => (
-            StatusCode::CREATED,
-            Json(json!({"grant_id": grant_id.to_string()})),
-        )
-            .into_response(),
+        Ok(grant_id) => {
+            append_after_act(
+                state.audit.as_ref(),
+                VaultAuditRow::binding(
+                    actor_id,
+                    VaultAction::GrantAdded,
+                    binding_id,
+                    &lifecycle_state(actor_caller(&actor), before.as_ref()),
+                ),
+            )
+            .await;
+            (
+                StatusCode::CREATED,
+                Json(json!({"grant_id": grant_id.to_string()})),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
@@ -1227,7 +1661,7 @@ pub(crate) async fn revoke_grant_handler(
     Path((id, grant_id_str)): Path<(String, String)>,
     request: axum::extract::Request,
 ) -> Response {
-    let (actor, _sub) = match credential_actor(request.extensions()) {
+    let (actor, sub) = match credential_actor(request.extensions()) {
         Ok(v) => v,
         Err(r) => return r,
     };
@@ -1253,12 +1687,25 @@ pub(crate) async fn revoke_grant_handler(
         }
     };
 
+    let before = binding_for_audit(&svc, &actor, &binding_id).await;
     match svc.revoke_grant(&actor, &binding_id, &grant_id).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(json!({"status": "revoked", "grant_id": grant_id_str})),
-        )
-            .into_response(),
+        Ok(()) => {
+            append_after_act(
+                state.audit.as_ref(),
+                VaultAuditRow::binding(
+                    sub,
+                    VaultAction::GrantRevoked,
+                    binding_id,
+                    &lifecycle_state(actor_caller(&actor), before.as_ref()),
+                ),
+            )
+            .await;
+            (
+                StatusCode::OK,
+                Json(json!({"status": "revoked", "grant_id": grant_id_str})),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
@@ -1567,7 +2014,7 @@ pub(crate) async fn get_secret_handler(
 
 /// `PUT /v1/secrets/{path}` — write (create or update) a secret.
 pub(crate) async fn write_secret_handler(
-    State(state): State<Arc<AppState>>,
+    State(state): State<SecretsByPathState>,
     Path(path): Path<String>,
     request: axum::extract::Request,
 ) -> Response {
@@ -1624,11 +2071,24 @@ pub(crate) async fn write_secret_handler(
     let ctx = AccessContext::system(&identity.sub);
 
     match sm.write_secret("kv", &path, secret_data, &ctx).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(json!({"status": "written", "path": path})),
-        )
-            .into_response(),
+        Ok(()) => {
+            append_after_act(
+                state.audit.as_ref(),
+                VaultAuditRow::secret_path(
+                    identity.sub.clone(),
+                    VaultAction::SecretWritten,
+                    "kv",
+                    &path,
+                    &lifecycle_state(VaultCaller::Operator, None),
+                ),
+            )
+            .await;
+            (
+                StatusCode::OK,
+                Json(json!({"status": "written", "path": path})),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
@@ -1639,7 +2099,7 @@ pub(crate) async fn write_secret_handler(
 
 /// `DELETE /v1/secrets/{path}` — delete a secret by path.
 pub(crate) async fn delete_secret_handler(
-    State(state): State<Arc<AppState>>,
+    State(state): State<SecretsByPathState>,
     Path(path): Path<String>,
     request: axum::extract::Request,
 ) -> Response {
@@ -1652,11 +2112,24 @@ pub(crate) async fn delete_secret_handler(
     let ctx = AccessContext::system(&identity.sub);
 
     match sm.delete_secret("kv", &path, &ctx).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(json!({"status": "deleted", "path": path})),
-        )
-            .into_response(),
+        Ok(()) => {
+            append_after_act(
+                state.audit.as_ref(),
+                VaultAuditRow::secret_path(
+                    identity.sub.clone(),
+                    VaultAction::SecretDeleted,
+                    "kv",
+                    &path,
+                    &lifecycle_state(VaultCaller::Operator, None),
+                ),
+            )
+            .await;
+            (
+                StatusCode::OK,
+                Json(json!({"status": "deleted", "path": path})),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
@@ -1705,7 +2178,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     #[derive(Default)]
-    struct InMemoryBindings {
+    pub(super) struct InMemoryBindings {
         rows: RwLock<HashMap<CredentialBindingId, UserCredentialBinding>>,
     }
 
@@ -1775,7 +2248,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct InMemoryMemberships {
+    pub(super) struct InMemoryMemberships {
         rows: RwLock<Vec<Membership>>,
     }
 
@@ -1918,6 +2391,7 @@ mod tests {
         let base = serve(
             credentials_by_id_router(CredentialsByIdState {
                 credential_service: Some(service as Arc<dyn CredentialManagementService>),
+                audit: std::sync::Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_vault_audit::InMemoryVaultAuditSink::new()),
             }),
             Some(identity_provider(&rows)),
             None,
@@ -2286,6 +2760,7 @@ mod mailbox_route_tests {
         let base = serve(
             credentials_mailboxes_router(CredentialsMailboxesState {
                 credential_service: Some(Arc::new(service) as Arc<dyn CredentialManagementService>),
+                audit: std::sync::Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_vault_audit::InMemoryVaultAuditSink::new()),
             }),
             Some(identity_provider(&[
                 ("owner-token", consumer(OWNER), SCOPES),
@@ -2472,6 +2947,7 @@ mod mailbox_route_tests {
         let base = serve(
             credentials_mailboxes_router(CredentialsMailboxesState {
                 credential_service: Some(Arc::new(service) as Arc<dyn CredentialManagementService>),
+                audit: std::sync::Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_vault_audit::InMemoryVaultAuditSink::new()),
             }),
             Some(identity_provider(&[(
                 "owner-token",
@@ -2599,6 +3075,7 @@ mod mailbox_route_tests {
                     credential_service: Some(
                         Arc::new(service) as Arc<dyn CredentialManagementService>
                     ),
+                    audit: std::sync::Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_vault_audit::InMemoryVaultAuditSink::new()),
                 }),
                 Some(identity_provider(&[(
                     "owner-token",
@@ -3129,11 +3606,16 @@ mod reach_route_tests {
         let store_service = service.clone();
         let router = credentials_by_id_router(CredentialsByIdState {
             credential_service: Some(service),
+            audit: std::sync::Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_vault_audit::InMemoryVaultAuditSink::new()),
         })
         .route(
             "/v1/credentials/api-keys",
             post(move |request: axum::extract::Request| {
-                store_api_key_answer(Some(store_service.clone()), request)
+                store_api_key_answer(
+                    Some(store_service.clone()),
+                    std::sync::Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_vault_audit::InMemoryVaultAuditSink::new()),
+                    request,
+                )
             }),
         );
         let base = serve(
@@ -3442,5 +3924,747 @@ mod oauth_callback_answer_tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert_eq!(body["error"], "calendar_unreachable");
         assert_eq!(body["status"], serde_json::Value::Null);
+    }
+}
+
+#[cfg(test)]
+mod vault_value_route_tests {
+    //! `POST /v1/credentials/{id}/value` (AEGIS ADR-150 V3) and the vault's
+    //! audit rows (V7), driven through the daemon's real authentication
+    //! stack against the real `StandardCredentialManagementService`, with
+    //! in-memory binding, membership and audit stores.
+
+    use super::tests::{InMemoryBindings, InMemoryMemberships};
+    use super::{
+        credentials_api_keys_router, credentials_by_id_router, secrets_by_path_router,
+        CredentialsApiKeysState, CredentialsByIdState, SecretsByPathState,
+    };
+    use crate::daemon::handlers::test_support::{
+        consumer, identity_provider, operator, send, send_with_headers, serve, service_account,
+    };
+    use aegis_orchestrator_core::application::credential_service::{
+        CredentialManagementService, OAuthProviderRegistry, StandardCredentialManagementService,
+        StoreApiKeyCommand,
+    };
+    use aegis_orchestrator_core::domain::credential::{
+        BindingReach, CredentialBindingId, CredentialBindingRepository, CredentialProvider,
+        CredentialScope, CredentialStatus, CredentialType, ReachKind,
+    };
+    use aegis_orchestrator_core::domain::iam::AegisRole;
+    use aegis_orchestrator_core::domain::secrets::SensitiveString;
+    use aegis_orchestrator_core::domain::team::{
+        Membership, MembershipRepository, MembershipRole, TeamId,
+    };
+    use aegis_orchestrator_core::domain::tenant::TenantId;
+    use aegis_orchestrator_core::domain::vault_audit::{VaultAction, VaultAuditRow};
+    use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
+    use aegis_orchestrator_core::infrastructure::repositories::postgres_vault_audit::InMemoryVaultAuditSink;
+    use aegis_orchestrator_core::infrastructure::secrets_manager::{
+        SecretsManager, TestSecretStore,
+    };
+    use axum::routing::get;
+    use reqwest::Method;
+    use serde_json::{json, Value};
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    const OWNER: &str = "vault-owner-sub";
+    const OTHER: &str = "vault-other-sub";
+    const MEMBER: &str = "vault-team-member-sub";
+    const TEAM: uuid::Uuid = uuid::Uuid::from_u128(0x5eed_0000_0000_4000_8000_000000000150);
+    /// The fixture key's value. Its appearance in any row or log line is the
+    /// leak.
+    const VALUE: &str = "sk-vault-fixture-7Qx2-value";
+    const SCOPES: &str =
+        "credential:read credential:create credential:delete credential:rotate credential:grant";
+
+    struct Vault {
+        base: String,
+        bindings: Arc<InMemoryBindings>,
+        service: Arc<StandardCredentialManagementService>,
+        audit: Arc<InMemoryVaultAuditSink>,
+    }
+
+    fn tokens() -> Vec<(
+        &'static str,
+        aegis_orchestrator_core::domain::iam::UserIdentity,
+    )> {
+        vec![
+            ("owner-token", consumer(OWNER)),
+            ("other-token", consumer(OTHER)),
+            ("member-token", consumer(MEMBER)),
+            ("admin-token", operator(AegisRole::Admin)),
+            ("operator-token", operator(AegisRole::Operator)),
+            ("readonly-token", operator(AegisRole::Readonly)),
+            ("service-token", service_account()),
+        ]
+    }
+
+    /// The value route, the api-keys route and the by-id routes over one
+    /// service and one audit sink.
+    async fn vault(audit: InMemoryVaultAuditSink) -> Vault {
+        let bindings = Arc::new(InMemoryBindings::default());
+        let memberships = Arc::new(InMemoryMemberships::default());
+        memberships
+            .save(&Membership::new_active(
+                TeamId(TEAM),
+                MEMBER.into(),
+                MembershipRole::Member,
+            ))
+            .await
+            .expect("seed membership");
+        let event_bus = Arc::new(EventBus::new(16));
+        let service = Arc::new(
+            StandardCredentialManagementService::new(
+                bindings.clone(),
+                Arc::new(SecretsManager::from_store(
+                    Arc::new(TestSecretStore::new()),
+                    event_bus.clone(),
+                )),
+                event_bus,
+                Arc::new(OAuthProviderRegistry::new()),
+            )
+            .with_membership_repo(memberships),
+        );
+        let audit = Arc::new(audit);
+        let dyn_service = service.clone() as Arc<dyn CredentialManagementService>;
+        let router = credentials_by_id_router(CredentialsByIdState {
+            credential_service: Some(dyn_service.clone()),
+            audit: audit.clone(),
+        })
+        .merge(credentials_api_keys_router(CredentialsApiKeysState {
+            credential_service: Some(dyn_service),
+            audit: audit.clone(),
+        }));
+        let rows: Vec<_> = tokens()
+            .into_iter()
+            .map(|(token, id)| (token, id, SCOPES))
+            .collect();
+        let base = serve(router, Some(identity_provider(&rows)), None).await;
+        Vault {
+            base,
+            bindings,
+            service,
+            audit,
+        }
+    }
+
+    impl Vault {
+        /// A binding of `OWNER` holding `VALUE`.
+        async fn store(
+            &self,
+            provider: &str,
+            credential_type: CredentialType,
+            scope: CredentialScope,
+        ) -> CredentialBindingId {
+            self.service
+                .store_api_key(StoreApiKeyCommand {
+                    owner_user_id: OWNER.into(),
+                    tenant_id: TenantId::for_consumer_user(OWNER).expect("owner tenant"),
+                    provider: CredentialProvider::new(provider),
+                    label: "the owner's key".into(),
+                    scope,
+                    api_key_value: SensitiveString::new(VALUE),
+                    credential_type,
+                })
+                .await
+                .expect("seed binding")
+        }
+
+        async fn secret(&self) -> CredentialBindingId {
+            self.store("openai", CredentialType::Secret, CredentialScope::Personal)
+                .await
+        }
+
+        async fn edit(
+            &self,
+            id: &CredentialBindingId,
+            change: impl FnOnce(&mut aegis_orchestrator_core::domain::credential::UserCredentialBinding),
+        ) {
+            let mut b = self
+                .bindings
+                .find_by_id(id)
+                .await
+                .unwrap()
+                .expect("the binding");
+            change(&mut b);
+            self.bindings.save(&b).await.unwrap();
+        }
+
+        async fn read(&self, id: &str, token: &str, body: Option<Value>) -> (u16, Value) {
+            send(
+                &self.base,
+                &Method::POST,
+                &format!("/v1/credentials/{id}/value"),
+                &body,
+                Some(token),
+            )
+            .await
+        }
+
+        async fn read_for(&self, id: &str, token: &str) -> (u16, Value) {
+            self.read(id, token, Some(json!({"purpose": "chat-turn"})))
+                .await
+        }
+
+        async fn rows(&self, action: VaultAction) -> Vec<VaultAuditRow> {
+            self.audit
+                .rows()
+                .await
+                .into_iter()
+                .filter(|r| r.action == action)
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_owner_reads_their_personal_active_secret_binding() {
+        let v = vault(InMemoryVaultAuditSink::new()).await;
+        let id = v.secret().await;
+        let (status, headers, body) = send_with_headers(
+            &v.base,
+            &Method::POST,
+            &format!("/v1/credentials/{id}/value"),
+            &Some(json!({"purpose": "chat-turn"})),
+            Some("owner-token"),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            body,
+            json!({"id": id.to_string(), "provider": "openai", "value": VALUE})
+        );
+        assert_eq!(
+            headers
+                .get(reqwest::header::CACHE_CONTROL)
+                .and_then(|h| h.to_str().ok()),
+            Some("no-store")
+        );
+    }
+
+    #[tokio::test]
+    async fn another_person_a_team_member_and_a_nonexistent_id_get_the_identical_404() {
+        let v = vault(InMemoryVaultAuditSink::new()).await;
+        let personal = v.secret().await;
+        let team = v
+            .store(
+                "openai",
+                CredentialType::Secret,
+                CredentialScope::Team { team_id: TEAM },
+            )
+            .await;
+        let missing = CredentialBindingId::new();
+        let answers = [
+            v.read_for(&personal.to_string(), "other-token").await,
+            v.read_for(&team.to_string(), "member-token").await,
+            v.read_for(&missing.to_string(), "owner-token").await,
+        ];
+        for (status, body) in &answers {
+            assert_eq!(
+                (*status, body),
+                (404, &json!({"error": "Credential binding not found"}))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_operator_of_each_role_and_a_service_account_get_403_owner_only() {
+        let v = vault(InMemoryVaultAuditSink::new()).await;
+        let id = v.secret().await.to_string();
+        for token in [
+            "admin-token",
+            "operator-token",
+            "readonly-token",
+            "service-token",
+        ] {
+            let (status, body) = v.read_for(&id, token).await;
+            assert_eq!(status, 403, "{token}: {body}");
+            assert_eq!(
+                body,
+                json!({
+                    "error": "vault_value_owner_only",
+                    "message": "A key's value is answered only to the person who owns it.",
+                }),
+                "{token}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_aegis_api_key_gets_401() {
+        let v = vault(InMemoryVaultAuditSink::new()).await;
+        let id = v.secret().await.to_string();
+        let (status, body) = v.read_for(&id, "aegis_live_0123456789abcdef").await;
+        assert_eq!(status, 401, "{body}");
+        assert!(
+            !body.to_string().contains(VALUE),
+            "the refusal carries the value"
+        );
+    }
+
+    #[tokio::test]
+    async fn bindings_the_vault_does_not_answer_get_422_not_readable() {
+        let v = vault(InMemoryVaultAuditSink::new()).await;
+        let mut cases = vec![
+            (
+                "oauth2",
+                v.store("google", CredentialType::OAuth2, CredentialScope::Personal)
+                    .await,
+            ),
+            (
+                "mailbox",
+                v.store("imap", CredentialType::Mailbox, CredentialScope::Personal)
+                    .await,
+            ),
+            (
+                "caldav",
+                v.store(
+                    "caldav",
+                    CredentialType::Calendar,
+                    CredentialScope::Personal,
+                )
+                .await,
+            ),
+            (
+                "team",
+                v.store(
+                    "openai",
+                    CredentialType::Secret,
+                    CredentialScope::Team { team_id: TEAM },
+                )
+                .await,
+            ),
+        ];
+        let reach = v.secret().await;
+        v.edit(&reach, |b| {
+            b.metadata.reach = Some(BindingReach {
+                kind: ReachKind::Apex,
+                instance_slug: None,
+                instance_id: None,
+                workspace_id: None,
+                login: None,
+                grounded_at: chrono::Utc::now(),
+            })
+        })
+        .await;
+        cases.push(("reach", reach));
+        let expired = v.secret().await;
+        v.edit(&expired, |b| b.status = CredentialStatus::Expired)
+            .await;
+        cases.push(("expired", expired));
+
+        let mut failures = Vec::new();
+        for (name, id) in cases {
+            let (status, body) = v.read_for(&id.to_string(), "owner-token").await;
+            let expected = json!({
+                "error": "vault_value_not_readable",
+                "message": "This connection's value is not answered by the vault; it is used only inside the platform.",
+            });
+            if (status, &body) != (422, &expected) {
+                failures.push(format!("{name}: {status} {body}"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_malformed_purpose_gets_400() {
+        let v = vault(InMemoryVaultAuditSink::new()).await;
+        let id = v.secret().await.to_string();
+        let mut failures = Vec::new();
+        for (name, body) in [
+            ("missing", Some(json!({}))),
+            ("no body", None),
+            ("empty", Some(json!({"purpose": ""}))),
+            ("65 characters", Some(json!({"purpose": "a".repeat(65)}))),
+            ("uppercase", Some(json!({"purpose": "Chat-turn"}))),
+        ] {
+            let (status, answer) = v.read(&id, "owner-token", body).await;
+            let expected = json!({
+                "error": "vault_purpose_required",
+                "message": "Name the purpose of this read: lowercase letters, digits and dashes, at most 64 characters.",
+            });
+            if (status, &answer) != (400, &expected) {
+                failures.push(format!("{name}: {status} {answer}"));
+            }
+        }
+        let (status, _) = v
+            .read(&id, "owner-token", Some(json!({"purpose": "a".repeat(64)})))
+            .await;
+        if status != 200 {
+            failures.push(format!("64 characters: {status}"));
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[tokio::test]
+    async fn each_answer_writes_one_value_read_row_and_each_refusal_one_value_refused_row() {
+        let v = vault(InMemoryVaultAuditSink::new()).await;
+        let id = v.secret().await;
+        let ids = id.to_string();
+        let tenant = TenantId::for_consumer_user(OWNER).unwrap();
+        v.read_for(&ids, "owner-token").await;
+        v.read_for(&ids, "owner-token").await;
+        v.read_for(&ids, "other-token").await;
+        v.read_for(&ids, "admin-token").await;
+        v.read(&ids, "owner-token", Some(json!({"purpose": "NOPE"})))
+            .await;
+
+        let read = v.rows(VaultAction::ValueRead).await;
+        assert_eq!(read.len(), 2, "{read:#?}");
+        assert_eq!(read[0].actor_id, OWNER);
+        assert_eq!(read[0].target_resource, format!("credential:{ids}"));
+        assert_eq!(
+            read[0].after_state,
+            json!({
+                "caller": "session",
+                "tenant_id": tenant.as_str(),
+                "provider": "openai",
+                "credential_type": "secret",
+                "purpose": "chat-turn",
+                "outcome": "answered",
+            })
+        );
+        let refused = v.rows(VaultAction::ValueRefused).await;
+        let outcomes: Vec<_> = refused
+            .iter()
+            .map(|r| {
+                (
+                    r.actor_id.as_str(),
+                    r.after_state["caller"].clone(),
+                    r.after_state["outcome"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                (OTHER, json!("session"), json!("not_found")),
+                (
+                    "op-aegis:admin",
+                    json!("operator"),
+                    json!("vault_value_owner_only")
+                ),
+                (OWNER, json!("session"), json!("vault_purpose_required")),
+            ]
+        );
+        assert_eq!(
+            refused[0].after_state["purpose"],
+            json!("chat-turn"),
+            "a valid purpose is recorded"
+        );
+        assert_eq!(
+            refused[2].after_state.get("purpose"),
+            None,
+            "an invalid purpose is never recorded"
+        );
+        assert_eq!(v.audit.rows().await.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_failing_audit_sink_refuses_the_read_with_503_and_no_value() {
+        let v = vault(InMemoryVaultAuditSink::failing()).await;
+        let id = v.secret().await.to_string();
+        let (status, body) = v.read_for(&id, "owner-token").await;
+        assert_eq!(status, 503, "{body}");
+        assert_eq!(
+            body,
+            json!({
+                "error": "vault_unavailable",
+                "message": "The vault could not be read right now. Try again in a moment.",
+            })
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// No audit row, and no log line emitted at any level while values are
+    /// read, answered or refused, carries the value.
+    #[tokio::test]
+    async fn no_audit_row_and_no_log_line_carries_the_value() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let v = vault(InMemoryVaultAuditSink::new()).await;
+        let id = v.secret().await.to_string();
+        let (status, _) = v.read_for(&id, "owner-token").await;
+        assert_eq!(status, 200);
+        v.read_for(&id, "other-token").await;
+        v.read_for(&id, "admin-token").await;
+        let failing = vault(InMemoryVaultAuditSink::failing()).await;
+        let failing_id = failing.secret().await.to_string();
+        let (status, _) = failing.read_for(&failing_id, "owner-token").await;
+        assert_eq!(status, 503);
+
+        let log = String::from_utf8_lossy(&captured.0.lock().unwrap()).into_owned();
+        assert!(
+            log.contains("the vault audit row was not written; the value read is refused"),
+            "precondition: the refusal's log line was not captured, so nothing was tested:\n{log}"
+        );
+        assert!(!log.contains(VALUE), "a log line carries the value:\n{log}");
+        for row in v.audit.rows().await {
+            let text = format!("{row:?} {}", row.after_state);
+            assert!(
+                !text.contains(VALUE),
+                "an audit row carries the value: {text}"
+            );
+        }
+        assert_eq!(v.audit.rows().await.len(), 3);
+    }
+
+    /// Store, rotate, grant added, grant revoked and revoke each write one
+    /// row, after the act, with the binding's fields and no value.
+    #[tokio::test]
+    async fn each_lifecycle_act_writes_one_row() {
+        let v = vault(InMemoryVaultAuditSink::new()).await;
+        let (status, body) = send(
+            &v.base,
+            &Method::POST,
+            "/v1/credentials/api-keys",
+            &Some(json!({
+                "provider": "openai",
+                "label": "a key",
+                "value": VALUE,
+                "credential_type": "secret",
+            })),
+            Some("owner-token"),
+        )
+        .await;
+        assert_eq!(status, 201, "{body}");
+        let id = body["id"].as_str().expect("the id").to_string();
+        let (status, body) = send(
+            &v.base,
+            &Method::POST,
+            &format!("/v1/credentials/{id}/rotate"),
+            &Some(json!({"value": "sk-vault-fixture-rotated"})),
+            Some("owner-token"),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let (status, body) = send(
+            &v.base,
+            &Method::POST,
+            &format!("/v1/credentials/{id}/grants"),
+            &Some(json!({"target_type": "all_agents"})),
+            Some("owner-token"),
+        )
+        .await;
+        assert_eq!(status, 201, "{body}");
+        let grant = body["grant_id"].as_str().expect("the grant id").to_string();
+        let (status, body) = send(
+            &v.base,
+            &Method::DELETE,
+            &format!("/v1/credentials/{id}/grants/{grant}"),
+            &None,
+            Some("owner-token"),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let (status, body) = send(
+            &v.base,
+            &Method::DELETE,
+            &format!("/v1/credentials/{id}"),
+            &None,
+            Some("owner-token"),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+
+        let rows = v.audit.rows().await;
+        let actions: Vec<_> = rows.iter().map(|r| r.action).collect();
+        assert_eq!(
+            actions,
+            vec![
+                VaultAction::BindingStored,
+                VaultAction::BindingRotated,
+                VaultAction::GrantAdded,
+                VaultAction::GrantRevoked,
+                VaultAction::BindingRevoked,
+            ]
+        );
+        let tenant = TenantId::for_consumer_user(OWNER).unwrap();
+        for row in &rows {
+            assert_eq!(row.actor_id, OWNER, "{row:?}");
+            assert_eq!(row.target_resource, format!("credential:{id}"), "{row:?}");
+            assert_eq!(
+                row.after_state,
+                json!({
+                    "caller": "session",
+                    "tenant_id": tenant.as_str(),
+                    "provider": "openai",
+                    "credential_type": "secret",
+                    "outcome": "answered",
+                }),
+                "{row:?}"
+            );
+            assert!(!format!("{row:?}").contains(VALUE));
+        }
+    }
+
+    /// `POST /v1/credentials/api-keys` over its narrow state answers as it
+    /// did over the daemon's state: 201 `{id}`.
+    #[tokio::test]
+    async fn the_api_keys_route_answers_as_before() {
+        let v = vault(InMemoryVaultAuditSink::new()).await;
+        let (status, body) = send(
+            &v.base,
+            &Method::POST,
+            "/v1/credentials/api-keys",
+            &Some(json!({
+                "provider": "openai",
+                "label": "a key",
+                "value": VALUE,
+                "credential_type": "secret",
+            })),
+            Some("owner-token"),
+        )
+        .await;
+        assert_eq!(status, 201, "{body}");
+        let id = body["id"].as_str().expect("the id");
+        assert_eq!(body, json!({"id": id}));
+        let (status, body) = send(
+            &v.base,
+            &Method::POST,
+            "/v1/credentials/api-keys",
+            &Some(json!({"provider": "openai"})),
+            Some("owner-token"),
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        let (status, body) = send(
+            &v.base,
+            &Method::POST,
+            "/v1/credentials/api-keys",
+            &Some(json!({
+                "provider": "openai",
+                "label": "a key",
+                "value": VALUE,
+                "credential_type": "secret",
+            })),
+            Some("admin-token"),
+        )
+        .await;
+        assert_eq!(
+            (status, body),
+            (
+                403,
+                json!({"error": "Consumer or tenant user identity required"})
+            )
+        );
+    }
+
+    /// `PUT` and `DELETE /v1/secrets/{path}` over their narrow state answer
+    /// as they did, beside `GET /v1/secrets/{path}` still on its own router,
+    /// merged the way `create_router` merges them; each act writes its row.
+    #[tokio::test]
+    async fn the_secret_path_routes_answer_as_before_and_write_their_rows() {
+        let event_bus = Arc::new(EventBus::new(16));
+        let sm = Arc::new(SecretsManager::from_store(
+            Arc::new(TestSecretStore::new()),
+            event_bus,
+        ));
+        let audit = Arc::new(InMemoryVaultAuditSink::new());
+        let router = axum::Router::new()
+            .route(
+                "/v1/secrets/{path}",
+                get(|| async { (axum::http::StatusCode::OK, "the get route") }),
+            )
+            .merge(secrets_by_path_router(SecretsByPathState {
+                secrets_manager: sm,
+                audit: audit.clone(),
+            }));
+        let rows: Vec<_> = tokens()
+            .into_iter()
+            .map(|(token, id)| (token, id, SCOPES))
+            .collect();
+        let base = serve(router, Some(identity_provider(&rows)), None).await;
+
+        let (status, body) = send(
+            &base,
+            &Method::PUT,
+            "/v1/secrets/platform-key",
+            &Some(json!({"data": {"field": VALUE}})),
+            Some("admin-token"),
+        )
+        .await;
+        assert_eq!(
+            (status, body),
+            (200, json!({"status": "written", "path": "platform-key"}))
+        );
+        let (status, body) = send(
+            &base,
+            &Method::DELETE,
+            "/v1/secrets/platform-key",
+            &None,
+            Some("operator-token"),
+        )
+        .await;
+        assert_eq!(
+            (status, body),
+            (200, json!({"status": "deleted", "path": "platform-key"}))
+        );
+        let (status, body) = send(
+            &base,
+            &Method::PUT,
+            "/v1/secrets/platform-key",
+            &Some(json!({"data": {"field": VALUE}})),
+            Some("owner-token"),
+        )
+        .await;
+        assert_eq!(
+            (status, body),
+            (403, json!({"error": "Operator or Admin role required"}))
+        );
+        let (status, _) = send(
+            &base,
+            &Method::GET,
+            "/v1/secrets/platform-key",
+            &None,
+            Some("admin-token"),
+        )
+        .await;
+        assert_eq!(status, 200, "the GET route was lost in the merge");
+
+        let rows = audit.rows().await;
+        let got: Vec<_> = rows
+            .iter()
+            .map(|r| (r.action, r.actor_id.as_str(), r.target_resource.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    VaultAction::SecretWritten,
+                    "op-aegis:admin",
+                    "secret:kv/platform-key"
+                ),
+                (
+                    VaultAction::SecretDeleted,
+                    "op-aegis:operator",
+                    "secret:kv/platform-key"
+                ),
+            ]
+        );
+        for row in &rows {
+            assert_eq!(row.after_state["caller"], json!("operator"));
+            assert!(!format!("{row:?}").contains(VALUE));
+        }
     }
 }

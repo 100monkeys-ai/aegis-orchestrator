@@ -2438,6 +2438,7 @@ mod tests {
                 zaru: None,
                 oauth_providers: Vec::new(),
                 goals: crate::domain::node_config::GoalsConfig::default(),
+                vault: crate::domain::node_config::VaultConfig::default(),
             },
         };
 

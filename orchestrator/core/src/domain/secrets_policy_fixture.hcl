@@ -20,6 +20,15 @@ path "tenant-zaru-consumer/kv/data/users/*" {
 path "tenant-zaru-consumer/kv/metadata/users/*" {
   capabilities = ["list", "read", "delete"]
 }
+# A declared confidential client keeps the tokens of its own sessions in its
+# realm's mount at clients/<client_id>/<kind>/<id>; the orchestrator checks
+# the client id before any read or write.
+path "tenant-zaru-consumer/kv/data/clients/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+path "tenant-zaru-consumer/kv/metadata/clients/*" {
+  capabilities = ["list", "read", "delete"]
+}
 path "aegis-system/kv/data/*" {
   capabilities = ["create", "read", "update", "delete", "list"]
 }

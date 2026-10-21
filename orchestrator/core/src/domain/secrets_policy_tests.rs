@@ -525,3 +525,50 @@ async fn the_policy_admits_the_tool_approval_and_webhook_transit_keys_and_no_oth
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+const CLIENTS_DATA_RULE: &str = "tenant-zaru-consumer/kv/data/clients/*";
+
+/// A declared client's session and revocation secrets are kept in the
+/// realm's mount at `clients/<client_id>/<kind>/<id>` (AEGIS ADR-150 V10):
+/// the policy admits writing, reading and deleting one there, and its
+/// clients rule admits no person's mount and not the system mount.
+#[tokio::test]
+async fn secrets_policy_admits_a_declared_clients_secrets_in_the_realm_mount() {
+    let policy = policy_text();
+    let store = PolicyEnforcingStore::new();
+    let mut failures = Vec::new();
+    let engine = "tenant-zaru-consumer/kv";
+    let path = "clients/zaru-web/session/0b6c2f4e-1a2b-4c3d-8e9f-0a1b2c3d4e5f";
+    let mut secret = HashMap::new();
+    secret.insert("value".to_string(), SensitiveString::new("{}"));
+    if let Err(e) = store.write(engine, path, secret).await {
+        failures.push(format!("write refused: {e}"));
+    }
+    if let Err(e) = store.read(engine, path).await {
+        failures.push(format!("read refused: {e}"));
+    }
+    if let Err(e) = store.delete(engine, path).await {
+        failures.push(format!("delete refused: {e}"));
+    }
+    if !policy.contains(&format!("path \"{CLIENTS_DATA_RULE}\"")) {
+        failures.push(format!("the policy carries no rule {CLIENTS_DATA_RULE}"));
+    }
+    for elsewhere in [
+        "tenant-u-x/kv/data/clients/anything",
+        "aegis-system/kv/data/clients/anything",
+    ] {
+        if matches(CLIENTS_DATA_RULE, elsewhere) {
+            failures.push(format!("the clients rule admits {elsewhere}"));
+        }
+    }
+    if store
+        .read("tenant-u-x/kv", "clients/anything")
+        .await
+        .map_err(|e| e.to_string())
+        .err()
+        .is_none_or(|e| !e.contains("403"))
+    {
+        failures.push("tenant-u-x/kv/data/clients/anything was not refused 403".to_string());
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}

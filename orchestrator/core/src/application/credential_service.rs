@@ -594,6 +594,34 @@ pub enum CredentialActor {
     Operator { may_write: bool },
 }
 
+/// The answer of [`CredentialManagementService::owner_key_value`] (AEGIS
+/// ADR-150 V3).
+pub enum OwnerKeyValue {
+    /// No such binding, or one that is not the caller's own: answered
+    /// exactly as for a binding that does not exist, so an id cannot be
+    /// probed. A team binding the caller is only a member of is here.
+    NotFound,
+    /// The caller's own binding, which the vault does not answer: a type
+    /// other than `secret`, a team scope, a reach, or a status other than
+    /// `active`. The binding is carried for the audit row only.
+    NotReadable(Box<UserCredentialBinding>),
+    /// The caller's own personal, active `secret` binding with no reach,
+    /// and its stored `value`.
+    Value {
+        binding: Box<UserCredentialBinding>,
+        value: SensitiveString,
+    },
+}
+
+/// Whether the vault answers `binding`'s value to its owner (V3): a
+/// personal, active `secret` binding whose metadata names no reach.
+pub fn owner_may_read_value(binding: &UserCredentialBinding) -> bool {
+    binding.credential_type == CredentialType::Secret
+        && binding.scope == CredentialScope::Personal
+        && binding.status == CredentialStatus::Active
+        && binding.metadata.reach.is_none()
+}
+
 /// What a by-id operation does to a binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BindingAccess {
@@ -735,6 +763,26 @@ pub trait CredentialManagementService: Send + Sync {
         actor: &CredentialActor,
         binding_id: &CredentialBindingId,
     ) -> anyhow::Result<Option<UserCredentialBinding>>;
+
+    /// The value of `binding_id` for its owner, the person `owner_user_id`
+    /// in `tenant_id`, under AEGIS ADR-150 V3's conditions: answered only
+    /// for the caller's own personal, active `secret` binding with no
+    /// reach, read through the secrets manager with an access context
+    /// naming the caller. Anyone else's binding, a team binding and an id
+    /// that does not exist are [`OwnerKeyValue::NotFound`]. An error means
+    /// the binding store or the secret store could not be read.
+    ///
+    /// The default answers none: an implementation that does not keep
+    /// values answers every id as one that does not exist.
+    async fn owner_key_value(
+        &self,
+        owner_user_id: &str,
+        tenant_id: &TenantId,
+        binding_id: &CredentialBindingId,
+    ) -> anyhow::Result<OwnerKeyValue> {
+        let _ = (owner_user_id, tenant_id, binding_id);
+        Ok(OwnerKeyValue::NotFound)
+    }
 
     /// Ground the binding's token at the remote server its provider names
     /// again and rewrite its `reach` (AEGIS ADR-132 (7a) S2, "and on
@@ -3330,6 +3378,40 @@ impl CredentialManagementService for StandardCredentialManagementService {
     // -----------------------------------------------------------------------
     // introspect_binding (ADR-132 (7a) S2)
     // -----------------------------------------------------------------------
+
+    async fn owner_key_value(
+        &self,
+        owner_user_id: &str,
+        tenant_id: &TenantId,
+        binding_id: &CredentialBindingId,
+    ) -> anyhow::Result<OwnerKeyValue> {
+        let Some(binding) = self.repo.find_by_id(binding_id).await? else {
+            return Ok(OwnerKeyValue::NotFound);
+        };
+        // Only the owner, in the owner's own tenant: a team member, an
+        // operator and another person are answered as for no binding.
+        if binding.owner_user_id != owner_user_id || &binding.tenant_id != tenant_id {
+            return Ok(OwnerKeyValue::NotFound);
+        }
+        if !owner_may_read_value(&binding) {
+            return Ok(OwnerKeyValue::NotReadable(Box::new(binding)));
+        }
+        let mut stored = self
+            .secrets
+            .read_secret(
+                &binding.secret_path.effective_mount(),
+                &binding.secret_path.path,
+                &AccessContext::system(owner_user_id),
+            )
+            .await?;
+        let value = stored
+            .remove("value")
+            .ok_or_else(|| anyhow!("credential binding {} holds no value field", binding.id))?;
+        Ok(OwnerKeyValue::Value {
+            binding: Box::new(binding),
+            value,
+        })
+    }
 
     async fn introspect_binding(
         &self,

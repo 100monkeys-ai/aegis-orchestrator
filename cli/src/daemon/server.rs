@@ -3067,9 +3067,21 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         profile_service,
     };
 
+    // The vault's audit rows (AEGIS ADR-150 V7) go to admin_audit_log; a
+    // node without a database keeps them in process.
+    let vault_audit: Arc<dyn aegis_orchestrator_core::domain::vault_audit::VaultAuditSink> =
+        match db_pool.as_ref() {
+            Some(pool) => Arc::new(
+                aegis_orchestrator_core::infrastructure::repositories::postgres_vault_audit::PostgresVaultAuditSink::new(pool.clone()),
+            ),
+            None => Arc::new(
+                aegis_orchestrator_core::infrastructure::repositories::postgres_vault_audit::InMemoryVaultAuditSink::new(),
+            ),
+        };
+
     info!("Building router...");
     // Build HTTP router
-    let app = create_router(Arc::new(app_state), iam_service.clone());
+    let app = create_router(Arc::new(app_state), iam_service.clone(), vault_audit);
 
     // Start HTTP server. Audit 002 §4.27: when no network block is supplied
     // we default to the loopback address. Operators must explicitly set
