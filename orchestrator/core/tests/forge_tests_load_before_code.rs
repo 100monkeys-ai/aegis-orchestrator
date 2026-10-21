@@ -584,11 +584,16 @@ fn failed_sentence(blackboard: serde_json::Value) -> String {
 /// "": the sentence was built from DIFF and COMMIT only. A failed state with
 /// an `on_failure` route leaves `{status: "failed", error}` on the
 /// blackboard; FAILED's sentence now carries that error when DIFF and
-/// COMMIT carry none.
+/// COMMIT carry none. The error is the end sentence the supervisor words
+/// since AEGIS ADR-141's Update of 2026-10-21, clause 14 (clause 10 of the
+/// Update `tries-end-names-their-cause-2026-10-16` as amended): the tries and
+/// the last attempt's cause first, the time second.
 #[test]
 fn a_code_failure_is_the_failed_states_sentence() {
-    let error = "Agent execution failed: Failed to execute task: Execution ended: 899 s left \
-                 under the 1815 s bound, under the 900 s a try needs";
+    let error = "Agent execution failed: Failed to execute task: Execution ended after 1 try: \
+                 the last attempt ran past its time limit of 900 s and was stopped; a further \
+                 try does not fit: 899 s left under the 1815 s bound, under the 900 s a try \
+                 needs";
     let sentence = failed_sentence(serde_json::json!({
         "ANALYZE": {"status": "completed", "output": "the requirements"},
         "ARCHITECT": {"status": "completed", "output": "the design"},

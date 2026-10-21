@@ -1388,9 +1388,26 @@ pub(crate) fn program_checks_of(
 
 #[cfg(test)]
 mod tests {
-    use super::{calculate_max_attempts, judge_ended_error};
+    use super::{
+        calculate_max_attempts, judge_ended_error, run_judge_with_one_rerun, JudgeBound, JudgeRun,
+    };
+    use crate::application::execution::ExecutionService;
     use crate::domain::agent::AgentId;
-    use crate::domain::execution::{Execution, ExecutionStatus};
+    use crate::domain::events::ExecutionEvent;
+    use crate::domain::execution::{
+        Execution, ExecutionId, ExecutionInput, ExecutionStatus, Iteration, LlmInteraction,
+        TrajectoryStep,
+    };
+    use crate::domain::goal::JudgeContext;
+    use crate::domain::iam::UserIdentity;
+    use crate::domain::shared_kernel::TenantId;
+    use crate::infrastructure::event_bus::DomainEvent;
+    use anyhow::{bail, Result};
+    use async_trait::async_trait;
+    use futures::Stream;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    use std::time::Duration;
 
     /// A judge execution as the poll loop reads it once it has ended.
     fn ended_judge(status: ExecutionStatus, error: Option<&str>) -> Execution {
@@ -1446,6 +1463,217 @@ mod tests {
         assert_eq!(calculate_max_attempts(1, 1000).unwrap(), 1);
         assert_eq!(calculate_max_attempts(1, 600).unwrap(), 2);
         assert_eq!(calculate_max_attempts(5, 2000).unwrap(), 3);
+    }
+
+    /// A judge whose first run completes at `faults_at` with an answer that
+    /// is no verdict, and whose later runs never end; it records the time
+    /// each run was started.
+    struct FaultsOnceThenRuns {
+        faults_at: Duration,
+        clock: tokio::time::Instant,
+        starts: Mutex<Vec<(ExecutionId, Duration)>>,
+    }
+
+    impl FaultsOnceThenRuns {
+        fn new(faults_at: Duration) -> Self {
+            Self {
+                faults_at,
+                clock: tokio::time::Instant::now(),
+                starts: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// When each run was started, from the clock's start.
+        fn started_at(&self) -> Vec<Duration> {
+            let starts = self.starts.lock().expect("the starts");
+            starts.iter().map(|(_, at)| *at).collect()
+        }
+    }
+
+    #[async_trait]
+    impl ExecutionService for FaultsOnceThenRuns {
+        async fn start_execution(
+            &self,
+            _agent_id: AgentId,
+            _input: ExecutionInput,
+            _security_context_name: String,
+            _identity: Option<&UserIdentity>,
+        ) -> Result<ExecutionId> {
+            bail!("a judge is started as a child")
+        }
+
+        async fn start_execution_with_id(
+            &self,
+            _execution_id: ExecutionId,
+            _agent_id: AgentId,
+            _input: ExecutionInput,
+            _security_context_name: String,
+            _identity: Option<&UserIdentity>,
+        ) -> Result<ExecutionId> {
+            bail!("a judge is started as a child")
+        }
+
+        async fn start_child_execution(
+            &self,
+            _agent_id: AgentId,
+            _input: ExecutionInput,
+            _parent_execution_id: ExecutionId,
+        ) -> Result<ExecutionId> {
+            let id = ExecutionId::new();
+            let at = self.clock.elapsed();
+            self.starts.lock().expect("the starts").push((id, at));
+            Ok(id)
+        }
+
+        async fn get_execution_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            id: ExecutionId,
+        ) -> Result<Execution> {
+            let (run, started_at) = {
+                let starts = self.starts.lock().expect("the starts");
+                let run = starts
+                    .iter()
+                    .position(|(started, _)| *started == id)
+                    .expect("a started judge");
+                (run, starts[run].1)
+            };
+            let mut exec = Execution::new(AgentId::new(), judge_input(), 1, "judge".to_string());
+            exec.start();
+            if run == 0 && self.clock.elapsed() >= started_at + self.faults_at {
+                exec.start_iteration("judge".to_string())
+                    .expect("an iteration");
+                exec.complete_iteration("I cannot score this answer.".to_string());
+                exec.complete();
+            }
+            Ok(exec)
+        }
+
+        async fn get_execution_unscoped(&self, _id: ExecutionId) -> Result<Execution> {
+            bail!("a judge's parent is not read here")
+        }
+
+        async fn get_iterations_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _exec_id: ExecutionId,
+        ) -> Result<Vec<Iteration>> {
+            bail!("a judge's iterations are read from its execution")
+        }
+
+        async fn cancel_execution_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _id: ExecutionId,
+        ) -> Result<()> {
+            bail!("no judge is cancelled here")
+        }
+
+        async fn stream_execution(
+            &self,
+            _id: ExecutionId,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
+            bail!("no judge is streamed")
+        }
+
+        async fn stream_agent_events(
+            &self,
+            _id: AgentId,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
+            bail!("no judge is streamed")
+        }
+
+        async fn list_executions_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _agent_id: Option<AgentId>,
+            _workflow_id: Option<crate::domain::workflow::WorkflowId>,
+            _limit: usize,
+            _offset: usize,
+        ) -> Result<Vec<Execution>> {
+            bail!("no judge is listed")
+        }
+
+        async fn delete_execution_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _id: ExecutionId,
+        ) -> Result<()> {
+            bail!("no judge is deleted")
+        }
+
+        async fn record_llm_interaction(
+            &self,
+            _execution_id: ExecutionId,
+            _iteration: u8,
+            _interaction: LlmInteraction,
+        ) -> Result<()> {
+            bail!("a judge records nothing here")
+        }
+
+        async fn store_iteration_trajectory(
+            &self,
+            _execution_id: ExecutionId,
+            _iteration: u8,
+            _trajectory: Vec<TrajectoryStep>,
+        ) -> Result<()> {
+            bail!("a judge stores nothing here")
+        }
+    }
+
+    fn judge_input() -> ExecutionInput {
+        serde_json::from_value(serde_json::json!({ "input": {} })).expect("a judge's input")
+    }
+
+    /// AEGIS ADR-141, Update `tries-end-names-their-cause-2026-10-16`, clause
+    /// 11 and Trigger (k): a judge's `timeout_seconds` bounds its run and its
+    /// one re-run together. A judge of 5 s whose first run faults at 3 s has
+    /// its re-run ended at 2 s, the timed-out sentence naming the re-run's 2
+    /// s; before, the re-run had 5 s of its own and the judge took 8 s.
+    #[tokio::test(start_paused = true)]
+    async fn a_judges_rerun_is_ended_at_the_time_its_first_run_left() {
+        let service = FaultsOnceThenRuns::new(Duration::from_secs(3));
+        let tenant = TenantId::system();
+        let started = tokio::time::Instant::now();
+
+        let result = run_judge_with_one_rerun(JudgeRun {
+            service: &service,
+            tenant_id: &tenant,
+            judge_id: AgentId::new(),
+            judge_name: "email-draft-judge",
+            input: judge_input(),
+            bound: JudgeBound {
+                context: JudgeContext::UNCONFIGURED,
+                reserve_bytes: 0,
+            },
+            parent_execution_id: ExecutionId::new(),
+            timeout_seconds: 5,
+            poll_interval_ms: 100,
+            event_bus: None,
+        })
+        .await;
+        let ended_after = started.elapsed();
+
+        let mut complaints = Vec::new();
+        let expected = "Judge 'email-draft-judge' timed out after 2 seconds";
+        match &result {
+            Err(error) if format!("{error:#}").contains(expected) => {}
+            other => complaints.push(format!(
+                "the judge ended {other:?}, expected \"{expected}\""
+            )),
+        }
+        let started_at = service.started_at();
+        if started_at != vec![Duration::ZERO, Duration::from_secs(3)] {
+            complaints.push(format!(
+                "the judge's runs started at {started_at:?}, expected [0s, 3s]"
+            ));
+        }
+        if ended_after != Duration::from_secs(5) {
+            complaints.push(format!(
+                "the judge ended {ended_after:?} after it started, expected 5s"
+            ));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
 }
 
