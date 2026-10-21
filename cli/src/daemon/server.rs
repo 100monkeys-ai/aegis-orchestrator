@@ -1944,6 +1944,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         crate::daemon::two_tries_bound_floor::run_at_start(pool).await;
     }
 
+    // AEGIS ADR-005, Update of 2026-10-21, E4: with `mode` honoured, the data
+    // step `one_shot_tries_kept` sets every stored `one-shot` agent whose
+    // `max_retries` is 2 or more to `iterative`, so it keeps its count of
+    // tries, once (recorded in `data_steps`), one log line per row.
+    if let Some(pool) = db_pool.as_ref() {
+        crate::daemon::one_shot_tries_kept::run_at_start(pool).await;
+    }
+
     // ─── Credential Management Service (BC-11, ADR-078) ────────────────────────
     // The same store answers a remote tool call's credential (AEGIS ADR-132
     // H1), wired into the tool invocation service with `seal_gateway`.

@@ -39,6 +39,7 @@ pub mod handlers;
 pub mod install;
 pub(crate) mod log_sanitize;
 pub mod migrations;
+pub mod one_shot_tries_kept;
 pub mod operator_read_models;
 pub(crate) mod ports;
 pub mod relay_server;
@@ -46,7 +47,6 @@ pub(crate) mod router;
 pub mod server;
 pub(crate) mod state;
 pub(crate) mod temporal_helpers;
-pub mod one_shot_tries_kept;
 pub mod two_tries_bound_floor;
 pub mod worker_lifecycle;
 

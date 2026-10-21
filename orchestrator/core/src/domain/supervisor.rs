@@ -290,17 +290,20 @@ impl std::fmt::Display for TwoTriesRefusal {
 
 impl std::error::Error for TwoTriesRefusal {}
 
-/// The refusal of a manifest whose `max_retries` is 2 or more and whose
-/// bound is under [`two_tries_bound`], or `None` when it fits (AEGIS
-/// ADR-141, Update of 2026-10-21, clause 12). A manifest with no
-/// `spec.execution` is read with the default strategy. `built_in` is true for
-/// the system tenant's rows, where a name on [`TWO_TRIES_EXEMPT`] is exempt.
+/// The refusal of a manifest that runs 2 tries or more
+/// ([`ExecutionStrategy::tries`](crate::domain::agent::ExecutionStrategy::tries))
+/// and whose bound is under [`two_tries_bound`], or `None` when it fits
+/// (AEGIS ADR-141, Update of 2026-10-21, clause 12; AEGIS ADR-005, Update of
+/// 2026-10-21, E2: a `one-shot` manifest runs one try and is never refused).
+/// A manifest with no `spec.execution` is read with the default strategy.
+/// `built_in` is true for the system tenant's rows, where a name on
+/// [`TWO_TRIES_EXEMPT`] is exempt.
 pub fn two_tries_refusal(
     manifest: &crate::domain::agent::AgentManifest,
     built_in: bool,
 ) -> Option<TwoTriesRefusal> {
     let execution = manifest.spec.execution.clone().unwrap_or_default();
-    if execution.max_retries < 2 {
+    if execution.tries() < 2 {
         return None;
     }
     let name = manifest.metadata.name.as_str();
@@ -686,7 +689,10 @@ impl Supervisor {
     /// # Arguments
     /// * `runtime_config` - Configuration for spawning runtime instances
     /// * `input` - Execution input with intent/payload
-    /// * `max_retries` - Maximum number of iteration attempts (from manifest)
+    /// * `max_retries` - The Execution record's cap on its tries; the loop
+    ///   runs at most this many and at most its strategy's
+    ///   [`ExecutionStrategy::tries`](crate::domain::agent::ExecutionStrategy::tries),
+    ///   which both start paths record as the cap
     /// * `observer` - Observer for iteration lifecycle events
     /// * `cancellation_token` - Token to cooperatively cancel the execution
     /// * `validation_pipeline` - Optional gradient validation pipeline (ADR-017)
@@ -711,6 +717,9 @@ impl Supervisor {
         let per_iteration_timeout = iteration_timeout(&runtime_config.execution);
         // What a later try needs under the bound: its clock and its judges'.
         let try_needs = whole_try(&runtime_config.execution);
+        // The tries this execution runs: its strategy's, under the record's
+        // cap (AEGIS ADR-005, Update of 2026-10-21, E1 and E2).
+        let max_retries = max_retries.min(runtime_config.execution.tries());
 
         info!(
             overall_timeout_secs = overall_timeout_secs,
@@ -3334,8 +3343,10 @@ mod tests {
         assert_eq!(started, 1, "tries started");
         assert_eq!(
             ending.as_deref(),
-            Ok("Max retries exceeded after 1 attempt; the last attempt could not start: \
-                Resource exhausted")
+            Ok(
+                "Max retries exceeded after 1 attempt; the last attempt could not start: \
+                Resource exhausted"
+            )
         );
     }
 
@@ -3347,8 +3358,10 @@ mod tests {
         assert_eq!(started, 3, "tries started");
         assert_eq!(
             ending.as_deref(),
-            Ok("Max retries exceeded after 3 attempts; the last attempt could not start: \
-                Resource exhausted")
+            Ok(
+                "Max retries exceeded after 3 attempts; the last attempt could not start: \
+                Resource exhausted"
+            )
         );
     }
 

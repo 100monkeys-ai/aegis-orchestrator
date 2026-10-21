@@ -8077,12 +8077,9 @@ impl StandardExecutionService {
         let (persisted_input, runtime_input) = Self::prepare_execution_input(input, &agent)?;
         let (program_files, program_input) = Self::program_for(&agent, &persisted_input.input);
 
-        // 3. Create Execution Record
-        let max_retries = if let Some(exec) = &agent.manifest.spec.execution {
-            exec.max_retries as u8
-        } else {
-            3 // Default
-        };
+        // 3. Create Execution Record: its cap is the agent's tries (AEGIS
+        // ADR-005, Update of 2026-10-21, E1).
+        let max_retries = u8::try_from(agent.manifest.tries()).unwrap_or(u8::MAX);
 
         // Retain a copy before `security_context_name` is moved into the Execution (ADR-088 §A8).
         let seal_security_context = security_context_name.clone();
@@ -9230,14 +9227,9 @@ impl ExecutionService for StandardExecutionService {
         let (persisted_input, runtime_input) = Self::prepare_execution_input(input, &agent)?;
         let (program_files, program_input) = Self::program_for(&agent, &persisted_input.input);
 
-        // 4. Create child execution record with hierarchy.
-        let max_retries = agent
-            .manifest
-            .spec
-            .execution
-            .as_ref()
-            .map(|e| e.max_retries as u8)
-            .unwrap_or(3);
+        // 4. Create child execution record with hierarchy; its cap is the
+        // agent's tries (AEGIS ADR-005, Update of 2026-10-21, E1).
+        let max_retries = u8::try_from(agent.manifest.tries()).unwrap_or(u8::MAX);
 
         let parent_agent_id = parent.agent_id;
 

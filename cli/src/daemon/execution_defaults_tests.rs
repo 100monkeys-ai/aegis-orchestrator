@@ -156,7 +156,12 @@ async fn one_shot_tries_kept_keeps_every_stored_count() {
         .map(|row| (row.name.clone(), row.max_retries))
         .collect();
     kept.sort();
-    if kept != vec![("five-tries".to_string(), 5), ("three-tries".to_string(), 3)] {
+    if kept
+        != vec![
+            ("five-tries".to_string(), 5),
+            ("three-tries".to_string(), 3),
+        ]
+    {
         complaints.push(format!("the first start kept {kept:?}"));
     }
     let mut changed = Vec::new();
@@ -172,14 +177,20 @@ async fn one_shot_tries_kept_keeps_every_stored_count() {
             complaints.push(format!("{} reads {read:?}", agent.name));
         }
         if from_yaml != from_json {
-            complaints.push(format!("{}: manifest_yaml and manifest_json disagree", agent.name));
+            complaints.push(format!(
+                "{}: manifest_yaml and manifest_json disagree",
+                agent.name
+            ));
         }
         let mut expected = agent.manifest.clone();
         if let Some(execution) = expected.spec.execution.as_mut() {
             execution.mode = ExecutionMode::Iterative;
         }
         if from_json != expected {
-            complaints.push(format!("{}: the step changed more than its mode", agent.name));
+            complaints.push(format!(
+                "{}: the step changed more than its mode",
+                agent.name
+            ));
         }
         changed.push((yaml, json));
     }

@@ -17,7 +17,8 @@
 //! ## Aggregate Invariants (see AGENTS.md §Execution Aggregate)
 //!
 //! - An `Execution` must have at least 1 `Iteration`.
-//! - At most `max_iterations` iterations (default 10).
+//! - At most `max_iterations` iterations: the agent's `ExecutionStrategy::tries`
+//!   (default 5).
 //! - Only one `Iteration` may be `Running` at a time.
 //! - Iteration numbers are sequential starting from 1.
 //!

@@ -727,7 +727,7 @@ impl DeclaredOutput {
 impl Default for ExecutionStrategy {
     fn default() -> Self {
         Self {
-            mode: ExecutionMode::OneShot,
+            mode: ExecutionMode::Iterative,
             max_retries: default_max_retries(),
             iteration_timeout: None,
             llm_timeout_seconds: default_llm_timeout(),
@@ -742,11 +742,27 @@ impl Default for ExecutionStrategy {
     }
 }
 
+impl ExecutionStrategy {
+    // AEGIS ADR-005, Update of 2026-10-21, E1 and E2: every reader of the
+    // count of tries calls this, on `spec.execution` or the default strategy.
+    /// How many tries an execution of this strategy runs at most: one for
+    /// `one-shot`, whatever `max_retries` says; `max_retries` for
+    /// `iterative`.
+    pub fn tries(&self) -> u32 {
+        match self.mode {
+            ExecutionMode::OneShot => 1,
+            ExecutionMode::Iterative => self.max_retries,
+        }
+    }
+}
+
+// AEGIS ADR-005, Update of 2026-10-21, E3: a manifest that omits `mode` runs
+// up to its `max_retries`; only a written `one-shot` runs once.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExecutionMode {
-    #[default]
     OneShot,
+    #[default]
     Iterative,
 }
 
@@ -1206,6 +1222,16 @@ impl Agent {
 }
 
 impl AgentManifest {
+    /// How many tries an execution of this agent runs at most: its
+    /// `spec.execution`'s [`ExecutionStrategy::tries`], or the default
+    /// strategy's when the manifest has none.
+    pub fn tries(&self) -> u32 {
+        match &self.spec.execution {
+            Some(execution) => execution.tries(),
+            None => ExecutionStrategy::default().tries(),
+        }
+    }
+
     /// Validate the manifest structure and constraints
     pub fn validate(&self) -> Result<(), String> {
         // Validate API version

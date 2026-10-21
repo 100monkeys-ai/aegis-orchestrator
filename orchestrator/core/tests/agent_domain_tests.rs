@@ -622,7 +622,7 @@ fn execution_strategy_defaults() {
     let es = ExecutionStrategy::default();
     assert_eq!(es.max_retries, 5);
     assert_eq!(es.llm_timeout_seconds, 300);
-    assert!(matches!(es.mode, ExecutionMode::OneShot));
+    assert!(matches!(es.mode, ExecutionMode::Iterative));
     assert!(es.validation.is_none());
     assert!(es.tool_validation.is_none());
     assert!(es.delivery.is_none());
