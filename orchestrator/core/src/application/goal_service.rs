@@ -1644,9 +1644,10 @@ impl<E: std::fmt::Display> std::fmt::Display for CancelPathError<E> {
     }
 }
 
-/// U33a: run `cancel`, the cancel of one execution by any of its four paths
-/// (`aegis.task.cancel`, `aegis.workflow.cancel` and their two REST routes),
-/// and when it succeeds close the open goal the execution is bound to,
+/// U33a as U39 narrows it: run `cancel`, the cancel of one execution by
+/// either REST route (`POST /v1/executions/{id}/cancel`,
+/// `POST /v1/workflows/executions/{id}/cancel`), and when it succeeds close
+/// the open goal the execution is bound to,
 /// before the cancel answers. A goal that cannot be closed is logged and the
 /// cancel's own answer stands: the execution was cancelled.
 pub async fn cancel_ending_its_goal<T, E>(

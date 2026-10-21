@@ -504,17 +504,13 @@ impl ToolInvocationService {
                 .map_err(|e| SealSessionError::InvalidArguments(format!("Invalid UUID: {e}")))?,
         );
 
-        // AEGIS ADR-131 U33a: a cancel of an execution bound to an open goal
-        // closes the goal `cancelled` before this call answers, so no round
-        // re-dispatches the work the person stopped.
-        match crate::application::goal_service::cancel_ending_its_goal(
-            self.goal_service.as_deref(),
-            &tenant_id,
-            exec_id,
-            self.execution_service
-                .cancel_execution_for_tenant(&tenant_id, exec_id),
-        )
-        .await
+        // AEGIS ADR-131 U39: the cancel ends this one execution and leaves
+        // the goal it is bound to as it was, so the corrected execution can
+        // start next under the same goal; `aegis.goal.cancel` ends the goal.
+        match self
+            .execution_service
+            .cancel_execution_for_tenant(&tenant_id, exec_id)
+            .await
         {
             // A cancel of an execution that had already ended leaves it as it
             // was; the answer carries the state the execution is in after the
@@ -537,17 +533,6 @@ impl ToolInvocationService {
                     "execution_id": exec_id_str
                 }))),
             },
-            // C3, finding 4: the execution was cancelled but its goal is
-            // still open; the answer says so, naming the goal.
-            Err(e @ crate::application::goal_service::CancelPathError::GoalStillOpen { .. }) => {
-                Ok(ToolInvocationResult::Direct(serde_json::json!({
-                    "tool": "aegis.task.cancel",
-                    "cancelled": true,
-                    "execution_id": exec_id_str,
-                    "goal_still_open": e.goal_still_open().map(|g| g.to_string()),
-                    "error": e.to_string()
-                })))
-            }
             Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.task.cancel",
                 "cancelled": false,

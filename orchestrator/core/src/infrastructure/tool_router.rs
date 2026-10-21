@@ -203,7 +203,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("aegis.workflow.generate", "Generates a Workflow manifest from a natural-language objective."),
     BuiltinToolDefinition::new("aegis.workflow.logs", "Returns paginated workflow execution events.").skip_judge(),
     BuiltinToolDefinition::new("aegis.workflow.wait", "Polls a workflow execution until it reaches a terminal state and returns the result.").skip_judge(),
-    BuiltinToolDefinition::new("aegis.workflow.cancel", "Cancel a running workflow execution.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.workflow.cancel", "Cancel one running workflow execution by its id. The person's goal stays open, so you can start the corrected run next. To end the whole request, call aegis.goal.cancel.").skip_judge(),
     BuiltinToolDefinition::new("aegis.workflow.signal", "Send human input response to a paused workflow execution.").skip_judge(),
     BuiltinToolDefinition::new("aegis.workflow.remove", "Remove a workflow execution record.").skip_judge(),
     BuiltinToolDefinition::new("aegis.workflow.promote", "Promote a workflow from user scope to tenant scope."),
@@ -215,7 +215,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("aegis.task.execute", "Starts a new agent execution (task) by agent UUID or name."),
     BuiltinToolDefinition::new("aegis.task.status", "Returns the current status and output of an execution by UUID.").skip_judge(),
     BuiltinToolDefinition::new("aegis.task.list", "Lists recent executions, optionally filtered by agent.").skip_judge(),
-    BuiltinToolDefinition::new("aegis.task.cancel", "Cancels an active agent execution by UUID."),
+    BuiltinToolDefinition::new("aegis.task.cancel", "Cancel one running agent execution by its id. The person's goal stays open, so you can start the corrected execution next. To end the whole request, call aegis.goal.cancel."),
     BuiltinToolDefinition::new("aegis.task.remove", "Removes a completed or failed execution record by UUID."),
     BuiltinToolDefinition::new("aegis.task.logs", "Returns paginated execution events for a task by UUID.").skip_judge(),
     BuiltinToolDefinition::new("aegis.task.wait", "Polls an execution until it reaches a terminal state and returns the result.").skip_judge(),
@@ -246,7 +246,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("aegis.goal.create", "Hold the user's request as a goal that the executions started for it are bound to. Called by the turn, never by a model.").skip_judge(),
     BuiltinToolDefinition::new("aegis.goal.evaluate", "Judge the goal after an execution turn with the built-in judge agent goal-judge, and answer whether a round is granted. Blocks at most 45 s, answering judging until the verdict is in. Called by the turn, never by a model.").skip_judge(),
     BuiltinToolDefinition::new("aegis.goal.status", "The goal, its bound executions with their states, and every verdict. Read-only.").skip_judge(),
-    BuiltinToolDefinition::new("aegis.goal.cancel", "Stop the person's goal: no further round, every execution still running for it cancelled, and the goal closed cancelled with the reason given. Call it when the person asks to stop.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.goal.cancel", "End the person's whole request: no further round, every execution still running for it cancelled, and the goal closed cancelled with the reason given. Call it only when the person asks to stop. To stop one execution and go on, cancel that execution instead.").skip_judge(),
     BuiltinToolDefinition::new("aegis.document.render", "Render a document from Markdown or plain text into a file the person downloads: pdf, docx, html or md. Answers the file's path, size_bytes and format, and the execution_id that holds it; give that id to aegis.execution.file to read the file.").skip_judge(),
 ];
 

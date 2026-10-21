@@ -961,32 +961,15 @@ impl ToolInvocationService {
             }
         };
 
-        // AEGIS ADR-131 U33a: a cancel of a workflow execution bound to an
-        // open goal closes the goal `cancelled` before this call answers.
-        match crate::application::goal_service::cancel_ending_its_goal(
-            self.goal_service.as_deref(),
-            &tenant_id,
-            exec_id,
-            port.cancel_workflow_execution(&tenant_id, exec_id),
-        )
-        .await
-        {
+        // AEGIS ADR-131 U39: the cancel ends this one workflow execution and
+        // leaves the goal it is bound to as it was; `aegis.goal.cancel` ends
+        // the goal.
+        match port.cancel_workflow_execution(&tenant_id, exec_id).await {
             Ok(()) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.workflow.cancel",
                 "cancelled": true,
                 "execution_id": exec_id_str
             }))),
-            // C3, finding 4: the execution was cancelled but its goal is
-            // still open; the answer says so, naming the goal.
-            Err(e @ crate::application::goal_service::CancelPathError::GoalStillOpen { .. }) => {
-                Ok(ToolInvocationResult::Direct(serde_json::json!({
-                    "tool": "aegis.workflow.cancel",
-                    "cancelled": true,
-                    "execution_id": exec_id_str,
-                    "goal_still_open": e.goal_still_open().map(|g| g.to_string()),
-                    "error": e.to_string()
-                })))
-            }
             Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.workflow.cancel",
                 "cancelled": false,
