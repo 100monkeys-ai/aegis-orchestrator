@@ -150,31 +150,14 @@ async fn get_secret(path: &str, client: &DaemonClient, output_format: OutputForm
 }
 
 async fn list_secrets(client: &DaemonClient, output_format: OutputFormat) -> Result<()> {
-    match client.list_secrets().await? {
-        None => {
-            if output_format.is_structured() {
-                return render_serialized(
-                    output_format,
-                    &serde_json::json!({
-                        "error": "secret listing is not implemented on this server"
-                    }),
-                );
-            }
-            println!(
-                "{}",
-                "Secret listing is not supported by this daemon version.".yellow()
-            );
-        }
-        Some(body) => {
-            if output_format.is_structured() {
-                return render_serialized(output_format, &body);
-            }
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&body).unwrap_or_default()
-            );
-        }
+    let body = client.list_secrets().await?;
+    if output_format.is_structured() {
+        return render_serialized(output_format, &body);
     }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&body).unwrap_or_default()
+    );
     Ok(())
 }
 

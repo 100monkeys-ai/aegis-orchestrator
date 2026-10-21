@@ -1967,6 +1967,11 @@ pub(crate) async fn device_poll_handler(
 // Secrets Handlers
 // ============================================================================
 
+/// The engine the platform's secret paths live in (AEGIS ADR-150 V1, V13):
+/// the system mount, which the deployed secret-store policy admits for read,
+/// write, delete and list.
+const PLATFORM_SECRETS_ENGINE: &str = "aegis-system/kv";
+
 /// `GET /v1/secrets?prefix=<prefix>`'s query: the folder to list, the
 /// engine's root when absent.
 #[derive(Debug, Deserialize)]
@@ -2009,7 +2014,7 @@ pub(crate) async fn list_secrets_handler(
     let ctx = AccessContext::system(&identity.sub);
     match state
         .secrets_manager
-        .list_secrets("kv", &query.prefix, &ctx)
+        .list_secrets(PLATFORM_SECRETS_ENGINE, &query.prefix, &ctx)
         .await
     {
         Ok(paths) => {
@@ -2045,7 +2050,7 @@ pub(crate) async fn get_secret_handler(
     let sm = &state.secrets_manager;
     let ctx = AccessContext::system(&identity.sub);
 
-    match sm.read_secret("kv", &path, &ctx).await {
+    match sm.read_secret(PLATFORM_SECRETS_ENGINE, &path, &ctx).await {
         Ok(data) => {
             // Return field keys only — never expose raw secret values over REST.
             let fields: Vec<&String> = data.keys().collect();
@@ -2129,14 +2134,17 @@ pub(crate) async fn write_secret_handler(
     let sm = &state.secrets_manager;
     let ctx = AccessContext::system(&identity.sub);
 
-    match sm.write_secret("kv", &path, secret_data, &ctx).await {
+    match sm
+        .write_secret(PLATFORM_SECRETS_ENGINE, &path, secret_data, &ctx)
+        .await
+    {
         Ok(()) => {
             append_after_act(
                 state.audit.as_ref(),
                 VaultAuditRow::secret_path(
                     identity.sub.clone(),
                     VaultAction::SecretWritten,
-                    "kv",
+                    PLATFORM_SECRETS_ENGINE,
                     &path,
                     &lifecycle_state(VaultCaller::Operator, None),
                 ),
@@ -2170,14 +2178,14 @@ pub(crate) async fn delete_secret_handler(
     let sm = &state.secrets_manager;
     let ctx = AccessContext::system(&identity.sub);
 
-    match sm.delete_secret("kv", &path, &ctx).await {
+    match sm.delete_secret(PLATFORM_SECRETS_ENGINE, &path, &ctx).await {
         Ok(()) => {
             append_after_act(
                 state.audit.as_ref(),
                 VaultAuditRow::secret_path(
                     identity.sub.clone(),
                     VaultAction::SecretDeleted,
-                    "kv",
+                    PLATFORM_SECRETS_ENGINE,
                     &path,
                     &lifecycle_state(VaultCaller::Operator, None),
                 ),
@@ -3997,7 +4005,7 @@ mod vault_value_route_tests {
     use super::{
         credentials_api_keys_router, credentials_by_id_router, secrets_by_path_router,
         secrets_list_router, CredentialsApiKeysState, CredentialsByIdState, SecretsByPathState,
-        SecretsListState,
+        SecretsListState, PLATFORM_SECRETS_ENGINE,
     };
     use crate::daemon::handlers::test_support::{
         consumer, identity_provider, operator, send, send_with_headers, serve, service_account,
@@ -4713,12 +4721,12 @@ mod vault_value_route_tests {
                 (
                     VaultAction::SecretWritten,
                     "op-aegis:admin",
-                    "secret:kv/platform-key"
+                    "secret:aegis-system/kv/platform-key"
                 ),
                 (
                     VaultAction::SecretDeleted,
                     "op-aegis:operator",
-                    "secret:kv/platform-key"
+                    "secret:aegis-system/kv/platform-key"
                 ),
             ]
         );
@@ -4749,7 +4757,7 @@ mod vault_value_route_tests {
                 "field".to_string(),
                 SensitiveString::new(VALUE),
             )]);
-            sm.write_secret("kv", path, fields, &ctx)
+            sm.write_secret(PLATFORM_SECRETS_ENGINE, path, fields, &ctx)
                 .await
                 .expect("seed path");
         }

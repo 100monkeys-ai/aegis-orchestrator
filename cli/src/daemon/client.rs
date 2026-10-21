@@ -468,8 +468,8 @@ impl DaemonClient {
             .context("Failed to parse secret response")
     }
 
-    /// Returns `None` when the server responds 501 (listing not implemented).
-    pub async fn list_secrets(&self) -> Result<Option<serde_json::Value>> {
+    /// The platform's secret paths, `{"paths": [...], "count": n}`.
+    pub async fn list_secrets(&self) -> Result<serde_json::Value> {
         let url = format!("{}/v1/secrets", self.base_url);
         let response = self
             .request(reqwest::Method::GET, &url)
@@ -477,18 +477,14 @@ impl DaemonClient {
             .await
             .context("Failed to list secrets")?;
 
-        if response.status() == reqwest::StatusCode::NOT_IMPLEMENTED {
-            return Ok(None);
-        }
         if !response.status().is_success() {
             let err = response.text().await.unwrap_or_default();
             anyhow::bail!("Failed to list secrets: {err}");
         }
-        let body = response
+        response
             .json()
             .await
-            .context("Failed to parse list response")?;
-        Ok(Some(body))
+            .context("Failed to parse list response")
     }
 
     pub async fn delete_secret(&self, path: &str) -> Result<()> {
