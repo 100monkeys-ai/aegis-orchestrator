@@ -1445,3 +1445,245 @@ mod tests {
         assert_eq!(calculate_max_attempts(5, 2000).unwrap(), 3);
     }
 }
+
+/// A manifest's `- type: exit_code` validator, built into the pipeline the
+/// supervisor runs after each try, passes when the try's last exit code is the
+/// spec's `expected` code (default 0) and fails otherwise.
+#[cfg(test)]
+mod exit_code_pipeline_tests {
+    use super::build_validation_pipeline;
+    use crate::application::execution::ExecutionService;
+    use crate::domain::agent::{AgentId, ValidatorSpec};
+    use crate::domain::events::ExecutionEvent;
+    use crate::domain::execution::{
+        Execution, ExecutionId, ExecutionInput, Iteration, LlmInteraction, TrajectoryStep,
+    };
+    use crate::domain::iam::UserIdentity;
+    use crate::domain::shared_kernel::TenantId;
+    use crate::domain::validation::{ValidationContext, ValidationPipeline};
+    use crate::infrastructure::event_bus::{DomainEvent, EventBus};
+    use crate::infrastructure::repositories::InMemoryAgentRepository;
+    use anyhow::{bail, Result};
+    use async_trait::async_trait;
+    use futures::Stream;
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    /// No exit-code check starts or reads an execution; every call fails.
+    struct NoExecutions;
+
+    #[async_trait]
+    impl ExecutionService for NoExecutions {
+        async fn start_execution(
+            &self,
+            _agent_id: AgentId,
+            _input: ExecutionInput,
+            _security_context_name: String,
+            _identity: Option<&UserIdentity>,
+        ) -> Result<ExecutionId> {
+            bail!("an exit-code check starts no execution")
+        }
+
+        async fn start_execution_with_id(
+            &self,
+            _execution_id: ExecutionId,
+            _agent_id: AgentId,
+            _input: ExecutionInput,
+            _security_context_name: String,
+            _identity: Option<&UserIdentity>,
+        ) -> Result<ExecutionId> {
+            bail!("an exit-code check starts no execution")
+        }
+
+        async fn start_child_execution(
+            &self,
+            _agent_id: AgentId,
+            _input: ExecutionInput,
+            _parent_execution_id: ExecutionId,
+        ) -> Result<ExecutionId> {
+            bail!("an exit-code check starts no execution")
+        }
+
+        async fn get_execution_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _id: ExecutionId,
+        ) -> Result<Execution> {
+            bail!("an exit-code check reads no execution")
+        }
+
+        async fn get_execution_unscoped(&self, _id: ExecutionId) -> Result<Execution> {
+            bail!("an exit-code check reads no execution")
+        }
+
+        async fn get_iterations_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _exec_id: ExecutionId,
+        ) -> Result<Vec<Iteration>> {
+            bail!("an exit-code check reads no execution")
+        }
+
+        async fn cancel_execution_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _id: ExecutionId,
+        ) -> Result<()> {
+            bail!("an exit-code check cancels no execution")
+        }
+
+        async fn stream_execution(
+            &self,
+            _id: ExecutionId,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
+            bail!("an exit-code check streams no execution")
+        }
+
+        async fn stream_agent_events(
+            &self,
+            _id: AgentId,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
+            bail!("an exit-code check streams no events")
+        }
+
+        async fn list_executions_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _agent_id: Option<AgentId>,
+            _workflow_id: Option<crate::domain::workflow::WorkflowId>,
+            _limit: usize,
+            _offset: usize,
+        ) -> Result<Vec<Execution>> {
+            bail!("an exit-code check lists no execution")
+        }
+
+        async fn delete_execution_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _id: ExecutionId,
+        ) -> Result<()> {
+            bail!("an exit-code check deletes no execution")
+        }
+
+        async fn record_llm_interaction(
+            &self,
+            _execution_id: ExecutionId,
+            _iteration: u8,
+            _interaction: LlmInteraction,
+        ) -> Result<()> {
+            bail!("an exit-code check records nothing")
+        }
+
+        async fn store_iteration_trajectory(
+            &self,
+            _execution_id: ExecutionId,
+            _iteration: u8,
+            _trajectory: Vec<TrajectoryStep>,
+        ) -> Result<()> {
+            bail!("an exit-code check stores nothing")
+        }
+    }
+
+    /// The pipeline the supervisor would run for a manifest whose
+    /// `spec.execution.validation` is `validation_yaml`, and the specs the
+    /// manifest's YAML parsed to.
+    fn pipeline_from(validation_yaml: &str) -> (Vec<ValidatorSpec>, ValidationPipeline) {
+        let specs: Vec<ValidatorSpec> =
+            serde_yaml::from_str(validation_yaml).expect("the validation list parses");
+        let pipeline = build_validation_pipeline(
+            &specs,
+            Arc::new(InMemoryAgentRepository::new()),
+            Arc::new(NoExecutions),
+            Arc::new(EventBus::new(16)),
+            ExecutionId::new(),
+            TenantId::system(),
+            None,
+        );
+        (specs, pipeline)
+    }
+
+    /// A try that ended with `exit_code`, printing nothing on stderr.
+    fn try_ended_with(exit_code: i64) -> ValidationContext {
+        ValidationContext {
+            task: "exit with the expected code".to_string(),
+            output: "done".to_string(),
+            exit_code,
+            stderr: String::new(),
+            worker_mounts: Vec::new(),
+            policy_violations: Vec::new(),
+            tool_trajectory: Vec::new(),
+        }
+    }
+
+    /// Whether the pipeline passes a try that ended with `exit_code`, and why
+    /// not when it does not.
+    async fn verdict(pipeline: &ValidationPipeline, exit_code: i64) -> (bool, Option<String>) {
+        let result = pipeline
+            .validate(&try_ended_with(exit_code))
+            .await
+            .expect("an exit-code check runs");
+        (result.passed, result.blocking_reason)
+    }
+
+    const EXPECTS_TWO: &str = "- type: exit_code\n  expected: 2\n";
+    const EXPECTS_DEFAULT: &str = "- type: exit_code\n";
+
+    #[test]
+    fn the_manifest_parser_reads_expected_from_an_exit_code_validator() {
+        let (specs, _) = pipeline_from(EXPECTS_TWO);
+        assert_eq!(
+            specs,
+            vec![ValidatorSpec::ExitCode {
+                expected: 2,
+                min_score: 1.0,
+            }]
+        );
+        let (specs, _) = pipeline_from(EXPECTS_DEFAULT);
+        assert_eq!(
+            specs,
+            vec![ValidatorSpec::ExitCode {
+                expected: 0,
+                min_score: 1.0,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exit_code_validator_expecting_2_passes_a_try_that_exited_2() {
+        let (_, pipeline) = pipeline_from(EXPECTS_TWO);
+        let (passed, reason) = verdict(&pipeline, 2).await;
+        assert!(
+            passed,
+            "expected: 2 failed a try that exited 2: {}",
+            reason.unwrap_or_default()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exit_code_validator_expecting_2_fails_a_try_that_exited_0() {
+        let (_, pipeline) = pipeline_from(EXPECTS_TWO);
+        let (passed, _) = verdict(&pipeline, 0).await;
+        assert!(!passed, "expected: 2 passed a try that exited 0");
+    }
+
+    #[tokio::test]
+    async fn an_exit_code_validator_without_expected_passes_a_try_that_exited_0() {
+        let (_, pipeline) = pipeline_from(EXPECTS_DEFAULT);
+        let (passed, reason) = verdict(&pipeline, 0).await;
+        assert!(
+            passed,
+            "the default exit-code check failed a try that exited 0: {}",
+            reason.unwrap_or_default()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exit_code_validator_without_expected_fails_a_try_that_exited_1() {
+        let (_, pipeline) = pipeline_from(EXPECTS_DEFAULT);
+        let (passed, _) = verdict(&pipeline, 1).await;
+        assert!(
+            !passed,
+            "the default exit-code check passed a try that exited 1"
+        );
+    }
+}

@@ -3792,4 +3792,31 @@ mod tests {
             }
         );
     }
+
+    /// The wait tools' `timeout_seconds` descriptions state the default their
+    /// handlers apply: aegis.task.wait and its alias aegis.agent.wait wait 600
+    /// seconds when none is given (`invoke_aegis_task_wait_tool`), and
+    /// aegis.workflow.wait and aegis.execute.wait 300.
+    #[test]
+    fn the_wait_tools_describe_the_timeout_default_their_handlers_apply() {
+        let mut wrong = Vec::new();
+        for (tool, said, not_said) in [
+            ("aegis.task.wait", "(default 600)", "(default 300)"),
+            ("aegis.agent.wait", "(default 600)", "(default 300)"),
+            ("aegis.workflow.wait", "(default: 300)", "600"),
+            ("aegis.execute.wait", "(default: 300)", "600"),
+        ] {
+            let schema = ToolRouter::schema_for_builtin(tool);
+            let description = schema["properties"]["timeout_seconds"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if !description.contains(said) || description.contains(not_said) {
+                wrong.push(format!(
+                    "{tool}: timeout_seconds reads {description:?}, expected it to say {said:?}"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
 }
