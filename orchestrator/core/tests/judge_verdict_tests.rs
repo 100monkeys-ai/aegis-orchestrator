@@ -160,6 +160,7 @@ impl ExecutionService for JudgeOutputExecutionService {
         _agent_id: Option<AgentId>,
         _workflow_id: Option<aegis_orchestrator_core::domain::workflow::WorkflowId>,
         _limit: usize,
+        _offset: usize,
     ) -> anyhow::Result<Vec<Execution>> {
         Ok(vec![])
     }
@@ -633,6 +634,7 @@ impl ExecutionService for SequencedJudgeExecutionService {
         _agent_id: Option<AgentId>,
         _workflow_id: Option<aegis_orchestrator_core::domain::workflow::WorkflowId>,
         _limit: usize,
+        _offset: usize,
     ) -> anyhow::Result<Vec<Execution>> {
         Ok(vec![])
     }

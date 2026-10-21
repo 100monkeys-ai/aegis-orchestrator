@@ -156,6 +156,7 @@ impl ExecutionService for TenantScopedMockExecutionService {
         _agent_id: Option<AgentId>,
         _workflow_id: Option<aegis_orchestrator_core::domain::workflow::WorkflowId>,
         _limit: usize,
+        _offset: usize,
     ) -> anyhow::Result<Vec<Execution>> {
         Ok(vec![])
     }

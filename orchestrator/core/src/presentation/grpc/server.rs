@@ -2676,6 +2676,7 @@ mod tests {
             _agent_id: Option<AgentId>,
             _workflow_id: Option<crate::domain::workflow::WorkflowId>,
             _limit: usize,
+            _offset: usize,
         ) -> Result<Vec<Execution>> {
             Err(anyhow!(
                 "list_executions_for_tenant not used in grpc server tests"

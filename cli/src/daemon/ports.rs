@@ -307,7 +307,7 @@ impl aegis_orchestrator_core::application::ports::AgentActivityPort for DaemonAg
         let agent_id = aegis_orchestrator_core::domain::agent::AgentId(agent_id);
         let executions = self
             .execution_repo
-            .find_by_agent_for_tenant(tenant_id, agent_id, limit + offset)
+            .find_by_agent_for_tenant(tenant_id, agent_id, limit + offset, 0)
             .await
             .map_err(|e: aegis_orchestrator_core::domain::repository::RepositoryError| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
 

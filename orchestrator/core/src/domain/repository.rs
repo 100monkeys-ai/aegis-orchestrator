@@ -442,6 +442,7 @@ pub trait ExecutionRepository: Send + Sync {
         tenant_id: &TenantId,
         agent_id: AgentId,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<Execution>, RepositoryError>;
 
     async fn find_by_workflow_for_tenant(
@@ -449,6 +450,7 @@ pub trait ExecutionRepository: Send + Sync {
         tenant_id: &TenantId,
         workflow_id: WorkflowId,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<Execution>, RepositoryError>;
 
     /// The step executions of one workflow execution, oldest first: every
@@ -493,7 +495,7 @@ pub trait ExecutionRepository: Send + Sync {
         let mut all: Vec<Execution> = Vec::new();
         for id in workflow_ids {
             for execution in self
-                .find_by_workflow_for_tenant(tenant_id, *id, limit)
+                .find_by_workflow_for_tenant(tenant_id, *id, limit, 0)
                 .await?
             {
                 if !all.iter().any(|e| e.id == execution.id) {
@@ -510,6 +512,7 @@ pub trait ExecutionRepository: Send + Sync {
         &self,
         tenant_id: &TenantId,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<Execution>, RepositoryError>;
 
     /// List recent executions across every tenant, newest first.

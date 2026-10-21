@@ -362,7 +362,6 @@ pub(crate) async fn list_executions_handler(
     (axum::http::StatusCode, axum::Json<serde_json::Value>),
 > {
     scope_guard.require("execution:list")?;
-    let agent_id = query.agent_id.map(AgentId);
 
     // Determine the maximum allowed page size from configuration, with a
     // backward-compatible default of 1000 if not set.
@@ -372,25 +371,46 @@ pub(crate) async fn list_executions_handler(
         .max_execution_list_limit
         .unwrap_or(DEFAULT_MAX_EXECUTION_LIST_LIMIT);
 
+    Ok(axum::Json(
+        list_executions(
+            state.execution_repo.as_ref(),
+            state.execution_service.as_ref(),
+            state.workflow_repo.as_ref(),
+            max_limit,
+            identity.as_ref().map(|identity| &identity.0),
+            &query,
+        )
+        .await,
+    ))
+}
+
+/// `GET /v1/executions`'s answer for `query` as `identity` sees it: an
+/// array of executions, newest first, at most `limit` (20 when absent,
+/// capped at `max_limit`), or `{"error": …}`.
+pub(crate) async fn list_executions(
+    execution_repo: &dyn ExecutionRepository,
+    execution_service: &dyn ExecutionService,
+    workflow_repo: &dyn WorkflowRepository,
+    max_limit: usize,
+    identity: Option<&UserIdentity>,
+    query: &ListExecutionsQuery,
+) -> serde_json::Value {
+    let agent_id = query.agent_id.map(AgentId);
     let limit = query.limit.unwrap_or(20).min(max_limit);
-    let identity_ref = identity.as_ref().map(|identity| &identity.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
+    let tenant_id = tenant_id_from_identity(identity);
 
     // Resolve workflow_name to a WorkflowId if provided
     let workflow_id = if let Some(ref wf_name) = query.workflow_name {
-        match state
-            .workflow_repo
+        match workflow_repo
             .find_by_name_visible(&tenant_id, wf_name)
             .await
         {
             Ok(Some(wf)) => Some(wf.id),
             Ok(None) => {
-                return Ok(axum::Json(
-                    serde_json::json!({"error": format!("Workflow '{}' not found", wf_name)}),
-                ));
+                return serde_json::json!({"error": format!("Workflow '{}' not found", wf_name)});
             }
             Err(e) => {
-                return Ok(axum::Json(serde_json::json!({"error": e.to_string()})));
+                return serde_json::json!({"error": e.to_string()});
             }
         }
     } else {
@@ -401,8 +421,7 @@ pub(crate) async fn list_executions_handler(
     // archived (AEGIS ADR-148).
     let workflow_ids = match (&query.workflow_name, workflow_id) {
         (Some(wf_name), Some(wid)) => {
-            let mut ids = state
-                .workflow_repo
+            let mut ids = workflow_repo
                 .version_ids_visible(&tenant_id, wf_name)
                 .await
                 .unwrap_or_default();
@@ -418,24 +437,21 @@ pub(crate) async fn list_executions_handler(
     // filters are present, fall through to the tenant-scoped path —
     // operators wanting to filter cross-tenant by agent/workflow can use
     // the future `?tenant=<slug>` pivot.
-    let executions_result =
-        if is_operator(identity_ref) && agent_id.is_none() && workflow_id.is_none() {
-            state
-                .execution_repo
-                .list_recent_all_paginated(limit, 0)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))
-        } else if workflow_ids.len() > 1 {
-            state
-                .execution_service
-                .list_executions_for_workflows_for_tenant(&tenant_id, &workflow_ids, limit)
-                .await
-        } else {
-            state
-                .execution_service
-                .list_executions_for_tenant(&tenant_id, agent_id, workflow_id, limit)
-                .await
-        };
+    let executions_result = if is_operator(identity) && agent_id.is_none() && workflow_id.is_none()
+    {
+        execution_repo
+            .list_recent_all_paginated(limit, 0)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    } else if workflow_ids.len() > 1 {
+        execution_service
+            .list_executions_for_workflows_for_tenant(&tenant_id, &workflow_ids, limit, 0)
+            .await
+    } else {
+        execution_service
+            .list_executions_for_tenant(&tenant_id, agent_id, workflow_id, limit, 0)
+            .await
+    };
 
     match executions_result {
         Ok(executions) => {
@@ -452,9 +468,9 @@ pub(crate) async fn list_executions_handler(
                     })
                 })
                 .collect();
-            Ok(axum::Json(serde_json::json!(json_executions)))
+            serde_json::json!(json_executions)
         }
-        Err(e) => Ok(axum::Json(serde_json::json!({"error": e.to_string()}))),
+        Err(e) => serde_json::json!({"error": e.to_string()}),
     }
 }
 
@@ -1296,6 +1312,7 @@ mod cancel_ends_goal_tests {
             _: Option<AgentId>,
             _: Option<aegis_orchestrator_core::domain::workflow::WorkflowId>,
             _: usize,
+            _: usize,
         ) -> Result<Vec<Execution>> {
             anyhow::bail!("not exercised")
         }
@@ -1567,5 +1584,361 @@ mod cancel_tenant_tests {
         .await;
         assert_eq!(status.as_u16(), 500);
         assert_eq!(status_of(&executions, id), ExecutionStatus::Running);
+    }
+}
+
+#[cfg(test)]
+mod list_offset_tests {
+    //! `GET /v1/executions` pages by `offset` as the workflow list does:
+    //! `?limit=20&offset=20` answers the twenty executions after the first
+    //! twenty, newest first, and a missing offset answers from the newest
+    //! (row `executions-list-no-offset-2026-10-21`: the offset was dropped,
+    //! so every page was the first). Driven through the daemon's real
+    //! authentication stack (`test_support::serve`).
+
+    use super::{list_executions, ListExecutionsQuery, DEFAULT_MAX_EXECUTION_LIST_LIMIT};
+    use crate::daemon::handlers::test_support::{consumer, identity_provider, operator, serve};
+    use aegis_orchestrator_core::application::execution::ExecutionService;
+    use aegis_orchestrator_core::domain::agent::AgentId;
+    use aegis_orchestrator_core::domain::events::ExecutionEvent;
+    use aegis_orchestrator_core::domain::execution::{
+        Execution, ExecutionId, ExecutionInput, Iteration,
+    };
+    use aegis_orchestrator_core::domain::iam::{AegisRole, UserIdentity};
+    use aegis_orchestrator_core::domain::repository::ExecutionRepository;
+    use aegis_orchestrator_core::domain::tenant::TenantId;
+    use aegis_orchestrator_core::domain::workflow::WorkflowId;
+    use aegis_orchestrator_core::infrastructure::event_bus::DomainEvent;
+    use aegis_orchestrator_core::infrastructure::repositories::{
+        InMemoryExecutionRepository, InMemoryWorkflowRepository,
+    };
+    use anyhow::Result;
+    use axum::extract::{Extension, Query, State};
+    use axum::routing::get;
+    use axum::Router;
+    use futures::Stream;
+    use std::collections::HashMap;
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    /// Lists the in-memory store's executions the way the daemon's service
+    /// does: one agent's, one workflow's (by the ids `workflows` names) or
+    /// all of the tenant's, newest first, the `limit` after the first
+    /// `offset`.
+    #[derive(Default)]
+    struct StoreListed {
+        repo: Arc<InMemoryExecutionRepository>,
+        workflows: HashMap<WorkflowId, Vec<ExecutionId>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionService for StoreListed {
+        async fn start_execution(
+            &self,
+            _: AgentId,
+            _: ExecutionInput,
+            _: String,
+            _: Option<&UserIdentity>,
+        ) -> Result<ExecutionId> {
+            anyhow::bail!("not exercised")
+        }
+        async fn start_execution_with_id(
+            &self,
+            _: ExecutionId,
+            _: AgentId,
+            _: ExecutionInput,
+            _: String,
+            _: Option<&UserIdentity>,
+        ) -> Result<ExecutionId> {
+            anyhow::bail!("not exercised")
+        }
+        async fn start_child_execution(
+            &self,
+            _: AgentId,
+            _: ExecutionInput,
+            _: ExecutionId,
+        ) -> Result<ExecutionId> {
+            anyhow::bail!("not exercised")
+        }
+        async fn get_execution_for_tenant(
+            &self,
+            _: &TenantId,
+            _: ExecutionId,
+        ) -> Result<Execution> {
+            anyhow::bail!("not exercised")
+        }
+        async fn get_execution_unscoped(&self, _: ExecutionId) -> Result<Execution> {
+            anyhow::bail!("not exercised")
+        }
+        async fn get_iterations_for_tenant(
+            &self,
+            _: &TenantId,
+            _: ExecutionId,
+        ) -> Result<Vec<Iteration>> {
+            anyhow::bail!("not exercised")
+        }
+        async fn cancel_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<()> {
+            anyhow::bail!("not exercised")
+        }
+        async fn stream_execution(
+            &self,
+            _: ExecutionId,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
+            anyhow::bail!("not exercised")
+        }
+        async fn stream_agent_events(
+            &self,
+            _: AgentId,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
+            anyhow::bail!("not exercised")
+        }
+        async fn list_executions_for_tenant(
+            &self,
+            tenant: &TenantId,
+            agent_id: Option<AgentId>,
+            workflow_id: Option<WorkflowId>,
+            limit: usize,
+            offset: usize,
+        ) -> Result<Vec<Execution>> {
+            if let Some(workflow_id) = workflow_id {
+                let members = self
+                    .workflows
+                    .get(&workflow_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut rows: Vec<Execution> = self
+                    .repo
+                    .find_recent_for_tenant(tenant, usize::MAX, 0)
+                    .await?
+                    .into_iter()
+                    .filter(|e| members.contains(&e.id))
+                    .collect();
+                rows.sort_by_key(|e| std::cmp::Reverse(e.started_at));
+                return Ok(rows.into_iter().skip(offset).take(limit).collect());
+            }
+            Ok(match agent_id {
+                Some(agent_id) => {
+                    self.repo
+                        .find_by_agent_for_tenant(tenant, agent_id, limit, offset)
+                        .await?
+                }
+                None => {
+                    self.repo
+                        .find_recent_for_tenant(tenant, limit, offset)
+                        .await?
+                }
+            })
+        }
+        async fn delete_execution_for_tenant(&self, _: &TenantId, _: ExecutionId) -> Result<()> {
+            anyhow::bail!("not exercised")
+        }
+        async fn record_llm_interaction(
+            &self,
+            _: ExecutionId,
+            _: u8,
+            _: aegis_orchestrator_core::domain::execution::LlmInteraction,
+        ) -> Result<()> {
+            anyhow::bail!("not exercised")
+        }
+        async fn store_iteration_trajectory(
+            &self,
+            _: ExecutionId,
+            _: u8,
+            _: Vec<aegis_orchestrator_core::domain::execution::TrajectoryStep>,
+        ) -> Result<()> {
+            anyhow::bail!("not exercised")
+        }
+    }
+
+    #[derive(Clone)]
+    struct ListState {
+        service: Arc<StoreListed>,
+        workflows: Arc<InMemoryWorkflowRepository>,
+    }
+
+    async fn list_route(
+        State(state): State<ListState>,
+        identity: Option<Extension<UserIdentity>>,
+        Query(query): Query<ListExecutionsQuery>,
+    ) -> axum::Json<serde_json::Value> {
+        axum::Json(
+            list_executions(
+                state.service.repo.as_ref(),
+                state.service.as_ref(),
+                state.workflows.as_ref(),
+                DEFAULT_MAX_EXECUTION_LIST_LIMIT,
+                identity.as_ref().map(|identity| &identity.0),
+                &query,
+            )
+            .await,
+        )
+    }
+
+    /// One execution of `agent` in `tenant`, started `second` seconds after
+    /// a fixed instant.
+    fn execution(tenant: &TenantId, agent: AgentId, second: i64) -> Execution {
+        let mut execution = Execution::new(
+            agent,
+            ExecutionInput {
+                intent: Some("work".to_string()),
+                input: serde_json::json!({}),
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
+                workspace_remote_path: None,
+                workflow_execution_id: None,
+                attachments: Vec::new(),
+            },
+            1,
+            "aegis-system-operator".to_string(),
+        );
+        execution.tenant_id = tenant.clone();
+        execution.started_at =
+            chrono::DateTime::from_timestamp(1_760_000_000 + second, 0).expect("an instant");
+        execution
+    }
+
+    /// Store `executions` and answer their ids newest first.
+    async fn stored(repo: &InMemoryExecutionRepository, executions: &[Execution]) -> Vec<String> {
+        for execution in executions {
+            repo.save_for_tenant(&execution.tenant_id, execution)
+                .await
+                .unwrap();
+        }
+        let mut newest_first: Vec<&Execution> = executions.iter().collect();
+        newest_first.sort_by_key(|e| std::cmp::Reverse(e.started_at));
+        newest_first.iter().map(|e| e.id.0.to_string()).collect()
+    }
+
+    /// `GET /v1/executions{query}` as `caller`: the status and the ids
+    /// answered, in order.
+    async fn list(service: StoreListed, caller: UserIdentity, query: &str) -> (u16, Vec<String>) {
+        let router = Router::new()
+            .route("/v1/executions", get(list_route))
+            .with_state(ListState {
+                service: Arc::new(service),
+                workflows: Arc::new(InMemoryWorkflowRepository::new()),
+            });
+        let base = serve(
+            router,
+            Some(identity_provider(&[("caller", caller, "execution:list")])),
+            None,
+        )
+        .await;
+        let response = reqwest::Client::new()
+            .get(format!("{base}/v1/executions{query}"))
+            .bearer_auth("caller")
+            .send()
+            .await
+            .expect("loopback request");
+        let status = response.status().as_u16();
+        let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+        let ids = body
+            .as_array()
+            .unwrap_or_else(|| panic!("an array of executions, not {body}"))
+            .iter()
+            .map(|e| e["id"].as_str().expect("an id").to_string())
+            .collect();
+        (status, ids)
+    }
+
+    /// A consumer with forty-five executions: no offset answers the newest
+    /// twenty, `offset=20` the next twenty, `offset=40` the last five.
+    #[tokio::test]
+    async fn a_tenants_list_answers_the_rows_after_the_offset() {
+        let owner = consumer("owner-sub");
+        let tenant = TenantId::for_consumer_user("owner-sub").expect("owner tenant");
+        let agent = AgentId::new();
+        let mut pages = Vec::new();
+        for query in ["?limit=20", "?limit=20&offset=20", "?limit=20&offset=40"] {
+            let service = StoreListed::default();
+            let executions: Vec<Execution> =
+                (0..45).map(|i| execution(&tenant, agent, i)).collect();
+            let expected = stored(&service.repo, &executions).await;
+            let (status, ids) = list(service, owner.clone(), query).await;
+            println!("{query}: {status}, {} rows", ids.len());
+            assert_eq!(status, 200);
+            pages.push((query, ids, expected));
+        }
+        for ((query, ids, expected), range) in pages.into_iter().zip([0..20, 20..40, 40..45]) {
+            assert_eq!(
+                ids,
+                expected[range.clone()].to_vec(),
+                "{query} answers the rows {range:?}, newest first"
+            );
+        }
+    }
+
+    /// An operator's list of every tenant pages the same way.
+    #[tokio::test]
+    async fn an_operators_list_of_every_tenant_answers_the_rows_after_the_offset() {
+        let tenant_a = TenantId::for_consumer_user("a-sub").expect("tenant a");
+        let tenant_b = TenantId::for_consumer_user("b-sub").expect("tenant b");
+        let agent = AgentId::new();
+        let mut answered = Vec::new();
+        for query in ["?limit=20", "?limit=20&offset=20"] {
+            let service = StoreListed::default();
+            let executions: Vec<Execution> = (0..30)
+                .map(|i| {
+                    let tenant = if i % 2 == 0 { &tenant_a } else { &tenant_b };
+                    execution(tenant, agent, i)
+                })
+                .collect();
+            let expected = stored(&service.repo, &executions).await;
+            let (status, ids) = list(service, operator(AegisRole::Admin), query).await;
+            println!("operator {query}: {status}, {} rows", ids.len());
+            assert_eq!(status, 200);
+            answered.push((query, ids, expected));
+        }
+        for ((query, ids, expected), range) in answered.into_iter().zip([0..20, 20..30]) {
+            assert_eq!(
+                ids,
+                expected[range.clone()].to_vec(),
+                "{query} answers the rows {range:?}, newest first"
+            );
+        }
+    }
+
+    /// One agent's executions page by offset among another agent's.
+    #[tokio::test]
+    async fn one_agents_list_answers_the_rows_after_the_offset() {
+        let owner = consumer("owner-sub");
+        let tenant = TenantId::for_consumer_user("owner-sub").expect("owner tenant");
+        let agent = AgentId::new();
+        let other = AgentId::new();
+        let service = StoreListed::default();
+        let mine: Vec<Execution> = (0..6).map(|i| execution(&tenant, agent, 2 * i)).collect();
+        let theirs: Vec<Execution> = (0..6)
+            .map(|i| execution(&tenant, other, 2 * i + 1))
+            .collect();
+        let expected = stored(&service.repo, &mine).await;
+        stored(&service.repo, &theirs).await;
+        let query = format!("?agent_id={}&limit=2&offset=2", agent.0);
+        let (status, ids) = list(service, owner, &query).await;
+        println!("{query}: {status}, {ids:?}");
+        assert_eq!(status, 200);
+        assert_eq!(ids, expected[2..4].to_vec(), "the agent's third and fourth");
+    }
+
+    /// A workflow name's executions across two versions page by offset over
+    /// the merged list, newest first.
+    #[tokio::test]
+    async fn a_workflow_names_list_across_versions_answers_the_rows_after_the_offset() {
+        let tenant = TenantId::for_consumer_user("owner-sub").expect("owner tenant");
+        let agent = AgentId::new();
+        let (v1, v2) = (WorkflowId::new(), WorkflowId::new());
+        let mut service = StoreListed::default();
+        let executions: Vec<Execution> = (0..10).map(|i| execution(&tenant, agent, i)).collect();
+        let expected = stored(&service.repo, &executions).await;
+        for (i, e) in executions.iter().enumerate() {
+            let version = if i % 2 == 0 { v1 } else { v2 };
+            service.workflows.entry(version).or_default().push(e.id);
+        }
+        let rows = service
+            .list_executions_for_workflows_for_tenant(&tenant, &[v1, v2], 3, 3)
+            .await
+            .expect("the merged list");
+        let ids: Vec<String> = rows.iter().map(|e| e.id.0.to_string()).collect();
+        println!("versions v1, v2, limit 3, offset 3: {ids:?}");
+        assert_eq!(ids, expected[3..6].to_vec(), "the merged fourth to sixth");
     }
 }

@@ -902,6 +902,7 @@ mod step_facts_tests {
             _: Option<AgentId>,
             _: Option<WorkflowId>,
             _: usize,
+            _: usize,
         ) -> anyhow::Result<Vec<Execution>> {
             anyhow::bail!("not exercised")
         }
@@ -969,6 +970,7 @@ mod step_facts_tests {
             _: &TenantId,
             _: AgentId,
             _: usize,
+            _: usize,
         ) -> Result<Vec<Execution>, RepositoryError> {
             not_exercised()
         }
@@ -976,6 +978,7 @@ mod step_facts_tests {
             &self,
             _: &TenantId,
             _: WorkflowId,
+            _: usize,
             _: usize,
         ) -> Result<Vec<Execution>, RepositoryError> {
             not_exercised()
@@ -1016,6 +1019,7 @@ mod step_facts_tests {
         async fn find_recent_for_tenant(
             &self,
             _: &TenantId,
+            _: usize,
             _: usize,
         ) -> Result<Vec<Execution>, RepositoryError> {
             not_exercised()
@@ -1721,6 +1725,7 @@ mod cancel_path_tests {
             _: &TenantId,
             _: Option<AgentId>,
             _: Option<crate::domain::workflow::WorkflowId>,
+            _: usize,
             _: usize,
         ) -> anyhow::Result<Vec<Execution>> {
             anyhow::bail!("not exercised")

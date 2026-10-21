@@ -150,6 +150,7 @@ impl ExecutionService for Executions {
         _: Option<AgentId>,
         _: Option<crate::domain::workflow::WorkflowId>,
         _: usize,
+        _: usize,
     ) -> Result<Vec<Execution>> {
         anyhow::bail!("not exercised")
     }

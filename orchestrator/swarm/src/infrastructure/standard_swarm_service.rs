@@ -612,6 +612,7 @@ mod tests {
             _tenant_id: &TenantId,
             _agent_id: AgentId,
             _limit: usize,
+            _offset: usize,
         ) -> std::result::Result<Vec<Execution>, RepositoryError> {
             Ok(Vec::new())
         }
@@ -621,6 +622,7 @@ mod tests {
             _tenant_id: &TenantId,
             _workflow_id: WorkflowId,
             _limit: usize,
+            _offset: usize,
         ) -> std::result::Result<Vec<Execution>, RepositoryError> {
             Ok(Vec::new())
         }
@@ -637,6 +639,7 @@ mod tests {
             &self,
             _tenant_id: &TenantId,
             _limit: usize,
+            _offset: usize,
         ) -> std::result::Result<Vec<Execution>, RepositoryError> {
             Ok(Vec::new())
         }

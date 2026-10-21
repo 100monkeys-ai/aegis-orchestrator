@@ -153,6 +153,7 @@ impl ExecutionService for TwoTenantExecutions {
         _: Option<AgentId>,
         _: Option<crate::domain::workflow::WorkflowId>,
         _: usize,
+        _: usize,
     ) -> Result<Vec<Execution>> {
         Ok(self
             .executions

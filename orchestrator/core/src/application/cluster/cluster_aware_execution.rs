@@ -330,9 +330,10 @@ impl ExecutionService for ClusterAwareExecutionService {
         agent_id: Option<AgentId>,
         workflow_id: Option<crate::domain::workflow::WorkflowId>,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<Execution>> {
         self.inner
-            .list_executions_for_tenant(tenant_id, agent_id, workflow_id, limit)
+            .list_executions_for_tenant(tenant_id, agent_id, workflow_id, limit, offset)
             .await
     }
 

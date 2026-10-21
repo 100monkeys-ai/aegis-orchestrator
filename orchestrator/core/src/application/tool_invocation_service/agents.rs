@@ -1372,7 +1372,7 @@ spec:
         }
         let stored = h
             .executions
-            .find_by_agent_for_tenant(&tenant(), h.refused.id, 100)
+            .find_by_agent_for_tenant(&tenant(), h.refused.id, 100, 0)
             .await
             .unwrap();
         if !stored.is_empty() {

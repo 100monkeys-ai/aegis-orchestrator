@@ -446,7 +446,7 @@ impl ToolInvocationService {
             }
         } else {
             self.execution_service
-                .list_executions_for_tenant(&tenant_id, agent_id, None, limit)
+                .list_executions_for_tenant(&tenant_id, agent_id, None, limit, 0)
                 .await
         };
         match listed {

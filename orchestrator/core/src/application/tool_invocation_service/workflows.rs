@@ -2382,6 +2382,7 @@ mod workflow_run_tests {
             _: Option<AgentId>,
             _: Option<crate::domain::workflow::WorkflowId>,
             _: usize,
+            _: usize,
         ) -> anyhow::Result<Vec<Execution>> {
             Ok(vec![])
         }

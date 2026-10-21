@@ -174,6 +174,7 @@ impl ExecutionService for Records {
         _: Option<AgentId>,
         _: Option<crate::domain::workflow::WorkflowId>,
         _: usize,
+        _: usize,
     ) -> anyhow::Result<Vec<Execution>> {
         anyhow::bail!("not exercised")
     }
@@ -260,6 +261,7 @@ impl crate::domain::repository::ExecutionRepository for Records {
         _: &TenantId,
         _: AgentId,
         _: usize,
+        _: usize,
     ) -> Result<Vec<Execution>, crate::domain::repository::RepositoryError> {
         Ok(vec![])
     }
@@ -267,6 +269,7 @@ impl crate::domain::repository::ExecutionRepository for Records {
         &self,
         _: &TenantId,
         _: crate::domain::workflow::WorkflowId,
+        _: usize,
         _: usize,
     ) -> Result<Vec<Execution>, crate::domain::repository::RepositoryError> {
         Ok(vec![])
@@ -281,6 +284,7 @@ impl crate::domain::repository::ExecutionRepository for Records {
     async fn find_recent_for_tenant(
         &self,
         _: &TenantId,
+        _: usize,
         _: usize,
     ) -> Result<Vec<Execution>, crate::domain::repository::RepositoryError> {
         Ok(vec![])

@@ -298,6 +298,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
         tenant_id: &TenantId,
         agent_id: AgentId,
         limit: usize,
+        _offset: usize,
     ) -> Result<Vec<Execution>, RepositoryError> {
         let rows = sqlx::query(
             r#"
@@ -415,6 +416,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
         tenant_id: &TenantId,
         workflow_id: crate::domain::workflow::WorkflowId,
         limit: usize,
+        _offset: usize,
     ) -> Result<Vec<Execution>, RepositoryError> {
         let rows = sqlx::query(
             r#"
@@ -597,6 +599,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
         &self,
         tenant_id: &TenantId,
         limit: usize,
+        _offset: usize,
     ) -> Result<Vec<Execution>, RepositoryError> {
         let rows = sqlx::query(
             r#"

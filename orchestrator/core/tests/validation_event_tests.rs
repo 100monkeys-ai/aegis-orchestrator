@@ -165,6 +165,7 @@ impl ExecutionService for MockExecutionService {
         _agent_id: Option<AgentId>,
         _workflow_id: Option<aegis_orchestrator_core::domain::workflow::WorkflowId>,
         _limit: usize,
+        _offset: usize,
     ) -> anyhow::Result<Vec<Execution>> {
         Ok(vec![])
     }
@@ -539,9 +540,10 @@ impl ExecutionService for StoredExecutionsService {
         agent_id: Option<AgentId>,
         workflow_id: Option<aegis_orchestrator_core::domain::workflow::WorkflowId>,
         limit: usize,
+        offset: usize,
     ) -> anyhow::Result<Vec<Execution>> {
         MockExecutionService
-            .list_executions_for_tenant(tenant_id, agent_id, workflow_id, limit)
+            .list_executions_for_tenant(tenant_id, agent_id, workflow_id, limit, offset)
             .await
     }
     async fn delete_execution_for_tenant(

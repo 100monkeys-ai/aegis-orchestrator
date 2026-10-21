@@ -208,7 +208,7 @@ impl CorrelatedActivityStreamService {
     ) -> Result<Vec<CorrelatedActivityEvent>> {
         let executions = self
             .execution_repository
-            .find_by_agent_for_tenant(tenant_id, agent_id, 50)
+            .find_by_agent_for_tenant(tenant_id, agent_id, 50, 0)
             .await?;
         let mut history = Vec::new();
 

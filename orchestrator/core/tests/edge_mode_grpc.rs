@@ -947,6 +947,7 @@ mod prod_handler_stubs {
             _agent_id: Option<aegis_orchestrator_core::domain::agent::AgentId>,
             _workflow_id: Option<aegis_orchestrator_core::domain::workflow::WorkflowId>,
             _limit: usize,
+            _offset: usize,
         ) -> anyhow::Result<Vec<aegis_orchestrator_core::domain::execution::Execution>> {
             unimplemented!("test stub")
         }

@@ -264,6 +264,7 @@ impl ExecutionService for NoExecutions {
         _: Option<AgentId>,
         _: Option<aegis_orchestrator_core::domain::workflow::WorkflowId>,
         _: usize,
+        _: usize,
     ) -> Result<Vec<Execution>> {
         Ok(vec![])
     }

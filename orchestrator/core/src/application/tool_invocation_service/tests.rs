@@ -441,6 +441,7 @@ impl ExecutionService for TestExecutionService {
         _: Option<AgentId>,
         _: Option<crate::domain::workflow::WorkflowId>,
         _: usize,
+        _: usize,
     ) -> Result<Vec<Execution>> {
         anyhow::bail!("TestExecutionService::list_executions_for_tenant not exercised in this test")
     }
@@ -550,6 +551,7 @@ impl ExecutionService for LogsTestExecutionService {
         _: &TenantId,
         _: Option<AgentId>,
         _: Option<crate::domain::workflow::WorkflowId>,
+        _: usize,
         _: usize,
     ) -> Result<Vec<Execution>> {
         anyhow::bail!(
@@ -1260,6 +1262,7 @@ impl ExecutionService for PassingJudgeExecutionService {
         _: Option<AgentId>,
         _: Option<crate::domain::workflow::WorkflowId>,
         _: usize,
+        _: usize,
     ) -> Result<Vec<Execution>> {
         anyhow::bail!(
             "PassingJudgeExecutionService::list_executions_for_tenant not exercised in this test"
@@ -1587,9 +1590,10 @@ impl ExecutionService for ChatSessionJudgeExecutionService {
         agent_id: Option<AgentId>,
         workflow_id: Option<crate::domain::workflow::WorkflowId>,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<Execution>> {
         PassingJudgeExecutionService
-            .list_executions_for_tenant(tenant_id, agent_id, workflow_id, limit)
+            .list_executions_for_tenant(tenant_id, agent_id, workflow_id, limit, offset)
             .await
     }
     async fn delete_execution_for_tenant(
@@ -3941,6 +3945,7 @@ async fn tool_invocation_propagates_initiating_user_sub_to_child_execution() {
             _: Option<AgentId>,
             _: Option<crate::domain::workflow::WorkflowId>,
             _: usize,
+            _: usize,
         ) -> Result<Vec<Execution>> {
             anyhow::bail!("not exercised")
         }
@@ -4715,6 +4720,7 @@ impl ExecutionService for AttachmentsCapturingExecutionService {
         _: Option<AgentId>,
         _: Option<crate::domain::workflow::WorkflowId>,
         _: usize,
+        _: usize,
     ) -> Result<Vec<Execution>> {
         anyhow::bail!("not exercised")
     }
@@ -5415,6 +5421,7 @@ impl ExecutionService for CannedListExecutionService {
         _: Option<AgentId>,
         _: Option<crate::domain::workflow::WorkflowId>,
         _: usize,
+        _: usize,
     ) -> Result<Vec<Execution>> {
         Ok(self.executions.clone())
     }
@@ -5900,6 +5907,7 @@ impl ExecutionService for TenantScopedTaskExecutionService {
         tenant_id: &TenantId,
         _: Option<AgentId>,
         _: Option<crate::domain::workflow::WorkflowId>,
+        _: usize,
         _: usize,
     ) -> Result<Vec<Execution>> {
         *self.list_called_with.lock().unwrap() = Some(tenant_id.clone());
@@ -7321,6 +7329,7 @@ impl ExecutionService for RenderExecutionService {
         _: &TenantId,
         _: Option<AgentId>,
         _: Option<crate::domain::workflow::WorkflowId>,
+        _: usize,
         _: usize,
     ) -> Result<Vec<Execution>> {
         Ok(vec![])

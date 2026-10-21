@@ -571,6 +571,7 @@ impl ExecutionRepository for InMemoryExecutionRepository {
         tenant_id: &TenantId,
         agent_id: AgentId,
         limit: usize,
+        _offset: usize,
     ) -> Result<Vec<Execution>, RepositoryError> {
         let executions = self.executions.read().unwrap();
         let mut results: Vec<Execution> = executions
@@ -589,6 +590,7 @@ impl ExecutionRepository for InMemoryExecutionRepository {
         _tenant_id: &TenantId,
         _workflow_id: crate::domain::workflow::WorkflowId,
         _limit: usize,
+        _offset: usize,
     ) -> Result<Vec<Execution>, RepositoryError> {
         // In-memory repo does not track workflow-to-execution relationships
         Ok(Vec::new())
@@ -615,6 +617,7 @@ impl ExecutionRepository for InMemoryExecutionRepository {
         &self,
         tenant_id: &TenantId,
         limit: usize,
+        _offset: usize,
     ) -> Result<Vec<Execution>, RepositoryError> {
         let executions = self.executions.read().unwrap();
         let mut execution_list: Vec<Execution> = executions
@@ -1592,7 +1595,7 @@ mod tests {
         // Test with empty repository
         let agent_id = AgentId::new();
         let agent_executions = repo
-            .find_by_agent_for_tenant(&tenant, agent_id, 100)
+            .find_by_agent_for_tenant(&tenant, agent_id, 100, 0)
             .await
             .unwrap();
         assert_eq!(agent_executions.len(), 0);
@@ -1675,6 +1678,59 @@ mod tests {
         assert_eq!(page1.len(), 2);
         assert_eq!(page2.len(), 2);
         assert_ne!(page1[0].id, page2[0].id);
+    }
+
+    /// A tenant's executions page by offset, newest first: the rows after
+    /// the first `offset`, at most `limit`, another tenant's never among
+    /// them (row `executions-list-no-offset-2026-10-21`).
+    #[tokio::test]
+    async fn find_recent_for_tenant_answers_the_rows_after_the_offset() {
+        let repo = InMemoryExecutionRepository::new();
+        let t = TenantId::new("t-a".to_string()).unwrap();
+        let other = TenantId::new("t-b".to_string()).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let e = make_execution(&t, 1000 + i);
+            repo.save_for_tenant(&t, &e).await.unwrap();
+            ids.push(e.id);
+            let o = make_execution(&other, 1000 + i);
+            repo.save_for_tenant(&other, &o).await.unwrap();
+        }
+        ids.reverse();
+        let page = |rows: Vec<Execution>| rows.iter().map(|e| e.id).collect::<Vec<_>>();
+        let second = page(repo.find_recent_for_tenant(&t, 2, 2).await.unwrap());
+        let last = page(repo.find_recent_for_tenant(&t, 2, 4).await.unwrap());
+        let past = page(repo.find_recent_for_tenant(&t, 2, 5).await.unwrap());
+        println!("offset 2: {second:?}; offset 4: {last:?}; offset 5: {past:?}");
+        assert_eq!(second, ids[2..4].to_vec());
+        assert_eq!(last, ids[4..5].to_vec());
+        assert!(past.is_empty());
+    }
+
+    /// One agent's executions page by offset, newest first, another agent's
+    /// never among them.
+    #[tokio::test]
+    async fn find_by_agent_for_tenant_answers_the_rows_after_the_offset() {
+        let repo = InMemoryExecutionRepository::new();
+        let t = TenantId::new("t-a".to_string()).unwrap();
+        let agent = AgentId::new();
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let mut e = make_execution(&t, 1000 + 2 * i);
+            e.agent_id = agent;
+            repo.save_for_tenant(&t, &e).await.unwrap();
+            ids.push(e.id);
+            let o = make_execution(&t, 1001 + 2 * i);
+            repo.save_for_tenant(&t, &o).await.unwrap();
+        }
+        ids.reverse();
+        let rows = repo
+            .find_by_agent_for_tenant(&t, agent, 2, 1)
+            .await
+            .unwrap();
+        let page: Vec<_> = rows.iter().map(|e| e.id).collect();
+        println!("agent, limit 2, offset 1: {page:?}");
+        assert_eq!(page, ids[1..3].to_vec());
     }
 
     fn make_workflow_exec(

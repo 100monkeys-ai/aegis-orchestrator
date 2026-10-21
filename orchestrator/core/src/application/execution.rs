@@ -214,7 +214,7 @@ pub trait ExecutionService: Send + Sync {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>>;
 
     /// List executions for a tenant, optionally filtered by `agent_id` and/or
-    /// `workflow_id`, newest first, capped at `limit`.
+    /// `workflow_id`, newest first: the `limit` rows after the first `offset`.
     ///
     /// All caller-facing list queries MUST be tenant-scoped. There is no
     /// `list_executions` convenience that defaults to a consumer-tier
@@ -225,21 +225,23 @@ pub trait ExecutionService: Send + Sync {
         agent_id: Option<AgentId>,
         workflow_id: Option<crate::domain::workflow::WorkflowId>,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<Execution>>;
 
-    /// The tenant's executions of any of `workflow_ids`, newest first, at
-    /// most `limit`: a workflow name's executions across its versions (AEGIS
-    /// ADR-148).
+    /// The tenant's executions of any of `workflow_ids`, newest first, the
+    /// `limit` rows after the first `offset`: a workflow name's executions
+    /// across its versions (AEGIS ADR-148).
     async fn list_executions_for_workflows_for_tenant(
         &self,
         tenant_id: &TenantId,
         workflow_ids: &[crate::domain::workflow::WorkflowId],
         limit: usize,
+        _offset: usize,
     ) -> Result<Vec<Execution>> {
         let mut rows: Vec<Execution> = Vec::new();
         for id in workflow_ids {
             for execution in self
-                .list_executions_for_tenant(tenant_id, None, Some(*id), limit)
+                .list_executions_for_tenant(tenant_id, None, Some(*id), limit, 0)
                 .await?
             {
                 if !rows.iter().any(|e| e.id == execution.id) {
@@ -860,21 +862,22 @@ impl StandardExecutionService {
         agent_id: Option<AgentId>,
         workflow_id: Option<crate::domain::workflow::WorkflowId>,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<Execution>> {
         if let Some(wid) = workflow_id {
             Ok(self
                 .repository
-                .find_by_workflow_for_tenant(tenant_id, wid, limit)
+                .find_by_workflow_for_tenant(tenant_id, wid, limit, offset)
                 .await?)
         } else if let Some(aid) = agent_id {
             Ok(self
                 .repository
-                .find_by_agent_for_tenant(tenant_id, aid, limit)
+                .find_by_agent_for_tenant(tenant_id, aid, limit, offset)
                 .await?)
         } else {
             Ok(self
                 .repository
-                .find_recent_for_tenant(tenant_id, limit)
+                .find_recent_for_tenant(tenant_id, limit, offset)
                 .await?)
         }
     }
@@ -1889,11 +1892,62 @@ mod tests {
             "expected NFS gateway error, got: {err}"
         );
         let executions = execution_repo
-            .find_recent_for_tenant(&tenant_id, 10)
+            .find_recent_for_tenant(&tenant_id, 10, 0)
             .await
             .unwrap();
         assert_eq!(executions.len(), 1);
         assert_eq!(executions[0].id, parent_execution.id);
+    }
+
+    /// The service lists a tenant's executions by offset, newest first:
+    /// all of them and one agent's, the rows after the first `offset`
+    /// (row `executions-list-no-offset-2026-10-21`).
+    #[tokio::test]
+    async fn list_executions_for_tenant_answers_the_rows_after_the_offset() {
+        let tenant_id = CoreTenantId::for_consumer_user("lister").unwrap();
+        let agent = AgentId::new();
+        let other = AgentId::new();
+        let execution_repo = Arc::new(InMemoryExecutionRepository::new());
+        let mut all = Vec::new();
+        let mut mine = Vec::new();
+        for i in 0..6 {
+            let owner = if i % 2 == 0 { agent } else { other };
+            let mut execution = make_parent_execution(owner);
+            execution.tenant_id = tenant_id.clone();
+            execution.started_at = chrono::DateTime::from_timestamp(1_760_000_000 + i, 0).unwrap();
+            execution_repo
+                .save_for_tenant(&tenant_id, &execution)
+                .await
+                .unwrap();
+            all.push(execution.id);
+            if owner == agent {
+                mine.push(execution.id);
+            }
+        }
+        all.reverse();
+        mine.reverse();
+        let service = StandardExecutionService::new(
+            Arc::new(InMemoryAgentRepository::new()),
+            Arc::new(TestVolumeService {
+                volumes: HashMap::new(),
+            }),
+            Arc::new(Supervisor::new(Arc::new(TestRuntime::default()))),
+            execution_repo,
+            Arc::new(EventBus::new(16)),
+            Arc::new(crate::domain::node_config::NodeConfigManifest::default()),
+        );
+        let ids = |rows: Vec<Execution>| rows.iter().map(|e| e.id).collect::<Vec<_>>();
+        let recent = ids(service
+            .list_executions_for_tenant(&tenant_id, None, None, 2, 2)
+            .await
+            .unwrap());
+        let agents = ids(service
+            .list_executions_for_tenant(&tenant_id, Some(agent), None, 2, 1)
+            .await
+            .unwrap());
+        println!("all, limit 2, offset 2: {recent:?}; agent, limit 2, offset 1: {agents:?}");
+        assert_eq!(recent, all[2..4].to_vec());
+        assert_eq!(agents, mine[1..3].to_vec());
     }
 
     /// Mock OutputHandlerService for regression tests.
@@ -4177,7 +4231,7 @@ mod tests {
     ) -> Vec<String> {
         let mut found = Vec::new();
         let stored = execution_repo
-            .find_by_agent_for_tenant(tenant_id, agent_id, 100)
+            .find_by_agent_for_tenant(tenant_id, agent_id, 100, 0)
             .await
             .unwrap();
         if !stored.is_empty() {
@@ -8993,6 +9047,7 @@ impl ExecutionService for StandardExecutionService {
         agent_id: Option<AgentId>,
         workflow_id: Option<crate::domain::workflow::WorkflowId>,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<Execution>> {
         StandardExecutionService::list_executions_for_tenant(
             self,
@@ -9000,6 +9055,7 @@ impl ExecutionService for StandardExecutionService {
             agent_id,
             workflow_id,
             limit,
+            offset,
         )
         .await
     }
