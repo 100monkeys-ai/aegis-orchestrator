@@ -2572,7 +2572,7 @@ mod tests {
     /// left (C3); every ContainerRun mounts the run's tree volume `tree` at
     /// `/workspace` and none the run's repository, and the workflow works on
     /// no repository (C2, C4); a refused landing ends in LAND_REFUSED
-    /// carrying the landing's own sentence, Nuclear Notes' (C5); `draft_only`
+    /// carrying the landing's own sentence, Carbon Forge's (C5); `draft_only`
     /// defaults to true and routes the write to COMPLETE (C6).
     #[test]
     fn carbon_forge_is_a_second_builtin_beside_the_forge_on_a_nuclear_notes_tree() {

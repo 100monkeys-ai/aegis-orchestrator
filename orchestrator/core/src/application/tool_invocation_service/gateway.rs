@@ -174,7 +174,11 @@ impl ToolInvocationService {
                 ))
             })?;
 
-        let declared_tools = agent.manifest.spec.tools;
+        let declared_tools = self
+            .remote_tool_former_names
+            .manifest(agent.manifest)
+            .spec
+            .tools;
         if declared_tools.is_empty() {
             return Ok(Vec::new());
         }
@@ -271,7 +275,11 @@ impl ToolInvocationService {
                 ))
             })?;
 
-        let declared_tools = agent.manifest.spec.tools;
+        let declared_tools = self
+            .remote_tool_former_names
+            .manifest(agent.manifest)
+            .spec
+            .tools;
         if declared_tools.is_empty() {
             return Ok(Vec::new());
         }
@@ -322,7 +330,10 @@ impl ToolInvocationService {
                     "Failed to load agent for tool scoping: {e}"
                 ))
             })?;
-        let declared_tools = agent.manifest.spec.tools;
+        // Carbon Forge ADR-0198, Update of 2026-10-21, R3 step 1: the
+        // manifest and the run's choices read each server by its own name.
+        let manifest = self.remote_tool_former_names.manifest(agent.manifest);
+        let declared_tools = manifest.spec.tools.clone();
         // The run's person and its dispatch's choices, as the execution
         // recorded them: never a service account's person (G2,
         // `execution::person_sub`).
@@ -333,15 +344,17 @@ impl ToolInvocationService {
             .ok();
         let contexts = execution
             .as_ref()
-            .map(|execution| execution.input.contexts())
+            .map(|execution| {
+                self.remote_tool_former_names
+                    .execution_contexts(execution.input.contexts())
+            })
             .unwrap_or_default();
         let contexts_of_run = contexts.clone();
         // Zaru ADR-0055 D16: a declared context the dispatch filled with a
         // binding brings its server's tools, unless `spec.tools` names some
         // of them, when the run sees exactly those; an undeclared one brings
         // none.
-        let filled_contexts: Vec<String> = agent
-            .manifest
+        let filled_contexts: Vec<String> = manifest
             .spec
             .contexts
             .iter()
@@ -439,7 +452,7 @@ impl ToolInvocationService {
             None => None,
         };
         tools.retain(|tool| match &admission {
-            Some(admission) => admission.admits(&tool.name),
+            Some(admission) => self.profile_admits(admission, &tool.name),
             None => {
                 let family = tool.name.split('.').next().unwrap_or(&tool.name);
                 !(family == crate::application::profile_service::MAIL_FAMILY
@@ -1271,7 +1284,11 @@ impl ToolInvocationService {
             .get_execution_unscoped(execution_id)
             .await
         {
-            Ok(execution) => (execution.input.contexts(), true),
+            Ok(execution) => (
+                self.remote_tool_former_names
+                    .execution_contexts(execution.input.contexts()),
+                true,
+            ),
             Err(_) => (call_contexts.cloned().unwrap_or_default(), false),
         };
         GatewayActing {
@@ -1389,6 +1406,8 @@ impl ToolInvocationService {
             Some(meta) => super::context_args::parse_contexts(meta)?,
             None => None,
         }
+        .map(|choices| self.resolve_former_contexts(choices))
+        .transpose()?
         .unwrap_or_default();
         // AEGIS ADR-140 D12, D10: the conversation's profile, one id, never
         // beside chosen contexts; its active bindings are the choices.
@@ -1544,12 +1563,33 @@ impl ToolInvocationService {
             .map(|run| run.workflow_id.as_uuid())
     }
 
-    /// The registered remote server `tool_name` belongs to, and the tool's
-    /// own name on it (`<server>.<tool>`; a server's name has no dot).
-    pub(super) fn remote_tool_of<'a>(&self, tool_name: &'a str) -> Option<(&'a str, &'a str)> {
+    /// The registered remote server `tool_name` belongs to, by the server's
+    /// own name, and the tool's own name on it (`<server>.<tool>`; a
+    /// server's name has no dot). A tool named by a former name of the
+    /// server is the server's (Carbon Forge ADR-0198, Update of 2026-10-21,
+    /// R3 step 1).
+    pub(super) fn remote_tool_of<'s, 'a>(
+        &'s self,
+        tool_name: &'a str,
+    ) -> Option<(&'s str, &'a str)> {
         let (server, tool) = tool_name.split_once('.')?;
-        (!tool.is_empty() && self.remote_tool_servers.iter().any(|name| name == server))
-            .then_some((server, tool))
+        if tool.is_empty() {
+            return None;
+        }
+        let server = self.remote_tool_former_names.current(server);
+        self.remote_tool_servers
+            .iter()
+            .find(|name| name.as_str() == server)
+            .map(|name| (name.as_str(), tool))
+    }
+
+    /// The remote server a run's tree lives on (AEGIS ADR-147): the
+    /// configured server whose name or former names include
+    /// [`crate::domain::run_tree::NUCLEAR_NOTES_SERVER`], by its own name
+    /// (Carbon Forge ADR-0198, Update of 2026-10-21, R3 step 1).
+    pub(super) fn run_tree_server(&self) -> &str {
+        self.remote_tool_former_names
+            .current(crate::domain::run_tree::NUCLEAR_NOTES_SERVER)
     }
 
     /// The acting user's credential for `server` (AEGIS ADR-132 H1, H3,
@@ -1587,9 +1627,7 @@ impl ToolInvocationService {
             ))
             .answered(CallerAnswer::Internal(InternalFailure::Unavailable))
         })?;
-        if carries == CallCredential::ExecutionToken
-            && server == crate::domain::run_tree::NUCLEAR_NOTES_SERVER
-        {
+        if carries == CallCredential::ExecutionToken && server == self.run_tree_server() {
             return match source
                 .execution_token(tenant_id, user_id, execution_id.0)
                 .await

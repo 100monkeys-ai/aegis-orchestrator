@@ -17,10 +17,10 @@
 # approval, a crossing of the boundary gated as every landing is. Each
 # step's answer rides the fields every repository step answers: RENDER's
 # commit sha1 in `commit_sha`, its tag in `ref`, its snapshot id in
-# `branch` and Nuclear Notes' whole answer in `diff`; PUSH's job id in
+# `branch` and Carbon Forge's whole answer in `diff`; PUSH's job id in
 # `commit_sha`, its remote in `ref` and whether it queued in `branch`.
 # WAIT waits for the deploy run on the remote: it reads the GitHub Actions
-# runs of the pushed tag's commit through Nuclear Notes until every run
+# runs of the pushed tag's commit through Carbon Forge until every run
 # concluded, answering the run's id in `commit_sha`, its conclusion (or
 # `no_run` when the remote ran none) in `branch` and its html_url in `ref`;
 # a failed run, or one unconcluded at the timeout, goes to DEPLOY_FAILED
@@ -35,7 +35,7 @@ metadata:
   name: "carbon-deploy"
   version: "1.1.0"
   description: |-
-    Deploys one cut of one of your Nuclear Notes trees: the cut is rendered
+    Deploys one cut of one of your Carbon Forge trees: the cut is rendered
     into the tree's git archive and tagged, then, after your approval, the
     archive is pushed to its remote, whose own pipeline deploys it. The run
     records the cut, the environment, the snapshot, the commit and the push
@@ -48,7 +48,7 @@ metadata:
     properties:
       cut:
         type: string
-        description: "The cut to deploy, as Nuclear Notes names it (stable, v0.9, forge-<execution id>)."
+        description: "The cut to deploy, as Carbon Forge names it (stable, v0.9, forge-<execution id>)."
       environment:
         type: string
         description: "The environment the deploy is for. Recorded, not interpreted."

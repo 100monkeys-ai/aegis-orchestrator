@@ -1,7 +1,7 @@
 # Copyright (c) 2026 100monkeys.ai
 # SPDX-License-Identifier: AGPL-3.0
 #
-# Carbon Forge: The Forge on a Nuclear Notes tree (AEGIS ADR-147).
+# Carbon Forge: The Forge on a Carbon Forge tree (AEGIS ADR-147).
 #
 #   ANALYZE ─► AWAIT_REQUIREMENTS_APPROVAL ─yes─► ARCHITECT ─► AWAIT_ARCH_APPROVAL ─yes─► TEST ◄─┐
 #      ▲                 │ no                        ▲                  │ no                │    │ the tests
@@ -26,14 +26,14 @@
 # at /workspace in every agent state and step container (C4). DIFF is the
 # run's change against that revision; COMMIT writes the run's tree to a lane
 # of the run's own; LAND lands that lane as one changeset after your
-# approval, and a conflict ends in LAND_REFUSED with Nuclear Notes' own
+# approval, and a conflict ends in LAND_REFUSED with Carbon Forge's own
 # sentence (C5). draft_only (the default) ends at COMPLETE with the change
 # on the lane (C6). Every path in the prompts and in tests is written
 # relative to the tree's root, never absolute.
 #
 # A landed run becomes a cut (AEGIS ADR-149 C1): CUT names a snapshot of the
 # tree's workspace with the dispatch's `cut`, else forge-<execution id>, and
-# a refusal ends in CUT_REFUSED with Nuclear Notes' own sentence. The step's
+# a refusal ends in CUT_REFUSED with Carbon Forge's own sentence. The step's
 # answer carries the cut name in `ref` and the snapshot id in `commit_sha`,
 # which COMPLETE records as `cut` and `snapshot_id`. A draft_only run never
 # reaches LAND, and so never cuts.
@@ -45,7 +45,7 @@ metadata:
   name: "carbon-forge"
   version: "1.1.0"
   description: |-
-    Develops one change in one of your Nuclear Notes trees: requirements and a
+    Develops one change in one of your Carbon Forge trees: requirements and a
     design, each approved by you, then tests written first, the implementation,
     your test suite run in a container on the tree, a review by three judges,
     and the change written to the run's own lane. With draft_only false, the
@@ -563,7 +563,7 @@ spec:
         sentence: "{{{LAND.output.sentence}}}"
       transitions: []
 
-    # The run landed and its cut was refused: Nuclear Notes' own sentence.
+    # The run landed and its cut was refused: Carbon Forge's own sentence.
     CUT_REFUSED:
       kind: Action
       action: update_blackboard

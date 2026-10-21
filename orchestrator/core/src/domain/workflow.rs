@@ -1216,7 +1216,7 @@ pub enum ActionName {
     /// image generation models and writes each as a file into the run's
     /// workspace volume (AEGIS ADR-143 I5).
     ImageGenerate,
-    /// The diff of the run's Nuclear Notes tree against the revision it was
+    /// The diff of the run's Carbon Forge tree against the revision it was
     /// materialized from (AEGIS ADR-147 C3).
     TreeDiff,
     /// Writes the run's tree, with the argument `message` as its intent, to
@@ -1269,11 +1269,11 @@ pub enum ActionNeed {
     /// manifest cannot say whether the node has one, so a workflow's
     /// registration on the node checks it, never the parse.
     ImageGenerationModel,
-    /// The run's Nuclear Notes tree, named at its start by `trees` (AEGIS
+    /// The run's Carbon Forge tree, named at its start by `trees` (AEGIS
     /// ADR-147 C2). The manifest cannot say what a run names, so a run
     /// holding none is refused by the step, never the parse.
     RunTree,
-    /// The run's Nuclear Notes tree named by `trees`, never materialized: a
+    /// The run's Carbon Forge tree named by `trees`, never materialized: a
     /// workflow whose every state is an Action needing only this binds the
     /// tree with no volume (AEGIS ADR-149 C2).
     RunTreeRef,

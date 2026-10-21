@@ -1,8 +1,8 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # A workflow run's Nuclear Notes code tree (AEGIS ADR-147)
+//! # A workflow run's Carbon Forge code tree (AEGIS ADR-147)
 //!
-//! `carbon-forge` works on a Nuclear Notes code tree instead of a git
+//! `carbon-forge` works on a Carbon Forge code tree instead of a git
 //! repository. A start names it by the dispatch key `trees` (C2): one entry
 //! naming its workspace, its path and the revision the run starts from. The
 //! start materializes that revision into a volume of the run's own, named
@@ -35,7 +35,9 @@ pub const RUN_TREE_VOLUME: &str = "tree";
 /// Where an agent state of the run sees its tree (C4).
 pub const RUN_TREE_MOUNT: &str = "/workspace";
 
-/// The remote MCP server a tree lives on.
+/// The name the remote MCP server a tree lives on is looked up by: the
+/// configured server whose name or former names include it (Carbon Forge
+/// ADR-0198, Update of 2026-10-21, R3 step 1), called by its own name.
 pub const NUCLEAR_NOTES_SERVER: &str = "nuclear-notes";
 
 /// The Carbon Forge tool a run's execution token always holds (NN ADR-0179
@@ -77,7 +79,7 @@ pub const CARBON_FORGE_ACTION_TOOLS: &[(ActionName, &[&str])] = &[
 /// The refusal of a start naming a tree on a node that cannot materialize
 /// one.
 pub const NO_TREE_SERVICE: &str =
-    "this node has no Nuclear Notes tree service, so a run cannot be given trees";
+    "this node has no Carbon Forge tree service, so a run cannot be given trees";
 
 /// The refusal of a tree step in a run that names no tree.
 pub const RUN_HOLDS_NO_TREE: &str = "this run holds no tree";
@@ -89,7 +91,7 @@ pub const TREES_ARE_A_WORKFLOWS: &str =
 /// The sentence refusing a `trees` of any other shape (C2).
 pub fn trees_refusal() -> String {
     format!(
-        "trees must be {TREES_SHAPE}: one tree, naming its Nuclear Notes workspace, its path and the revision the run starts from"
+        "trees must be {TREES_SHAPE}: one tree, naming its Carbon Forge workspace, its path and the revision the run starts from"
     )
 }
 
@@ -163,7 +165,7 @@ pub fn tree_lane(run: uuid::Uuid) -> String {
     format!("carbon-forge-{run}")
 }
 
-/// The SHA-256 of `bytes`, lowercase hex, as Nuclear Notes names a blob.
+/// The SHA-256 of `bytes`, lowercase hex, as Carbon Forge names a blob.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -187,7 +189,7 @@ pub enum RunTreeError {
 }
 
 /// Where a run's tree is materialized and mounted (C4): the interpreter's
-/// tool invocation service, which reaches Nuclear Notes through the SEAL
+/// tool invocation service, which reaches Carbon Forge through the SEAL
 /// gateway as the run's person, with the binding the run's `contexts` chose.
 #[async_trait]
 pub trait RunTrees: Send + Sync {

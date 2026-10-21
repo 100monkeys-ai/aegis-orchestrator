@@ -5,7 +5,7 @@
 //! A profile is a person's own named set of their credential bindings, any
 //! number of any kinds, with an allow-list of tool patterns that can only
 //! narrow what the deployment's security context admits, and optional
-//! defaults (a repository, a Nuclear Notes workspace, instructions).
+//! defaults (a repository, a Carbon Forge workspace, instructions).
 //!
 //! Names (D11): "profile" is this object. "Security context" keeps meaning
 //! the deployment's named policy (`zaru-free`, ...) and "contexts" the
@@ -43,7 +43,7 @@ pub const NAME_TAKEN_REFUSAL: &str =
 pub const INSTRUCTIONS_REFUSAL: &str = "'instructions' must be at most 4,000 characters.";
 /// The refusal of a `notes_workspace` out of range.
 pub const NOTES_WORKSPACE_REFUSAL: &str =
-    "'notes_workspace' must be a Nuclear Notes workspace id or slug of 1 to 128 characters.";
+    "'notes_workspace' must be a Carbon Forge workspace id or slug of 1 to 128 characters.";
 /// The refusal of a `repository` that is not one of the owner's.
 pub const REPOSITORY_REFUSAL: &str = "'repository' must be the id of one of your repositories.";
 /// The refusal of a `bindings` that is not a list of ids.
@@ -204,7 +204,7 @@ pub struct Profile {
     pub tools: ToolAllowList,
     /// The default repository: one of the owner's git repository bindings.
     pub repository: Option<Uuid>,
-    /// The default Nuclear Notes workspace, by id or slug.
+    /// The default Carbon Forge workspace, by id or slug.
     pub notes_workspace: Option<String>,
     pub instructions: Option<String>,
     pub created_at: DateTime<Utc>,

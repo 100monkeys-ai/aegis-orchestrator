@@ -161,7 +161,7 @@ pub struct StandardStartWorkflowExecutionUseCase {
     /// Set once at the composition root via `set_profiles()`; unset, a
     /// start that names a profile is refused.
     run_profiles: std::sync::OnceLock<Arc<dyn crate::application::profile_service::RunProfiles>>,
-    /// Where a workflow run's Nuclear Notes trees are materialized (AEGIS
+    /// Where a workflow run's Carbon Forge trees are materialized (AEGIS
     /// ADR-147 C4). Set once at the composition root via `set_trees()`;
     /// unset, a start that names trees is refused.
     run_trees: std::sync::OnceLock<Arc<dyn crate::domain::run_tree::RunTrees>>,
@@ -329,7 +329,7 @@ impl StandardStartWorkflowExecutionUseCase {
     /// AEGIS ADR-147 C2, C4: the trees a start names, by
     /// `[{workspace, path, revision}]`, each materialized into the run's
     /// volume `tree` before its first agent, as the run's person, through
-    /// the binding the run's `contexts` chose for Nuclear Notes. The
+    /// the binding the run's `contexts` chose for Carbon Forge. The
     /// persisted input keeps each tree with its volume and the blob refs
     /// its files were verified against. A workflow whose every state is an
     /// Action needing only the tree's name (AEGIS ADR-149 C2,

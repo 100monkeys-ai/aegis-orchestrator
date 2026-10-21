@@ -7,11 +7,11 @@
 //! `/workspace`, before the first agent; each file is verified against its
 //! SHA-256, and the run's record quotes the blob refs. The start is given
 //! its tree service as it is given its repositories (`set_repositories`):
-//! the interpreter's tool invocation service, which reaches Nuclear Notes
+//! the interpreter's tool invocation service, which reaches Carbon Forge
 //! through the SEAL gateway with the person's credential for the binding
 //! the run's `contexts` chose (AEGIS ADR-132 H1 to H8). Here that gateway
 //! is the loopback one of `carbon_forge_support`, answering the recorded
-//! `trees.materialize` and `blobs.get` of Nuclear Notes at `76d62e5`.
+//! `trees.materialize` and `blobs.get` of Carbon Forge at `76d62e5`.
 //!
 //! Until the start can be given a tree service this file does not compile:
 //! its red is `no method named set_trees found for struct
@@ -121,13 +121,13 @@ struct Started {
     _dirs: tempfile::TempDir,
 }
 
-/// Start carbon-forge on `TREE_PATH` at `REVISION`, Nuclear Notes answering
+/// Start carbon-forge on `TREE_PATH` at `REVISION`, Carbon Forge answering
 /// `blobs.get` with `bytes`.
 async fn start(bytes: &str) -> Started {
     start_answering(bytes, |_| {}).await
 }
 
-/// [`start`], Nuclear Notes' answers changed by `answers`.
+/// [`start`], Carbon Forge's answers changed by `answers`.
 async fn start_answering(
     bytes: &str,
     answers: impl FnOnce(&mut HashMap<String, Answer>),

@@ -4,7 +4,7 @@
 //! D2, D3): the orchestrator, not a header, tells the person's own chat turn
 //! from a key, by the credential that attested the session. Calls through
 //! the invoke route's service on sessions with no execution record, for a
-//! person whose one mailbox, one GitHub binding and one Nuclear Notes
+//! person whose one mailbox, one GitHub binding and one Carbon Forge
 //! binding are all connected.
 //!
 //! Trigger 1:
@@ -84,7 +84,7 @@ impl EnvelopeVerifier for Call {
     }
 }
 
-/// The person's one GitHub binding and one Nuclear Notes binding, each
+/// The person's one GitHub binding and one Carbon Forge binding, each
 /// answering its token.
 struct OneBindingPerServer {
     github: CredentialBindingId,

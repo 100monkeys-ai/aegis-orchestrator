@@ -4,7 +4,7 @@
 //!
 //! AEGIS ADR-147 (Proposed, page revision 55541) C2: a run names one tree
 //! by the dispatch key `trees`, `[{workspace, path, revision}]`, and its
-//! Nuclear Notes binding by `contexts`. Like `repositories` and `contexts`,
+//! Carbon Forge binding by `contexts`. Like `repositories` and `contexts`,
 //! `trees` is the platform's: a start checks its shape before anything is
 //! held, and the tree is materialized into the run's volume before its
 //! first agent (C4), so a node that cannot materialize a tree refuses the

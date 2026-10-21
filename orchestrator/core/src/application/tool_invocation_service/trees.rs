@@ -1,6 +1,6 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # A carbon-forge run's Nuclear Notes tree (AEGIS ADR-147)
+//! # A carbon-forge run's Carbon Forge tree (AEGIS ADR-147)
 //!
 //! The interpreter's tool invocation service is the run's tree service: at
 //! the start it materializes the named revision into a volume `tree` of the
@@ -11,9 +11,9 @@
 //! `trees.put` and `lane`; the landing lands that lane as one changeset
 //! with `lanes.land` once the run's person approved the call
 //! `aegis.tree.land` at the gate, as `aegis.git.land` is gated (AEGIS
-//! ADR-141 F8). A conflict is answered in Nuclear Notes' own sentence.
+//! ADR-141 F8). A conflict is answered in Carbon Forge's own sentence.
 //!
-//! Nuclear Notes is reached only through the SEAL gateway's `InvokeTool`,
+//! Carbon Forge is reached only through the SEAL gateway's `InvokeTool`,
 //! as the run's person, with the credential of the binding the run's
 //! `contexts` chose for it (AEGIS ADR-132 H1 to H8); never by direct HTTP,
 //! so a materialized entry's presigned `url` is never fetched and every
@@ -38,7 +38,7 @@ use crate::domain::execution_token::{
 use crate::domain::fsal::FsalAccessPolicy;
 use crate::domain::run_tree::{
     blob_mismatch, parse_run_trees, sha256_hex, tree_lane, unified_diff, FileChange, RunTree,
-    RunTreeError, RunTrees, TreeBlob, NUCLEAR_NOTES_SERVER, RUN_HOLDS_NO_TREE, TREES_INPUT_KEY,
+    RunTreeError, RunTrees, TreeBlob, RUN_HOLDS_NO_TREE, TREES_INPUT_KEY,
 };
 use crate::domain::seal_session::{CallerAnswer, SealSessionError};
 use crate::domain::secrets::SensitiveString;
@@ -48,7 +48,7 @@ use crate::domain::tenant::TenantId;
 use crate::domain::volume::{AccessMode, StorageClass, Volume, VolumeBackend, VolumeMount};
 use crate::infrastructure::tool_router::{ARCHIVE_PUSH_TOOL, TREE_LAND_TOOL};
 
-/// The most a blob read or a `blobs.put` carries: Nuclear Notes' part.
+/// The most a blob read or a `blobs.put` carries: Carbon Forge's part.
 const PART: usize = 4 * 1024 * 1024;
 
 /// The entries `trees.materialize` is asked for per page.
@@ -83,12 +83,12 @@ const ARCHIVE_PUSH_IS_THE_WORKFLOWS: &str =
     "aegis.archive.push is answered only for a workflow's own push step";
 
 /// A run's cut is named `forge-<execution id>` when its state names none
-/// (AEGIS ADR-149 C1): a cut name admits no slash (Nuclear Notes
+/// (AEGIS ADR-149 C1): a cut name admits no slash (Carbon Forge
 /// `snapshot.ts` CUT_NAME_PATTERN).
 const CUT_NAME_DEFAULT_PREFIX: &str = "forge-";
 
 /// How often the deploy wait reads `archives.deploy_status` (AEGIS ADR-149
-/// C2): each read is one GitHub API call made by Nuclear Notes.
+/// C2): each read is one GitHub API call made by Carbon Forge.
 const DEPLOY_POLL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// How long the deploy wait waits for every run to conclude when its
@@ -113,7 +113,7 @@ const DEPLOY_WAIT_ARGUMENTS: &str = "archive_deploy_wait takes a cut name, or a 
 /// the keys `cut` (required), `timeout_seconds` (optional, default 1800)
 /// and `no_run_grace_seconds` (optional, default 300); any other `message`
 /// is a bare cut name with both defaults. The two cannot be confused
-/// because a cut name cannot start with `{` (Nuclear Notes `snapshot.ts`
+/// because a cut name cannot start with `{` (Carbon Forge `snapshot.ts`
 /// CUT_NAME_PATTERN).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DeployWait {
@@ -330,7 +330,7 @@ struct TreeOfRun {
 }
 
 /// The sentence a tree step answers for a refusal its person can act on:
-/// Nuclear Notes' own error, or no usable credential for it. `None`: a
+/// Carbon Forge's own error, or no usable credential for it. `None`: a
 /// failure of the node.
 fn step_refusal(e: &SealSessionError) -> Option<String> {
     fn of(answer: &CallerAnswer) -> Option<String> {
@@ -348,7 +348,7 @@ fn step_refusal(e: &SealSessionError) -> Option<String> {
     }
 }
 
-/// Nuclear Notes' own error text, when the server refused the call.
+/// Carbon Forge's own error text, when the server refused the call.
 fn remote_tool_error(e: &SealSessionError) -> Option<&str> {
     match e {
         SealSessionError::Answered {
@@ -495,7 +495,7 @@ async fn write_file(storage: &dyn StorageProvider, path: &str, bytes: &[u8]) -> 
 }
 
 impl ToolInvocationService {
-    /// Call `tool` of Nuclear Notes in `workspace` for the run `run`, as
+    /// Call `tool` of Carbon Forge in `workspace` for the run `run`, as
     /// `acting`: the tool's own answer, or the refusal.
     async fn nuclear_notes(
         &self,
@@ -510,7 +510,7 @@ impl ToolInvocationService {
             map.insert("workspace".to_string(), json!(workspace));
         }
         let result = self
-            .invoke_remote_tool_for_run(run, tenant_id, acting, NUCLEAR_NOTES_SERVER, tool, args)
+            .invoke_remote_tool_for_run(run, tenant_id, acting, self.run_tree_server(), tool, args)
             .await?;
         tool_answer(result)
     }
@@ -552,7 +552,7 @@ impl ToolInvocationService {
                 run,
                 tenant_id,
                 acting,
-                NUCLEAR_NOTES_SERVER,
+                self.run_tree_server(),
                 tool,
                 args,
             )
@@ -889,7 +889,13 @@ impl ToolInvocationService {
         };
         let volume_id = volume_of(&tree);
         let person = execution.initiating_user_sub.clone().unwrap_or_default();
-        let contexts = ExecutionContexts::from_value(execution.input.get(CONTEXTS_INPUT_KEY));
+        // Carbon Forge ADR-0198, Update of 2026-10-21, R3 step 1: each
+        // server the run chose for, by its own name.
+        let contexts =
+            self.remote_tool_former_names
+                .execution_contexts(ExecutionContexts::from_value(
+                    execution.input.get(CONTEXTS_INPUT_KEY),
+                ));
         Ok(Ok(TreeOfRun {
             run,
             acting: Self::run_acting(
@@ -1332,7 +1338,7 @@ impl ToolInvocationService {
     /// step and its person `person` only (AEGIS ADR-147 C5): what
     /// `aegis.tree.land` runs once the person approved. Lands the run's own
     /// lane with the stored call's intent as one changeset and answers its
-    /// id; Nuclear Notes' refusal (a conflict with the trunk among them) is
+    /// id; Carbon Forge's refusal (a conflict with the trunk among them) is
     /// answered in its own words under `sentence`, nothing landed.
     pub(super) async fn tree_land_for_interpreter(
         &self,
@@ -1397,7 +1403,7 @@ impl ToolInvocationService {
 impl ToolInvocationService {
     /// The cut of the run's tree's workspace (AEGIS ADR-149 C1): a snapshot
     /// of its every entity's current revision, named `name`. Answers
-    /// Nuclear Notes' own answer, the snapshot's header and its `cut`.
+    /// Carbon Forge's own answer, the snapshot's header and its `cut`.
     async fn tree_cut(
         &self,
         tenant_id: &TenantId,
@@ -1426,7 +1432,7 @@ impl ToolInvocationService {
 
     /// The render of the cut `cut` of the run's tree into its git archive
     /// (AEGIS ADR-149 C2): the cut's revision rendered, main moved to it
-    /// fast-forward only and tagged `nn/<cut>`. Answers Nuclear Notes' own
+    /// fast-forward only and tagged `nn/<cut>`. Answers Carbon Forge's own
     /// answer.
     async fn archive_render(
         &self,
@@ -1495,7 +1501,7 @@ impl ToolInvocationService {
     /// and its person `person` only (AEGIS ADR-149 C2): what
     /// `aegis.archive.push` runs once the person approved. Queues the push
     /// of the run's tree's git archive to its remote and answers the job;
-    /// Nuclear Notes' refusal (no remote, no rendered cut, a role short of
+    /// Carbon Forge's refusal (no remote, no rendered cut, a role short of
     /// the workspace's admin) is answered in its own words under
     /// `sentence`, nothing queued.
     pub(super) async fn archive_push_for_interpreter(
@@ -1591,7 +1597,12 @@ impl ExecutionTokens for ToolInvocationService {
                 None => RunTreeError::Failed(format!("{what} failed: {e}")),
             }
         };
-        let acting = Self::run_acting(Some(person), None, contexts.clone());
+        let acting = Self::run_acting(
+            Some(person),
+            None,
+            self.remote_tool_former_names
+                .execution_contexts(contexts.clone()),
+        );
         let ground = self
             .carbon_forge_with_binding(
                 run,
@@ -1686,7 +1697,12 @@ impl ExecutionTokens for ToolInvocationService {
                 return;
             }
         };
-        let acting = Self::run_acting(Some(person), None, contexts.clone());
+        let acting = Self::run_acting(
+            Some(person),
+            None,
+            self.remote_tool_former_names
+                .execution_contexts(contexts.clone()),
+        );
         self.revoke_execution_token(run, tenant_id, &acting, &token.token_id)
             .await;
         if let Err(e) = source.delete_execution_token(tenant_id, person, run).await {
@@ -1709,7 +1725,12 @@ impl RunTrees for ToolInvocationService {
         contexts: &ExecutionContexts,
         requested: Vec<RunTree>,
     ) -> Result<Vec<RunTree>, RunTreeError> {
-        let acting = Self::run_acting(person, None, contexts.clone());
+        let acting = Self::run_acting(
+            person,
+            None,
+            self.remote_tool_former_names
+                .execution_contexts(contexts.clone()),
+        );
         let mut filled = Vec::with_capacity(requested.len());
         for tree in requested {
             let tree = self.materialize_tree(tenant_id, run, &acting, tree).await?;

@@ -577,6 +577,17 @@ pub(crate) fn daemon_seal_gateway_wiring(
         .context("seal_gateway configuration")
 }
 
+/// The remote servers' former names as `seal_gateway.remote_servers` names
+/// them (Carbon Forge ADR-0198, Update of 2026-10-21, R3 step 1); none with
+/// no `seal_gateway`.
+pub(crate) fn daemon_former_names(
+    gateway: Option<&aegis_orchestrator_core::domain::node_config::SealGatewayConfig>,
+) -> aegis_orchestrator_core::domain::node_config::FormerNames {
+    gateway
+        .map(|gateway| gateway.former_names())
+        .unwrap_or_default()
+}
+
 /// Hand the credential service the grounding of remote servers' tokens and
 /// `seal_gateway.remote_servers` with each server's grounding tool (AEGIS
 /// ADR-132 (7a) S2, ADR-136 G14): a server named with `grounding_tool` has
@@ -1829,7 +1840,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             token_issuer,
         )
         .with_gateway_client(attestation_gateway_client)
-        .with_agent_manifest_tools(execution_service.clone(), agent_service.clone());
+        .with_agent_manifest_tools(execution_service.clone(), agent_service.clone())
+        .with_former_names(daemon_former_names(config.spec.seal_gateway.as_ref()));
 
     match aegis_orchestrator_core::infrastructure::docker::BollardContainerVerifier::new(
         config.spec.runtime.container_socket_path.as_deref(),
@@ -2253,7 +2265,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         aegis_orchestrator_core::application::tool_approval_service::ToolApprovalService::new(
             tool_approval_repo,
             event_bus.clone(),
-        ),
+        )
+        .with_former_names(daemon_former_names(config.spec.seal_gateway.as_ref())),
     );
     tool_approval_service.clone().spawn_expiry_sweep(
         aegis_orchestrator_core::application::tool_approval_service::EXPIRY_SWEEP_INTERVAL,
@@ -2595,7 +2608,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         );
         service.clone().release_runs_on_end();
     }
-    // AEGIS ADR-147 C4: a run's Nuclear Notes tree is materialized, mounted at /workspace and written back through the SEAL gateway.
+    // AEGIS ADR-147 C4: a run's Carbon Forge tree is materialized, mounted at /workspace and written back through the SEAL gateway.
     start_workflow_execution_use_case.set_trees(tool_invocation_service.clone());
     temporal_event_listener.set_execution_tokens(tool_invocation_service.clone());
     execution_service.set_trees(tool_invocation_service.clone());

@@ -1340,7 +1340,7 @@ impl ToolInvocationService {
         action: &str,
         message: Option<&str>,
     ) -> Result<RepositoryActionAnswer, RepositoryActionError> {
-        // AEGIS ADR-147 C3: carbon-forge's steps on the run's Nuclear Notes
+        // AEGIS ADR-147 C3: carbon-forge's steps on the run's Carbon Forge
         // tree ride the same step, as do the cut, the render and the push of
         // AEGIS ADR-149 C1, C2.
         if matches!(

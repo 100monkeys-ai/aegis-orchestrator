@@ -181,8 +181,8 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("aegis.git.commit", "Stages every change in one of your run's repositories and commits it on the run's work branch."),
     BuiltinToolDefinition::new("aegis.git.push", "Pushes the run's work branch of one of your run's repositories to its origin, never with force. Only that branch is pushed."),
     BuiltinToolDefinition::new("aegis.git.land", "Lands a workflow run's work branch on its repository's branch as a fast-forward: pushes the work branch to its origin, then the branch, never with force. Answered only for a workflow's own landing step, after the person's approval.").requires_approval(),
-    BuiltinToolDefinition::new("aegis.tree.land", "Lands a carbon-forge run's lane on its Nuclear Notes tree as one changeset. Answered only for a workflow's own landing step, after the person's approval.").requires_approval(),
-    BuiltinToolDefinition::new("aegis.archive.push", "Queues the push of a carbon-deploy run's Nuclear Notes tree's git archive to its remote. Answered only for a workflow's own push step, after the person's approval.").requires_approval(),
+    BuiltinToolDefinition::new("aegis.tree.land", "Lands a carbon-forge run's lane on its Carbon Forge tree as one changeset. Answered only for a workflow's own landing step, after the person's approval.").requires_approval(),
+    BuiltinToolDefinition::new("aegis.archive.push", "Queues the push of a carbon-deploy run's Carbon Forge tree's git archive to its remote. Answered only for a workflow's own push step, after the person's approval.").requires_approval(),
     BuiltinToolDefinition::new("aegis.schema.get", "Returns the canonical JSON Schema for a manifest kind (agent or workflow).").skip_judge(),
     BuiltinToolDefinition::new("aegis.schema.validate", "Validates a manifest YAML string against its canonical JSON Schema.").skip_judge(),
     BuiltinToolDefinition::new("aegis.agent.create", "Parses, validates, and deploys an Agent manifest to the registry.").skip_judge(),
@@ -1363,7 +1363,7 @@ impl ToolRouter {
         json!({
             "type": "object",
             "properties": {
-                "tree": {"type": "string", "description": "The path of the run's Nuclear Notes tree."},
+                "tree": {"type": "string", "description": "The path of the run's Carbon Forge tree."},
                 "lane": {"type": "string", "description": "The run's lane, landed as one changeset."},
                 "intent": {"type": "string", "description": "The changeset's intent."}
             },
@@ -1376,7 +1376,7 @@ impl ToolRouter {
         json!({
             "type": "object",
             "properties": {
-                "tree": {"type": "string", "description": "The path of the run's Nuclear Notes tree, whose git archive is pushed to its remote."}
+                "tree": {"type": "string", "description": "The path of the run's Carbon Forge tree, whose git archive is pushed to its remote."}
             },
             "required": ["tree"]
         })

@@ -1,7 +1,7 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! What the carbon-forge tests (AEGIS ADR-147) share: Nuclear Notes behind
-//! a loopback SEAL gateway over TLS, answering each tool as Nuclear Notes at
+//! What the carbon-forge tests (AEGIS ADR-147) share: Carbon Forge behind
+//! a loopback SEAL gateway over TLS, answering each tool as Carbon Forge at
 //! `76d62e5` answers it and recording every call; the person's binding; and
 //! the interpreter's tool invocation service dialling that gateway.
 #![allow(dead_code)]
@@ -52,7 +52,7 @@ use aegis_orchestrator_core::infrastructure::tool_router::ToolRouter;
 
 /// The run's person.
 pub const PERSON: &str = "the-person";
-/// The Nuclear Notes binding the run's `contexts` chose.
+/// The Carbon Forge binding the run's `contexts` chose.
 pub const BINDING: &str = "4f6b1c1e-2d3a-4b5c-8d7e-9f0a1b2c3d4e";
 /// The bearer token that binding resolves to (a fake).
 pub const TOKEN: &str = "nn-test-token";
@@ -93,7 +93,7 @@ pub fn lane_of(run: uuid::Uuid) -> String {
 }
 
 // ===========================================================================
-// The loopback gateway, answering as Nuclear Notes answers
+// The loopback gateway, answering as Carbon Forge answers
 // ===========================================================================
 
 /// How the stub answers one tool.
@@ -222,7 +222,7 @@ pub fn materialized() -> Value {
     })
 }
 
-/// Nuclear Notes as the tests need it: the run's revision, a blob store, a
+/// Carbon Forge as the tests need it: the run's revision, a blob store, a
 /// lane and a landing answering as `catalog.ts` 2774-2910 answers.
 pub fn nuclear_notes(run: uuid::Uuid) -> StubGateway {
     let mut answers = HashMap::new();
@@ -314,7 +314,7 @@ pub fn nuclear_notes(run: uuid::Uuid) -> StubGateway {
 // Test doubles
 // ===========================================================================
 
-/// The person's Nuclear Notes binding, resolved only for the binding the
+/// The person's Carbon Forge binding, resolved only for the binding the
 /// run chose; and the runs' execution tokens, kept by person and execution
 /// id as the secret store keeps them (X3).
 #[derive(Default)]
@@ -646,7 +646,7 @@ pub fn tool_service_with(
     )
 }
 
-/// Each call Nuclear Notes received: its tool and its arguments.
+/// Each call Carbon Forge received: its tool and its arguments.
 pub fn calls_of(calls: &Mutex<Vec<InvokeToolRequest>>) -> Vec<(String, Value)> {
     calls
         .lock()

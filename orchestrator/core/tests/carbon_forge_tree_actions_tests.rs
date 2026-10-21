@@ -1,23 +1,23 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # carbon-forge's own steps on a Nuclear Notes tree (AEGIS ADR-147)
+//! # carbon-forge's own steps on a Carbon Forge tree (AEGIS ADR-147)
 //!
 //! AEGIS ADR-147 (Proposed, page revision 55541) builds `carbon-forge`, a
-//! second built-in beside `the-forge` whose run works on a Nuclear Notes
+//! second built-in beside `the-forge` whose run works on a Carbon Forge
 //! code tree instead of a git repository. Its DIFF, COMMIT and LAND are the
 //! Action states `tree_diff`, `tree_write` and `tree_land` (C3), answered
 //! by the interpreter's `run_repository_action`, as the-forge's are (AEGIS
 //! ADR-142). `tree_write` writes the run's change to a lane of its own;
 //! `tree_land` lands that lane as one changeset after the person's
 //! approval, as `aegis.git.land` is gated (ADR-141 F8), and a conflict ends
-//! with Nuclear Notes' own sentence, which the template carries into
+//! with Carbon Forge's own sentence, which the template carries into
 //! LAND_REFUSED (C5). A draft run's write lands nothing (C6).
 //!
-//! Nuclear Notes is reached where every remote MCP tool is: the SEAL
+//! Carbon Forge is reached where every remote MCP tool is: the SEAL
 //! gateway's `InvokeTool` (AEGIS ADR-132 H1 to H8), with the run's person's
 //! credential for the binding the run's `contexts` chose. The gateway here
 //! is a loopback one over TLS that records every call and answers each tool
-//! as Nuclear Notes at `76d62e5` answers it
+//! as Carbon Forge at `76d62e5` answers it
 //! (`apps/web/src/contexts/mcp/application/catalog-substrate.ts`,
 //! `catalog.ts` `lanes.*`, `content/domain/lane.ts` `laneConflictRefusal`).
 //!
@@ -30,7 +30,7 @@
 //! | C5: the landing is gated and listed to no agent | `the_tree_landing_is_gated_and_listed_to_no_agent` |
 //! | C5, C6: the write goes to a lane of the run's own | `tree_write_puts_the_runs_change_on_a_lane_of_its_own_and_lands_nothing` |
 //! | C5: the landing after approval, one changeset | `tree_land_lands_the_lane_as_one_changeset_after_the_persons_approval` |
-//! | C5: a conflict, in Nuclear Notes' own words | `a_conflicting_landing_answers_nuclear_notes_own_sentence` |
+//! | C5: a conflict, in Carbon Forge's own words | `a_conflicting_landing_answers_nuclear_notes_own_sentence` |
 //! | Update `execution-token-2026-10-17` X3: the child, never the binding | `execution_token_carries_every_carbon_forge_call_of_the_run_never_the_binding` |
 //! | X3: a run with no child is refused | `execution_token_absent_refuses_every_carbon_forge_call_of_the_run` |
 //! | X5: the lane's owner is the run's person | `execution_token_run_lane_is_created_owned_by_the_runs_person` |
@@ -123,12 +123,12 @@ struct Fixture {
 /// into its volume `tree` and its README changed by its agents, as a start
 /// leaves it: the run's `trees` entry names the workspace, path and
 /// revision (C2) and the volume it was materialized into (C4); its
-/// `contexts` chose the person's Nuclear Notes binding.
+/// `contexts` chose the person's Carbon Forge binding.
 async fn fixture() -> Fixture {
     fixture_answering(|_, _| {}).await
 }
 
-/// The fixture, its Nuclear Notes answering as `answers` changes it.
+/// The fixture, its Carbon Forge answering as `answers` changes it.
 async fn fixture_answering(
     answers: impl FnOnce(uuid::Uuid, &mut HashMap<String, Answer>),
 ) -> Fixture {
@@ -266,12 +266,12 @@ spec:
 }
 
 impl Fixture {
-    /// Each call Nuclear Notes received: its tool and its arguments.
+    /// Each call Carbon Forge received: its tool and its arguments.
     fn calls(&self) -> Vec<(String, Value)> {
         calls_of(&self.calls)
     }
 
-    /// Every call went to Nuclear Notes, in the run's workspace, with the
+    /// Every call went to Carbon Forge, in the run's workspace, with the
     /// run's execution token, minted from the person's binding the run
     /// chose (AEGIS ADR-147 Update `execution-token-2026-10-17` X3).
     fn assert_each_call_is_the_persons_in_the_workspace(&self) {
@@ -307,7 +307,7 @@ impl Fixture {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!(
-            "AEGIS ADR-147 C5: no landing waited at the gate; Nuclear Notes received {:?}",
+            "AEGIS ADR-147 C5: no landing waited at the gate; Carbon Forge received {:?}",
             self.calls().into_iter().map(|(t, _)| t).collect::<Vec<_>>()
         );
     }
@@ -419,9 +419,7 @@ async fn tree_write_puts_the_runs_change_on_a_lane_of_its_own_and_lands_nothing(
             Some("carbon-forge: the task"),
         )
         .await
-        .unwrap_or_else(|e| {
-            panic!("AEGIS ADR-147 C5: tree_write never reached Nuclear Notes: {e}")
-        });
+        .unwrap_or_else(|e| panic!("AEGIS ADR-147 C5: tree_write never reached Carbon Forge: {e}"));
     assert_eq!(answer.sentence, None, "AEGIS ADR-147 C5: {answer:?}");
 
     let calls = fx.calls();
@@ -437,7 +435,7 @@ async fn tree_write_puts_the_runs_change_on_a_lane_of_its_own_and_lands_nothing(
     });
     let (Some(created), Some(put)) = (created, put) else {
         panic!(
-            "AEGIS ADR-147 C5: the run's change was not put on its lane {lane}: Nuclear Notes received {tools:?}"
+            "AEGIS ADR-147 C5: the run's change was not put on its lane {lane}: Carbon Forge received {tools:?}"
         );
     };
     assert!(
@@ -622,7 +620,7 @@ async fn tree_land_lands_the_lane_as_one_changeset_after_the_persons_approval() 
 
 #[tokio::test]
 async fn a_conflicting_landing_answers_nuclear_notes_own_sentence() {
-    // Nuclear Notes' own refusal (`content/domain/lane.ts`
+    // Carbon Forge's own refusal (`content/domain/lane.ts`
     // `laneConflictRefusal` at `76d62e5`), relayed as the gateway relays a
     // remote tool's error.
     let sentence = |run: uuid::Uuid| {
@@ -642,7 +640,7 @@ async fn a_conflicting_landing_answers_nuclear_notes_own_sentence() {
     assert_eq!(
         answer.sentence.as_deref(),
         Some(sentence(fx.run).as_str()),
-        "AEGIS ADR-147 C5: a conflicting landing does not answer Nuclear Notes' own sentence: {answer:?}"
+        "AEGIS ADR-147 C5: a conflicting landing does not answer Carbon Forge's own sentence: {answer:?}"
     );
     assert_eq!(
         answer.commit_sha, None,
@@ -657,7 +655,7 @@ async fn a_conflicting_landing_answers_nuclear_notes_own_sentence() {
 /// The push's gated tool (AEGIS ADR-149 C2), as `tool_router.rs` names it.
 const ARCHIVE_PUSH_TOOL: &str = "aegis.archive.push";
 
-/// The snapshot Nuclear Notes answers a cut with (`catalog-snapshots.ts`
+/// The snapshot Carbon Forge answers a cut with (`catalog-snapshots.ts`
 /// 145 to 162 at `4569806`: the snapshot's header and `cut`).
 const SNAPSHOT_ID: &str = "5a9c0e11-0000-4000-8000-000000000004";
 
@@ -745,7 +743,7 @@ async fn tree_cut_names_the_landed_run_with_the_given_cut_or_forge_and_its_execu
     assert_eq!(
         cuts.len(),
         1,
-        "AEGIS ADR-149 C1: tree_cut did not cut one snapshot: Nuclear Notes received {:?}",
+        "AEGIS ADR-149 C1: tree_cut did not cut one snapshot: Carbon Forge received {:?}",
         fx.calls().into_iter().map(|(t, _)| t).collect::<Vec<_>>()
     );
     assert_eq!(cuts[0]["name"].as_str(), Some("v1.2"));
@@ -756,7 +754,7 @@ async fn tree_cut_names_the_landed_run_with_the_given_cut_or_forge_and_its_execu
     );
     fx.assert_each_call_is_the_persons_in_the_workspace();
 
-    // Default: forge-<execution id>, a name Nuclear Notes' cut pattern
+    // Default: forge-<execution id>, a name Carbon Forge's cut pattern
     // admits (snapshot.ts:240 at 4569806: no slash).
     let fx = fixture_answering(|run, answers| {
         answers.insert(
@@ -819,7 +817,7 @@ async fn archive_render_renders_the_cut_of_a_tree_named_and_not_materialized() {
     assert_eq!(
         renders.len(),
         1,
-        "AEGIS ADR-149 C2: archive_render did not render once: Nuclear Notes received {tools:?}"
+        "AEGIS ADR-149 C2: archive_render did not render once: Carbon Forge received {tools:?}"
     );
     assert_eq!(renders[0]["tree"].as_str(), Some(TREE_PATH));
     assert_eq!(renders[0]["cut"].as_str(), Some("v1.2"));

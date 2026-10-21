@@ -1896,10 +1896,15 @@ pub struct SealGatewayConfig {
     /// by the gateway's own rule ([`Self::remote_server_names`]). Empty: no
     /// remote server, and no person's credential is ever resolved.
     ///
-    /// Each entry is a bare name or `{name, grounding_tool?}` (AEGIS ADR-136
-    /// G14, G14a): `grounding_tool` names the server's tool a person's token
-    /// is grounded with when it is stored, rotated or introspected; a bare
-    /// name, or an entry without it, means the server has none.
+    /// Each entry is a bare name or `{name, grounding_tool?, former_names?}`
+    /// (AEGIS ADR-136 G14, G14a): `grounding_tool` names the server's tool a
+    /// person's token is grounded with when it is stored, rotated or
+    /// introspected; a bare name, or an entry without it, means the server
+    /// has none. `former_names` are names the server was known by before
+    /// (Carbon Forge ADR-0198, Update of 2026-10-21, R2 and R3 step 1): a
+    /// tool, a contexts key, a manifest's service, a pattern or a binding's
+    /// provider naming one of them is read as naming the entry, and nothing
+    /// lists or offers a former name ([`FormerNames`]).
     #[serde(default, skip_serializing_if = "RemoteServers::is_empty")]
     pub remote_servers: RemoteServers,
 }
@@ -1917,6 +1922,11 @@ pub struct RemoteServer {
     /// binding to the server is stored with no reach.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grounding_tool: Option<String>,
+    /// The names the server was known by before `name` (Carbon Forge
+    /// ADR-0198, Update of 2026-10-21, R2): each is read as naming this
+    /// server, and none is listed. Empty: none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub former_names: Vec<String>,
 }
 
 impl RemoteServer {
@@ -1925,6 +1935,7 @@ impl RemoteServer {
         Self {
             name: name.into(),
             grounding_tool: None,
+            former_names: Vec::new(),
         }
     }
 
@@ -1933,7 +1944,24 @@ impl RemoteServer {
         Self {
             name: name.into(),
             grounding_tool: Some(tool.into()),
+            former_names: Vec::new(),
         }
+    }
+
+    /// The server, also known by each of `former_names` (Carbon Forge
+    /// ADR-0198, Update of 2026-10-21, R2).
+    pub fn formerly<I, S>(mut self, former_names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.former_names = former_names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Whether `name` is this server's name or one of its former names.
+    pub fn is_named(&self, name: &str) -> bool {
+        self.name == name || self.former_names.iter().any(|former| former == name)
     }
 }
 
@@ -1955,6 +1983,7 @@ enum RemoteServerEntry {
 pub struct RemoteServers {
     names: Vec<String>,
     grounding_tools: Vec<Option<String>>,
+    former_names: Vec<Vec<String>>,
 }
 
 impl RemoteServers {
@@ -1963,16 +1992,25 @@ impl RemoteServers {
         self.names.is_empty()
     }
 
-    /// The servers, each with its grounding tool, in the order given.
+    /// The servers, each with its grounding tool and former names, in the
+    /// order given.
     pub fn entries(&self) -> Vec<RemoteServer> {
         self.names
             .iter()
             .zip(&self.grounding_tools)
-            .map(|(name, tool)| RemoteServer {
+            .zip(&self.former_names)
+            .map(|((name, tool), former_names)| RemoteServer {
                 name: name.clone(),
                 grounding_tool: tool.clone(),
+                former_names: former_names.clone(),
             })
             .collect()
+    }
+
+    /// Each former name with the name of the server it now names (Carbon
+    /// Forge ADR-0198, Update of 2026-10-21, R3 step 1).
+    pub fn former_names(&self) -> FormerNames {
+        FormerNames::of_servers(&self.entries())
     }
 }
 
@@ -1997,6 +2035,7 @@ impl FromIterator<RemoteServer> for RemoteServers {
         for server in iter {
             servers.names.push(server.name);
             servers.grounding_tools.push(server.grounding_tool);
+            servers.former_names.push(server.former_names);
         }
         servers
     }
@@ -2005,28 +2044,302 @@ impl FromIterator<RemoteServer> for RemoteServers {
 impl<'de> Deserialize<'de> for RemoteServers {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let entries = Vec::<RemoteServerEntry>::deserialize(deserializer)?;
-        Ok(entries
+        let servers: Self = entries
             .into_iter()
             .map(|entry| match entry {
                 RemoteServerEntry::Name(name) => RemoteServer::named(name),
                 RemoteServerEntry::Entry(server) => server,
             })
-            .collect())
+            .collect();
+        // Carbon Forge ADR-0198, Update of 2026-10-21, R2: a former name
+        // that is also a name in use would make one name mean two servers;
+        // the configuration is refused as it loads.
+        check_former_names(&servers.entries()).map_err(serde::de::Error::custom)?;
+        Ok(servers)
     }
 }
 
-/// A server with no grounding tool is written as its bare name.
+/// A server with no grounding tool and no former name is written as its
+/// bare name.
 impl Serialize for RemoteServers {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
         let mut seq = serializer.serialize_seq(Some(self.names.len()))?;
         for server in self.entries() {
-            match server.grounding_tool {
-                None => seq.serialize_element(&server.name)?,
-                Some(_) => seq.serialize_element(&server)?,
+            if server.grounding_tool.is_none() && server.former_names.is_empty() {
+                seq.serialize_element(&server.name)?;
+            } else {
+                seq.serialize_element(&server)?;
             }
         }
         seq.end()
+    }
+}
+
+/// Whether `name` is one the SEAL gateway could register a server under:
+/// lowercase letters, digits and hyphens, not empty.
+fn is_gateway_server_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Carbon Forge ADR-0198, Update of 2026-10-21, R2: each former name is a
+/// name the gateway could have registered, is given once, and is no
+/// server's name and no other server's former name, so that every name
+/// reads as exactly one server. The refusal names both entries.
+fn check_former_names(servers: &[RemoteServer]) -> Result<(), String> {
+    for (i, server) in servers.iter().enumerate() {
+        for (j, former) in server.former_names.iter().enumerate() {
+            if !is_gateway_server_name(former) {
+                return Err(format!(
+                    "seal_gateway.remote_servers: '{}' names the former name '{former}', which \
+                     must be lowercase letters, digits and hyphens, the rule of the gateway's \
+                     spec.mcp_servers[].name",
+                    server.name
+                ));
+            }
+            if server.former_names[..j].contains(former) {
+                return Err(format!(
+                    "seal_gateway.remote_servers: '{}' names the former name '{former}' twice",
+                    server.name
+                ));
+            }
+            for (k, other) in servers.iter().enumerate() {
+                if other.name == *former {
+                    return Err(if k == i {
+                        format!(
+                            "seal_gateway.remote_servers: '{}' names its own name as a former name",
+                            server.name
+                        )
+                    } else {
+                        format!(
+                            "seal_gateway.remote_servers: '{}' names the former name '{former}', \
+                             which is the name of the entry '{}'",
+                            server.name, other.name
+                        )
+                    });
+                }
+                if k != i && other.former_names.contains(former) {
+                    return Err(format!(
+                        "seal_gateway.remote_servers: '{}' names the former name '{former}', \
+                         which the entry '{}' also names as a former name",
+                        server.name, other.name
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The remote servers' former names, each with the name of the server it
+/// now names (Carbon Forge ADR-0198, Update of 2026-10-21, R2 and R3 step
+/// 1): every reader of a server's name resolves a former name to the
+/// server's own name before it compares, so a tool `<former>.<tool>`, a
+/// contexts key, a manifest's `spec.contexts[].service` or `spec.tools`
+/// entry, a profile's or an approval policy's tool pattern and a binding's
+/// provider naming a former name are read as naming the server; listings
+/// and refusals name the server's own name. Empty (every configuration
+/// with no `former_names`): every name reads as written, and nothing
+/// changes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FormerNames {
+    /// `(former, current)`, in the order the configuration gives them.
+    renames: Vec<(String, String)>,
+}
+
+impl FormerNames {
+    /// The former names of `servers`, each with its server's name.
+    pub fn of_servers(servers: &[RemoteServer]) -> Self {
+        Self {
+            renames: servers
+                .iter()
+                .flat_map(|server| {
+                    server
+                        .former_names
+                        .iter()
+                        .map(|former| (former.clone(), server.name.clone()))
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether no server has a former name.
+    pub fn is_empty(&self) -> bool {
+        self.renames.is_empty()
+    }
+
+    /// The server's own name for `name`: the name it now has when `name` is
+    /// a former name, else `name` as written.
+    pub fn current<'a>(&'a self, name: &'a str) -> &'a str {
+        self.renames
+            .iter()
+            .find(|(former, _)| former == name)
+            .map_or(name, |(_, current)| current.as_str())
+    }
+
+    /// The former names of the server named `current`, in order.
+    pub fn of<'a>(&'a self, current: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.renames
+            .iter()
+            .filter(move |(_, now)| now == current)
+            .map(|(former, _)| former.as_str())
+    }
+
+    /// `tool` (or a tool pattern) with its server, the part before its first
+    /// dot, read as the server's own name: `<former>.<rest>` becomes
+    /// `<current>.<rest>`, `<former>.*` becomes `<current>.*`; anything
+    /// else as written.
+    pub fn tool<'a>(&self, tool: &'a str) -> std::borrow::Cow<'a, str> {
+        match tool.split_once('.') {
+            Some((server, rest)) if self.current(server) != server => {
+                std::borrow::Cow::Owned(format!("{}.{rest}", self.current(server)))
+            }
+            _ => std::borrow::Cow::Borrowed(tool),
+        }
+    }
+
+    /// Every spelling of `tool` a stored pattern or policy may name it by:
+    /// `tool` with its server's own name first, then with each of that
+    /// server's former names.
+    pub fn spellings(&self, tool: &str) -> Vec<String> {
+        let tool = self.tool(tool).into_owned();
+        let mut spellings = vec![tool.clone()];
+        if let Some((server, rest)) = tool.split_once('.') {
+            spellings.extend(self.of(server).map(|former| format!("{former}.{rest}")));
+        }
+        spellings
+    }
+
+    /// A `contexts` map (`{"<server>": <choice>}`) with each key read as its
+    /// server's own name. A server named twice, by its name and a former
+    /// name or by two former names, takes the bindings both choices name,
+    /// in order, each once; when either of them is not a choice of bindings
+    /// (`null`, or a value no binding reads from) the two cannot both be
+    /// the server's choice, and the map is refused with the sentence naming
+    /// both keys.
+    pub fn contexts(
+        &self,
+        map: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+        if self.is_empty() {
+            return Ok(map);
+        }
+        fn ids(value: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
+            match value {
+                serde_json::Value::String(_) => Some(vec![value.clone()]),
+                serde_json::Value::Array(items)
+                    if !items.is_empty() && items.iter().all(serde_json::Value::is_string) =>
+                {
+                    Some(items.clone())
+                }
+                _ => None,
+            }
+        }
+        let mut resolved = serde_json::Map::with_capacity(map.len());
+        let mut keyed_by: Vec<(String, String)> = Vec::new();
+        for (key, choice) in map {
+            let server = self.current(&key).to_string();
+            let Some((_, first)) = keyed_by.iter().find(|(s, _)| *s == server) else {
+                keyed_by.push((server.clone(), key));
+                resolved.insert(server, choice);
+                continue;
+            };
+            let merged = match (resolved.get(&server).and_then(ids), ids(&choice)) {
+                (Some(mut chosen), Some(more)) => {
+                    for id in more {
+                        if !chosen.contains(&id) {
+                            chosen.push(id);
+                        }
+                    }
+                    chosen
+                }
+                _ => {
+                    return Err(format!(
+                        "contexts chooses for the server '{server}' twice, as '{first}' and as \
+                         '{key}', and one of the two chooses no binding; choose for it once"
+                    ))
+                }
+            };
+            resolved.insert(server, serde_json::Value::Array(merged));
+        }
+        Ok(resolved)
+    }
+
+    /// An execution's recorded choices with each server read by its own
+    /// name, a server recorded under two of its names taking the bindings
+    /// both name; where that cannot be read, the choice under the server's
+    /// own name stands.
+    pub fn execution_contexts(
+        &self,
+        contexts: crate::domain::execution::ExecutionContexts,
+    ) -> crate::domain::execution::ExecutionContexts {
+        use crate::domain::execution::ServerChoice;
+        if self.is_empty() {
+            return contexts;
+        }
+        let value_of = |choice: &ServerChoice| match choice {
+            ServerChoice::NotGiven | ServerChoice::None => serde_json::Value::Null,
+            ServerChoice::Bindings(ids) => serde_json::Value::Array(
+                ids.iter()
+                    .map(|id| serde_json::Value::String(id.0.to_string()))
+                    .collect(),
+            ),
+        };
+        // The server's own name first, so it stands where the two differ.
+        let mut ordered = serde_json::Map::new();
+        let mut former = serde_json::Map::new();
+        for (server, choice) in contexts.servers() {
+            if matches!(choice, ServerChoice::NotGiven) {
+                continue;
+            }
+            if self.current(server) == server {
+                ordered.insert(server.to_string(), value_of(choice));
+            } else {
+                former.insert(server.to_string(), value_of(choice));
+            }
+        }
+        let mut map = ordered.clone();
+        map.extend(former.clone());
+        let resolved = match self.contexts(map) {
+            Ok(resolved) => resolved,
+            Err(_) => {
+                let mut kept = ordered;
+                for (server, choice) in former {
+                    kept.entry(self.current(&server).to_string())
+                        .or_insert(choice);
+                }
+                kept
+            }
+        };
+        crate::domain::execution::ExecutionContexts::from_value(Some(&serde_json::Value::Object(
+            resolved,
+        )))
+    }
+
+    /// `manifest` with each `spec.tools` entry and each
+    /// `spec.contexts[].service` read by its server's own name.
+    pub fn manifest(
+        &self,
+        mut manifest: crate::domain::agent::AgentManifest,
+    ) -> crate::domain::agent::AgentManifest {
+        if self.is_empty() {
+            return manifest;
+        }
+        for tool in &mut manifest.spec.tools {
+            if let std::borrow::Cow::Owned(resolved) = self.tool(tool) {
+                *tool = resolved;
+            }
+        }
+        for context in &mut manifest.spec.contexts {
+            let service = self.current(context.service.trim());
+            if service != context.service.trim() {
+                context.service = service.to_string();
+            }
+        }
+        manifest
     }
 }
 
@@ -2041,11 +2354,7 @@ impl SealGatewayConfig {
     pub fn remote_server_names(&self) -> anyhow::Result<Vec<String>> {
         let mut names: Vec<String> = Vec::with_capacity(self.remote_servers.len());
         for name in self.remote_servers.iter() {
-            let valid = !name.is_empty()
-                && name
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-            if !valid {
+            if !is_gateway_server_name(name) {
                 anyhow::bail!(
                     "seal_gateway.remote_servers: '{name}' must be lowercase letters, digits and \
                      hyphens, the rule of the gateway's spec.mcp_servers[].name"
@@ -2056,7 +2365,14 @@ impl SealGatewayConfig {
             }
             names.push(name.clone());
         }
+        check_former_names(&self.remote_servers.entries()).map_err(anyhow::Error::msg)?;
         Ok(names)
+    }
+
+    /// The remote servers' former names (Carbon Forge ADR-0198, Update of
+    /// 2026-10-21, R3 step 1), each with the name of the server it names.
+    pub fn former_names(&self) -> FormerNames {
+        self.remote_servers.former_names()
     }
 
     /// `remote_servers` with each server's grounding tool, the names checked

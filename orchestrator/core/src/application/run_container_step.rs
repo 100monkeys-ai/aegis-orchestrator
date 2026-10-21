@@ -79,7 +79,7 @@ pub struct RunContainerStepUseCase {
     /// The runs' attachments a step may mount, and the gateway's registry it
     /// mounts their copy through (AEGIS ADR-143 S4). Unset: no step may.
     attachments: std::sync::OnceLock<(Arc<dyn StepAttachments>, NfsVolumeRegistry)>,
-    /// The runs' Nuclear Notes trees a step may mount (AEGIS ADR-147 C4).
+    /// The runs' Carbon Forge trees a step may mount (AEGIS ADR-147 C4).
     /// Unset: no step may.
     trees: std::sync::OnceLock<Arc<dyn crate::domain::run_tree::RunTrees>>,
     /// The node's network for steps that reach public hosts (core's

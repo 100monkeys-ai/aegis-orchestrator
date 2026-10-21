@@ -891,7 +891,7 @@ pub fn not_connected_sentence(key: &str) -> String {
         CredentialProvider::IMAP => "a mailbox",
         CALENDAR_CHOICE_KEY => "a calendar",
         "github" => "GitHub",
-        "nuclear-notes" => "Carbon Forge",
+        "nuclear-notes" | "carbon-forge" => "Carbon Forge",
         server => server,
     };
     format!(
@@ -907,7 +907,7 @@ fn your_family(key: &str) -> &str {
         CredentialProvider::IMAP => "mailbox",
         CALENDAR_CHOICE_KEY => "calendar",
         "github" => "GitHub",
-        "nuclear-notes" => "Carbon Forge",
+        "nuclear-notes" | "carbon-forge" => "Carbon Forge",
         server => server,
     }
 }
@@ -1151,7 +1151,7 @@ impl ToolCredentialSource for StandardCredentialManagementService {
                     Some(binding)
                         if binding.owner_user_id == actor.user_id
                             && &binding.tenant_id == actor.tenant_id
-                            && binding.provider == provider
+                            && self.same_server(&binding.provider, &provider)
                             && binding.status == CredentialStatus::Active =>
                     {
                         binding
@@ -1201,7 +1201,7 @@ impl ToolCredentialSource for StandardCredentialManagementService {
             .await?
             .into_iter()
             .filter(|binding| {
-                binding.provider == provider
+                self.same_server(&binding.provider, &provider)
                     && binding.owner_user_id == user_id
                     && &binding.tenant_id == tenant_id
                     && binding.status == CredentialStatus::Active
@@ -1521,7 +1521,7 @@ impl StandardCredentialManagementService {
             .await?
             .into_iter()
             .filter(|binding| {
-                &binding.provider == provider
+                self.same_server(&binding.provider, provider)
                     && binding.owner_user_id == user_id
                     && &binding.tenant_id == tenant_id
                     && binding.status == CredentialStatus::Active
@@ -1907,22 +1907,50 @@ impl StandardCredentialManagementService {
             .is_ok()
     }
 
+    /// The remote server of this node `provider` names, by its name or a
+    /// former name (Carbon Forge ADR-0198, Update of 2026-10-21, R3 step 1).
+    fn remote_server(&self, provider: &CredentialProvider) -> Option<&RemoteServer> {
+        self.remote_grounding.get().and_then(|handle| {
+            handle
+                .servers
+                .iter()
+                .find(|s| s.is_named(provider.as_str()))
+        })
+    }
+
+    /// `provider` by its remote server's own name when it names a former
+    /// name of one (Carbon Forge ADR-0198, Update of 2026-10-21, R3 step
+    /// 1), else as given.
+    fn current_provider(&self, provider: CredentialProvider) -> CredentialProvider {
+        match self.remote_server(&provider) {
+            Some(server) if server.name != provider.as_str() => {
+                CredentialProvider::new(server.name.clone())
+            }
+            _ => provider,
+        }
+    }
+
+    /// Whether the providers `a` and `b` name one server: equal, or one
+    /// remote server by its name and a former name (Carbon Forge ADR-0198,
+    /// Update of 2026-10-21, R3 step 1), so a binding stored under a former
+    /// name is found for the server.
+    fn same_server(&self, a: &CredentialProvider, b: &CredentialProvider) -> bool {
+        a == b
+            || self
+                .remote_server(a)
+                .is_some_and(|server| server.is_named(b.as_str()))
+    }
+
     /// Whether `provider` names a remote server of this node.
     fn is_remote_server(&self, provider: &CredentialProvider) -> bool {
-        self.remote_grounding
-            .get()
-            .is_some_and(|handle| handle.servers.iter().any(|s| s.name == provider.as_str()))
+        self.remote_server(provider).is_some()
     }
 
     /// Whether `provider` names a remote server of this node that has a
     /// grounding tool (AEGIS ADR-136 G14).
     fn has_grounding_tool(&self, provider: &CredentialProvider) -> bool {
-        self.remote_grounding.get().is_some_and(|handle| {
-            handle
-                .servers
-                .iter()
-                .any(|s| s.name == provider.as_str() && s.grounding_tool.is_some())
-        })
+        self.remote_server(provider)
+            .is_some_and(|server| server.grounding_tool.is_some())
     }
 
     /// What `token` reaches on the remote server `provider` names, or
@@ -1941,13 +1969,17 @@ impl StandardCredentialManagementService {
         let Some(handle) = self.remote_grounding.get() else {
             return Ok(None);
         };
-        let server = provider.as_str();
-        let Some(tool) = handle
+        // Carbon Forge ADR-0198, Update of 2026-10-21, R3 step 1: a former
+        // name grounds with its server, called by the server's own name.
+        let Some(entry) = handle
             .servers
             .iter()
-            .find(|s| s.name == server)
-            .and_then(|s| s.grounding_tool.as_deref())
+            .find(|s| s.is_named(provider.as_str()))
         else {
+            return Ok(None);
+        };
+        let server = entry.name.as_str();
+        let Some(tool) = entry.grounding_tool.as_deref() else {
             return Ok(None);
         };
         let Some(grounding) = handle.grounding.upgrade() else {
@@ -2391,6 +2423,9 @@ impl CredentialManagementService for StandardCredentialManagementService {
             api_key_value,
             credential_type,
         } = cmd;
+        // Carbon Forge ADR-0198, Update of 2026-10-21, R3 step 1: a binding
+        // stored for a former name is stored for its server.
+        let provider = self.current_provider(provider);
         // A remote server's token is grounded before anything is written:
         // a token whose reach is unknown is never stored (ADR-132 (7a) S2).
         let reach = self

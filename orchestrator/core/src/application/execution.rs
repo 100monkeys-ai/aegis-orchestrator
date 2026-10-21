@@ -563,7 +563,7 @@ pub struct StandardExecutionService {
     /// refused.
     run_repositories:
         std::sync::OnceLock<Arc<dyn crate::application::git_repo_service::RunRepositories>>,
-    /// Where a workflow run's Nuclear Notes tree is mounted for its agent
+    /// Where a workflow run's Carbon Forge tree is mounted for its agent
     /// states (AEGIS ADR-147 C4). Set once at the composition root via
     /// `set_trees()`; unset, a workflow's agent state mounts no tree.
     run_trees: std::sync::OnceLock<Arc<dyn crate::domain::run_tree::RunTrees>>,
@@ -7189,6 +7189,71 @@ impl StandardExecutionService {
         Ok(())
     }
 
+    /// The remote servers' former names (Carbon Forge ADR-0198, Update of
+    /// 2026-10-21, R3 step 1), as `seal_gateway.remote_servers` names them;
+    /// none without a gateway.
+    fn former_names(&self) -> crate::domain::node_config::FormerNames {
+        self.config
+            .spec
+            .seal_gateway
+            .as_ref()
+            .map(|gateway| gateway.former_names())
+            .unwrap_or_default()
+    }
+
+    /// `agent` with its manifest's `spec.tools` and `spec.contexts[].service`
+    /// reading each remote server by its own name (Carbon Forge ADR-0198,
+    /// Update of 2026-10-21, R3 step 1).
+    fn with_former_names(
+        &self,
+        mut agent: crate::domain::agent::Agent,
+    ) -> crate::domain::agent::Agent {
+        agent.manifest = self.former_names().manifest(agent.manifest);
+        agent
+    }
+
+    /// Read the start's `contexts` keys by each server's own name (Carbon
+    /// Forge ADR-0198, Update of 2026-10-21, R3 step 1), before any check
+    /// reads them; a server chosen for twice in ways that cannot both stand
+    /// refuses the start with the sentence naming both keys. A `contexts`
+    /// that is not an object is left to the shape check.
+    fn resolve_former_contexts(&self, input: &mut ExecutionInput) -> Result<()> {
+        let names = self.former_names();
+        if names.is_empty() {
+            return Ok(());
+        }
+        let key = crate::domain::execution::CONTEXTS_INPUT_KEY;
+        if let JsonValue::Object(map) = &mut input.input {
+            if let Some(JsonValue::Object(contexts)) = map.get(key) {
+                let resolved = names
+                    .contexts(contexts.clone())
+                    .map_err(ExecutionError::Refused)?;
+                map.insert(key.to_string(), JsonValue::Object(resolved));
+            }
+        }
+        Ok(())
+    }
+
+    /// `from` (a workflow execution's or a parent's input) with its
+    /// recorded `contexts` read by each server's own name, as the start it
+    /// is inherited by reads its own (Carbon Forge ADR-0198, Update of
+    /// 2026-10-21, R3 step 1).
+    fn with_former_contexts(&self, mut from: JsonValue) -> JsonValue {
+        let names = self.former_names();
+        if names.is_empty() {
+            return from;
+        }
+        let key = crate::domain::execution::CONTEXTS_INPUT_KEY;
+        if let JsonValue::Object(map) = &mut from {
+            if let Some(JsonValue::Object(contexts)) = map.get(key) {
+                if let Ok(resolved) = names.contexts(contexts.clone()) {
+                    map.insert(key.to_string(), JsonValue::Object(resolved));
+                }
+            }
+        }
+        from
+    }
+
     /// AEGIS ADR-132 Update (13) S11a, S11l: a reserved `contexts` of any
     /// shape but S11a's refuses the start, on every path, the HTTP execute
     /// route's (which inserts the value unchecked) included.
@@ -7707,6 +7772,9 @@ impl StandardExecutionService {
             .agent_service
             .get_agent_visible(&tenant_id, agent_id)
             .await?;
+        // Carbon Forge ADR-0198, Update of 2026-10-21, R3 step 1: the
+        // manifest's tools and contexts read each server by its own name.
+        let agent = self.with_former_names(agent);
 
         // AEGIS ADR-148, A10: an archived agent version stays readable, and
         // a new run naming it is refused with the name's active version. A
@@ -7758,6 +7826,9 @@ impl StandardExecutionService {
         // AEGIS ADR-136 G3: so does it take its workflow execution's
         // repositories.
         let mut input = input;
+        // Carbon Forge ADR-0198, Update of 2026-10-21, R3 step 1: the start's
+        // own choices read each server by its own name.
+        self.resolve_former_contexts(&mut input)?;
         // AEGIS ADR-140 D10: a run started on its own carries one profile or
         // raw bindings, never both; an agent state takes both from its
         // workflow execution and is not asked again.
@@ -7787,7 +7858,8 @@ impl StandardExecutionService {
         {
             let workflow_input = self
                 .workflow_execution_input(&tenant_id, input.workflow_execution_id)
-                .await?;
+                .await?
+                .map(|from| self.with_former_contexts(from));
             Self::inherit_contexts(&mut input, workflow_input.as_ref())?;
             Self::inherit_repositories(&mut input, workflow_input.as_ref());
             // AEGIS ADR-126, Update of 2026-10-07 (2), clause 3: and so does
@@ -7810,6 +7882,7 @@ impl StandardExecutionService {
                 .await?;
         }
         Self::refuse_malformed_contexts(&input)?;
+        self.resolve_former_contexts(&mut input)?;
         Self::refuse_malformed_repositories(&input)?;
         Self::refuse_unfilled_context(&agent, &input)?;
 
@@ -8996,11 +9069,17 @@ impl ExecutionService for StandardExecutionService {
             .agent_service
             .get_agent_visible(&tenant_id, agent_id)
             .await?;
+        // Carbon Forge ADR-0198, Update of 2026-10-21, R3 step 1.
+        let agent = self.with_former_names(agent);
         // AEGIS ADR-005 O6: an agent O4 or O5 refuses is refused before anything starts.
         Self::refuse_at_start(&agent, &input)?;
         // Zaru ADR-0055 D14: a child with no binding choices of its own takes
         // its parent's; D16: a required context left unfilled refuses it.
-        Self::inherit_contexts(&mut input, Some(&parent.input.input))?;
+        self.resolve_former_contexts(&mut input)?;
+        Self::inherit_contexts(
+            &mut input,
+            Some(&self.with_former_contexts(parent.input.input.clone())),
+        )?;
         // AEGIS ADR-126, Update of 2026-10-07 (2), clause 3: and its
         // parent's conversation.
         Self::inherit_conversation(&mut input, Some(&parent.input.input));
@@ -9013,6 +9092,7 @@ impl ExecutionService for StandardExecutionService {
         )
         .await?;
         Self::refuse_malformed_contexts(&input)?;
+        self.resolve_former_contexts(&mut input)?;
         Self::refuse_unfilled_context(&agent, &input)?;
         // AEGIS ADR-132 Update (13) S11f: a child acts for its parent's
         // person, and every binding it chose or took is checked as theirs.

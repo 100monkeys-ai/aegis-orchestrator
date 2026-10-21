@@ -45,9 +45,11 @@ impl ToolInvocationService {
         };
 
         // AEGIS ADR-005 O7d: the generator's floor.
+        // Carbon Forge ADR-0198, Update of 2026-10-21, R3 step 1: a
+        // `spec.contexts` service naming a former name declares its server.
         if let Some(sentence) = generator_floor(
             calling_agent,
-            &manifest,
+            &self.remote_tool_former_names.manifest(manifest.clone()),
             &self.remote_servers_named(&manifest),
         ) {
             return Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -378,9 +380,11 @@ impl ToolInvocationService {
         }
 
         // AEGIS ADR-005 O7d: the generator's floor.
+        // Carbon Forge ADR-0198, Update of 2026-10-21, R3 step 1: a
+        // `spec.contexts` service naming a former name declares its server.
         if let Some(sentence) = generator_floor(
             calling_agent,
-            &manifest,
+            &self.remote_tool_former_names.manifest(manifest.clone()),
             &self.remote_servers_named(&manifest),
         ) {
             return Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -2232,6 +2236,53 @@ spec:
             if answer.get("updated") != Some(&Value::Bool(true)) {
                 complaints.push(format!(
                     "a remote tool declared with its context was refused at update: {answer}"
+                ));
+            }
+            assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+        }
+
+        /// Carbon Forge ADR-0198, Update of 2026-10-21, R3 step 1: on a node
+        /// naming `{name: carbon-forge, former_names: [nuclear-notes]}`, the
+        /// creator's manifest naming `nuclear-notes.pages.read` with the
+        /// context `service: nuclear-notes` validates and is deployed, and a
+        /// tool the node does not know is refused naming `carbon-forge` alone.
+        #[tokio::test]
+        async fn a_manifest_naming_a_former_server_name_validates_as_its_server() {
+            let config: crate::domain::node_config::SealGatewayConfig = serde_yaml::from_str(
+                "url: https://aegis-seal-gateway:50055\nremote_servers:\n  - name: carbon-forge\n    former_names: [nuclear-notes]\n",
+            )
+            .expect("the renamed configuration loads");
+            let service = service_with(&["carbon-forge"])
+                .await
+                .with_remote_tool_former_names(config.former_names());
+            let mut complaints = Vec::new();
+            let name = "notes-summarizer-agent";
+            let answer = create(
+                &service,
+                &notes_yaml(name, "1.0.0", &[NOTES_READ], true),
+                Some(AGENT_GENERATOR_NAME),
+            )
+            .await;
+            println!("the creator's create under the former name answered {answer}");
+            if answer.get("deployed") != Some(&Value::Bool(true))
+                || !is_deployed(&service, name).await
+            {
+                complaints.push(format!(
+                    "a manifest naming nuclear-notes.pages.read with service nuclear-notes was \
+                     refused on a node naming carbon-forge formerly nuclear-notes: {answer}"
+                ));
+            }
+            let answer = create(
+                &service,
+                &notes_yaml("notes-other-agent", "1.0.0", &["notes.pages.read"], true),
+                None,
+            )
+            .await;
+            println!("create naming an unknown tool answered {answer}");
+            let refusal = errors(&answer).join(" ");
+            if !refusal.contains("this node's remote servers: [carbon-forge]") {
+                complaints.push(format!(
+                    "the refusal does not name the server by its own name alone: {refusal}"
                 ));
             }
             assert!(complaints.is_empty(), "{}", complaints.join("\n"));

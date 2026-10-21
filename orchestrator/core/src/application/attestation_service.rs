@@ -92,6 +92,10 @@ pub struct AttestationServiceImpl {
     execution_service: Option<Arc<dyn ExecutionService>>,
     agent_lifecycle: Option<Arc<dyn AgentLifecycleService>>,
     container_verifier: Option<Arc<dyn ContainerVerificationPort>>,
+    /// The remote servers' former names (Carbon Forge ADR-0198, Update of
+    /// 2026-10-21, R3 step 1): the manifest-derived patterns name each
+    /// server by its own name, as the execution's pre-created session does.
+    former_names: crate::domain::node_config::FormerNames,
 }
 
 impl AttestationServiceImpl {
@@ -108,7 +112,18 @@ impl AttestationServiceImpl {
             execution_service: None,
             agent_lifecycle: None,
             container_verifier: None,
+            former_names: Default::default(),
         }
+    }
+
+    /// Wire in the remote servers' former names (Carbon Forge ADR-0198,
+    /// Update of 2026-10-21, R3 step 1).
+    pub fn with_former_names(
+        mut self,
+        former_names: crate::domain::node_config::FormerNames,
+    ) -> Self {
+        self.former_names = former_names;
+        self
     }
 
     pub fn with_gateway_client(mut self, gateway_client: Arc<dyn SealGatewayClient>) -> Self {
@@ -302,7 +317,8 @@ impl AttestationServiceImpl {
                             .await
                         {
                             Ok(agent) => {
-                                let tools = agent.manifest.spec.tools.clone();
+                                let manifest = self.former_names.manifest(agent.manifest);
+                                let tools = manifest.spec.tools.clone();
                                 // Zaru ADR-0055 D16: each declared context the
                                 // dispatch filled adds its server's tools unless
                                 // `spec.tools` names some of them, as at the
@@ -311,8 +327,10 @@ impl AttestationServiceImpl {
                                 let mut from_contexts = tools.clone();
                                 crate::domain::agent::add_filled_context_patterns(
                                     &mut from_contexts,
-                                    &agent.manifest.spec.contexts,
-                                    &execution.input.contexts(),
+                                    &manifest.spec.contexts,
+                                    &self
+                                        .former_names
+                                        .execution_contexts(execution.input.contexts()),
                                 );
                                 if tools.is_empty() {
                                     tracing::debug!(

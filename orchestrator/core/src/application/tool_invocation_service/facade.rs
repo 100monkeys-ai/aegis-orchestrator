@@ -66,6 +66,50 @@ impl ProfileRefusal {
     }
 }
 
+/// An envelope whose tool is read by its server's own name (Carbon Forge
+/// ADR-0198, Update of 2026-10-21, R3 step 1): `<former>.<tool>` reads as
+/// `<server>.<tool>` to the session's policy, the gate and the routing;
+/// the token, the signature, the arguments and the nonce are the sent
+/// envelope's own. With no former names every tool reads as sent.
+pub(super) struct FormerNamesEnvelope<'e, E> {
+    inner: &'e E,
+    tool: Option<String>,
+}
+
+impl<'e, E: EnvelopeVerifier> FormerNamesEnvelope<'e, E> {
+    pub(super) fn new(
+        inner: &'e E,
+        former_names: &crate::domain::node_config::FormerNames,
+    ) -> Self {
+        let tool = inner
+            .extract_tool_name()
+            .map(|tool| former_names.tool(&tool).into_owned());
+        Self { inner, tool }
+    }
+}
+
+impl<E: EnvelopeVerifier> EnvelopeVerifier for FormerNamesEnvelope<'_, E> {
+    fn security_token(&self) -> &crate::domain::secrets::SensitiveString {
+        self.inner.security_token()
+    }
+
+    fn verify_signature(&self, public_key_bytes: &[u8]) -> Result<(), SealSessionError> {
+        self.inner.verify_signature(public_key_bytes)
+    }
+
+    fn extract_tool_name(&self) -> Option<String> {
+        self.tool.clone()
+    }
+
+    fn extract_arguments(&self) -> Option<Value> {
+        self.inner.extract_arguments()
+    }
+
+    fn replay_nonce(&self) -> String {
+        self.inner.replay_nonce()
+    }
+}
+
 /// The refusal of a profile that is not the person's or was deleted, at a
 /// call: its sentence and code as before, needing the Profiles page (Zaru
 /// ADR-0070 D1 (d)).
@@ -173,6 +217,7 @@ impl ToolInvocationService {
             seal_gateway_ca: None,
             tool_credentials: None,
             remote_tool_servers: Vec::new(),
+            remote_tool_former_names: Default::default(),
             mail_tools: None,
             calendar_tools: None,
             schema_registry: Arc::new(SchemaRegistry::build()),
@@ -386,6 +431,20 @@ impl ToolInvocationService {
         self
     }
 
+    /// The remote servers' former names (Carbon Forge ADR-0198, Update of
+    /// 2026-10-21, R3 step 1): a call of `<former>.<tool>` is routed as
+    /// `<server>.<tool>`, a contexts key `<former>` chooses for the server,
+    /// and a manifest, a profile or a policy naming a former name is read
+    /// as naming the server; every listing and refusal names the server's
+    /// own name.
+    pub fn with_remote_tool_former_names(
+        mut self,
+        former_names: crate::domain::node_config::FormerNames,
+    ) -> Self {
+        self.remote_tool_former_names = former_names;
+        self
+    }
+
     /// The SEAL gateway's part of the service as the node configures it
     /// (AEGIS ADR-132 H1, H4, H8), the one way the daemon wires it:
     /// `seal_gateway.ca_cert_path`'s CA, `seal_gateway.remote_servers`'
@@ -430,6 +489,7 @@ impl ToolInvocationService {
         }
         service = service
             .with_remote_tool_servers(names)
+            .with_remote_tool_former_names(gateway.former_names())
             .with_tool_credentials(credentials);
         Ok(service)
     }
@@ -614,6 +674,10 @@ impl ToolInvocationService {
         envelope: &(impl EnvelopeVerifier + Send + Sync),
         meta: Option<&Value>,
     ) -> Result<Value, SealSessionError> {
+        // Carbon Forge ADR-0198, Update of 2026-10-21, R3 step 1: a tool of
+        // a former server name is evaluated, gated and routed as its
+        // server's own; the signed payload is verified as sent.
+        let envelope = &FormerNamesEnvelope::new(envelope, &self.remote_tool_former_names);
         // 1. Look up the active session by the opaque security_token string.
         let mut session = self
             .seal_session_repo
@@ -672,11 +736,12 @@ impl ToolInvocationService {
         // 2b2. AEGIS ADR-132 S7: the conversation's choices, refused before
         // anything runs when malformed.
         let call_contexts = match meta {
-            Some(meta) => super::context_args::parse_contexts(meta)?.map(|choices| {
-                crate::domain::execution::ExecutionContexts::from_value(Some(&Value::Object(
-                    choices,
-                )))
-            }),
+            Some(meta) => match super::context_args::parse_contexts(meta)? {
+                Some(choices) => Some(crate::domain::execution::ExecutionContexts::from_value(
+                    Some(&Value::Object(self.resolve_former_contexts(choices)?)),
+                )),
+                None => None,
+            },
             None => None,
         };
         // 2b3. AEGIS ADR-126, Update of 2026-10-07 (2), clause 2: the
@@ -1244,6 +1309,12 @@ impl ToolInvocationService {
         // tenant — agent lookups, judge spawning, gateway forwarding, etc.
         // All `aegis.*` arg-bearing tool dispatch goes through `enforce_tenant_arg`.
         let tenant_id = &tenant_scope.authenticated_tenant;
+        // Carbon Forge ADR-0198, Update of 2026-10-21, R3 step 1: a tool of a
+        // former server name is the server's own tool from here on.
+        let tool_name = match self.remote_tool_former_names.tool(&tool_name) {
+            std::borrow::Cow::Owned(resolved) => resolved,
+            std::borrow::Cow::Borrowed(_) => tool_name,
+        };
         let invocation_id = ToolInvocationId::new();
         let started_at = Instant::now();
         self.publish_invocation_requested(
@@ -2226,7 +2297,7 @@ impl ToolInvocationService {
         })?;
         match profiles.contexts_of(tenant_id, person, profile).await {
             Ok(map) => Ok(crate::domain::execution::ExecutionContexts::from_value(
-                Some(&Value::Object(map)),
+                Some(&Value::Object(self.resolve_former_contexts(map)?)),
             )),
             Err(ProfileError::NotFound) => Err(profile_gone()),
             Err(e) => Err(SealSessionError::InternalError(format!(
@@ -2257,7 +2328,7 @@ impl ToolInvocationService {
             )),
         };
         let unreadable = match read {
-            Ok(admission) if admission.admits(tool_name) => return Ok(()),
+            Ok(admission) if self.profile_admits(&admission, tool_name) => return Ok(()),
             Ok(_) => return Err(ProfileRefusal::NotAdmitted),
             Err(ProfileError::NotFound) => ProfileRefusal::Gone,
             Err(ProfileError::Refused(sentence)) => ProfileRefusal::Other(sentence),
@@ -2269,7 +2340,9 @@ impl ToolInvocationService {
             .get_execution_unscoped(execution_id)
             .await
         {
-            Ok(execution) => execution.input.contexts(),
+            Ok(execution) => self
+                .remote_tool_former_names
+                .execution_contexts(execution.input.contexts()),
             Err(_) => call_contexts.cloned().unwrap_or_default(),
         };
         let governed = tool_name.contains('.')
@@ -2281,6 +2354,33 @@ impl ToolInvocationService {
         } else {
             Ok(())
         }
+    }
+
+    /// A `contexts` map with each server read by its own name (Carbon
+    /// Forge ADR-0198, Update of 2026-10-21, R3 step 1); a server named
+    /// twice with a `null` beside a choice is refused before anything runs.
+    pub(super) fn resolve_former_contexts(
+        &self,
+        map: serde_json::Map<String, Value>,
+    ) -> Result<serde_json::Map<String, Value>, SealSessionError> {
+        self.remote_tool_former_names
+            .contexts(map)
+            .map_err(SealSessionError::InvalidArguments)
+    }
+
+    /// Whether `admission` lets `tool_name` through (AEGIS ADR-140 D2, D7),
+    /// the tool read by every name of its server (Carbon Forge ADR-0198,
+    /// Update of 2026-10-21, R3 step 1): the profile governs it when it
+    /// governs any of them, and its list admits it when a pattern admits
+    /// any of them.
+    pub(super) fn profile_admits(
+        &self,
+        admission: &crate::application::profile_service::ProfileAdmission,
+        tool_name: &str,
+    ) -> bool {
+        let spellings = self.remote_tool_former_names.spellings(tool_name);
+        let governed = spellings.iter().any(|tool| admission.governs(tool));
+        !governed || spellings.iter().any(|tool| admission.tools.admits(tool))
     }
 
     /// The conversation of a call (AEGIS ADR-126, Update of 2026-10-07 (2),

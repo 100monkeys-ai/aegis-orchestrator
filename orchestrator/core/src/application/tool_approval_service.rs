@@ -150,11 +150,29 @@ pub trait ApprovedCallRunner: Send + Sync {
 pub struct ToolApprovalService {
     repo: Arc<dyn ToolApprovalRepository>,
     event_bus: Arc<EventBus>,
+    /// The remote servers' former names (Carbon Forge ADR-0198, Update of
+    /// 2026-10-21, R3 step 1): a policy stored for a tool by a former name
+    /// of its server answers the call of the server's own tool.
+    former_names: crate::domain::node_config::FormerNames,
 }
 
 impl ToolApprovalService {
     pub fn new(repo: Arc<dyn ToolApprovalRepository>, event_bus: Arc<EventBus>) -> Self {
-        Self { repo, event_bus }
+        Self {
+            repo,
+            event_bus,
+            former_names: Default::default(),
+        }
+    }
+
+    /// Wire in the remote servers' former names (Carbon Forge ADR-0198,
+    /// Update of 2026-10-21, R3 step 1).
+    pub fn with_former_names(
+        mut self,
+        former_names: crate::domain::node_config::FormerNames,
+    ) -> Self {
+        self.former_names = former_names;
+        self
     }
 
     /// The gate (ADR-126 D2), for a call of a gated tool.
@@ -165,16 +183,24 @@ impl ToolApprovalService {
             .ok_or_else(|| ToolApprovalError::RequiresUser(call.tool_name.to_string()))?;
         let binding_id = call.contract.binding_of(call.arguments);
         let now = Utc::now();
-        let policy = self
-            .repo
-            .find_active_policy(
-                call.tenant_id,
-                user_sub,
-                call.tool_name,
-                binding_id.as_deref(),
-                call.profile_id,
-            )
-            .await?;
+        // Carbon Forge ADR-0198, Update of 2026-10-21, R3 step 1: the tool by
+        // its server's own name first, then by each former name of it.
+        let mut policy = None;
+        for tool_name in self.former_names.spellings(call.tool_name) {
+            policy = self
+                .repo
+                .find_active_policy(
+                    call.tenant_id,
+                    user_sub,
+                    &tool_name,
+                    binding_id.as_deref(),
+                    call.profile_id,
+                )
+                .await?;
+            if policy.is_some() {
+                break;
+            }
+        }
         // AEGIS ADR-139 N9: the schedule whose run made the call, from the
         // run's record, as the conversation is.
         let schedule_id = self.repo.schedule_of_run(call.execution_id).await?;

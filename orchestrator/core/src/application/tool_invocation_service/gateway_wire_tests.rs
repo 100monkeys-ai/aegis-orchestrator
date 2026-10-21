@@ -2510,7 +2510,7 @@ async fn without_a_gateway_an_agents_run_is_offered_what_it_was_offered_before()
 // ---------------------------------------------------------------------------
 
 /// The `tools/call` result of `cortex.ground` whose token reaches one
-/// instance, as Nuclear Notes answers it: the payload as the text of the
+/// instance, as Carbon Forge answers it: the payload as the text of the
 /// first content item.
 fn grounding_result(instances: &[(&str, &str)]) -> Answer {
     let payload = json!({

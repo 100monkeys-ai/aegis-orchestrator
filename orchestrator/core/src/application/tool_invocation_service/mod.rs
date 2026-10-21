@@ -154,6 +154,11 @@ pub struct ToolInvocationService {
     /// tool named `<server>.<tool>` of one of them is called with
     /// `InvokeTool` and the acting user's credential (AEGIS ADR-132 H4).
     remote_tool_servers: Vec<String>,
+    /// The remote servers' former names, each with the name of the server
+    /// it now names (Carbon Forge ADR-0198, Update of 2026-10-21, R3 step
+    /// 1): a tool, a contexts key, a manifest or a pattern naming one is
+    /// read as naming that server. Empty: every name reads as written.
+    remote_tool_former_names: crate::domain::node_config::FormerNames,
     /// The mail tools (AEGIS ADR-125 D4): the acting person's mailbox and
     /// the connector their sessions open over. `None`: every mail tool is
     /// answered as not configured.
