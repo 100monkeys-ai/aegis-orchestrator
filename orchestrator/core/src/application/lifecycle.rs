@@ -734,4 +734,155 @@ spec:
             "a refused update leaves the deployed manifest in place"
         );
     }
+
+    /// The shape of `mail-reply-drafter` 1.0.0 (execution `1c86c074`): a
+    /// semantic judge of 180 s, no `iteration_timeout` (600 s), with the
+    /// `max_retries` and `resources.timeout` given.
+    fn mail_reply_drafter(version: &str, max_retries: u32, timeout: &str) -> AgentManifest {
+        crate::infrastructure::agent_manifest_parser::AgentManifestParser::parse_yaml(&format!(
+            r#"apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: mail-reply-drafter
+  version: "{version}"
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+  task:
+    instruction: Draft a reply to the email in the input.
+  execution:
+    mode: iterative
+    max_retries: {max_retries}
+    validation:
+      - type: semantic
+        judge_agent: email-draft-judge
+        criteria: The reply answers every question the email asks.
+        min_score: 0.7
+        timeout_seconds: 180
+  security:
+    resources:
+      timeout: "{timeout}"
+"#
+        ))
+        .expect("the mail-reply-drafter manifest parses")
+    }
+
+    /// AEGIS ADR-141, Update of 2026-10-21, clause 12: 2 x (600 + 180) + 15
+    /// + 30 = 1605 s.
+    const TWO_TRIES_SENTENCE: &str = "Agent 'mail-reply-drafter' is refused \
+        (execution-bound/two-tries): resources.timeout 900 s is under the 1605 s that two whole \
+        tries need (iteration_timeout 600 s and its judges' 180 s each, the wait between them \
+        and the start). Set resources.timeout to 1605s or more, or max_retries to 1.";
+
+    /// Trigger (n): a bound of 900 s under three tries is refused on create
+    /// with clause 12's sentence, and nothing is saved.
+    #[tokio::test]
+    async fn deploy_refuses_a_bound_under_two_tries_with_its_sentence() {
+        let (svc, _bus) = make_service();
+        let alice =
+            TenantId::for_consumer_user("alice").expect("valid per-user tenant id for alice");
+
+        let refused = svc
+            .deploy_agent_for_tenant(
+                &alice,
+                mail_reply_drafter("1.0.0", 3, "900s"),
+                false,
+                AgentScope::Tenant,
+                None,
+            )
+            .await;
+        let mut complaints = Vec::new();
+        match &refused {
+            Err(e) if e.to_string() == TWO_TRIES_SENTENCE => {}
+            other => complaints.push(format!(
+                "create answered {other:?}, expected \"{TWO_TRIES_SENTENCE}\""
+            )),
+        }
+        if svc
+            .lookup_agent_for_tenant(&alice, "mail-reply-drafter")
+            .await
+            .expect("lookup ok")
+            .is_some()
+        {
+            complaints.push("a refused agent was saved".to_string());
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// Trigger (n): the same bound is refused on update with the same
+    /// sentence, and the deployed manifest stays in place.
+    #[tokio::test]
+    async fn update_refuses_a_bound_under_two_tries_with_its_sentence() {
+        let (svc, _bus) = make_service();
+        let alice =
+            TenantId::for_consumer_user("alice").expect("valid per-user tenant id for alice");
+
+        let id = svc
+            .deploy_agent_for_tenant(
+                &alice,
+                mail_reply_drafter("1.0.0", 3, "1605s"),
+                false,
+                AgentScope::Tenant,
+                None,
+            )
+            .await
+            .expect("a bound of two whole tries is accepted");
+
+        let refused = svc
+            .update_agent_for_tenant(&alice, id, mail_reply_drafter("1.0.1", 3, "900s"))
+            .await;
+        let mut complaints = Vec::new();
+        match &refused {
+            Err(e) if e.to_string() == TWO_TRIES_SENTENCE => {}
+            other => complaints.push(format!(
+                "update answered {other:?}, expected \"{TWO_TRIES_SENTENCE}\""
+            )),
+        }
+        let kept = svc.get_agent_for_tenant(&alice, id).await.expect("get ok");
+        let timeout = kept
+            .manifest
+            .spec
+            .security
+            .as_ref()
+            .and_then(|s| s.resources.timeout.clone());
+        if timeout.as_deref() != Some("1605s") {
+            complaints.push(format!(
+                "a refused update changed the deployed bound to {timeout:?}"
+            ));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// Trigger (n): at 1605 s, and at `max_retries: 1` with 900 s, the agent
+    /// is accepted on create and on update.
+    #[tokio::test]
+    async fn a_bound_of_two_whole_tries_or_one_try_is_accepted() {
+        let (svc, _bus) = make_service();
+        let alice =
+            TenantId::for_consumer_user("alice").expect("valid per-user tenant id for alice");
+
+        let id = svc
+            .deploy_agent_for_tenant(
+                &alice,
+                mail_reply_drafter("1.0.0", 3, "1605s"),
+                false,
+                AgentScope::Tenant,
+                None,
+            )
+            .await
+            .expect("1605 s under three tries is accepted on create");
+        svc.update_agent_for_tenant(&alice, id, mail_reply_drafter("1.0.1", 1, "900s"))
+            .await
+            .expect("900 s under one try is accepted on update");
+        svc.deploy_agent_for_tenant(
+            &alice,
+            mail_reply_drafter("2.0.0", 1, "900s"),
+            false,
+            AgentScope::Tenant,
+            None,
+        )
+        .await
+        .expect("900 s under one try is accepted on create");
+    }
 }

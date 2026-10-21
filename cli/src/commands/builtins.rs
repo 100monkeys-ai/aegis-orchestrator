@@ -987,65 +987,6 @@ mod tests {
         );
     }
 
-    /// Built-in agents whose clocks a record decides, exempt from the
-    /// two-tries rule below, each with the record that sets its clock. A
-    /// clock here moves only by an Update of its record.
-    const TWO_TRIES_EXEMPT: &[(&str, &str)] = &[
-        (
-            AEGIS_CODE_VALIDATOR_AGENT_NAME,
-            "AEGIS ADR-124, Update of 2026-10-04: llm_timeout_seconds 300, resources.timeout 300s",
-        ),
-        (GOAL_JUDGE_NAME, "AEGIS ADR-131 D3: resources.timeout 300s"),
-        (
-            "code-quality-judge",
-            "AEGIS ADR-052, Update of 2026-10-04 (the judges keep 300 s) and ADR-124",
-        ),
-        (
-            "tool-call-policy-judge",
-            "AEGIS ADR-052, Update of 2026-10-04 (the judges keep 300 s) and ADR-124",
-        ),
-        (
-            AGENT_GENERATOR_JUDGE_NAME,
-            "AEGIS ADR-052, Update of 2026-10-04 (the judges keep 300 s) and ADR-124",
-        ),
-        (
-            WORKFLOW_GENERATOR_JUDGE_NAME,
-            "AEGIS ADR-052, Update of 2026-10-04 (the judges keep 300 s) and ADR-124",
-        ),
-        (
-            AEGIS_PYTHON_EXECUTOR_AGENT_NAME,
-            "AEGIS ADR-087: the intent-to-execution pipeline's executors",
-        ),
-        (
-            AEGIS_JAVASCRIPT_EXECUTOR_AGENT_NAME,
-            "AEGIS ADR-087: the intent-to-execution pipeline's executors",
-        ),
-        (
-            AEGIS_BASH_EXECUTOR_AGENT_NAME,
-            "AEGIS ADR-087: the intent-to-execution pipeline's executors",
-        ),
-        (
-            AEGIS_OUTPUT_FORMATTER_AGENT_NAME,
-            "AEGIS ADR-103: the output handler",
-        ),
-        (
-            AEGIS_DOCUMENT_RENDERER_AGENT_NAME,
-            "AEGIS ADR-135 D1: one fixed program, max_iterations 1",
-        ),
-        (
-            AGENT_GENERATOR_AGENT_NAME,
-            "AEGIS ADR-052, Update of 2026-10-04: resources.timeout 600s",
-        ),
-        (
-            WORKFLOW_CREATOR_AGENT_NAME,
-            "AEGIS ADR-052, Update of 2026-10-04: resources.timeout 600s",
-        ),
-        (
-            WORKFLOW_GENERATOR_PLANNER_AGENT_NAME,
-            "AEGIS ADR-052, Update of 2026-10-04: resources.timeout 600s",
-        ),
-    ];
-
     /// The seven agents of the Forge.
     const FORGE_AGENTS: &[&str] = &[
         "requirements-analyst",
@@ -1068,7 +1009,9 @@ mod tests {
     /// supervisor makes after a failed try and the time a try takes to start
     /// (`resources.timeout >= 2 x (iteration_timeout + judges' timeout_seconds)
     /// + failed_execution_backoff(1) + TRY_START_ALLOWANCE`, the supervisor's
-    /// `two_tries_bound`), outside the exemptions above. Run `e7f2c2aa`'s
+    /// `two_tries_bound`), outside the exemptions the domain names beside it
+    /// (`TWO_TRIES_EXEMPT`, moved there by AEGIS ADR-141's Update of
+    /// 2026-10-21, clause 12, and read from there). Run `e7f2c2aa`'s
     /// coder had 899 s left of 1815 s after its first try ran to its 900 s
     /// clock, and its second try was refused. The Forge's seven agents take
     /// `iteration_timeout: "900s"` and exactly the bound their own manifest
@@ -1077,7 +1020,7 @@ mod tests {
     fn builtin_agent_execution_bound_fits_two_tries() {
         use aegis_orchestrator_core::domain::agent::{ExecutionStrategy, ResourceLimits};
         use aegis_orchestrator_core::domain::supervisor::{
-            iteration_timeout, two_tries_bound, DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+            iteration_timeout, two_tries_bound, DEFAULT_EXECUTION_TIMEOUT_SECONDS, TWO_TRIES_EXEMPT,
         };
 
         let names: Vec<&str> = BUILTIN_AGENTS.iter().map(|(name, _)| *name).collect();
@@ -1151,6 +1094,31 @@ mod tests {
             ));
         }
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
+
+    /// AEGIS ADR-141, Update of 2026-10-21, Trigger (o): every built-in is
+    /// registered through `deploy_agent_for_tenant` as the system tenant's
+    /// row (`cli/src/daemon/server.rs`), where clause 12's check runs, so
+    /// each built-in passes it: one outside `TWO_TRIES_EXEMPT` fits two whole
+    /// tries, and one on it is not held to them.
+    #[test]
+    fn every_builtin_agent_passes_the_two_tries_check_at_registration() {
+        use aegis_orchestrator_core::domain::agent::AgentManifest;
+        use aegis_orchestrator_core::domain::supervisor::two_tries_refusal;
+
+        let refused: Vec<String> = BUILTIN_AGENTS
+            .iter()
+            .filter_map(|(name, yaml)| {
+                let manifest: AgentManifest = serde_yaml::from_str(yaml)
+                    .unwrap_or_else(|e| panic!("builtin agent '{name}' does not parse: {e}"));
+                two_tries_refusal(&manifest, true).map(|refusal| refusal.to_string())
+            })
+            .collect();
+        assert!(
+            refused.is_empty(),
+            "built-in agents the registration would refuse:\n{}",
+            refused.join("\n")
+        );
     }
 
     /// The coder edits an existing file and never rewrites it: on run

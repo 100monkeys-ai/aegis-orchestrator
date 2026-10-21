@@ -2537,4 +2537,126 @@ spec:
             );
         }
     }
+
+    /// `mail-reply-drafter`'s shape (execution `1c86c074`): a semantic judge
+    /// of 180 s, no `iteration_timeout`, three tries and the bound given.
+    fn mail_reply_drafter_yaml(version: &str, timeout: &str) -> String {
+        format!(
+            r#"apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: mail-reply-drafter
+  version: "{version}"
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+  task:
+    instruction: Draft a reply to the email in the input.
+  execution:
+    mode: iterative
+    max_retries: 3
+    validation:
+      - type: semantic
+        judge_agent: email-draft-judge
+        criteria: The reply answers every question the email asks.
+        min_score: 0.7
+        timeout_seconds: 180
+  security:
+    resources:
+      timeout: "{timeout}"
+"#
+        )
+    }
+
+    /// The tool service over the lifecycle service the daemon wires, so
+    /// `aegis.agent.create` and `aegis.agent.update` reach its checks.
+    fn service_over_the_lifecycle_service() -> ToolInvocationService {
+        let agents = Arc::new(InMemoryAgentRepository::new());
+        let event_bus = Arc::new(EventBus::new(256));
+        let lifecycle = Arc::new(
+            crate::application::lifecycle::StandardAgentLifecycleService::new(
+                agents.clone(),
+                event_bus.clone(),
+                Arc::new(
+                    crate::infrastructure::security_context::InMemorySecurityContextRepository::new(
+                    ),
+                ),
+            ),
+        );
+        let execution_service = Arc::new(StandardExecutionService::new(
+            agents,
+            Arc::new(NoVolumes),
+            Arc::new(Supervisor::new(Arc::new(NoContainers::default()))),
+            Arc::new(InMemoryExecutionRepository::new()),
+            event_bus.clone(),
+            Arc::new(crate::domain::node_config::NodeConfigManifest::default()),
+        ));
+        let storage_root =
+            std::env::temp_dir().join(format!("aegis-two-tries-tests-{}", uuid::Uuid::new_v4()));
+        let fsal = Arc::new(AegisFSAL::new(
+            Arc::new(LocalHostStorageProvider::new(&storage_root).unwrap()),
+            Arc::new(InMemoryVolumeRepository::new()),
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            Arc::new(NoPublisher),
+        ));
+        ToolInvocationService::new(
+            Arc::new(InMemorySealSessionRepository::new()),
+            Arc::new(
+                crate::infrastructure::security_context::InMemorySecurityContextRepository::new(),
+            ),
+            Arc::new(SealMiddleware::new()),
+            Arc::new(ToolRouter::new(vec![])),
+            fsal,
+            NfsVolumeRegistry::new(),
+            lifecycle,
+            execution_service,
+            Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
+            event_bus,
+            None,
+        )
+    }
+
+    /// AEGIS ADR-141, Update of 2026-10-21, Trigger (n): `aegis.agent.create`
+    /// and `aegis.agent.update` answer `validated: false` with clause 12's
+    /// sentence as it is, and nothing is deployed or updated.
+    #[tokio::test]
+    async fn agent_create_and_update_answer_the_two_tries_refusal() {
+        let service = service_over_the_lifecycle_service();
+        let sentence = "Agent 'mail-reply-drafter' is refused (execution-bound/two-tries): \
+            resources.timeout 900 s is under the 1605 s that two whole tries need \
+            (iteration_timeout 600 s and its judges' 180 s each, the wait between them and the \
+            start). Set resources.timeout to 1605s or more, or max_retries to 1.";
+        let mut complaints = Vec::new();
+
+        let answer = create(&service, &mail_reply_drafter_yaml("1.0.0", "900s"), None).await;
+        if errors(&answer) != vec![sentence.to_string()]
+            || answer.get("validated") != Some(&Value::Bool(false))
+            || answer.get("deployed") != Some(&Value::Bool(false))
+        {
+            complaints.push(format!("create of the 900 s bound answered {answer}"));
+        }
+        if service
+            .agent_lifecycle
+            .lookup_agent_for_tenant(&tenant(), "mail-reply-drafter")
+            .await
+            .unwrap()
+            .is_some()
+        {
+            complaints.push("the refused agent was deployed".to_string());
+        }
+
+        let accepted = create(&service, &mail_reply_drafter_yaml("1.0.0", "1605s"), None).await;
+        if accepted.get("deployed") != Some(&Value::Bool(true)) {
+            complaints.push(format!("create of the 1605 s bound answered {accepted}"));
+        }
+        let answer = update(&service, &mail_reply_drafter_yaml("1.0.1", "900s"), None).await;
+        if errors(&answer) != vec![sentence.to_string()]
+            || answer.get("validated") != Some(&Value::Bool(false))
+            || answer.get("updated") != Some(&Value::Bool(false))
+        {
+            complaints.push(format!("update to the 900 s bound answered {answer}"));
+        }
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    }
 }

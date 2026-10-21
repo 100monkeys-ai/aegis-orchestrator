@@ -17,7 +17,10 @@ use aegis_orchestrator_core::domain::runtime::{
     TaskInput, TaskOutput,
 };
 use aegis_orchestrator_core::domain::supervisor::{Supervisor, SupervisorObserver};
-use aegis_orchestrator_core::domain::validation::ValidationResults;
+use aegis_orchestrator_core::domain::validation::{
+    GradientResult, GradientValidator, ValidationContext, ValidationPipeline, ValidationResults,
+    ValidatorEntry, ValidatorKind,
+};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -144,7 +147,8 @@ fn input() -> ExecutionInput {
 
 /// Try 1 ends at its 10 s clock and the wait after it runs to 25 s, leaving
 /// 5 s of the 30 s bound: try 2 is not started, and the execution ends at
-/// once saying so, with try 1 recorded exhausted by its clock.
+/// once saying so, try 1's cause first (AEGIS ADR-141, Update of 2026-10-21,
+/// clause 14), with try 1 recorded exhausted by its clock.
 #[tokio::test(start_paused = true)]
 async fn a_try_that_cannot_fit_under_the_bound_is_not_started() {
     let runtime = Arc::new(SlowRuntime::default());
@@ -164,7 +168,9 @@ async fn a_try_that_cannot_fit_under_the_bound_is_not_started() {
     let ended_after = started.elapsed();
 
     let mut complaints = Vec::new();
-    let expected = "Execution ended: 5 s left under the 30 s bound, under the 10 s a try needs";
+    let expected = "Execution ended after 1 try: the last attempt ran past its time limit of 10 s \
+                    and was stopped; a further try does not fit: 5 s left under the 30 s bound, \
+                    under the 10 s a try needs";
     match &result {
         Err(error) if error.to_string().contains(expected) => {}
         other => complaints.push(format!(
@@ -218,4 +224,143 @@ async fn the_first_try_always_starts() {
         matches!(result, Err(RuntimeError::TimedOut(5))),
         "the bound cut the first try: {result:?}"
     );
+}
+
+/// A runtime whose every try answers at once.
+#[derive(Default)]
+struct AnsweringRuntime {
+    spawns: Mutex<u32>,
+}
+
+#[async_trait]
+impl AgentRuntime for AnsweringRuntime {
+    async fn spawn(&self, _config: RuntimeConfig) -> Result<InstanceId, RuntimeError> {
+        let mut spawns = self.spawns.lock().await;
+        *spawns += 1;
+        Ok(InstanceId::new(format!("instance-{spawns}")))
+    }
+
+    async fn execute(
+        &self,
+        _id: &InstanceId,
+        _input: TaskInput,
+    ) -> Result<TaskOutput, RuntimeError> {
+        Ok(TaskOutput {
+            result: serde_json::Value::String("Dear Ana, thank you for your note.".to_string()),
+            logs: vec![],
+            tool_calls: vec![],
+            exit_code: 0,
+            trajectory: vec![],
+        })
+    }
+
+    async fn terminate(&self, _id: &InstanceId) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    async fn status(&self, id: &InstanceId) -> Result<InstanceStatus, RuntimeError> {
+        Ok(InstanceStatus {
+            id: id.clone(),
+            state: "running".to_string(),
+            uptime_seconds: 0,
+            memory_usage_mb: 0,
+            cpu_usage_percent: 0.0,
+        })
+    }
+}
+
+/// A judge that takes 25 s and then rejects the answer, or answers the
+/// error its wait timed out with.
+struct SlowJudge {
+    rejects: bool,
+}
+
+#[async_trait]
+impl GradientValidator for SlowJudge {
+    async fn validate(&self, _ctx: &ValidationContext) -> anyhow::Result<GradientResult> {
+        tokio::time::sleep(Duration::from_secs(25)).await;
+        if self.rejects {
+            Ok(GradientResult {
+                score: 0.0,
+                confidence: 0.9,
+                reasoning: "the reply answers none of the questions".to_string(),
+                signals: vec![],
+                metadata: HashMap::new(),
+            })
+        } else {
+            Err(anyhow::anyhow!(
+                "Judge 'email-draft-judge' timed out after 180 seconds"
+            ))
+        }
+    }
+}
+
+/// The end of an execution whose one try answered at once and whose judge
+/// took 25 s of the 30 s bound, leaving 5 s, under the 10 s a try needs.
+async fn ended_after_the_judge(rejects: bool) -> (Result<String, RuntimeError>, u32) {
+    let runtime = Arc::new(AnsweringRuntime::default());
+    let pipeline = Arc::new(ValidationPipeline::new(vec![ValidatorEntry {
+        kind: ValidatorKind::Semantic,
+        validator: Box::new(SlowJudge { rejects }),
+        min_score: 0.7,
+        min_confidence: 0.0,
+    }]));
+    let result = Supervisor::new(runtime.clone())
+        .run_loop(
+            config(),
+            input(),
+            3,
+            Arc::new(RecordingObserver::default()),
+            CancellationToken::new(),
+            Some(pipeline),
+        )
+        .await;
+    let spawns = *runtime.spawns.lock().await;
+    (result, spawns)
+}
+
+/// AEGIS ADR-141, Update of 2026-10-21, Trigger (q): a judge rejects try 1,
+/// the bound refuses try 2, and the execution's error reads clause 14's
+/// sentence, the judge's reason before "a further try does not fit".
+/// Execution `1c86c074` ended "Execution ended: 666 s left under the 900 s
+/// bound, under the 780 s a try needs", the verdict dropped.
+#[tokio::test(start_paused = true)]
+async fn a_try_refused_after_a_rejection_names_the_judges_reason_first() {
+    let (result, spawns) = ended_after_the_judge(true).await;
+    let expected = "Execution ended after 1 try: the last attempt's output was rejected: \
+                    Validation score 0.00 below minimum 0.70: the reply answers none of the \
+                    questions; a further try does not fit: 5 s left under the 30 s bound, under \
+                    the 10 s a try needs";
+    let mut complaints = Vec::new();
+    match &result {
+        Err(RuntimeError::ExecutionFailed(reason)) if reason == expected => {}
+        other => complaints.push(format!(
+            "the execution ended {other:?}, expected \"{expected}\""
+        )),
+    }
+    if spawns != 1 {
+        complaints.push(format!("{spawns} tries were spawned, expected 1"));
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// Trigger (q), the judge's wait timed out (execution `098812cc`): the
+/// error names the judge's timeout before "a further try does not fit".
+#[tokio::test(start_paused = true)]
+async fn a_try_refused_after_a_judges_timeout_names_the_timeout_first() {
+    let (result, spawns) = ended_after_the_judge(false).await;
+    let expected = "Execution ended after 1 try: the last attempt failed validation: Judge \
+                    'email-draft-judge' timed out after 180 seconds; a further try does not fit: \
+                    5 s left under the 30 s bound, under the 10 s a try needs";
+    let mut complaints = Vec::new();
+    match &result {
+        Err(RuntimeError::ExecutionFailed(reason)) if reason == expected => {}
+        other => complaints.push(format!(
+            "the execution ended {other:?}, expected \"{expected}\""
+        )),
+    }
+    if spawns != 1 {
+        complaints.push(format!("{spawns} tries were spawned, expected 1"));
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
 }

@@ -6141,6 +6141,123 @@ async fn aegis_task_status_answers_an_undeclared_produced_file() {
     );
 }
 
+/// AEGIS ADR-141, Update of 2026-10-21, clause 15: `aegis.task.status` and
+/// `aegis.task.wait` answered the last iteration's error, never the
+/// execution's, so execution `1c86c074` answered `failed` with no reason.
+/// They answer `error`, the execution's own reason, and `answer_rejected`.
+const ENDED_AFTER_A_REJECTION: &str = "Execution ended after 1 try: the last attempt's \
+    output was rejected: Validation score 0.00 below minimum 0.70: the reply answers none of \
+    the questions; a further try does not fit: 666 s left under the 900 s bound, under the \
+    780 s a try needs";
+
+/// An execution whose one try answered and whose judge rejected the answer.
+fn execution_rejected_by_its_judge(tenant: TenantId) -> Execution {
+    let mut exec = make_execution_with_tenant(tenant);
+    exec.start();
+    exec.start_iteration("act".to_string()).unwrap();
+    exec.complete_iteration("Dear Ana, thank you for your note.".to_string());
+    exec.store_validation_results(
+        1,
+        crate::domain::validation::ValidationResults {
+            system: None,
+            output: None,
+            semantic: Some(crate::domain::validation::SemanticValidationResult {
+                success: false,
+                score: 0.0,
+                reasoning: "the reply answers none of the questions".to_string(),
+            }),
+            gradient: None,
+            consensus: None,
+        },
+    )
+    .unwrap();
+    exec.fail(ENDED_AFTER_A_REJECTION.to_string());
+    exec
+}
+
+/// An execution whose one try failed before it answered.
+fn execution_whose_try_failed(tenant: TenantId) -> Execution {
+    let mut exec = make_execution_with_tenant(tenant);
+    exec.start();
+    exec.start_iteration("act".to_string()).unwrap();
+    exec.fail_iteration(crate::domain::execution::IterationError {
+        message: "the container exited 1".to_string(),
+        details: None,
+    });
+    exec.fail(
+        "Max retries exceeded after 1 attempt; the last attempt failed: the container exited 1"
+            .to_string(),
+    );
+    exec
+}
+
+/// Trigger (r): a failed execution answers `error` equal to
+/// `Execution.error` on `aegis.task.status` and `aegis.task.wait`, and
+/// `answer_rejected: true` after a judge's rejection of its answer, false
+/// otherwise; the status stays `failed` and `last_output` the answer.
+#[tokio::test]
+async fn aegis_task_status_and_wait_answer_the_executions_error_and_a_rejected_answer() {
+    let tenant = TenantId::for_consumer_user("user-a-sub").unwrap();
+    let mut complaints = Vec::new();
+    for (exec, rejected) in [
+        (execution_rejected_by_its_judge(tenant.clone()), true),
+        (execution_whose_try_failed(tenant.clone()), false),
+    ] {
+        let exec_id = exec.id;
+        let expected_error = exec.error.clone();
+        let expected_output = exec.iterations().last().and_then(|i| i.output.clone());
+        let svc = Arc::new(TenantScopedTaskExecutionService::new(tenant.clone(), exec));
+        let service = build_task_service_with(svc);
+        let scope = consumer_tenant_scope(tenant.clone());
+
+        let status = service
+            .invoke_aegis_task_status_tool(
+                &mut serde_json::json!({ "execution_id": exec_id.0.to_string() }),
+                &scope,
+            )
+            .await
+            .expect("status tool returns a Direct payload");
+        let wait = service
+            .invoke_aegis_task_wait_tool(
+                &mut serde_json::json!({
+                    "execution_id": exec_id.0.to_string(),
+                    "poll_interval_seconds": 1,
+                    "timeout_seconds": 1,
+                }),
+                &scope,
+            )
+            .await
+            .expect("wait tool returns a Direct payload");
+        for (tool, result) in [("aegis.task.status", status), ("aegis.task.wait", wait)] {
+            let ToolInvocationResult::Direct(payload) = result else {
+                panic!("expected direct payload");
+            };
+            if payload["error"].as_str() != expected_error.as_deref() {
+                complaints.push(format!(
+                    "{tool} answered error {}, expected {expected_error:?}",
+                    payload["error"]
+                ));
+            }
+            if payload["answer_rejected"] != serde_json::json!(rejected) {
+                complaints.push(format!(
+                    "{tool} answered answer_rejected {}, expected {rejected}",
+                    payload["answer_rejected"]
+                ));
+            }
+            if payload["status"] != "failed" {
+                complaints.push(format!("{tool} answered status {}", payload["status"]));
+            }
+            if payload["last_output"].as_str() != expected_output.as_deref() {
+                complaints.push(format!(
+                    "{tool} answered last_output {}, expected {expected_output:?}",
+                    payload["last_output"]
+                ));
+            }
+        }
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
 /// Bug 2 — `aegis.task.wait` regression: same as task.status, but for the
 /// blocking-poll handler. The first poll must short-circuit on the
 /// tenant-scoped lookup failure rather than entering the wait loop.
