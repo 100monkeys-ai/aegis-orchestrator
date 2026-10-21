@@ -299,6 +299,16 @@ spec:
         };
         let repository = PostgresAgentRepository::new(db.pool.clone());
         let alice = TenantId::for_consumer_user("alice").expect("a tenant id for alice");
+        // An agent row names its tenant (`agents_tenant_fk`); the system
+        // tenant is seeded by the migrations, alice's is added here.
+        sqlx::query(
+            "INSERT INTO tenants (slug, display_name, keycloak_realm, openbao_namespace) \
+             VALUES ($1, $1, 'zaru-consumer', $1) ON CONFLICT DO NOTHING",
+        )
+        .bind(alice.as_str())
+        .execute(&db.pool)
+        .await
+        .expect("insert alice's tenant");
         let save = |name: &str, max_retries: u32, timeout: &str, tenant: &TenantId| {
             let mut agent = Agent::new(manifest(name, max_retries, timeout));
             agent.tenant_id = tenant.clone();
