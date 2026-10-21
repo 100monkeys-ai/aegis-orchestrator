@@ -19,6 +19,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Held for writing while the stand-ins are open for writing and for reading
+/// around every spawn in this file, because a child forked while another test
+/// holds a stand-in open for writing inherits that descriptor and the stand-in's
+/// exec then fails with ETXTBSY ("Text file busy").
+static STAND_INS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
@@ -97,12 +103,14 @@ fn render(input: &str) -> String {
     std::fs::write(&awk, image_file(TURNS_AWK)).unwrap();
     let segments = dir.path().join("segments.txt");
     std::fs::write(&segments, input).unwrap();
+    let spawning = STAND_INS.read().unwrap_or_else(|e| e.into_inner());
     let out = Command::new(mawk())
         .arg("-f")
         .arg(&awk)
         .arg(&segments)
         .output()
         .expect("mawk runs");
+    drop(spawning);
     assert!(
         out.status.success(),
         "turns.awk failed under mawk: {}",
@@ -214,6 +222,7 @@ fn run_transcribe(model: &str) -> Run {
     )
     .unwrap();
     let args_file = root.join("whisper-args.txt");
+    let writing = STAND_INS.write().unwrap_or_else(|e| e.into_inner());
     write_stand_in(
         &bin.join("whisper-cli"),
         &format!(
@@ -231,6 +240,7 @@ fn run_transcribe(model: &str) -> Run {
         &bin.join("ffmpeg"),
         "#!/bin/sh\nfor a in \"$@\"; do last=$a; done\n: > \"$last\"\n",
     );
+    drop(writing);
     std::os::unix::fs::symlink(mawk(), bin.join("awk")).unwrap();
 
     let audio = root.join("DIALOGUE.ogg");
@@ -241,6 +251,7 @@ fn run_transcribe(model: &str) -> Run {
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
+    let spawning = STAND_INS.read().unwrap_or_else(|e| e.into_inner());
     let out = Command::new("sh")
         .arg(&transcribe)
         .arg(&audio)
@@ -249,6 +260,7 @@ fn run_transcribe(model: &str) -> Run {
         .env("PATH", path)
         .output()
         .expect("sh runs transcribe");
+    drop(spawning);
     assert!(
         out.status.success(),
         "transcribe failed for model {model}: {}",
