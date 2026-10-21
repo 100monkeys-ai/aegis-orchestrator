@@ -163,6 +163,23 @@ struct Run {
     transcript: String,
 }
 
+/// Writes an executable stand-in at `path`, created with mode 0755 and closed
+/// on return, with no `chmod` child: a child another test forks while a
+/// script is open for writing inherits that descriptor, and exec of the
+/// script then fails with ETXTBSY ("Text file busy").
+fn write_stand_in(path: &Path, script: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .open(path)
+        .unwrap_or_else(|e| panic!("the stand-in {} is created: {e}", path.display()));
+    file.write_all(script.as_bytes())
+        .unwrap_or_else(|e| panic!("the stand-in {} is written: {e}", path.display()));
+}
+
 /// Runs the image's `transcribe` on an audio file in an image whose
 /// `/opt/whisper/model` names `model`. `whisper-cli` is a stand-in that
 /// records its arguments, writes "  the base model text" to its
@@ -197,9 +214,9 @@ fn run_transcribe(model: &str) -> Run {
     )
     .unwrap();
     let args_file = root.join("whisper-args.txt");
-    std::fs::write(
-        bin.join("whisper-cli"),
-        format!(
+    write_stand_in(
+        &bin.join("whisper-cli"),
+        &format!(
             "#!/bin/sh\n\
              for a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{args}'\n\
              prev=''\n\
@@ -209,20 +226,11 @@ fn run_transcribe(model: &str) -> Run {
             args = args_file.display(),
             stdout = stdout_fixture.display(),
         ),
-    )
-    .unwrap();
-    std::fs::write(
-        bin.join("ffmpeg"),
+    );
+    write_stand_in(
+        &bin.join("ffmpeg"),
         "#!/bin/sh\nfor a in \"$@\"; do last=$a; done\n: > \"$last\"\n",
-    )
-    .unwrap();
-    for tool in ["whisper-cli", "ffmpeg"] {
-        Command::new("chmod")
-            .arg("0755")
-            .arg(bin.join(tool))
-            .status()
-            .unwrap();
-    }
+    );
     std::os::unix::fs::symlink(mawk(), bin.join("awk")).unwrap();
 
     let audio = root.join("DIALOGUE.ogg");
