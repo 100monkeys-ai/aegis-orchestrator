@@ -7561,3 +7561,42 @@ async fn the_render_tool_answers_the_produced_files_path_size_format_and_executi
         complaints.join("\n")
     );
 }
+
+/// AEGIS ADR-131 U39: the three cancel tools are served with the clause's
+/// descriptions, so the model reads that cancelling one execution keeps the
+/// person's goal open and that only `aegis.goal.cancel` ends the request.
+#[tokio::test]
+async fn the_cancel_tools_are_described_as_one_executions_cancel_keeping_the_goal_open() {
+    let router = ToolRouter::new(ToolRouter::builtin_dispatchers());
+    let tools = router.list_tools().await.unwrap();
+    let described = |name: &str| {
+        tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} is listed"))
+            .description
+            .clone()
+    };
+    let expected = [
+        (
+            "aegis.task.cancel",
+            "Cancel one running agent execution by its id. The person's goal stays open, so you can start the corrected execution next. To end the whole request, call aegis.goal.cancel.",
+        ),
+        (
+            "aegis.workflow.cancel",
+            "Cancel one running workflow execution by its id. The person's goal stays open, so you can start the corrected run next. To end the whole request, call aegis.goal.cancel.",
+        ),
+        (
+            "aegis.goal.cancel",
+            "End the person's whole request: no further round, every execution still running for it cancelled, and the goal closed cancelled with the reason given. Call it only when the person asks to stop. To stop one execution and go on, cancel that execution instead.",
+        ),
+    ];
+    let complaints: Vec<String> = expected
+        .iter()
+        .filter_map(|(name, text)| {
+            let served = described(name);
+            (served != *text).then(|| format!("{name} is described {served:?}"))
+        })
+        .collect();
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}

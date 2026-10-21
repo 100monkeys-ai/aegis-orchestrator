@@ -1538,9 +1538,11 @@ mod step_facts_tests {
 /// AEGIS ADR-131 U33 and U33a in the tool path, through the real handlers of
 /// a `ToolInvocationService` with a real `GoalService` over the in-memory
 /// store and the real `GoalCallWorld`: `aegis.goal.cancel` ends the goal and
-/// cancels its work by kind; `aegis.task.cancel` and `aegis.workflow.cancel`
-/// of a bound execution close its goal with the reason before they answer,
-/// and a following starting call is refused `goal_not_open`.
+/// cancels its work by kind, and a following starting call is refused
+/// `goal_not_open`. AEGIS ADR-131 U39: `aegis.task.cancel` and
+/// `aegis.workflow.cancel` of a bound execution cancel that execution and
+/// leave its goal open, the execution still bound, so a following starting
+/// call naming the goal is admitted.
 #[cfg(test)]
 mod cancel_path_tests {
     use super::*;
@@ -2086,7 +2088,7 @@ mod cancel_path_tests {
     }
 
     #[tokio::test]
-    async fn task_cancel_of_a_bound_execution_closes_its_goal_before_it_answers() {
+    async fn task_cancel_of_a_bound_execution_leaves_its_goal_open_and_the_execution_bound() {
         let h = harness();
         let goal = h.create().await;
         let agent = h.running_agent(goal).await;
@@ -2103,14 +2105,33 @@ mod cancel_path_tests {
             "after aegis.task.cancel: the goal is {} ({reason:?})",
             state.as_str()
         );
-        assert_eq!(state, GoalState::Cancelled);
-        assert_eq!(reason, Some(format!("its execution {agent} was cancelled")));
-        let refused = h.task_execute(goal).await;
-        assert_eq!(refused["error"], "goal_not_open", "{refused}");
+        assert_eq!(state, GoalState::Open);
+        assert_eq!(reason, None);
+        let status = direct(
+            h.service
+                .invoke_aegis_goal_status_tool(
+                    &json!({"goal_id": goal.to_string()}),
+                    &zaru_free(),
+                    Some(&identity(OWNER)),
+                    &scope(OWNER),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(status["state"], "open", "{status}");
+        assert_eq!(status["closed_reason"], Value::Null, "{status}");
+        let executions = status["executions"].as_array().unwrap();
+        let bound = executions
+            .iter()
+            .find(|e| e["execution_id"] == agent.to_string())
+            .unwrap_or_else(|| panic!("the cancelled execution stays bound: {status}"));
+        assert_eq!(bound["status"], "cancelled", "{status}");
+        let admitted = h.task_execute(goal).await;
+        assert_eq!(admitted["status"], "started", "{admitted}");
     }
 
     #[tokio::test]
-    async fn workflow_cancel_of_a_bound_execution_closes_its_goal_before_it_answers() {
+    async fn workflow_cancel_of_a_bound_execution_leaves_its_goal_open_and_the_execution_bound() {
         let h = harness();
         let goal = h.create().await;
         let workflow = h.bound_workflow(goal).await;
@@ -2122,18 +2143,34 @@ mod cancel_path_tests {
                 .unwrap(),
         );
         assert_eq!(answer["cancelled"], true, "{answer}");
+        assert_eq!(*h.workflows.cancels.lock().unwrap(), vec![workflow]);
         let (state, reason) = h.state(goal).await;
         println!(
             "after aegis.workflow.cancel: the goal is {} ({reason:?})",
             state.as_str()
         );
-        assert_eq!(state, GoalState::Cancelled);
-        assert_eq!(
-            reason,
-            Some(format!("its execution {workflow} was cancelled"))
+        assert_eq!(state, GoalState::Open);
+        assert_eq!(reason, None);
+        let status = direct(
+            h.service
+                .invoke_aegis_goal_status_tool(
+                    &json!({"goal_id": goal.to_string()}),
+                    &zaru_free(),
+                    Some(&identity(OWNER)),
+                    &scope(OWNER),
+                )
+                .await
+                .unwrap(),
         );
-        let refused = h.task_execute(goal).await;
-        assert_eq!(refused["error"], "goal_not_open", "{refused}");
+        assert_eq!(status["state"], "open", "{status}");
+        assert_eq!(status["closed_reason"], Value::Null, "{status}");
+        let bound = h.goals.list_bound(goal).await.unwrap();
+        assert!(
+            bound.iter().any(|b| b.execution_id == workflow),
+            "the cancelled workflow execution stays bound"
+        );
+        let admitted = h.task_execute(goal).await;
+        assert_eq!(admitted["status"], "started", "{admitted}");
     }
 
     #[tokio::test]
