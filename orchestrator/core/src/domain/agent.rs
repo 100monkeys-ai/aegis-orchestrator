@@ -374,12 +374,12 @@ impl ProgramSpec {
     }
 }
 
-// Zaru ADR-0055 D5, D16; the doc comment is the manifest schema's text.
+// Zaru ADR-0055 D5, D16; NN ADR-0198 (the former name); the doc comment is the manifest schema's text.
 /// One service an agent declares as a context, named as the node names the
 /// remote server (`seal_gateway.remote_servers`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct ContextDeclaration {
-    /// The service, today `nuclear-notes`.
+    /// The service, today `carbon-forge` (its former name `nuclear-notes` is still accepted).
     pub service: String,
     /// Whether an execution with no binding chosen for the service is
     /// refused at start.
