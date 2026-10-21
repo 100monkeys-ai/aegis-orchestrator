@@ -853,5 +853,19 @@ mod tests {
             None,
             "a 257-character task_summary is over the limit and must be dropped"
         );
+
+        // The limit counts characters, not UTF-8 bytes: 256 two-byte
+        // characters (512 bytes) are within it, 257 are not.
+        let non_ascii_at_limit = "é".repeat(256);
+        assert_eq!(
+            issued_task_summary(non_ascii_at_limit.clone()).await,
+            Some(non_ascii_at_limit),
+            "a 256-character non-ASCII task_summary is at the limit and must be kept"
+        );
+        assert_eq!(
+            issued_task_summary("é".repeat(257)).await,
+            None,
+            "a 257-character non-ASCII task_summary is over the limit and must be dropped"
+        );
     }
 }

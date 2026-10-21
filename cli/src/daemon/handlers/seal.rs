@@ -1455,6 +1455,10 @@ mod operator_escalation_attest_tests {
 mod attest_invoke_tests;
 
 #[cfg(test)]
+#[path = "seal_attest_execution_binding_tests.rs"]
+mod attest_execution_binding_tests;
+
+#[cfg(test)]
 mod envelope_wire_tests {
     use super::*;
 
