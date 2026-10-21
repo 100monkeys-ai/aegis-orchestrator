@@ -239,7 +239,7 @@ impl ToolInvocationService {
     }
 
     /// Blocking poll tool — waits for an execution to reach a terminal state.
-    /// Polls every `poll_interval_seconds` (default 10s) up to `timeout_seconds` (default 300s).
+    /// Polls every `poll_interval_seconds` (default 10s) up to `timeout_seconds` (default 600s).
     /// Returns the final execution status, output, and error (if any).
     pub(super) async fn invoke_aegis_task_wait_tool(
         &self,

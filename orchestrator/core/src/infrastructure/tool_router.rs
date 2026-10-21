@@ -2350,7 +2350,7 @@ impl ToolRouter {
                 },
                 "timeout_seconds": {
                     "type": "integer",
-                    "description": "Maximum seconds to wait before returning a timeout (default 300).",
+                    "description": "Maximum seconds to wait before returning a timeout (default 600).",
                     "minimum": 1
                 }
             },
@@ -2374,7 +2374,7 @@ impl ToolRouter {
                 },
                 "timeout_seconds": {
                     "type": "integer",
-                    "description": "Maximum seconds to wait before returning a timeout (default 300).",
+                    "description": "Maximum seconds to wait before returning a timeout (default 600).",
                     "minimum": 1
                 }
             },

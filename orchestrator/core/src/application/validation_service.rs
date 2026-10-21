@@ -1241,12 +1241,15 @@ pub fn build_validation_pipeline(
     for spec in validators {
         match spec {
             ValidatorSpec::ExitCode {
-                expected: _,
+                expected,
                 min_score,
             } => {
                 entries.push(ValidatorEntry {
                     kind: ValidatorKind::System,
-                    validator: Box::new(SystemGradientValidator::new(true, false)),
+                    validator: Box::new(
+                        SystemGradientValidator::new(true, false)
+                            .with_expected_exit_code(*expected),
+                    ),
                     min_score: *min_score,
                     min_confidence: 0.0,
                 });

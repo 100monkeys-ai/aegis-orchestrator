@@ -365,21 +365,33 @@ pub trait GradientValidator: Send + Sync {
 /// Validates iteration output based on process exit code and stderr (ADR-017).
 ///
 /// Score calculation:
-/// - `exit_code == 0` → exit_score = 1.0; non-zero → 0.0
+/// - `exit_code == expected_exit_code` → exit_score = 1.0; any other code → 0.0
 /// - `stderr` empty or `allow_stderr` → stderr_score = 1.0; else 0.5
 /// - final = `exit_score * 0.7 + stderr_score * 0.3`
-/// - If `must_succeed && exit_code != 0` → score forced to 0.0 regardless of weights
+/// - If `must_succeed && exit_code != expected_exit_code` → score forced to 0.0
+///   regardless of weights
 pub struct SystemGradientValidator {
     pub must_succeed: bool,
     pub allow_stderr: bool,
+    /// The exit code a successful try ends with: 0 unless a manifest's
+    /// `- type: exit_code` validator sets `expected`.
+    pub expected_exit_code: i64,
 }
 
 impl SystemGradientValidator {
+    /// A validator expecting exit code 0.
     pub fn new(must_succeed: bool, allow_stderr: bool) -> Self {
         Self {
             must_succeed,
             allow_stderr,
+            expected_exit_code: 0,
         }
+    }
+
+    /// The same validator expecting `expected` in place of 0.
+    pub fn with_expected_exit_code(mut self, expected: i32) -> Self {
+        self.expected_exit_code = i64::from(expected);
+        self
     }
 }
 
@@ -389,7 +401,8 @@ impl GradientValidator for SystemGradientValidator {
         const EXIT_CODE_WEIGHT: f64 = 0.7;
         const STDERR_WEIGHT: f64 = 0.3;
 
-        let exit_score = if ctx.exit_code == 0 { 1.0 } else { 0.0 };
+        let exit_code_expected = ctx.exit_code == self.expected_exit_code;
+        let exit_score = if exit_code_expected { 1.0 } else { 0.0 };
         let stderr_score = if ctx.stderr.is_empty() || self.allow_stderr {
             1.0
         } else {
@@ -397,7 +410,7 @@ impl GradientValidator for SystemGradientValidator {
         };
 
         let weighted_score = exit_score * EXIT_CODE_WEIGHT + stderr_score * STDERR_WEIGHT;
-        let must_succeed_violated = self.must_succeed && ctx.exit_code != 0;
+        let must_succeed_violated = self.must_succeed && !exit_code_expected;
         let score = if must_succeed_violated {
             0.0
         } else {
@@ -405,11 +418,14 @@ impl GradientValidator for SystemGradientValidator {
         };
 
         let mut signals = Vec::new();
-        if ctx.exit_code != 0 {
+        if !exit_code_expected {
             signals.push(ValidationSignal {
                 category: "exit_code".to_string(),
                 score: 0.0,
-                message: format!("Process exited with code {}", ctx.exit_code),
+                message: format!(
+                    "Process exited with code {}, expected {}",
+                    ctx.exit_code, self.expected_exit_code
+                ),
             });
         }
         if !ctx.stderr.is_empty() && !self.allow_stderr {
@@ -423,7 +439,7 @@ impl GradientValidator for SystemGradientValidator {
         let reasoning = format!(
             "Exit code: {} ({}), stderr: {} bytes{}",
             ctx.exit_code,
-            if ctx.exit_code == 0 {
+            if exit_code_expected {
                 "success"
             } else {
                 "failure"
