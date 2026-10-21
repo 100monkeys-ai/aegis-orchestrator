@@ -15,8 +15,24 @@
 //! piles up handlers and breaks Claude Code's MCP usage. The verifier
 //! therefore enforces an explicit short timeout ([`VERIFIER_TIMEOUT_SECS`])
 //! independent of the runtime adapter's longer-lived lifecycle timeout.
+//!
+//! ## The claimed execution's own container
+//!
+//! An attestation that names an execution is admitted only for a container
+//! whose `aegis.execution_id` label names that execution (AEGIS ADR-035
+//! Updates, volume 2, the Update of 2026-10-21, E2): the runtime adapter
+//! labels every agent container it starts so, and a running container of
+//! another execution, or one it did not start, is refused with
+//! [`ContainerNotOfExecution`].
 
-use crate::application::ports::ContainerVerificationPort;
+use std::collections::HashMap;
+
+use crate::application::ports::{ContainerNotOfExecution, ContainerVerificationPort};
+use crate::domain::execution::ExecutionId;
+
+/// The label naming an agent container's execution. The runtime adapter
+/// writes it with its own constant of the same text, private to it.
+const EXECUTION_ID_LABEL: &str = "aegis.execution_id";
 
 /// Wall-clock budget for a single `inspect_container` call against the
 /// container runtime. Tight by design — attestation is on the request path
@@ -74,11 +90,12 @@ impl BollardContainerVerifier {
         };
         Ok(Self { docker })
     }
-}
 
-#[async_trait::async_trait]
-impl ContainerVerificationPort for BollardContainerVerifier {
-    async fn verify_container_running(&self, container_id: &str) -> anyhow::Result<()> {
+    /// The labels of the container, if it is running.
+    async fn running_container_labels(
+        &self,
+        container_id: &str,
+    ) -> anyhow::Result<Option<HashMap<String, String>>> {
         let inspect = self
             .docker
             .inspect_container(container_id, None)
@@ -94,7 +111,7 @@ impl ContainerVerificationPort for BollardContainerVerifier {
         let running = inspect.state.and_then(|s| s.running).unwrap_or(false);
 
         if running {
-            Ok(())
+            Ok(inspect.config.and_then(|config| config.labels))
         } else {
             Err(anyhow::anyhow!(
                 "Container '{}' is not in a running state",
@@ -102,6 +119,47 @@ impl ContainerVerificationPort for BollardContainerVerifier {
             ))
         }
     }
+}
+
+#[async_trait::async_trait]
+impl ContainerVerificationPort for BollardContainerVerifier {
+    async fn verify_container_running(&self, container_id: &str) -> anyhow::Result<()> {
+        self.running_container_labels(container_id).await?;
+        Ok(())
+    }
+
+    /// Running, and labelled `aegis.execution_id` with `execution_id`.
+    async fn verify_container_of_execution(
+        &self,
+        container_id: &str,
+        execution_id: &ExecutionId,
+    ) -> anyhow::Result<()> {
+        let labels = self.running_container_labels(container_id).await?;
+        let found = labels.and_then(|mut labels| labels.remove(EXECUTION_ID_LABEL));
+        label_names_execution(container_id, found, execution_id)
+    }
+}
+
+/// `Ok` when `found`, the container's execution label, names
+/// `execution_id`; [`ContainerNotOfExecution`] when it names another
+/// execution or is absent.
+fn label_names_execution(
+    container_id: &str,
+    found: Option<String>,
+    execution_id: &ExecutionId,
+) -> anyhow::Result<()> {
+    let names_it = found
+        .as_deref()
+        .and_then(|label| uuid::Uuid::parse_str(label).ok())
+        .is_some_and(|label| label == execution_id.0);
+    if names_it {
+        return Ok(());
+    }
+    Err(anyhow::Error::new(ContainerNotOfExecution {
+        container_id: container_id.to_string(),
+        claimed: execution_id.to_string(),
+        found,
+    }))
 }
 
 #[cfg(all(test, unix))]

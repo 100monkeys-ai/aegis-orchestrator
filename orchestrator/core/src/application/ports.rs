@@ -180,6 +180,34 @@ pub trait ContainerVerificationPort: Send + Sync {
     /// Returns an error if the container is not running, cannot be found,
     /// or the container runtime is unreachable.
     async fn verify_container_running(&self, container_id: &str) -> anyhow::Result<()>;
+
+    /// Returns `Ok(())` if the container with the given ID is currently
+    /// running and carries the label `aegis.execution_id` equal to
+    /// `execution_id`: the container is the claimed execution's own (AEGIS
+    /// ADR-035 Updates, volume 2, the Update of 2026-10-21, E2 and E4).
+    ///
+    /// # Errors
+    ///
+    /// [`ContainerNotOfExecution`] if the running container's label names
+    /// another execution or it carries none; otherwise the errors of
+    /// [`Self::verify_container_running`].
+    async fn verify_container_of_execution(
+        &self,
+        container_id: &str,
+        execution_id: &crate::domain::execution::ExecutionId,
+    ) -> anyhow::Result<()>;
+}
+
+/// A running container that is not the claimed execution's own: its
+/// execution label names another execution, or it carries none. The route
+/// answers it 403 with a fixed sentence; the fields go only to the
+/// operator's log.
+#[derive(Debug, thiserror::Error)]
+#[error("container '{container_id}' is not execution {claimed}'s: its label is {found:?}")]
+pub struct ContainerNotOfExecution {
+    pub container_id: String,
+    pub claimed: String,
+    pub found: Option<String>,
 }
 
 /// Port for workflow execution control operations (cancel, signal, remove).

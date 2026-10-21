@@ -42,8 +42,8 @@ use std::sync::Arc;
 use crate::application::agent::AgentLifecycleService;
 use crate::application::execution::ExecutionService;
 use crate::application::ports::{
-    AttestationTokenClaims, ContainerVerificationPort, SealGatewayClient, SealSessionCreateRequest,
-    SecurityTokenIssuerPort, TokenAudience,
+    AttestationTokenClaims, ContainerNotOfExecution, ContainerVerificationPort, SealGatewayClient,
+    SealSessionCreateRequest, SecurityTokenIssuerPort, TokenAudience,
 };
 use crate::domain::agent::AgentId;
 use crate::domain::execution::ExecutionId;
@@ -196,6 +196,14 @@ impl AttestationServiceImpl {
     }
 }
 
+/// The execution an attestation names: a present, non-empty, valid
+/// `execution_id`. A malformed one is refused 400 by the route before the
+/// service is reached; here it names none.
+fn claimed_execution(request: &AttestationRequest) -> Option<ExecutionId> {
+    let named = request.execution_id.as_deref().filter(|s| !s.is_empty())?;
+    ExecutionId::from_string(named).ok()
+}
+
 #[async_trait]
 impl AttestationService for AttestationServiceImpl {
     async fn attest_with_escalation(
@@ -219,14 +227,30 @@ impl AttestationServiceImpl {
     ) -> Result<AttestationResponse> {
         let (agent_id, execution_id) = self.resolve_ids(&request)?;
 
-        // 1. Verify the requesting container is running (ADR-035 §4.1).
+        // 1. Verify the requesting container is running (ADR-035 §4.1) and,
+        // when the attestation names an execution, that it is that
+        // execution's own container (ADR-035 Updates, volume 2, the Update of
+        // 2026-10-21, E2 and E3). A container of another execution keeps its
+        // typed error, which the route answers 403; every other failure is
+        // worded as before.
         if let (Some(container_id), Some(verifier)) =
             (&request.container_id, &self.container_verifier)
         {
-            verifier
-                .verify_container_running(container_id)
-                .await
-                .map_err(|e| anyhow::anyhow!("Container identity verification failed: {e}"))?;
+            let verified = match claimed_execution(&request) {
+                Some(claimed) => {
+                    verifier
+                        .verify_container_of_execution(container_id, &claimed)
+                        .await
+                }
+                None => verifier.verify_container_running(container_id).await,
+            };
+            verified.map_err(|e| {
+                if e.is::<ContainerNotOfExecution>() {
+                    e
+                } else {
+                    anyhow::anyhow!("Container identity verification failed: {e}")
+                }
+            })?;
         }
 
         // 1b. Resolve agent identity and applicable security context.
@@ -283,7 +307,12 @@ impl AttestationServiceImpl {
                 .clone()
                 .unwrap_or_else(|| execution_id.0.to_string()),
             tenant_id: Some(request.tenant_id.to_string()),
-            task_summary: request.task_summary.clone().filter(|s| s.len() <= 256),
+            // The limit counts characters, not UTF-8 bytes (ADR-035 Updates,
+            // volume 2, the Update of 2026-10-21, E5).
+            task_summary: request
+                .task_summary
+                .clone()
+                .filter(|s| s.chars().count() <= 256),
         };
 
         // 3. Issue Token

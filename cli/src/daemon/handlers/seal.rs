@@ -11,6 +11,7 @@ use axum::Json;
 
 use aegis_orchestrator_core::application::attestation_service::ContextNotEntitled;
 use aegis_orchestrator_core::application::execution::ExecutionService;
+use aegis_orchestrator_core::application::ports::ContainerNotOfExecution;
 use aegis_orchestrator_core::domain::iam::{IdentityKind, RealmKind, UserIdentity, ZaruTier};
 use aegis_orchestrator_core::domain::shared_kernel::ExecutionId;
 use aegis_orchestrator_core::domain::tenant::TenantId;
@@ -74,6 +75,10 @@ pub(crate) enum AttestTenantError {
     TenantMismatch { expected: String, got: String },
     /// The execution referenced by `request.execution_id` could not be loaded.
     ExecutionNotFound,
+    /// `request.execution_id` is present and non-empty but is not an
+    /// execution id (AEGIS ADR-035 Updates, volume 2, the Update of
+    /// 2026-10-21, E1).
+    InvalidExecutionId,
     /// A system operator submitted a request without specifying a target
     /// tenant or execution. Operators must always specify what they are
     /// attesting against.
@@ -86,6 +91,7 @@ impl AttestTenantError {
             AttestTenantError::Unauthenticated => StatusCode::UNAUTHORIZED,
             AttestTenantError::TenantMismatch { .. } => StatusCode::FORBIDDEN,
             AttestTenantError::ExecutionNotFound => StatusCode::NOT_FOUND,
+            AttestTenantError::InvalidExecutionId => StatusCode::BAD_REQUEST,
             AttestTenantError::OperatorMissingTarget => StatusCode::BAD_REQUEST,
         }
     }
@@ -97,6 +103,9 @@ impl AttestTenantError {
                 "permission_denied: tenant mismatch (identity tenant: {expected}, requested: {got})"
             ),
             AttestTenantError::ExecutionNotFound => "execution_not_found".to_string(),
+            AttestTenantError::InvalidExecutionId => {
+                "invalid_request: invalid execution_id".to_string()
+            }
             AttestTenantError::OperatorMissingTarget => {
                 "bad_request: operators must specify tenant_id or execution_id".to_string()
             }
@@ -144,7 +153,10 @@ fn identity_tenant(identity: &UserIdentity) -> TenantId {
 /// # Resolution rules
 ///
 /// 1. No identity → [`AttestTenantError::Unauthenticated`] (fail closed).
-/// 2. `request.execution_id` present:
+/// 2. `request.execution_id` present and non-empty (an empty string is read
+///    as absent):
+///    - Not an execution id → [`AttestTenantError::InvalidExecutionId`],
+///      never a fall-through to the branches below.
 ///    - Load the execution; verify its tenant matches the identity's tenant
 ///      OR the caller may delegate (operator / service account).
 ///    - Mismatch → [`AttestTenantError::TenantMismatch`].
@@ -181,12 +193,20 @@ where
     let canonical = identity_tenant(identity);
     let delegating = may_delegate(identity);
 
-    // (2) execution_id branch — verify the execution's tenant matches.
-    if let Some(exec_id) = request
-        .execution_id
-        .as_deref()
-        .and_then(|s| ExecutionId::from_string(s).ok())
-    {
+    // (2) execution_id branch — verify the execution's tenant matches. A
+    // named execution id that does not parse is refused here, never read as
+    // absent (ADR-035 Updates, volume 2, the Update of 2026-10-21, E1).
+    if let Some(named) = request.execution_id.as_deref().filter(|s| !s.is_empty()) {
+        let exec_id = ExecutionId::from_string(named).map_err(|_| {
+            tracing::warn!(
+                target: "aegis::seal::attest",
+                variant = "InvalidExecutionId",
+                branch = "execution_id",
+                identity_tenant = %canonical.as_str(),
+                "tenant resolution rejected: execution_id is not an execution id"
+            );
+            AttestTenantError::InvalidExecutionId
+        })?;
         tracing::info!(
             target: "aegis::seal::attest",
             branch = "execution_id",
@@ -625,6 +645,9 @@ pub(crate) fn attest_failure_response(
     e: &anyhow::Error,
     tenant_for_log: &str,
 ) -> axum::response::Response {
+    if let Some(not_its_own) = e.downcast_ref::<ContainerNotOfExecution>() {
+        return workload_not_of_execution_response(not_its_own, tenant_for_log);
+    }
     if let Some(not_entitled) = e.downcast_ref::<ContextNotEntitled>() {
         let refusal = SealSessionError::InvalidArguments(not_entitled.reason.clone())
             .answered(CallerAnswer::ContextNotAllowed)
@@ -665,6 +688,43 @@ pub(crate) fn attest_failure_response(
         StatusCode::UNAUTHORIZED,
         Json(serde_json::json!({
             "error": e.to_string()
+        })),
+    )
+        .into_response()
+}
+
+/// The answer to an attestation whose container is not the claimed
+/// execution's own (ADR-035 Updates, volume 2, the Update of 2026-10-21,
+/// E2): 403 `WORKLOAD_NOT_OF_EXECUTION` in the record's refusal shape, with a
+/// fixed sentence that names neither the container nor either execution;
+/// those go only to the log, under the body's `request_id`.
+fn workload_not_of_execution_response(
+    refused: &ContainerNotOfExecution,
+    tenant_for_log: &str,
+) -> axum::response::Response {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    tracing::info!(
+        target: "aegis::seal::attest",
+        request_id = %request_id,
+        code = "WORKLOAD_NOT_OF_EXECUTION",
+        tenant_id = %tenant_for_log,
+        container_id = %refused.container_id,
+        claimed_execution_id = %refused.claimed,
+        label_execution_id = ?refused.found,
+        "attestation refused: the container is not the claimed execution's"
+    );
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "protocol": "seal/v1",
+            "request_id": request_id,
+            "status": "error",
+            "error": {
+                "code": "WORKLOAD_NOT_OF_EXECUTION",
+                "message": "The container this attestation names does not belong to the execution it claims.",
+                "context": serde_json::Value::Null,
+                "tool": serde_json::Value::Null,
+            },
         })),
     )
         .into_response()

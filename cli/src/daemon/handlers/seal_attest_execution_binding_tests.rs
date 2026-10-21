@@ -325,7 +325,11 @@ async fn a_container_labelled_with_another_execution_is_refused_403_workload_not
     let result = attest(true, labels, Some(&claimed)).await;
     let e = refused(result, "another execution's container was attested");
     let (status, body, log) = answer(&e).await;
-    let detail = [claimed.to_string(), other.to_string(), CONTAINER.to_string()];
+    let detail = [
+        claimed.to_string(),
+        other.to_string(),
+        CONTAINER.to_string(),
+    ];
     assert_workload_not_of_execution(status, &body, &log, &detail);
 }
 
