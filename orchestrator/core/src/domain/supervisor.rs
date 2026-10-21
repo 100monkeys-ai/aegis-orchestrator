@@ -3299,4 +3299,92 @@ mod tests {
         }
         assert!(complaints.is_empty(), "{}", complaints.join("\n"));
     }
+
+    // ── How many tries a strategy runs: `ExecutionStrategy::tries` ───────────
+
+    /// Runs the loop under the Execution record's cap of 5, every try failing
+    /// to start, and answers how many tries were started and the ending.
+    async fn tries_started(
+        mode: crate::domain::agent::ExecutionMode,
+        max_retries: u32,
+    ) -> (usize, Result<String, String>) {
+        let runtime = Arc::new(TestRuntime::new());
+        for _ in 0..5 {
+            runtime
+                .spawn_results
+                .lock()
+                .await
+                .push(Err(RuntimeError::SpawnFailed(
+                    "Resource exhausted".to_string(),
+                )));
+        }
+        let mut config = create_test_config();
+        config.execution.mode = mode;
+        config.execution.max_retries = max_retries;
+        let ending = final_error(runtime.clone(), config, 5, None).await;
+        let started = runtime.spawn_envs.lock().await.len();
+        (started, ending)
+    }
+
+    /// A `one-shot` agent runs one try, whatever its `max_retries` says.
+    #[tokio::test]
+    async fn a_one_shot_agent_runs_once_whatever_its_max_retries() {
+        let (started, ending) =
+            tries_started(crate::domain::agent::ExecutionMode::OneShot, 5).await;
+        assert_eq!(started, 1, "tries started");
+        assert_eq!(
+            ending.as_deref(),
+            Ok("Max retries exceeded after 1 attempt; the last attempt could not start: \
+                Resource exhausted")
+        );
+    }
+
+    /// An `iterative` agent runs up to its `max_retries`.
+    #[tokio::test]
+    async fn an_iterative_agent_runs_up_to_max_retries() {
+        let (started, ending) =
+            tries_started(crate::domain::agent::ExecutionMode::Iterative, 3).await;
+        assert_eq!(started, 3, "tries started");
+        assert_eq!(
+            ending.as_deref(),
+            Ok("Max retries exceeded after 3 attempts; the last attempt could not start: \
+                Resource exhausted")
+        );
+    }
+
+    /// A `one-shot` manifest runs one try, so the two-tries check never
+    /// refuses it, whatever its `max_retries` and its bound; the same
+    /// manifest `iterative` is refused.
+    #[test]
+    fn a_one_shot_manifest_is_never_refused_for_two_tries() {
+        let manifest = |mode: &str| -> crate::domain::agent::AgentManifest {
+            serde_yaml::from_str(&format!(
+                r#"apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: short-bound
+  version: "1.0.0"
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+  task:
+    instruction: Answer the question.
+  execution:
+    mode: {mode}
+    max_retries: 3
+  security:
+    resources:
+      timeout: "900s"
+"#
+            ))
+            .expect("the manifest parses")
+        };
+        assert_eq!(two_tries_refusal(&manifest("one-shot"), false), None);
+        assert_eq!(two_tries_refusal(&manifest("one-shot"), true), None);
+        assert_eq!(
+            two_tries_refusal(&manifest("iterative"), false).map(|refusal| refusal.need),
+            Some(1245)
+        );
+    }
 }

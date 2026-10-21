@@ -371,4 +371,35 @@ spec:
         assert_eq!(parsed.metadata.name, manifest.metadata.name);
         assert_eq!(parsed.spec.runtime.language, manifest.spec.runtime.language);
     }
+
+    /// A manifest whose `spec.execution` omits `mode` reads `iterative`, so
+    /// it runs up to its `max_retries`, and so does the default strategy;
+    /// only a written `one-shot` runs once.
+    #[test]
+    fn mode_defaults_to_iterative_when_omitted() {
+        let yaml = r#"
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: no-mode
+  version: "1.0.0"
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+  task:
+    instruction: "Answer the question."
+  execution:
+    max_retries: 4
+"#;
+        let manifest = AgentManifestParser::parse_yaml(yaml).unwrap();
+        let execution = manifest.spec.execution.as_ref().unwrap();
+        assert_eq!(execution.mode, ExecutionMode::Iterative);
+        assert_eq!(execution.max_retries, 4);
+        assert_eq!(
+            crate::domain::agent::ExecutionStrategy::default().mode,
+            ExecutionMode::Iterative
+        );
+        assert_eq!(ExecutionMode::default(), ExecutionMode::Iterative);
+    }
 }

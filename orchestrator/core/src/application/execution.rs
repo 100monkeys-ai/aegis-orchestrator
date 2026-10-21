@@ -3893,6 +3893,59 @@ mod tests {
         }
     }
 
+    /// Starts an execution of an agent with no `spec.execution` by the
+    /// top-level path (`child: false`) or the child path, and answers the
+    /// cap of tries its Execution record holds.
+    async fn tries_recorded_without_spec_execution(child: bool) -> u8 {
+        let tenant = CoreTenantId::consumer();
+        let parent_agent = make_agent("parent-worker", None, None);
+        let worker = make_agent("default-worker", None, None);
+        assert!(worker.manifest.spec.execution.is_none());
+        let parent_execution = make_parent_execution_with_tenant(parent_agent.id, "zaru-consumer");
+        let (service, execution_repo) =
+            build_child_spawn_service(&tenant, &parent_agent, &worker, &parent_execution).await;
+        let input = ExecutionInput {
+            intent: Some("work".to_string()),
+            input: serde_json::json!({ "tenant_id": "zaru-consumer" }),
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
+            workspace_remote_path: None,
+            workflow_execution_id: None,
+            attachments: Vec::new(),
+        };
+        let id = if child {
+            service
+                .start_child_execution(worker.id, input, parent_execution.id)
+                .await
+                .unwrap()
+        } else {
+            service
+                .start_execution(worker.id, input, "test-ctx".to_string(), None)
+                .await
+                .unwrap()
+        };
+        execution_repo
+            .find_by_id_for_tenant(&tenant, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .max_iterations
+    }
+
+    /// A manifest with no `spec.execution` runs up to the default strategy's
+    /// five tries, the count the two-tries check measures it for.
+    #[tokio::test]
+    async fn a_manifest_without_spec_execution_runs_five_tries() {
+        assert_eq!(tries_recorded_without_spec_execution(false).await, 5);
+    }
+
+    /// A child whose manifest has no `spec.execution` runs up to five tries,
+    /// as at the top level.
+    #[tokio::test]
+    async fn a_child_without_spec_execution_runs_five_tries() {
+        assert_eq!(tries_recorded_without_spec_execution(true).await, 5);
+    }
+
     // ── Declared outputs, end to end (AEGIS ADR-005, Update of 2026-10-06) ───
 
     /// A worker whose model answers the path of a PDF with no tool call, as
