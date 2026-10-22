@@ -79,6 +79,11 @@ struct StubGateway {
     /// credential named by the key (AEGIS ADR-132 Update (13) S11d: two
     /// bindings' listings that differ).
     tools_for_credential: HashMap<String, Vec<String>>,
+    /// When set, a listing that carries a bound server is recorded, this is
+    /// notified, and the listing is never answered: a gateway whose
+    /// enumeration of the person's remote servers outlasts the
+    /// orchestrator's best-effort listing timeout.
+    hang_bound_listings: Option<Arc<tokio::sync::Notify>>,
     received: Arc<StdMutex<Received>>,
 }
 
@@ -89,8 +94,16 @@ impl StubGateway {
             answer,
             grounding_json: String::new(),
             tools_for_credential: HashMap::new(),
+            hang_bound_listings: None,
             received: Arc::new(StdMutex::new(Received::default())),
         }
+    }
+
+    /// The same stub, never answering a listing that carries a bound
+    /// server; `listed` is notified once each such listing is received.
+    fn hanging_bound_listings(mut self, listed: Arc<tokio::sync::Notify>) -> Self {
+        self.hang_bound_listings = Some(listed);
+        self
     }
 
     /// The same stub, listing `tools` (each `<tool>`, under the bound
@@ -161,6 +174,13 @@ impl GrpcGatewayInvocationService for StubGateway {
         req: tonic::Request<PbListToolsRequest>,
     ) -> Result<tonic::Response<ListToolsResponse>, tonic::Status> {
         let listing = req.into_inner();
+        if let Some(listed) = &self.hang_bound_listings {
+            if !listing.bound_servers.is_empty() {
+                self.received.lock().unwrap().lists.push(listing);
+                listed.notify_one();
+                return std::future::pending().await;
+            }
+        }
         let mut tools = self.tools.clone();
         // As the gateway does: each bound server's tools, under its name.
         for bound in &listing.bound_servers {
@@ -4542,4 +4562,337 @@ async fn a_stored_binding_no_longer_active_is_refused_at_the_rerun_with_d15s_sen
         complaints.push(format!("the re-run sent {sent:?}"));
     }
     assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// A bound-server listing past the gateway's best-effort listing timeout
+// ---------------------------------------------------------------------------
+
+/// The remote server the person holds a binding of in these tests.
+const CARBON_FORGE: &str = "carbon-forge";
+const CARBON_FORGE_TOKEN: &str = "Mk13-carbon-forge-token";
+
+/// A harness on a TLS gateway that knows `carbon-forge`, with `USER`
+/// holding one active binding of it granted to all their agents; the
+/// binding's id.
+async fn carbon_forge_harness(
+    url: &str,
+    tls: &Tls,
+    vault: &Vault,
+) -> (Harness, CredentialBindingId) {
+    let h = harness(Setup {
+        ca: Some(tls.ca_path.clone()),
+        credentials: Some(vault.service.clone()),
+        remote_servers: vec![CARBON_FORGE.to_string()],
+        ..Setup::gateway(url)
+    })
+    .await;
+    let id = vault
+        .bind(
+            &h.tenant,
+            USER,
+            CARBON_FORGE,
+            CredentialType::Secret,
+            &[("value", CARBON_FORGE_TOKEN)],
+            &[GrantTarget::AllAgents],
+        )
+        .await;
+    (h, id)
+}
+
+/// `call`'s answer, driven while the stub holds a bound listing
+/// unanswered: once the stub has received that listing, time is paused and
+/// advanced past the orchestrator's five-second listing timeout, so the
+/// test waits no wall-clock time for it.
+async fn past_the_listing_timeout<T>(
+    listed: &tokio::sync::Notify,
+    call: impl std::future::Future<Output = T>,
+) -> T {
+    let advance = async {
+        if tokio::time::timeout(std::time::Duration::from_secs(30), listed.notified())
+            .await
+            .is_err()
+        {
+            panic!("the gateway never received a listing carrying a bound server");
+        }
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+    };
+    let (answer, ()) = tokio::join!(call, advance);
+    answer
+}
+
+/// The stub received a listing carrying `carbon-forge` with the person's
+/// credential.
+fn assert_carbon_forge_was_listed(stub: &StubGateway) {
+    let received = stub.received.lock().unwrap();
+    assert!(
+        received
+            .lists
+            .iter()
+            .any(|list| list
+                .bound_servers
+                .iter()
+                .any(|bound| bound.server == CARBON_FORGE
+                    && bound.credential.as_ref().map(|c| c.value.as_str())
+                        == Some(CARBON_FORGE_TOKEN))),
+        "no listing carried the person's carbon-forge binding"
+    );
+}
+
+/// What the person's context lists of `tools`: the gateway's node-wide
+/// `ext.lookup` and a built-in `aegis.` tool are present, every tool is one
+/// the context lists, and no `carbon-forge.` tool is there.
+fn assert_context_tools_without_carbon_forge(tools: &[String], context: &[String]) {
+    assert!(
+        tools.iter().any(|name| name == "ext.lookup"),
+        "the gateway's node-wide tool is missing: {tools:?}"
+    );
+    let builtin = context
+        .iter()
+        .find(|name| name.starts_with("aegis."))
+        .expect("the context lists a built-in tool");
+    assert!(
+        tools.contains(builtin),
+        "the built-in tool {builtin} is missing: {tools:?}"
+    );
+    assert!(
+        tools.iter().all(|name| context.contains(name)),
+        "a tool the context does not list was answered: {tools:?}"
+    );
+    assert!(
+        !tools
+            .iter()
+            .any(|name| name.starts_with(&format!("{CARBON_FORGE}."))),
+        "a carbon-forge tool was answered though its listing never was: {tools:?}"
+    );
+}
+
+/// The person's tool list (`GET /v1/seal/tools` for their own session)
+/// answers the context's tools when the gateway's listing of their bound
+/// server outlasts the five-second best-effort timeout: the bound server's
+/// tools are left out, the list does not fail whole.
+#[tokio::test]
+async fn a_persons_tool_list_answers_the_context_tools_when_the_bound_listing_times_out() {
+    let listed_bound = Arc::new(tokio::sync::Notify::new());
+    let stub = StubGateway::new(vec![listed("ext.lookup", "workflow")], remote_result())
+        .hanging_bound_listings(listed_bound.clone());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let (h, _) = carbon_forge_harness(&url, &tls, &vault).await;
+    let context = names(
+        &h.service
+            .get_available_tools_for_context(CONTEXT)
+            .await
+            .unwrap(),
+    );
+
+    let answer = past_the_listing_timeout(
+        &listed_bound,
+        h.service.get_available_tools_for_person(
+            CONTEXT,
+            &h.tenant,
+            USER,
+            None,
+            false,
+            crate::domain::seal_session::AttestingCredential::Interactive,
+        ),
+    )
+    .await;
+    let tools = match answer {
+        Ok(tools) => names(&tools),
+        Err(e) => {
+            panic!("the person's tool list failed whole when the bound listing timed out: {e:?}")
+        }
+    };
+    assert_carbon_forge_was_listed(&stub);
+    assert_context_tools_without_carbon_forge(&tools, &context);
+}
+
+/// The profile an API key carries: `carbon-forge` with one binding, its
+/// tools not narrowed.
+struct CarbonForgeProfile {
+    id: uuid::Uuid,
+    binding: CredentialBindingId,
+}
+
+#[async_trait]
+impl crate::application::profile_service::RunProfiles for CarbonForgeProfile {
+    async fn contexts_of(
+        &self,
+        _: &TenantId,
+        person: Option<&str>,
+        id: uuid::Uuid,
+    ) -> Result<serde_json::Map<String, Value>, crate::application::profile_service::ProfileError>
+    {
+        if id != self.id || person != Some(USER) {
+            return Err(crate::application::profile_service::ProfileError::NotFound);
+        }
+        Ok(json!({ CARBON_FORGE: [self.binding.0.to_string()] })
+            .as_object()
+            .unwrap()
+            .clone())
+    }
+    async fn admission_of(
+        &self,
+        _: &TenantId,
+        person: Option<&str>,
+        id: uuid::Uuid,
+    ) -> Result<
+        crate::application::profile_service::ProfileAdmission,
+        crate::application::profile_service::ProfileError,
+    > {
+        if id != self.id || person != Some(USER) {
+            return Err(crate::application::profile_service::ProfileError::NotFound);
+        }
+        Ok(crate::application::profile_service::ProfileAdmission {
+            tools: crate::domain::profile::ToolAllowList(Vec::new()),
+            families: vec![CARBON_FORGE.to_string()],
+        })
+    }
+}
+
+/// An API key's tool list (the key's profile naming the person's
+/// carbon-forge binding) answers the context's tools when the gateway's
+/// listing of that bound server outlasts the five-second best-effort
+/// timeout.
+#[tokio::test]
+async fn an_api_keys_tool_list_answers_the_context_tools_when_the_bound_listing_times_out() {
+    let listed_bound = Arc::new(tokio::sync::Notify::new());
+    let stub = StubGateway::new(vec![listed("ext.lookup", "workflow")], remote_result())
+        .hanging_bound_listings(listed_bound.clone());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let (mut h, binding) = carbon_forge_harness(&url, &tls, &vault).await;
+    let profile = uuid::Uuid::new_v4();
+    h.service = h.service.with_profiles(Arc::new(CarbonForgeProfile {
+        id: profile,
+        binding,
+    }));
+    let context = names(
+        &h.service
+            .get_available_tools_for_context(CONTEXT)
+            .await
+            .unwrap(),
+    );
+
+    let answer = past_the_listing_timeout(
+        &listed_bound,
+        h.service.get_available_tools_for_person(
+            CONTEXT,
+            &h.tenant,
+            USER,
+            None,
+            false,
+            crate::domain::seal_session::AttestingCredential::ApiKey {
+                profile: Some(profile),
+            },
+        ),
+    )
+    .await;
+    let tools = match answer {
+        Ok(tools) => names(&tools),
+        Err(e) => {
+            panic!("the API key's tool list failed whole when the bound listing timed out: {e:?}")
+        }
+    };
+    assert_carbon_forge_was_listed(&stub);
+    assert_context_tools_without_carbon_forge(&tools, &context);
+}
+
+/// The context-tools listing of a conversation whose `_meta` chose the
+/// person's carbon-forge binding answers, with no carbon-forge tool, when
+/// the gateway's listing of that bound server outlasts the five-second
+/// best-effort timeout.
+#[tokio::test]
+async fn a_context_tools_listing_answers_when_the_bound_listing_times_out() {
+    let listed_bound = Arc::new(tokio::sync::Notify::new());
+    let stub = StubGateway::new(vec![listed("ext.lookup", "workflow")], remote_result())
+        .hanging_bound_listings(listed_bound.clone());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let (h, binding) = carbon_forge_harness(&url, &tls, &vault).await;
+    let token = h
+        .session_for(AgentId::new(), ExecutionId::new(), &["*"])
+        .await;
+    let meta = json!({ "contexts": { CARBON_FORGE: binding.0.to_string() } });
+
+    let answer =
+        past_the_listing_timeout(&listed_bound, h.list_with_meta(&token, Some(meta), "n-1")).await;
+    let tools = match answer {
+        Ok(tools) => names(&tools),
+        Err(e) => {
+            panic!("the context-tools listing failed whole when the bound listing timed out: {e:?}")
+        }
+    };
+    assert_carbon_forge_was_listed(&stub);
+    assert!(
+        !tools
+            .iter()
+            .any(|name| name.starts_with(&format!("{CARBON_FORGE}."))),
+        "a carbon-forge tool was answered though its listing never was: {tools:?}"
+    );
+}
+
+/// A bound listing the gateway answers still adds its tools: the person's
+/// own list, an API key's list on a profile naming the binding, and the
+/// context-tools listing each carry `carbon-forge.lookup`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answered_bound_listing_still_adds_the_bound_servers_tools() {
+    let stub = StubGateway::new(vec![listed("ext.lookup", "workflow")], remote_result());
+    let (url, tls, _shutdown) = serve_tls(stub.clone()).await;
+    let vault = Vault::new("https://token.example.test/token");
+    let (mut h, binding) = carbon_forge_harness(&url, &tls, &vault).await;
+    let profile = uuid::Uuid::new_v4();
+    h.service = h.service.with_profiles(Arc::new(CarbonForgeProfile {
+        id: profile,
+        binding,
+    }));
+    let lookup = format!("{CARBON_FORGE}.lookup");
+
+    let persons = h
+        .service
+        .get_available_tools_for_person(
+            CONTEXT,
+            &h.tenant,
+            USER,
+            None,
+            false,
+            crate::domain::seal_session::AttestingCredential::Interactive,
+        )
+        .await
+        .unwrap();
+    assert!(
+        names(&persons).contains(&lookup),
+        "the person's list: {:?}",
+        names(&persons)
+    );
+
+    let keys = h
+        .service
+        .get_available_tools_for_person(
+            CONTEXT,
+            &h.tenant,
+            USER,
+            None,
+            false,
+            crate::domain::seal_session::AttestingCredential::ApiKey {
+                profile: Some(profile),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        names(&keys).contains(&lookup),
+        "the API key's list: {:?}",
+        names(&keys)
+    );
+
+    let token = h
+        .session_for(AgentId::new(), ExecutionId::new(), &["*"])
+        .await;
+    let meta = json!({ "contexts": { CARBON_FORGE: binding.0.to_string() } });
+    let listed = h.list_with_meta(&token, Some(meta), "n-1").await.unwrap();
+    assert_eq!(names(&listed), vec![lookup]);
+    assert_carbon_forge_was_listed(&stub);
 }
