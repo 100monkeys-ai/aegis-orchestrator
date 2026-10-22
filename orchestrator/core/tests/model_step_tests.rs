@@ -263,6 +263,7 @@ fn resolution_gives_the_step_the_pinned_image_and_the_models_resources() {
             let resources = resources.expect("the model's resources apply");
             assert_eq!(resources.cpu, Some(2000));
             assert_eq!(resources.memory.as_deref(), Some("1Gi"));
+            assert_eq!(resources.timeout, Some(Duration::from_secs(600)));
             assert_eq!(network_mode.as_deref(), Some("none"));
         }
         other => panic!("expected a ContainerRun, got {other:?}"),
