@@ -1531,17 +1531,26 @@ impl ToolInvocationService {
         let bound_servers = self.bound_servers(tenant_id, &acting, None).await;
         let mut listed = Vec::new();
         if !bound_servers.is_empty() {
+            // Best effort, as the listing timeout documents: a slow or failing
+            // enumeration leaves the bound servers' tools out of this list and
+            // never fails the person's whole tool list.
+            let servers: Vec<String> = bound_servers.iter().map(|b| b.server.clone()).collect();
             let listing = ListToolsRequest {
                 tenant_id: tenant_id.as_str().to_string(),
                 acting: Some(acting.to_proto()),
                 bound_servers,
             };
-            listed.extend(
-                self.list_gateway_tools(listing, GATEWAY_LIST_TOOLS_TIMEOUT)
-                    .await?
-                    .into_iter()
-                    .map(Self::gateway_tool_metadata),
-            );
+            match self
+                .list_gateway_tools(listing, GATEWAY_LIST_TOOLS_TIMEOUT)
+                .await
+            {
+                Ok(tools) => listed.extend(tools.into_iter().map(Self::gateway_tool_metadata)),
+                Err(e) => tracing::warn!(
+                    servers = %servers.join(","),
+                    error = %e,
+                    "SEAL gateway tool enumeration of the chosen remote servers failed; proceeding with built-in tools only"
+                ),
+            }
         }
         listed.extend(self.listed_per_binding(tenant_id, &acting, None).await);
         let listed: Vec<_> = listed
