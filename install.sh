@@ -158,6 +158,7 @@ ensure_docker_engine() {
         sudo update-alternatives --set iptables /usr/sbin/iptables-legacy >/dev/null 2>&1 || true
         sudo update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy >/dev/null 2>&1 || true
         sudo service docker start 2>/dev/null || true
+        # shellcheck disable=SC2034 # i only counts the fifteen one-second retries
         for i in $(seq 1 15); do
             sudo docker info &>/dev/null && break
             sleep 1

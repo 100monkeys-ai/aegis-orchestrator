@@ -229,10 +229,33 @@ jobs:
             -p aegis-orchestrator-sdk \
             -p aegis-orchestrator
 
+  shell:
+    name: Shell
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: aegis-orchestrator
+
+      - name: Install shellcheck and bats
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck bats
+          shellcheck --version
+          bats --version
+
+      - name: Shellcheck install.sh
+        working-directory: aegis-orchestrator
+        run: shellcheck install.sh
+
+      - name: Installer tests
+        working-directory: aegis-orchestrator
+        run: bats tests/install
+
   # ── Stage 2: Build + Publish (only after ALL checks pass) ──────────────────
   build-deploy:
     name: Build & Publish
-    needs: [fmt, clippy, test, doc]
+    needs: [fmt, clippy, test, doc, shell]
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-22.04
 
