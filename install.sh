@@ -37,10 +37,10 @@ if [[ "$AEGIS_VERSION" == "latest" ]]; then
         RAW_RELEASE_JSON="$(curl -fsSL "$GITHUB_API_URL" 2>/dev/null || true)"
         if [[ -n "${RAW_RELEASE_JSON:-}" ]]; then
             if command -v jq >/dev/null 2>&1; then
-                LATEST_TAG="$(printf '%s' "$RAW_RELEASE_JSON" | jq -r '.[0].tag_name // empty')"
+                LATEST_TAG="$(printf '%s' "$RAW_RELEASE_JSON" | jq -r '.[0].tag_name // empty' || true)"
             else
                 # Minimal JSON parsing fallback if jq is unavailable.
-                LATEST_TAG="$(printf '%s' "$RAW_RELEASE_JSON" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
+                LATEST_TAG="$(printf '%s' "$RAW_RELEASE_JSON" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' || true)"
             fi
         fi
         if [[ -n "${LATEST_TAG}" ]]; then
@@ -132,6 +132,10 @@ ensure_docker_engine() {
     fi
     if docker info &>/dev/null; then
         return 0
+    fi
+    # On macOS the daemon is Docker Desktop's; the Linux steps below do not apply.
+    if [[ "$PLATFORM" == "macos" ]]; then
+        die "Docker Desktop is installed but not running. Start Docker Desktop, wait until it is ready, and rerun this installer."
     fi
     info "Docker daemon is not reachable. Starting the engine..."
     if [[ -d /run/systemd/system ]] && command -v systemctl &>/dev/null; then
@@ -329,11 +333,11 @@ install_aegis_from_release
 
 # ── Step 4: Start the AEGIS stack ─────────────────────────────────────────────
 # Socket access is resolved dynamically inside the aegis-runtime container at startup.
-info "Starting AEGIS stack (aegis up --tag $AEGIS_VERSION)..."
+info "Starting AEGIS stack (aegis up --tag $DOWNLOAD_VERSION)..."
 if [[ -n "$DOCKER_GROUP_PREFIX" ]]; then
-    sg docker -c "DOCKER_CONTEXT=${DOCKER_CONTEXT:-default} \"$AEGIS_BIN_PATH\" up --tag \"$AEGIS_VERSION\""
+    sg docker -c "DOCKER_CONTEXT=${DOCKER_CONTEXT:-default} \"$AEGIS_BIN_PATH\" up --tag \"$DOWNLOAD_VERSION\""
 else
-    "$AEGIS_BIN_PATH" up --tag "$AEGIS_VERSION"
+    "$AEGIS_BIN_PATH" up --tag "$DOWNLOAD_VERSION"
 fi
 
 success "AEGIS is ready!"
