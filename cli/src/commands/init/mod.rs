@@ -41,7 +41,7 @@ use self::configure::ConfigWizard;
 use self::download::fetch_stack;
 use self::prereqs::PrereqChecker;
 use self::verify::HealthChecker;
-use super::update::{run_database_migrations, sync_builtins};
+use super::update::{confirm_database_migrations, sync_builtins};
 
 /// Arguments for `aegis init`
 #[derive(Args)]
@@ -154,15 +154,17 @@ pub async fn run(args: InitArgs) -> Result<()> {
         runner.pull_ollama_model(&node_config.ollama_model).await?;
     }
 
-    // ─── Step 6: Apply database migrations ───────────────────────────────────
-    print_step(6, 8, "Applying database migrations");
-    let config_path = node_config.working_dir.join("aegis-config.yaml");
-    run_database_migrations(&node_config.working_dir, Some(config_path.clone()), false).await?;
-
-    // ─── Step 7: Verify health ────────────────────────────────────────────────
-    print_step(7, 8, "Verifying health");
+    // ─── Step 6: Verify health ────────────────────────────────────────────────
+    print_step(6, 8, "Verifying health");
     let checker = HealthChecker::new(&args.host, args.port);
     checker.wait_for_healthy().await?;
+
+    // ─── Step 7: Confirm database migrations ─────────────────────────────────
+    // The runtime applied them while starting; nothing on the host connects to
+    // the database, whose URL names the compose service `postgres`.
+    print_step(7, 8, "Confirming the runtime applied database migrations");
+    let config_path = node_config.working_dir.join("aegis-config.yaml");
+    confirm_database_migrations(&args.host, args.port, false).await?;
 
     // ─── Step 8: Sync built-in agents and workflows ──────────────────────────
     print_step(8, 8, "Syncing built-in agents and workflows");

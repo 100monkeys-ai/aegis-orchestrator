@@ -6,7 +6,9 @@
 //!
 //! 1. **Pull** — `docker compose pull` fetches the latest image tags.
 //! 2. **Restart** — `docker compose up -d --wait` replaces running containers.
-//! 3. **Migrate** — applies any pending database schema migrations.
+//! 3. **Confirm migrations** — the runtime applies pending schema migrations
+//!    when it starts; this step reads `/health/ready` and requires its
+//!    database to be ready. Nothing on the host connects to the database.
 //! 4. **Sync built-ins** — re-deploys bundled agents and workflows.
 //!
 //! Individual steps can be skipped via `--skip-pull`, `--skip-restart`, or
@@ -15,16 +17,16 @@
 //! # Architecture
 //!
 //! - **Layer:** CLI/Presentation
-//! - **Purpose:** Stack upgrade + database schema migration management
-//! - **Integration:** CLI → ComposeRunner → SQLx Migrator → PostgreSQL
+//! - **Purpose:** Stack upgrade + confirmation of the runtime's schema migrations
+//! - **Integration:** CLI → ComposeRunner → runtime `/health/ready`
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use aegis_orchestrator_core::domain::node_config::{resolve_env_value, NodeConfigManifest};
+use aegis_orchestrator_core::domain::node_config::NodeConfigManifest;
 use anyhow::{Context, Result};
 use clap::Args;
 use colored::Colorize;
-use sqlx::postgres::PgPoolOptions;
 
 use super::init::compose::ComposeRunner;
 use super::init::download::fetch_stack;
@@ -44,7 +46,7 @@ pub struct UpdateCommand {
     #[arg(long)]
     pub skip_restart: bool,
 
-    /// Skip running database migrations
+    /// Skip confirming that the runtime applied its database migrations
     #[arg(long)]
     pub skip_migrations: bool,
 
@@ -130,13 +132,31 @@ pub async fn execute(
     }
 
     // ─── Step 3: DB migrations ────────────────────────────────────────────────
-    if !cmd.skip_migrations {
-        println!();
-        println!("{}", "[3/4] Running database migrations...".bold());
-        run_database_migrations(&dir, config_path.clone(), cmd.dry_run).await?;
-    } else {
+    // The runtime applies pending migrations when it starts, so a restart is
+    // what migrates; this step only confirms it through the runtime's
+    // readiness answer. The host never connects to the database: the stack's
+    // spec.database.url names the compose service `postgres`.
+    if cmd.skip_migrations {
         println!();
         println!("{}", "[3/4] Database migrations... skipped".dimmed());
+    } else if cmd.skip_restart {
+        println!();
+        println!(
+            "{}",
+            "[3/4] Database migrations: the runtime applies them when it starts; \
+             services were not restarted, so none were applied now"
+                .dimmed()
+        );
+    } else {
+        println!();
+        println!(
+            "{}",
+            "[3/4] Confirming the runtime applied database migrations...".bold()
+        );
+        load_stack_env(&dir);
+        let config = NodeConfigManifest::load_or_default(config_path.clone())?;
+        let (host, port) = daemon_host_port(&config);
+        confirm_database_migrations(&host, port, cmd.dry_run).await?;
     }
 
     // ─── Step 4: Built-in templates ───────────────────────────────────────────
@@ -193,71 +213,82 @@ fn expand_tilde(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-pub(crate) async fn run_database_migrations(
-    dir: &Path,
-    config_path: Option<PathBuf>,
+/// The daemon's host and port as the node config names them, for a client on
+/// the same machine as the stack.
+pub(crate) fn daemon_host_port(config: &NodeConfigManifest) -> (String, u16) {
+    let host = config
+        .spec
+        .network
+        .as_ref()
+        .map(|n| n.bind_address.clone())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let port = config.spec.network.as_ref().map(|n| n.port).unwrap_or(8088);
+    (host, port)
+}
+
+/// Whether the runtime's `/health/ready` answer says its database is
+/// connected and migrated.
+///
+/// `daemon::server::connect_postgres` applies pending migrations before it
+/// hands the pool to the repositories, and readiness reports
+/// `dependencies.database` true only once that pool exists, so this answer is
+/// the runtime's own word on its schema. The host never connects to the
+/// database itself: the stack's `spec.database.url` names the compose service
+/// `postgres`, which only the compose network resolves, and the previous
+/// host-side migration failed on every `aegis init` with "failed to lookup
+/// address information" (2026-10-23, 1.2.0-beta).
+pub(crate) fn migrations_applied(readiness: &serde_json::Value) -> Result<()> {
+    match readiness
+        .pointer("/dependencies/database")
+        .and_then(|v| v.as_bool())
+    {
+        Some(true) => Ok(()),
+        Some(false) => anyhow::bail!(
+            "the runtime reports its database as not ready (status {}): its migrations \
+             were not applied; check `docker compose logs aegis-runtime`",
+            readiness
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+        ),
+        None => anyhow::bail!(
+            "the runtime's readiness answer carries no dependencies.database field \
+             ({readiness}); check `docker compose logs aegis-runtime`"
+        ),
+    }
+}
+
+/// Read the runtime's readiness and require its database to be ready.
+pub(crate) async fn confirm_database_migrations(
+    host: &str,
+    port: u16,
     dry_run: bool,
 ) -> Result<()> {
-    load_stack_env(dir);
-
-    let config = NodeConfigManifest::load_or_default(config_path)?;
-    let db_config = config
-        .spec
-        .database
-        .as_ref()
-        .context("spec.database not configured in aegis-config.yaml")?;
-    let database_url =
-        resolve_env_value(db_config.url.expose()).context("Failed to resolve spec.database.url")?;
-
-    // ADR-117 SEV-2 #2.1: the orchestrator binary lives in the `cli` crate;
-    // `sqlx::migrate!` resolves its argument relative to the crate root, so
-    // the canonical location for migrations is `cli/migrations/` (NOT
-    // `orchestrator/core/migrations/`). All ADR-117 edge migrations
-    // (029_edge_mode.sql, ...) live here.
-    use crate::daemon::migrations::{apply_migrations, MIGRATOR};
-
+    let url = format!("http://{host}:{port}/health/ready");
     if dry_run {
         println!(
-            "  {} would connect to database and run pending migrations",
+            "  {} would read {url} and require dependencies.database to be true",
             "→".dimmed()
-        );
-        println!(
-            "  {} total migrations available: {}",
-            "→".dimmed(),
-            MIGRATOR.iter().count()
         );
         return Ok(());
     }
 
-    let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&database_url)
+    let readiness: serde_json::Value = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("Failed to build HTTP client")?
+        .get(&url)
+        .send()
         .await
-        .context("Failed to connect to database")?;
-
-    let applied_count = sqlx::query("SELECT version FROM _sqlx_migrations")
-        .fetch_all(&pool)
+        .with_context(|| format!("Failed to reach the runtime at {url}"))?
+        .json()
         .await
-        .map(|r| r.len())
-        .unwrap_or(0);
-
-    let total = MIGRATOR.iter().count();
-    let pending = total.saturating_sub(applied_count);
-
-    if pending == 0 {
-        println!(
-            "  {} Database schema is up to date ({} migrations applied)",
-            "✓".green(),
-            applied_count
-        );
-    } else {
-        println!("  Applying {pending} pending migration(s)...");
-        apply_migrations(&pool)
-            .await
-            .context("Failed to apply migrations")?;
-        println!("  {} {} migration(s) applied", "✓".green(), pending);
-    }
-
+        .with_context(|| format!("The runtime's answer at {url} is not JSON"))?;
+    migrations_applied(&readiness)?;
+    println!(
+        "  {} The runtime applied its database migrations",
+        "✓".green()
+    );
     Ok(())
 }
 
@@ -270,13 +301,7 @@ pub(crate) async fn sync_builtins(
     load_stack_env(dir);
 
     let config = NodeConfigManifest::load_or_default(config_path)?;
-    let host = config
-        .spec
-        .network
-        .as_ref()
-        .map(|n| n.bind_address.clone())
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-    let port = config.spec.network.as_ref().map(|n| n.port).unwrap_or(8088);
+    let (host, port) = daemon_host_port(&config);
 
     if dry_run {
         println!(
