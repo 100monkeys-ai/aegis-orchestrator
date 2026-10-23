@@ -2658,14 +2658,21 @@ mod tests {
                 })
                 .unwrap_or_default()
         };
-        let write = routes("COMMIT");
-        let draft_first = write
+        let commit = routes("COMMIT");
+        if !commit
+            .iter()
+            .any(|(c, t)| c == "on_success" && t == "DRIFT")
+        {
+            complaints.push(format!("C6: COMMIT does not go on to DRIFT: {commit:?}"));
+        }
+        let drift = routes("DRIFT");
+        let draft_first = drift
             .iter()
             .position(|(c, t)| c.contains("input.draft_only") && t == "COMPLETE");
-        let land_at = write.iter().position(|(_, t)| t == "LAND");
+        let land_at = drift.iter().position(|(_, t)| t == "LAND");
         if !matches!((draft_first, land_at), (Some(d), Some(l)) if d < l) {
             complaints.push(format!(
-                "C6: COMMIT does not end a draft_only run at COMPLETE before LAND: {write:?}"
+                "C6: DRIFT does not end a draft_only run at COMPLETE before LAND: {drift:?}"
             ));
         }
         if !routes("LAND")

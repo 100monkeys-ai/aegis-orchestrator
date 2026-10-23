@@ -14,8 +14,11 @@
 #    └────────────────────────── AUDIT ◄──────── DIFF (tree_diff)
 #                                  │ consensus 0.95, agreement 0.8
 #                                  ▼
-#                               COMMIT (tree_write) ─ draft_only (default) ─► COMPLETE
-#                                  │ draft_only false
+#                               COMMIT (tree_write)
+#                                  │
+#                                  ▼
+#                               DRIFT (drift_report) ─ draft_only (default) ─► COMPLETE
+#                                  │ draft_only false, whatever the report
 #                                  ▼
 #                                LAND (tree_land) ─► CUT (tree_cut) ─► COMPLETE, or LAND_REFUSED / CUT_REFUSED
 #
@@ -31,6 +34,16 @@
 # on the lane (C6). Every path in the prompts and in tests is written
 # relative to the tree's root, never absolute.
 #
+# DRIFT reads the lane's drift report (AEGIS ADR-147 Update
+# drift-report-at-the-gate-2026-10-23): each definition the change adds,
+# removes or re-signs in a seam the workspace's governed seams declare, and
+# whether a page governing it changed on the lane too. The report advises
+# and never ends the run: a report, a refusal and a failure all go on, and
+# the blackboard's `drift` keeps the report, or the sentence of a report
+# that was not read. LAND's approval request shows you the counts by class
+# and the first ten findings beside the tree, the lane and the intent; the
+# verdict stays yours.
+#
 # A landed run becomes a cut (AEGIS ADR-149 C1): CUT names a snapshot of the
 # tree's workspace with the dispatch's `cut`, else forge-<execution id>, and
 # a refusal ends in CUT_REFUSED with Carbon Forge's own sentence. The step's
@@ -43,7 +56,7 @@ kind: Workflow
 
 metadata:
   name: "carbon-forge"
-  version: "1.1.0"
+  version: "1.2.0"
   description: |-
     Develops one change in one of your Carbon Forge trees: requirements and a
     design, each approved by you, then tests written first, the implementation,
@@ -494,12 +507,22 @@ spec:
       transitions:
         - condition: on_failure
           target: FAILED
+        - condition: on_success
+          target: DRIFT
+
+    # The lane's drift report, advice for the gate: every outcome goes on.
+    # The report's hash rides the step's `commit_sha`, its counts by class
+    # `branch`, the whole report `diff`, and a refusal `sentence`.
+    DRIFT:
+      kind: Action
+      action: drift_report
+      transitions:
         # draft_only true, or absent (its default), ends with the change on
         # the run's lane and the trunk untouched.
         - condition: custom
           expression: "(default input.draft_only true)"
           target: COMPLETE
-        - condition: on_success
+        - condition: always
           target: LAND
 
     LAND:
@@ -537,6 +560,8 @@ spec:
         # The cut the landed run became and its snapshot; empty for a draft.
         cut: "{{CUT.output.ref}}"
         snapshot_id: "{{CUT.output.commit_sha}}"
+        # The lane's drift report, or the sentence of one not read.
+        drift: "{{{DRIFT.output.diff}}}{{{DRIFT.output.sentence}}}"
         sentence: ""
       transitions: []
 
@@ -560,6 +585,7 @@ spec:
         outcome: "land_refused"
         commit_sha: "{{COMMIT.output.commit_sha}}"
         branch: "{{COMMIT.output.branch}}"
+        drift: "{{{DRIFT.output.diff}}}{{{DRIFT.output.sentence}}}"
         sentence: "{{{LAND.output.sentence}}}"
       transitions: []
 
@@ -571,5 +597,6 @@ spec:
         outcome: "cut_refused"
         commit_sha: "{{LAND.output.commit_sha}}"
         branch: "{{COMMIT.output.branch}}"
+        drift: "{{{DRIFT.output.diff}}}{{{DRIFT.output.sentence}}}"
         sentence: "{{{CUT.output.sentence}}}"
       transitions: []

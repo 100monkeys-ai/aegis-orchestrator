@@ -87,6 +87,95 @@ const ARCHIVE_PUSH_IS_THE_WORKFLOWS: &str =
 /// `snapshot.ts` CUT_NAME_PATTERN).
 const CUT_NAME_DEFAULT_PREFIX: &str = "forge-";
 
+/// The Carbon Forge tool answering a lane's drift report (Carbon Forge
+/// ADR-0207; AEGIS ADR-147 Update `drift-report-at-the-gate-2026-10-23`).
+const DRIFT_TOOL: &str = "symbols.drift";
+
+/// The findings the landing's approval request carries, in the report's
+/// order; the whole report rides the drift step's `diff`.
+const DRIFT_FINDINGS_AT_GATE: usize = 10;
+
+/// A drift report's finding classes, in the order its counts name them.
+const DRIFT_CLASSES: [&str; 2] = ["seam_changed_without_record", "seam_changed_with_record"];
+
+/// A drift report's counts: its findings of each class, then its pending
+/// files (changed files the semantic index cannot answer yet).
+fn drift_counts(report: &Value) -> serde_json::Map<String, Value> {
+    let findings = report
+        .get("findings")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut counts = serde_json::Map::new();
+    for class in DRIFT_CLASSES {
+        let of_class = findings
+            .iter()
+            .filter(|f| f.get("class").and_then(Value::as_str) == Some(class))
+            .count();
+        counts.insert(class.to_string(), json!(of_class));
+    }
+    let pending = report
+        .get("pending")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    counts.insert("pending".to_string(), json!(pending));
+    counts
+}
+
+/// A drift report's counts as one line, the drift step's `branch`:
+/// `seam_changed_without_record=<n> seam_changed_with_record=<n> pending=<n>`.
+fn drift_counts_line(report: &Value) -> String {
+    let counts = drift_counts(report);
+    DRIFT_CLASSES
+        .into_iter()
+        .chain(["pending"])
+        .map(|key| {
+            let count = counts
+                .get(key)
+                .map_or_else(|| "0".to_string(), Value::to_string);
+            format!("{key}={count}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The drift step's answer: the report's hash as `commit_sha`, its counts
+/// by class as `branch` and the whole report as `diff`; `git_ref` stays the
+/// tree's path.
+fn drift_step_answer(report: &Value, answer: RepositoryActionAnswer) -> RepositoryActionAnswer {
+    RepositoryActionAnswer {
+        commit_sha: report
+            .get("report_sha256")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        branch: drift_counts_line(report),
+        diff: Some(report.to_string()),
+        ..answer
+    }
+}
+
+/// The landing's approval argument `drift`: the report's hash, its counts
+/// by class and its first [`DRIFT_FINDINGS_AT_GATE`] findings, what the
+/// person reads at the gate before the lane replays onto the trunk.
+fn drift_at_gate(report: &Value) -> Value {
+    let findings: Vec<Value> = report
+        .get("findings")
+        .and_then(Value::as_array)
+        .map(|findings| {
+            findings
+                .iter()
+                .take(DRIFT_FINDINGS_AT_GATE)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({
+        "report_sha256": report.get("report_sha256").cloned().unwrap_or(Value::Null),
+        "counts": drift_counts(report),
+        "findings": findings,
+    })
+}
+
 /// How often the deploy wait reads `archives.deploy_status` (AEGIS ADR-149
 /// C2): each read is one GitHub API call made by Carbon Forge.
 const DEPLOY_POLL: std::time::Duration = std::time::Duration::from_secs(15);
@@ -942,8 +1031,10 @@ impl ToolInvocationService {
     /// One of carbon-forge's own steps on the run's tree (AEGIS ADR-147 C3,
     /// C5): `tree_diff` (the run's change against the revision it started
     /// from), `tree_write` (the run's tree to a lane of its own, with
-    /// `message` as its intent) or `tree_land` (that lane landed as one
-    /// changeset, through the person's approval). The answer's `branch` is
+    /// `message` as its intent), `drift_report` (that lane's drift report,
+    /// advice only, Update `drift-report-at-the-gate-2026-10-23`) or
+    /// `tree_land` (that lane landed as one changeset, through the person's
+    /// approval, the drift report shown at the gate). The answer's `branch` is
     /// the run's lane, its `git_ref` the tree's path and its `commit_sha` the
     /// landed changeset; a refusal answers its sentence.
     pub(super) async fn run_tree_action(
@@ -1003,6 +1094,19 @@ impl ToolInvocationService {
                     Err(e) => refused_or_failed(e, answer),
                 }
             }
+            // AEGIS ADR-147 Update `drift-report-at-the-gate-2026-10-23`: the
+            // lane's drift report, advice and never a refusal: its hash rides
+            // `commit_sha`, its counts by class `branch` and the whole report
+            // `diff`; a refusal or a failure rides `sentence`, and the run
+            // goes on either way.
+            "drift_report" => Ok(match self.drift_report(tenant_id, &tree).await {
+                Ok(report) => drift_step_answer(&report, answer),
+                Err(sentence) => RepositoryActionAnswer {
+                    branch: String::new(),
+                    sentence: Some(sentence),
+                    ..answer
+                },
+            }),
             // AEGIS ADR-149 C1: the landed run becomes a cut, named by the
             // state's `cut` (the step's message) or `forge-<execution id>`;
             // the cut rides `git_ref` and its snapshot `commit_sha`.
@@ -1114,10 +1218,19 @@ impl ToolInvocationService {
                     .filter(|m| !m.trim().is_empty())
                     .ok_or(RepositoryActionError::NoMessage)?;
                 let execution_id = ExecutionId(run);
+                // AEGIS ADR-147 Update `drift-report-at-the-gate-2026-10-23`:
+                // the person reads the lane's drift at the gate, before it
+                // replays onto the trunk; a refused or failed read is shown
+                // as its sentence and never refuses the landing.
+                let drift = match self.drift_report(tenant_id, &tree).await {
+                    Ok(report) => drift_at_gate(&report),
+                    Err(sentence) => json!({ "sentence": sentence }),
+                };
                 let arguments = json!({
                     "tree": tree.tree.path,
                     "lane": tree_lane(run),
                     "intent": message,
+                    "drift": drift,
                 });
                 let landed = match self
                     .land_at_gate(
@@ -1159,7 +1272,7 @@ impl ToolInvocationService {
             }
             other => Ok(RepositoryActionAnswer {
                 sentence: Some(format!(
-                    "unknown tree action '{other}': expected tree_diff, tree_write, tree_land, tree_cut, archive_render, archive_push or archive_deploy_wait"
+                    "unknown tree action '{other}': expected tree_diff, tree_write, drift_report, tree_land, tree_cut, archive_render, archive_push or archive_deploy_wait"
                 )),
                 ..answer
             }),
@@ -1401,6 +1514,50 @@ impl ToolInvocationService {
 }
 
 impl ToolInvocationService {
+    /// The drift report of the run's lane on the run's tree (Carbon Forge
+    /// ADR-0207, AEGIS ADR-147 Update `drift-report-at-the-gate-2026-10-23`):
+    /// `symbols.drift` through the run's own execution token, as the
+    /// landing calls `lanes.land`. Answers Carbon Forge's report, or the
+    /// sentence of its refusal or of the call's failure: never an error,
+    /// since the report advises and never ends the run.
+    async fn drift_report(&self, tenant_id: &TenantId, tree: &TreeOfRun) -> Result<Value, String> {
+        let lane = tree_lane(tree.run);
+        match self
+            .nuclear_notes(
+                tree.run,
+                tenant_id,
+                &tree.acting,
+                &tree.tree.workspace,
+                DRIFT_TOOL,
+                json!({ "lane": lane, "tree": tree.tree.path }),
+            )
+            .await
+        {
+            Ok(report) => {
+                tracing::info!(
+                    workflow_execution_id = %tree.run,
+                    lane = %lane,
+                    tree = %tree.tree.path,
+                    report_sha256 = %report.get("report_sha256").cloned().unwrap_or_default(),
+                    counts = %drift_counts_line(&report),
+                    "A run's lane's drift report was read"
+                );
+                Ok(report)
+            }
+            Err(e) => {
+                let sentence = step_refusal(&e).unwrap_or_else(|| e.to_string());
+                tracing::warn!(
+                    workflow_execution_id = %tree.run,
+                    lane = %lane,
+                    tree = %tree.tree.path,
+                    sentence = %sentence,
+                    "A run's lane's drift report was not read; the run goes on"
+                );
+                Err(sentence)
+            }
+        }
+    }
+
     /// The cut of the run's tree's workspace (AEGIS ADR-149 C1): a snapshot
     /// of its every entity's current revision, named `name`. Answers
     /// Carbon Forge's own answer, the snapshot's header and its `cut`.

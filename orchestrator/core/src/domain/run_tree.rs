@@ -69,7 +69,11 @@ pub const CARBON_FORGE_ACTION_TOOLS: &[(ActionName, &[&str])] = &[
             "blobs.upload_complete",
         ],
     ),
-    (ActionName::TreeLand, &["lanes.land"]),
+    // AEGIS ADR-147 Update `drift-report-at-the-gate-2026-10-23`: the
+    // drift step reads the lane's report, and the landing reads it again for
+    // the person's gate before it lands.
+    (ActionName::DriftReport, &["symbols.drift"]),
+    (ActionName::TreeLand, &["symbols.drift", "lanes.land"]),
     (ActionName::TreeCut, &["snapshots.cut"]),
     (ActionName::ArchiveRender, &["archives.render"]),
     (ActionName::ArchivePush, &["archives.push"]),

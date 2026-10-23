@@ -1222,6 +1222,11 @@ pub enum ActionName {
     /// Writes the run's tree, with the argument `message` as its intent, to
     /// a lane of the run's own (AEGIS ADR-147 C5); lands nothing.
     TreeWrite,
+    /// Reads Carbon Forge's drift report of the run's lane on its tree
+    /// (`symbols.drift`, Carbon Forge ADR-0207): advice for the person at
+    /// the landing's gate, never a refusal of it (AEGIS ADR-147 Update
+    /// `drift-report-at-the-gate-2026-10-23`); touches nothing.
+    DriftReport,
     /// Lands the run's lane as one changeset, with the argument `message`
     /// as its intent; gated (AEGIS ADR-147 C5).
     TreeLand,
@@ -1281,7 +1286,7 @@ pub enum ActionNeed {
 
 impl ActionName {
     /// Every action, in the order the refusal lists them.
-    pub const ALL: [ActionName; 12] = [
+    pub const ALL: [ActionName; 13] = [
         ActionName::UpdateBlackboard,
         ActionName::RepositoryDiff,
         ActionName::RepositoryCommit,
@@ -1289,6 +1294,7 @@ impl ActionName {
         ActionName::ImageGenerate,
         ActionName::TreeDiff,
         ActionName::TreeWrite,
+        ActionName::DriftReport,
         ActionName::TreeLand,
         ActionName::TreeCut,
         ActionName::ArchiveRender,
@@ -1306,6 +1312,7 @@ impl ActionName {
             ActionName::ImageGenerate => "image_generate",
             ActionName::TreeDiff => "tree_diff",
             ActionName::TreeWrite => "tree_write",
+            ActionName::DriftReport => "drift_report",
             ActionName::TreeLand => "tree_land",
             ActionName::TreeCut => "tree_cut",
             ActionName::ArchiveRender => "archive_render",
@@ -1332,9 +1339,10 @@ impl ActionName {
     pub fn arguments(&self) -> ActionArguments {
         match self {
             ActionName::UpdateBlackboard => ActionArguments::Any,
-            ActionName::RepositoryDiff | ActionName::RepositoryLand | ActionName::TreeDiff => {
-                ActionArguments::Required(&[])
-            }
+            ActionName::RepositoryDiff
+            | ActionName::RepositoryLand
+            | ActionName::TreeDiff
+            | ActionName::DriftReport => ActionArguments::Required(&[]),
             ActionName::RepositoryCommit | ActionName::TreeWrite | ActionName::TreeLand => {
                 ActionArguments::Required(&["message"])
             }
@@ -1372,7 +1380,8 @@ impl ActionName {
             ActionName::TreeDiff | ActionName::TreeWrite | ActionName::TreeLand => {
                 ActionNeed::RunTree
             }
-            ActionName::TreeCut
+            ActionName::DriftReport
+            | ActionName::TreeCut
             | ActionName::ArchiveRender
             | ActionName::ArchivePush
             | ActionName::ArchiveDeployWait => ActionNeed::RunTreeRef,

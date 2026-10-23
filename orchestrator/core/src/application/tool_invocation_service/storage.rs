@@ -1347,6 +1347,7 @@ impl ToolInvocationService {
             action,
             "tree_diff"
                 | "tree_write"
+                | "drift_report"
                 | "tree_land"
                 | "tree_cut"
                 | "archive_render"
