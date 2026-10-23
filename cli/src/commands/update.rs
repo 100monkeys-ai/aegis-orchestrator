@@ -351,6 +351,42 @@ pub(crate) fn persist_image_tag(
 mod tests {
     use super::*;
     use aegis_orchestrator_core::domain::node_config::NodeConfigManifest;
+
+    // The runtime applies its own migrations at startup (daemon::server::connect_postgres)
+    // and `/health/ready` reports `dependencies.database` true only once the
+    // migrated pool exists. `aegis init` and `aegis update` confirm the schema
+    // through that answer and never connect to the database from the host,
+    // whose `.env` names the compose service `postgres` that the host cannot
+    // resolve (Jeshua's `aegis init` on 1.2.0-beta, 2026-10-23:
+    // "failed to lookup address information: Name or service not known").
+
+    #[test]
+    fn readiness_with_database_true_means_the_runtime_applied_its_migrations() {
+        let ready = serde_json::json!({
+            "status": "ready",
+            "dependencies": { "database": true, "temporal": true }
+        });
+        migrations_applied(&ready).expect("a ready database is an applied schema");
+    }
+
+    #[test]
+    fn readiness_with_database_false_is_refused_and_names_the_runtime_log() {
+        let degraded = serde_json::json!({
+            "status": "degraded",
+            "dependencies": { "database": false, "temporal": true }
+        });
+        let err = migrations_applied(&degraded)
+            .expect_err("a database that is not ready is not a migrated schema")
+            .to_string();
+        assert!(err.contains("database"), "{err}");
+        assert!(err.contains("docker compose logs aegis-runtime"), "{err}");
+    }
+
+    #[test]
+    fn readiness_without_a_dependencies_block_is_refused() {
+        let unknown = serde_json::json!({ "status": "ready" });
+        assert!(migrations_applied(&unknown).is_err());
+    }
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
