@@ -114,12 +114,16 @@ pub fn declared_reach(workflow: &Workflow) -> BTreeSet<&'static str> {
 pub trait ExecutionTokens: Send + Sync {
     /// Mint the execution token of the workflow execution `run` from its
     /// person's binding, for `tree` and `tools`, and keep its secret keyed
-    /// by `run` (X2, X3). A refusal is Carbon Forge's own sentence.
+    /// by `run` (X2, X3). A refusal is Carbon Forge's own sentence. The
+    /// token names `workflow`, the run's workflow, so a landing rule's gate
+    /// can be satisfied by the run's approval (Carbon SCM R5.33a).
+    #[allow(clippy::too_many_arguments)]
     async fn mint_for_run(
         &self,
         tenant_id: &TenantId,
         person: Option<&str>,
         run: uuid::Uuid,
+        workflow: &str,
         contexts: &ExecutionContexts,
         tree: &RunTree,
         tools: &[&'static str],

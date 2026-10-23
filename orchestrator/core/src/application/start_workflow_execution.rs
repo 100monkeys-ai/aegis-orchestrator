@@ -307,7 +307,15 @@ impl StandardStartWorkflowExecutionUseCase {
             input.get(crate::domain::execution::CONTEXTS_INPUT_KEY),
         );
         tokens
-            .mint_for_run(tenant_id, person.as_deref(), run.0, &contexts, tree, &reach)
+            .mint_for_run(
+                tenant_id,
+                person.as_deref(),
+                run.0,
+                &workflow.metadata.name,
+                &contexts,
+                tree,
+                &reach,
+            )
             .await
             .map_err(|e| match e {
                 RunTreeError::Refused(sentence) => {

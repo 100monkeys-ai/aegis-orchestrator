@@ -1660,6 +1660,7 @@ mod tests {
             _: &TenantId,
             _: Option<&str>,
             _: uuid::Uuid,
+            _: &str,
             _: &crate::domain::execution::ExecutionContexts,
             _: &crate::domain::run_tree::RunTree,
             _: &[&'static str],
