@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-PINNED_VERSION="1.1.0-beta"
+PINNED_VERSION="1.2.0-beta"
 AEGIS_VERSION="${AEGIS_VERSION:-$PINNED_VERSION}"
 
 # ── Colours ───────────────────────────────────────────────────────────────────
