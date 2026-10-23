@@ -26,6 +26,7 @@
 //! | X2: a refused mint refuses the run before it is persisted | `execution_token_refused_mint_refuses_the_run_before_it_is_persisted` |
 //! | X4: the terminal event revokes the child and deletes its secret | `execution_token_terminal_event_revokes_the_child_and_deletes_its_secret` |
 //! | X3: the child's secret is in no record or event | `execution_token_secret_is_in_no_serialized_execution_record_or_event` |
+//! | Carbon SCM R5.33a: the mint names the run's workflow | `execution_token_mint_names_the_run_s_workflow` |
 
 mod carbon_forge_support;
 
@@ -80,17 +81,22 @@ impl WorkflowEnginePort for RecordingEngine {
 /// carbon-forge's start, its schema closed to all but `task`: the schema
 /// never sees `trees` or `contexts`, which are the platform's.
 fn workflow() -> aegis_orchestrator_core::domain::workflow::Workflow {
-    WorkflowParser::parse_yaml(
+    workflow_named("carbon-forge-start")
+}
+
+/// [`workflow`] under the name `name`.
+fn workflow_named(name: &str) -> aegis_orchestrator_core::domain::workflow::Workflow {
+    WorkflowParser::parse_yaml(&format!(
         r#"apiVersion: 100monkeys.ai/v1
 kind: Workflow
 metadata:
-  name: carbon-forge-start
+  name: {name}
   input_schema:
     type: object
     required: [task]
     additionalProperties: false
     properties:
-      task: { type: string }
+      task: {{ type: string }}
 spec:
   initial_state: ANALYZE
   states:
@@ -98,8 +104,8 @@ spec:
       kind: System
       command: "true"
       transitions: []
-"#,
-    )
+"#
+    ))
     .unwrap()
 }
 
@@ -129,6 +135,15 @@ async fn start(bytes: &str) -> Started {
 
 /// [`start`], Carbon Forge's answers changed by `answers`.
 async fn start_answering(
+    bytes: &str,
+    answers: impl FnOnce(&mut HashMap<String, Answer>),
+) -> Started {
+    start_workflow_answering(workflow(), bytes, answers).await
+}
+
+/// [`start_answering`] for the workflow `workflow`.
+async fn start_workflow_answering(
+    workflow: aegis_orchestrator_core::domain::workflow::Workflow,
     bytes: &str,
     answers: impl FnOnce(&mut HashMap<String, Answer>),
 ) -> Started {
@@ -179,7 +194,6 @@ async fn start_answering(
         binding.clone(),
     );
 
-    let workflow = workflow();
     let workflows = Arc::new(InMemoryWorkflowRepository::new());
     workflows.save_for_tenant(&tenant, &workflow).await.unwrap();
     let engine = Arc::new(RecordingEngine::default());
@@ -408,14 +422,47 @@ async fn execution_token_is_minted_with_the_binding_before_the_tree_and_carries_
             "workspace_id": WORKSPACE,
             "tree_path": TREE_PATH,
             "lane_label": lane_of(run),
+            "workflow": "carbon-forge-start",
             "tools": ["blobs.get", "cortex.ground", "trees.materialize"],
             "lifetime_seconds": 86400
         }),
-        "X2: the mint does not name the run, its tree, its lane, its declared tools and a day"
+        "X2: the mint does not name the run, its tree, its lane, its workflow, its declared tools and a day"
     );
     assert!(
         started.binding.holds_child(run),
         "X3: the child's secret was not kept"
+    );
+}
+
+/// Carbon SCM R5.33a: a landing rule's gate is satisfied by a live
+/// approval from an execution of the gate workflow, and Carbon Forge knows
+/// the execution's workflow by the name its token was minted with. So a
+/// run of the workflow `ci` mints its token naming `ci`, beside the run,
+/// its tree and its lane, every other argument as the X2 test has them.
+#[tokio::test]
+async fn execution_token_mint_names_the_run_s_workflow() {
+    let started = start_workflow_answering(workflow_named("ci"), README_BEFORE, |_| {}).await;
+    let run = run_of(&started);
+    let calls = calls_of(&started.calls);
+    let mints: Vec<&Value> = calls
+        .iter()
+        .filter(|(tool, _)| tool == "tokens.mint_execution")
+        .map(|(_, arguments)| arguments)
+        .collect();
+    assert_eq!(mints.len(), 1, "X2: the run's token was not minted once");
+    assert_eq!(
+        mints[0],
+        &json!({
+            "execution_id": run,
+            "instance_id": INSTANCE_ID,
+            "workspace_id": WORKSPACE,
+            "tree_path": TREE_PATH,
+            "lane_label": lane_of(run),
+            "workflow": "ci",
+            "tools": ["blobs.get", "cortex.ground", "trees.materialize"],
+            "lifetime_seconds": 86400
+        }),
+        "R5.33a: the mint of a run of the workflow ci does not name ci beside its run, tree and lane"
     );
 }
 
