@@ -455,12 +455,13 @@ mod tests {
             "blobs.upload_complete",
             "lanes.land",
             "snapshots.cut",
+            "symbols.drift",
         ]
         .into();
         assert_eq!(
             declared_reach(&forge),
             forge_tools,
-            "carbon-forge 1.1.0's declared reach is not the table's union over its Action states"
+            "carbon-forge 1.2.0's declared reach is not the table's union over its Action states"
         );
         let deploy_tools: BTreeSet<&str> = [
             "cortex.ground",

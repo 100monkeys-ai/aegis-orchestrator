@@ -222,6 +222,50 @@ pub fn materialized() -> Value {
     })
 }
 
+/// The hash of the lane's drift report [`drift_report`] answers.
+pub const DRIFT_REPORT_SHA256: &str =
+    "9b3e0c1d5f2a4e6b8c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b";
+
+/// One finding of a drift report: `symbol` in `src/deploy.ts`, re-signed on
+/// the lane in a governed seam, of `class`.
+pub fn drift_finding(class: &str, symbol: &str) -> Value {
+    json!({
+        "class": class,
+        "tree": TREE_PATH,
+        "path": "src/deploy.ts",
+        "symbol": symbol,
+        "kind": "function",
+        "from_signature": format!("{symbol}(env: string): Promise<void>"),
+        "to_signature": format!("{symbol}(env: string, dryRun: boolean): Promise<void>"),
+        "records": [{ "path": "adrs/0120-deploys", "updated_on_lane": false }],
+        "callers": 3
+    })
+}
+
+/// The run's lane's drift report holding `findings` and `pending`, as
+/// `symbols.drift` answers it (Carbon Forge `catalog-semantics.ts` 404 to
+/// 440 at `ba9c2f33`, ADR-0207).
+pub fn drift_report_of(run: uuid::Uuid, findings: Vec<Value>, pending: Vec<Value>) -> Value {
+    json!({
+        "lane": lane_of(run),
+        "composition_hash": "4c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d",
+        "report_sha256": DRIFT_REPORT_SHA256,
+        "findings": findings,
+        "pending": pending,
+        "governed_rows": 1
+    })
+}
+
+/// The run's lane's drift report: one seam re-signed with no governing page
+/// patched on the lane, nothing pending.
+pub fn drift_report(run: uuid::Uuid) -> Value {
+    drift_report_of(
+        run,
+        vec![drift_finding("seam_changed_without_record", "deploy")],
+        vec![],
+    )
+}
+
 /// Carbon Forge as the tests need it: the run's revision, a blob store, a
 /// lane and a landing answering as `catalog.ts` 2774-2910 answers.
 pub fn nuclear_notes(run: uuid::Uuid) -> StubGateway {
@@ -292,6 +336,12 @@ pub fn nuclear_notes(run: uuid::Uuid) -> StubGateway {
             "revoked": true,
             "already_revoked": false
         })),
+    );
+    // AEGIS ADR-147 Update `drift-report-at-the-gate-2026-10-23`: the
+    // lane's drift report (Carbon Forge ADR-0207).
+    answers.insert(
+        "symbols.drift".to_string(),
+        Answer::Result(drift_report(run)),
     );
     answers.insert(
         "lanes.land".to_string(),
