@@ -64,8 +64,8 @@ async fn main() -> anyhow::Result<()> {
 | Resource | Link |
 | --- | --- |
 | Getting Started | [docs.100monkeys.ai/docs/getting-started](https://docs.100monkeys.ai/docs/getting-started) |
-| Writing Agents | [docs.100monkeys.ai/docs/guides/writing-agents](https://docs.100monkeys.ai/docs/guides/writing-agents) |
-| Deploying Agents | [docs.100monkeys.ai/docs/guides/deploying-agents](https://docs.100monkeys.ai/docs/guides/deploying-agents) |
+| Writing Agents | [docs.100monkeys.ai/docs/agents/writing-agents](https://docs.100monkeys.ai/docs/agents/writing-agents) |
+| Deploying Agents | [docs.100monkeys.ai/docs/agents/deploying-agents](https://docs.100monkeys.ai/docs/agents/deploying-agents) |
 | Agent Manifest Reference | [docs.100monkeys.ai/docs/reference/agent-manifest](https://docs.100monkeys.ai/docs/reference/agent-manifest) |
 | gRPC API Reference | [docs.100monkeys.ai/docs/reference/grpc-api](https://docs.100monkeys.ai/docs/reference/grpc-api) |
 | Security Model | [docs.100monkeys.ai/docs/concepts/security-model](https://docs.100monkeys.ai/docs/concepts/security-model) |

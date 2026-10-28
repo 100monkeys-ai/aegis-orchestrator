@@ -53,8 +53,8 @@ use aegis_orchestrator_swarm::application::SwarmService;
 | Resource | Link |
 | --- | --- |
 | Swarms Concept | [docs.100monkeys.ai/docs/concepts/swarms](https://docs.100monkeys.ai/docs/concepts/swarms) |
-| Building Swarms Guide | [docs.100monkeys.ai/docs/guides/building-swarms](https://docs.100monkeys.ai/docs/guides/building-swarms) |
-| Architecture Overview | [docs.100monkeys.ai/docs/architecture](https://docs.100monkeys.ai/docs/architecture) |
+| Building Swarms Guide | [docs.100monkeys.ai/docs/workflows/building-swarms](https://docs.100monkeys.ai/docs/workflows/building-swarms) |
+| Architecture Overview | [docs.100monkeys.ai/docs/architecture/overview](https://docs.100monkeys.ai/docs/architecture/overview) |
 
 ## License
 
