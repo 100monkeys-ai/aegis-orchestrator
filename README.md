@@ -1,14 +1,24 @@
 # AEGIS Orchestrator
 
-The runtime and orchestration layer for AEGIS: policy-governed infrastructure for running autonomous AI agents without giving up control.
+AEGIS by 100monkeys.ai is a self-hosted orchestrator that runs autonomous agents in isolated, policy-enforced runtimes with durable FSM state. It is open source under AGPL-3.0 and in beta.
+
+```bash
+curl -fsSL https://get.100monkeys.ai | bash
+```
+
+[Website](https://100monkeys.ai/?utm_source=github&utm_medium=referral&utm_campaign=push-2026-10-28) · [Documentation](https://docs.100monkeys.ai) · [Discussions](https://github.com/100monkeys-ai/aegis-orchestrator/discussions)
 
 [![License](https://img.shields.io/badge/license-AGPL%203.0-blue.svg)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/100monkeys-ai/aegis-orchestrator?include_prereleases)](https://github.com/100monkeys-ai/aegis-orchestrator/releases)
+[![Pipeline](https://github.com/100monkeys-ai/aegis-orchestrator/actions/workflows/pipeline.yml/badge.svg?branch=main)](https://github.com/100monkeys-ai/aegis-orchestrator/actions/workflows/pipeline.yml)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange.svg)](https://www.rust-lang.org/)
 [![Documentation](https://img.shields.io/badge/docs-docs.100monkeys.ai-brightgreen.svg)](https://docs.100monkeys.ai)
 
 AEGIS is built for teams that want automation to be useful in production, not just impressive in a demo. If you are a DevOps engineer, SRE, or developer trying to run agents with predictable behavior, strong isolation, and operational visibility, this repository is the place to start.
 
-## Why Teams Use AEGIS
+## Why AEGIS
+
+An agent's autonomy should be bounded by the infrastructure it runs on, not by its prompt, so AEGIS enforces limits the agent cannot argue its way past. Security policy is declarative and deny-by-default, agent runs are isolated with Docker for local development and Firecracker micro-VMs as the production direction, and secrets are held by a keymaster so agents never see the credentials they use. Workflows are durable, so their state survives a crash or a restart.
 
 - **Deterministic control:** explicit workflows, typed manifests, and orchestrator-managed execution reduce hidden behavior and ad hoc agent sprawl.
 - **Built-in security controls:** network and filesystem access are policy-governed, runtimes are isolated, and production deployments can layer IAM and SEAL gateway controls on top of the orchestrator boundary.
@@ -179,6 +189,13 @@ The CLI README and crate READMEs go deeper on command surface and internals:
 - [`cli/README.md`](./cli/README.md)
 - [`orchestrator/core/README.md`](./orchestrator/core/README.md)
 - [`orchestrator/swarm/README.md`](./orchestrator/swarm/README.md)
+
+## Related
+
+We build two other products at 100monkeys.ai:
+
+- [Carbon Forge](https://carbonforge.dev/?utm_source=github&utm_medium=referral&utm_campaign=push-2026-10-28): source control for people and agents. Code, files and prose live in one record on the server, an agent opens a lane instead of cloning, and a landing is one changeset written whole or not at all. Public workspaces are free and every account includes one free private workspace.
+- [Zaru](https://myzaru.com/?utm_source=github&utm_medium=referral&utm_campaign=push-2026-10-28): a personal AI assistant that helps with messages, planning, follow-ups and scheduling, and shows you what it did. Its terminal harness is open source: [zaru-cli](https://github.com/100monkeys-ai/zaru-cli).
 
 ## License
 
