@@ -132,10 +132,10 @@ See the [Node Config Reference](https://docs.100monkeys.ai/docs/reference/node-c
 | CLI Reference | [docs.100monkeys.ai/docs/reference/cli](https://docs.100monkeys.ai/docs/reference/cli) |
 | Node Config Reference | [docs.100monkeys.ai/docs/reference/node-config](https://docs.100monkeys.ai/docs/reference/node-config) |
 | Agent Manifest Reference | [docs.100monkeys.ai/docs/reference/agent-manifest](https://docs.100monkeys.ai/docs/reference/agent-manifest) |
-| Deploying Agents | [docs.100monkeys.ai/docs/guides/deploying-agents](https://docs.100monkeys.ai/docs/guides/deploying-agents) |
+| Deploying Agents | [docs.100monkeys.ai/docs/agents/deploying-agents](https://docs.100monkeys.ai/docs/agents/deploying-agents) |
 | Docker Deployment | [docs.100monkeys.ai/docs/deployment/docker](https://docs.100monkeys.ai/docs/deployment/docker) |
 | Firecracker Deployment | [docs.100monkeys.ai/docs/deployment/firecracker](https://docs.100monkeys.ai/docs/deployment/firecracker) |
-| Local Testing | [docs.100monkeys.ai/docs/guides/local-testing](https://docs.100monkeys.ai/docs/guides/local-testing) |
+| Local Testing | [docs.100monkeys.ai/docs/agents/local-testing](https://docs.100monkeys.ai/docs/agents/local-testing) |
 
 ## Related Crates
 

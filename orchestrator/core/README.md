@@ -43,9 +43,9 @@ use aegis_orchestrator_core::domain::execution::Execution;
 | Resource | Link |
 | --- | --- |
 | Getting Started | [docs.100monkeys.ai/docs/getting-started](https://docs.100monkeys.ai/docs/getting-started) |
-| Architecture Overview | [docs.100monkeys.ai/docs/architecture](https://docs.100monkeys.ai/docs/architecture) |
+| Architecture Overview | [docs.100monkeys.ai/docs/architecture/overview](https://docs.100monkeys.ai/docs/architecture/overview) |
 | Execution Engine | [docs.100monkeys.ai/docs/architecture/execution-engine](https://docs.100monkeys.ai/docs/architecture/execution-engine) |
-| SEAL | [docs.100monkeys.ai/docs/architecture/seal](https://docs.100monkeys.ai/docs/architecture/seal) |
+| SEAL | [docs.100monkeys.ai/docs/gateway/seal-protocol](https://docs.100monkeys.ai/docs/gateway/seal-protocol) |
 | Agent Manifest Reference | [docs.100monkeys.ai/docs/reference/agent-manifest](https://docs.100monkeys.ai/docs/reference/agent-manifest) |
 | Node Config Reference | [docs.100monkeys.ai/docs/reference/node-config](https://docs.100monkeys.ai/docs/reference/node-config) |
 | Security Model | [docs.100monkeys.ai/docs/concepts/security-model](https://docs.100monkeys.ai/docs/concepts/security-model) |
