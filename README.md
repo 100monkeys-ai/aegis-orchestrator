@@ -11,7 +11,7 @@ curl -fsSL https://get.100monkeys.ai | bash
 [![License](https://img.shields.io/badge/license-AGPL%203.0-blue.svg)](LICENSE)
 [![Latest release](https://img.shields.io/github/v/release/100monkeys-ai/aegis-orchestrator?include_prereleases)](https://github.com/100monkeys-ai/aegis-orchestrator/releases)
 [![Pipeline](https://github.com/100monkeys-ai/aegis-orchestrator/actions/workflows/pipeline.yml/badge.svg?branch=main)](https://github.com/100monkeys-ai/aegis-orchestrator/actions/workflows/pipeline.yml)
-[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.91%2B-orange.svg)](https://www.rust-lang.org/)
 [![Documentation](https://img.shields.io/badge/docs-docs.100monkeys.ai-brightgreen.svg)](https://docs.100monkeys.ai)
 
 AEGIS is built for teams that want automation to be useful in production, not just impressive in a demo. If you are a DevOps engineer, SRE, or developer trying to run agents with predictable behavior, strong isolation, and operational visibility, this repository is the place to start.
