@@ -9,6 +9,7 @@
 //! wrote into `cluster_nodes` when it joined. One channel is kept per peer
 //! address.
 
+use crate::infrastructure::cluster::cluster_tls::{self, ClusterTls};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -108,6 +109,7 @@ pub struct GrpcPeerTransport {
     signing_key: Arc<ed25519_dalek::SigningKey>,
     token: Arc<SelfIssuedToken>,
     channels: Mutex<HashMap<String, NodeClusterServiceClient<Channel>>>,
+    tls: Option<ClusterTls>,
 }
 
 impl GrpcPeerTransport {
@@ -116,7 +118,14 @@ impl GrpcPeerTransport {
             signing_key,
             token,
             channels: Mutex::new(HashMap::new()),
+            tls: None,
         }
+    }
+
+    /// Dial peers over mutual TLS (`spec.cluster.tls`).
+    pub fn with_tls(mut self, tls: Option<ClusterTls>) -> Self {
+        self.tls = tls;
+        self
     }
 
     async fn envelope(&self, payload: Vec<u8>) -> Result<SealNodeEnvelope> {
@@ -132,13 +141,7 @@ impl GrpcPeerTransport {
         if let Some(client) = channels.get(address) {
             return Ok(client.clone());
         }
-        let endpoint = if address.contains("://") {
-            address.to_string()
-        } else {
-            format!("http://{address}")
-        };
-        let channel = Channel::from_shared(endpoint)
-            .context("invalid peer address")?
+        let channel = cluster_tls::endpoint(address, self.tls.as_ref())?
             .connect_timeout(std::time::Duration::from_secs(1))
             .connect_lazy();
         let client = NodeClusterServiceClient::new(channel);
