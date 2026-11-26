@@ -351,3 +351,198 @@ async fn a_node_outside_a_cluster_writes_unconditionally_and_claims_nothing() {
     );
     db.drop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Adoption (D5.7)
+// ---------------------------------------------------------------------------
+
+use aegis_orchestrator_core::domain::cluster_membership::{
+    ClusterDutyName, ClusterDutyRepository, DutyFence, ExecutionAdoptionRepository, NodeJoin,
+    NodeLeaseRepository,
+};
+use aegis_orchestrator_core::domain::execution::OWNER_LOST_FAILURE_REASON;
+use aegis_orchestrator_core::infrastructure::cluster::adoption_repo::{
+    adopt_sql, UNFINISHED_OF_SQL,
+};
+use aegis_orchestrator_core::infrastructure::cluster::{
+    PgClusterDutyRepository, PgExecutionAdoptionRepository, PgNodeLeaseRepository,
+};
+
+#[test]
+fn the_adoption_statements_pass_pg_strict() {
+    for (name, sql) in [
+        ("adopt", adopt_sql()),
+        ("unfinished of", UNFINISHED_OF_SQL.to_string()),
+    ] {
+        assert!(
+            unbounded_writes(&sql).is_empty(),
+            "{name}: {:?}",
+            unbounded_writes(&sql)
+        );
+    }
+}
+
+async fn joined(pool: &PgPool) -> NodeProcess {
+    let leases = PgNodeLeaseRepository::new(pool.clone());
+    let node_id = NodeId::new();
+    let incarnation = leases
+        .join(&NodeJoin {
+            node_id,
+            role: "hybrid".to_string(),
+            public_key: vec![9; 32],
+            grpc_address: "10.120.0.7:50056".to_string(),
+            vrack_address: Some("10.120.0.7".to_string()),
+            lease_ttl: std::time::Duration::from_secs(15),
+        })
+        .await
+        .unwrap();
+    NodeProcess {
+        node_id,
+        incarnation,
+    }
+}
+
+async fn holding_adoption(pool: &PgPool, holder: NodeProcess) -> DutyFence {
+    let duties = PgClusterDutyRepository::new(pool.clone());
+    duties
+        .ensure(ClusterDutyName::EXECUTION_ADOPTION)
+        .await
+        .unwrap();
+    let epoch = duties
+        .try_acquire(
+            ClusterDutyName::EXECUTION_ADOPTION,
+            holder,
+            std::time::Duration::from_secs(15),
+        )
+        .await
+        .unwrap()
+        .expect("the duty is free");
+    DutyFence::Leased {
+        duty: ClusterDutyName::EXECUTION_ADOPTION,
+        epoch,
+    }
+}
+
+#[tokio::test]
+async fn the_adopter_ends_a_dead_nodes_run_and_the_dead_owner_is_fenced() {
+    let Some(db) = Db::new().await else { return };
+    let tenant = TenantId::for_consumer_user("adoption").unwrap();
+    let dead = joined(&db.pool).await;
+    let adopter = joined(&db.pool).await;
+    let (dead_repo, dead_fenced) = owned(&db.pool, dead);
+    let run = running(&db.pool, &tenant).await;
+    let mut cancelled = running(&db.pool, &tenant).await;
+    dead_repo.save_for_tenant(&tenant, &run).await.unwrap();
+    dead_repo
+        .save_for_tenant(&tenant, &cancelled)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE executions SET cancel_requested_at = now() WHERE id = $1")
+        .bind(cancelled.id.0)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let fence = holding_adoption(&db.pool, adopter).await;
+    let adoption = PgExecutionAdoptionRepository::new(db.pool.clone());
+    let unfinished = adoption.unfinished_of(dead.node_id).await.unwrap();
+    assert_eq!(unfinished.len(), 2);
+    for (mut execution, cancel_requested) in unfinished {
+        assert_eq!(cancel_requested, execution.id == cancelled.id);
+        execution.end_owner_lost(cancel_requested);
+        assert!(adoption
+            .adopt(&execution, dead.node_id, adopter, fence)
+            .await
+            .unwrap());
+        // A second adoption of the same run takes nothing.
+        assert!(!adoption
+            .adopt(&execution, dead.node_id, adopter, fence)
+            .await
+            .unwrap());
+    }
+
+    assert_eq!(
+        owner_of(&db.pool, run.id).await,
+        (
+            Some(adopter.node_id.0),
+            Some(adopter.incarnation.0),
+            1,
+            "failed".to_string()
+        )
+    );
+    let error: Option<String> =
+        sqlx::query_scalar("SELECT error_message FROM executions WHERE id = $1")
+            .bind(run.id.0)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(error.as_deref(), Some(OWNER_LOST_FAILURE_REASON));
+    assert!(OWNER_LOST_FAILURE_REASON.starts_with("owner_lost"));
+    assert_eq!(
+        owner_of(&db.pool, cancelled.id).await.3,
+        "cancelled",
+        "a requested cancel is honoured"
+    );
+
+    // The dead owner's late write affects no row and reports the run fenced.
+    cancelled.complete();
+    assert!(matches!(
+        dead_repo.save_for_tenant(&tenant, &cancelled).await,
+        Err(RepositoryError::Fenced(_))
+    ));
+    assert_eq!(*dead_fenced.lock().unwrap(), vec![cancelled.id]);
+    assert_eq!(owner_of(&db.pool, cancelled.id).await.3, "cancelled");
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn a_holder_whose_duty_epoch_moved_on_adopts_nothing() {
+    let Some(db) = Db::new().await else { return };
+    let tenant = TenantId::for_consumer_user("adoption-stale").unwrap();
+    let dead = joined(&db.pool).await;
+    let stalled = joined(&db.pool).await;
+    let (dead_repo, _) = owned(&db.pool, dead);
+    let run = running(&db.pool, &tenant).await;
+    dead_repo.save_for_tenant(&tenant, &run).await.unwrap();
+
+    let stale_fence = holding_adoption(&db.pool, stalled).await;
+    // The stalled holder's lease runs out; another holder takes the duty at
+    // the next epoch.
+    sqlx::query(
+        "UPDATE cluster_duties SET lease_expires_at = now() - interval '1 second' WHERE duty = $1",
+    )
+    .bind(ClusterDutyName::EXECUTION_ADOPTION.as_str())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let next = joined(&db.pool).await;
+    let _ = holding_adoption(&db.pool, next).await;
+
+    let adoption = PgExecutionAdoptionRepository::new(db.pool.clone());
+    let (mut execution, _) = adoption
+        .unfinished_of(dead.node_id)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    execution.end_owner_lost(false);
+    assert!(!adoption
+        .adopt(&execution, dead.node_id, stalled, stale_fence)
+        .await
+        .unwrap());
+    assert_eq!(
+        owner_of(&db.pool, run.id).await,
+        (
+            Some(dead.node_id.0),
+            Some(dead.incarnation.0),
+            0,
+            "running".to_string()
+        )
+    );
+    // A node running its duties alone never adopts.
+    assert!(!adoption
+        .adopt(&execution, dead.node_id, stalled, DutyFence::Solo)
+        .await
+        .unwrap());
+    db.drop().await;
+}

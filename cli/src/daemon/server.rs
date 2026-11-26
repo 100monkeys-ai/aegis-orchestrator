@@ -3770,7 +3770,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     )
                     .with_tls(cluster_tls.clone()),
                 );
-                Arc::new(
+                let prober = Arc::new(
                     aegis_orchestrator_core::application::cluster::PeerProber::new(
                         joined.membership.clone(),
                         joined.leases.clone(),
@@ -3778,8 +3778,35 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         std::time::Duration::from_millis(m.probe_interval_ms.max(100)),
                         m.probe_failures_to_suspect,
                     ),
-                )
-                .spawn();
+                );
+                prober.clone().spawn();
+
+                // ADR-152 D5.7: the holder of execution-adoption ends what a
+                // dead peer left (lease expired and probes failed).
+                let adoption = Arc::new(
+                    aegis_orchestrator_core::application::cluster::ExecutionAdoption::new(
+                        prober,
+                        Arc::new(
+                            aegis_orchestrator_core::infrastructure::cluster::PgExecutionAdoptionRepository::new(
+                                joined.pool.clone(),
+                            ),
+                        ),
+                        joined.membership.process(),
+                        event_bus.clone(),
+                    ),
+                );
+                duty_runner.register(
+                    aegis_orchestrator_core::domain::cluster_membership::ClusterDutyName::EXECUTION_ADOPTION,
+                    aegis_orchestrator_core::application::cluster::DutySchedule::every(
+                        std::time::Duration::from_secs(5),
+                    ),
+                    move |fence| {
+                        let adoption = adoption.clone();
+                        async move {
+                            adoption.run_once(fence).await;
+                        }
+                    },
+                );
                 tracing::info!(
                     probe_interval_ms = m.probe_interval_ms,
                     "Probing cluster peers"
