@@ -137,11 +137,11 @@ impl ClusterDutyName {
     pub const OPERATOR_ESCALATION_EXPIRY: Self = Self("operator-escalation-expiry");
     pub const GOAL_EXPIRY: Self = Self("goal-expiry");
     pub const CLUSTER_HEALTH_SWEEP: Self = Self("cluster-health-sweep");
+    pub const EXECUTION_ADOPTION: Self = Self("execution-adoption");
 
-    /// Every cluster duty this binary knows (ADR-152 D2.4). `execution-
-    /// adoption` (D5) and `seal-nonce-gc` (D4.2) join with the phases that
-    /// build what they sweep.
-    pub const ALL: [Self; 8] = [
+    /// Every cluster duty this binary knows (ADR-152 D2.4). `seal-nonce-gc`
+    /// (D4.2) joins with the phase that builds what it sweeps.
+    pub const ALL: [Self; 9] = [
         Self::VOLUME_TTL_CLEANUP,
         Self::RATE_LIMIT_COUNTER_CLEANUP,
         Self::DISCOVERY_BACKFILL,
@@ -150,6 +150,7 @@ impl ClusterDutyName {
         Self::OPERATOR_ESCALATION_EXPIRY,
         Self::GOAL_EXPIRY,
         Self::CLUSTER_HEALTH_SWEEP,
+        Self::EXECUTION_ADOPTION,
     ];
 
     /// A name for a duty the catalogue above does not hold (tests).
@@ -256,6 +257,7 @@ mod tests {
                 "operator-escalation-expiry",
                 "goal-expiry",
                 "cluster-health-sweep",
+                "execution-adoption",
             ]
         );
     }
@@ -320,4 +322,29 @@ impl fmt::Debug for ExecutionOwnership {
             .field("process", &self.process.get())
             .finish_non_exhaustive()
     }
+}
+
+/// The executions of a dead node, and their adoption (ADR-152 D5.7).
+#[async_trait::async_trait]
+pub trait ExecutionAdoptionRepository: Send + Sync {
+    /// The executions `node` owns that are still `pending` or `running`,
+    /// each with whether a cancel was asked for.
+    async fn unfinished_of(
+        &self,
+        node: crate::domain::cluster::NodeId,
+    ) -> anyhow::Result<Vec<(crate::domain::execution::Execution, bool)>>;
+
+    /// Record `ended` (already ended in memory) as adopted by `adopter` from
+    /// `from`, in one statement: the epoch moves on, the adopter is the
+    /// owner, and the ending is written, only while `from` still owns the
+    /// unfinished row and the duty is still at the fence's epoch. `false`
+    /// when that no longer held (another holder adopted it, it ended, or the
+    /// duty moved on); nothing was written then.
+    async fn adopt(
+        &self,
+        ended: &crate::domain::execution::Execution,
+        from: crate::domain::cluster::NodeId,
+        adopter: NodeProcess,
+        fence: DutyFence,
+    ) -> anyhow::Result<bool>;
 }

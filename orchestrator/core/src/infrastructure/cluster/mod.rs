@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! # Cluster Infrastructure
 
+pub mod adoption_repo;
 pub mod cluster_tls;
 pub mod config_repo;
 pub mod enrolment_token_repo;
@@ -15,6 +16,7 @@ pub mod peer_transport;
 pub mod postgres_repo;
 pub mod round_robin_router;
 
+pub use adoption_repo::PgExecutionAdoptionRepository;
 pub use cluster_tls::ClusterTls;
 pub use config_repo::PgConfigLayerRepository;
 pub use enrolment_token_repo::PgClusterEnrolmentTokenRepository;

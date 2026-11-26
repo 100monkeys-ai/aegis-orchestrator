@@ -507,7 +507,15 @@ pub struct AttachmentRef {
 /// the execution's error, its in-flight iteration's error and the reason of
 /// its `ExecutionFailed` event, so every reader of the execution sees it.
 pub const ORCHESTRATOR_RESTART_FAILURE_REASON: &str =
-    "The orchestrator restarted while this execution was running; no process supervises it any more, so it was ended as failed";
+    "owner_restarted: The orchestrator restarted while this execution was running; no process supervises it any more, so it was ended as failed";
+
+/// The reason an execution fails with when the cluster node that owned it
+/// died and the `execution-adoption` duty ended it (ADR-152 D5.7). Like
+/// [`ORCHESTRATOR_RESTART_FAILURE_REASON`] it starts with the token a caller
+/// that retries matches (`owner_lost`, D5.8): the run is not resumed, so a
+/// retry starts a new one.
+pub const OWNER_LOST_FAILURE_REASON: &str =
+    "owner_lost: The cluster node running this execution died; another node ended it as failed, and it was not resumed";
 
 /// How long past an execution's own bound the container reaper waits before
 /// it ends an execution still running (ADR-040, Update of 2026-10-04). The
@@ -1172,6 +1180,24 @@ impl Execution {
             return None;
         }
         self.fail_with_iteration_in_flight(ORCHESTRATOR_RESTART_FAILURE_REASON.to_string())
+    }
+
+    /// End an execution whose owner died, as the `execution-adoption` duty
+    /// does (ADR-152 D5.7): as cancelled when a cancel had been asked for,
+    /// otherwise as failed with [`OWNER_LOST_FAILURE_REASON`], its iteration
+    /// in flight failing with the same reason. Returns the number of the
+    /// iteration it failed, if any. An execution that has already ended is
+    /// left exactly as it is and `None` is returned.
+    pub fn end_owner_lost(&mut self, cancel_requested: bool) -> Option<u8> {
+        if self.is_completed() {
+            return None;
+        }
+        if cancel_requested {
+            self.status = ExecutionStatus::Cancelled;
+            self.ended_at = Some(Utc::now());
+            return None;
+        }
+        self.fail_with_iteration_in_flight(OWNER_LOST_FAILURE_REASON.to_string())
     }
 
     /// Whether the container reaper may end this execution at `now`: it is

@@ -416,7 +416,7 @@ pub async fn fail_executions_cut_by_restart(
 /// Publish the events of an execution ended as failed outside its
 /// supervisor: `IterationFailed` for the iteration it failed, when one was in
 /// flight, then `ExecutionFailed`, both with `reason`.
-fn publish_execution_failure(
+pub fn publish_execution_failure(
     event_bus: &EventBus,
     execution: &Execution,
     failed_iteration: Option<u8>,
