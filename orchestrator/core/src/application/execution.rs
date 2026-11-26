@@ -551,6 +551,9 @@ pub struct StandardExecutionService {
     /// On a cluster node: this node, and how a cancel reaches another owner
     /// (ADR-152 D5.4). Set once the node has joined.
     cluster_cancel: Arc<std::sync::OnceLock<ClusterCancel>>,
+    /// Set when this node begins to drain (ADR-152 D5.9): no new execution
+    /// starts here; children of runs in flight still do.
+    draining: Arc<std::sync::atomic::AtomicBool>,
     /// Self-reference used by judge validators to spawn child executions (ADR-016, ADR-039).
     /// Set once at composition root via `set_child_execution_service()`.
     child_executor: std::sync::OnceLock<Arc<dyn ExecutionService>>,
@@ -829,6 +832,66 @@ impl StandardExecutionService {
         }
     }
 
+    /// Drain this node (ADR-152 D5.9): from now on no new execution starts
+    /// here ([`NodeDraining`]); the runs this process supervises get up to
+    /// `timeout` to end; whatever is still running then is ended as failed
+    /// with [`crate::domain::execution::NODE_DRAINED_FAILURE_REASON`] (retryable, D5.8), its events
+    /// published and its supervisor stopped. Returns how many ended by
+    /// themselves and how many the drain ended.
+    pub async fn drain(&self, timeout: std::time::Duration) -> DrainOutcome {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let at_start = self.cancellation_tokens.len();
+        tracing::info!(
+            running = at_start,
+            timeout_secs = timeout.as_secs(),
+            "Draining: no new executions start here"
+        );
+        let deadline = tokio::time::Instant::now() + timeout;
+        while !self.cancellation_tokens.is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        let left: Vec<(ExecutionId, CancellationToken)> = self
+            .cancellation_tokens
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect();
+        let mut ended = 0;
+        for (id, token) in left {
+            if let Ok(Some(mut execution)) = self.repository.find_by_id_unscoped(id).await {
+                let failed_iteration = execution.fail_node_drained();
+                if execution.status == ExecutionStatus::Failed {
+                    let tenant_id = execution.tenant_id.clone();
+                    match self
+                        .repository
+                        .save_for_tenant(&tenant_id, &execution)
+                        .await
+                    {
+                        Ok(()) => {
+                            publish_execution_failure(
+                                &self.event_bus,
+                                &execution,
+                                failed_iteration,
+                                execution.error.clone().unwrap_or_default(),
+                            );
+                            ended += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!(execution_id = %id, error = %e, "Could not end a run at the end of the drain; the restart pass ends it")
+                        }
+                    }
+                }
+            }
+            token.cancel();
+        }
+        let outcome = DrainOutcome {
+            ended_by_themselves: at_start.saturating_sub(ended),
+            ended_by_drain: ended,
+        };
+        tracing::info!(?outcome, "Drain done");
+        outcome
+    }
+
     /// Cancels reach the owner of a run this node does not supervise
     /// (ADR-152 D5.4): `me` is this node, `forwarder` dials the owner.
     pub fn set_cluster_cancel(
@@ -990,6 +1053,7 @@ impl StandardExecutionService {
             runtime_registry: None,
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
             cluster_cancel: Arc::new(std::sync::OnceLock::new()),
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             child_executor: std::sync::OnceLock::new(),
             context_bindings: std::sync::OnceLock::new(),
             run_profiles: std::sync::OnceLock::new(),
@@ -1255,6 +1319,19 @@ pub(crate) fn person_sub(identity: Option<&UserIdentity>) -> Option<String> {
         | crate::domain::iam::IdentityKind::Operator { .. }
         | crate::domain::iam::IdentityKind::TenantUser { .. } => Some(id.sub.clone()),
     })
+}
+
+/// A new execution refused because this node is draining (ADR-152 D5.9).
+/// Retryable: another node takes it.
+#[derive(Debug, thiserror::Error)]
+#[error("this node is draining and starts no new executions; try again, another node takes it")]
+pub struct NodeDraining;
+
+/// What a drain did (ADR-152 D5.9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrainOutcome {
+    pub ended_by_themselves: usize,
+    pub ended_by_drain: usize,
 }
 
 /// How often a live run on a cluster node reads whether a cancel was
@@ -6791,6 +6868,115 @@ mod tests {
         );
     }
 
+    fn drain_service(repo: Arc<InMemoryExecutionRepository>) -> StandardExecutionService {
+        StandardExecutionService::new(
+            Arc::new(InMemoryAgentRepository::new()),
+            Arc::new(TestVolumeService {
+                volumes: HashMap::new(),
+            }),
+            Arc::new(Supervisor::new(Arc::new(TestRuntime::default()))),
+            repo,
+            Arc::new(EventBus::new(16)),
+            Arc::new(crate::domain::node_config::NodeConfigManifest::default()),
+        )
+    }
+
+    /// ADR-152 D5.9: a draining node starts no new execution, retryably.
+    #[tokio::test]
+    async fn a_draining_node_refuses_a_new_execution() {
+        let service = drain_service(Arc::new(InMemoryExecutionRepository::new()));
+        assert_eq!(
+            service
+                .drain(std::time::Duration::ZERO)
+                .await
+                .ended_by_drain,
+            0
+        );
+        let refused = service
+            .start_execution(
+                AgentId::new(),
+                ExecutionInput {
+                    intent: Some("work".to_string()),
+                    input: serde_json::json!({}),
+                    workspace_volume_id: None,
+                    workspace_volume_mount_path: None,
+                    workspace_remote_path: None,
+                    workflow_execution_id: None,
+                    attachments: Vec::new(),
+                },
+                "aegis-system-operator".to_string(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused.downcast_ref::<NodeDraining>().is_some(),
+            "{refused}"
+        );
+    }
+
+    /// A run that ends inside the drain time ends by itself; one still
+    /// running when it runs out is ended `node_drained` and stopped.
+    #[tokio::test(start_paused = true)]
+    async fn the_drain_waits_for_its_runs_then_ends_the_rest_node_drained() {
+        let repo = Arc::new(InMemoryExecutionRepository::new());
+        let service = Arc::new(drain_service(repo.clone()));
+        let tenant = CoreTenantId::for_consumer_user("drain").unwrap();
+        let mut stays = Execution::new(
+            AgentId::new(),
+            ExecutionInput {
+                intent: Some("work".to_string()),
+                input: serde_json::json!({}),
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
+                workspace_remote_path: None,
+                workflow_execution_id: None,
+                attachments: Vec::new(),
+            },
+            3,
+            "aegis-system-operator".to_string(),
+        );
+        stays.tenant_id = tenant.clone();
+        stays.start();
+        repo.save_for_tenant(&tenant, &stays).await.unwrap();
+        let ends = ExecutionId::new();
+        let (stays_token, ends_token) = (CancellationToken::new(), CancellationToken::new());
+        service
+            .cancellation_tokens
+            .insert(stays.id, stays_token.clone());
+        service.cancellation_tokens.insert(ends, ends_token.clone());
+        let tokens = service.cancellation_tokens.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tokens.remove(&ends);
+        });
+
+        let outcome = service.drain(std::time::Duration::from_secs(5)).await;
+
+        assert_eq!(
+            outcome,
+            DrainOutcome {
+                ended_by_themselves: 1,
+                ended_by_drain: 1
+            }
+        );
+        assert!(
+            stays_token.is_cancelled(),
+            "the run left at the end is stopped"
+        );
+        assert!(
+            !ends_token.is_cancelled(),
+            "the run that ended by itself is not touched"
+        );
+        let ended = repo.find_by_id_unscoped(stays.id).await.unwrap().unwrap();
+        assert_eq!(ended.status, ExecutionStatus::Failed);
+        assert_eq!(
+            ended.error.as_deref(),
+            Some(crate::domain::execution::NODE_DRAINED_FAILURE_REASON)
+        );
+        assert!(crate::domain::execution::NODE_DRAINED_FAILURE_REASON.starts_with("node_drained:"));
+    }
+
     /// ADR-152 D5.2: when a write finds an execution adopted from under
     /// this node, the fence handler cancels that execution's token, which
     /// stops its supervisor and removes its container; no other run is
@@ -8164,6 +8350,9 @@ impl StandardExecutionService {
         security_context_name: String,
         identity: Option<&UserIdentity>,
     ) -> Result<ExecutionId> {
+        if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(anyhow!(NodeDraining));
+        }
         let tenant_id = Self::resolve_tenant_from_input(&input)?;
 
         // 0a. Quota check (ADR-056): enforce per-tenant concurrent execution limit.

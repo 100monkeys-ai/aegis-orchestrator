@@ -4273,6 +4273,23 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .context("HTTP server failed")?;
 
     info!("Daemon shutting down");
+    // ADR-152 D5.9: a cluster node drains. The HTTP listener is closed, so
+    // readiness fails and no request reaches it; the membership says
+    // draining; no new execution starts here; the runs it supervises get
+    // the drain time, and the rest end `node_drained` (retryable). Then its
+    // duties are released for a peer to take.
+    if let Some(joined) = joined_cluster.as_ref() {
+        joined.membership.start_drain();
+        let timeout = std::time::Duration::from_secs(
+            config
+                .spec
+                .cluster
+                .as_ref()
+                .map(|c| c.membership.drain_timeout_secs)
+                .unwrap_or(25),
+        );
+        execution_service.drain(timeout).await;
+    }
     duty_runner.shutdown().await;
 
     Ok(())

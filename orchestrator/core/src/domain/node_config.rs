@@ -1514,6 +1514,15 @@ pub struct ClusterMembershipConfig {
     /// which a peer is judged dead.
     #[serde(default = "default_probe_failures_to_suspect")]
     pub probe_failures_to_suspect: u32,
+    /// How long a stopping node lets the executions it runs end before it
+    /// ends the rest as failed, `node_drained` (ADR-152 D5.9). Keep it under
+    /// the process's stop grace period, or the stop kills the drain.
+    #[serde(default = "default_drain_timeout_secs")]
+    pub drain_timeout_secs: u64,
+}
+
+fn default_drain_timeout_secs() -> u64 {
+    25
 }
 
 fn default_lease_renew_secs() -> u64 {
@@ -1537,6 +1546,7 @@ impl Default for ClusterMembershipConfig {
             lease_ttl_secs: default_lease_ttl_secs(),
             probe_interval_ms: default_probe_interval_ms(),
             probe_failures_to_suspect: default_probe_failures_to_suspect(),
+            drain_timeout_secs: default_drain_timeout_secs(),
         }
     }
 }
