@@ -28,6 +28,9 @@ use crate::domain::llm::{ChatMessage, ContentPart, GenerationOptions, ImageSourc
 use crate::domain::tenant::TenantId;
 use crate::infrastructure::llm::registry::{ApiKeySource, ProviderRegistry};
 
+/// How much of a direct tool result the debug log shows.
+const DIRECT_RESULT_LOG_PREVIEW_CHARS: usize = 2_000;
+
 /// The share of the alias's prompt limit one command's output may take in
 /// the conversation: an eighth.
 const COMMAND_OUTPUT_SHARE_OF_PROMPT_LIMIT: usize = 8;
@@ -1724,15 +1727,16 @@ impl InnerLoopService {
                                 });
                             }
                             Ok(crate::application::tool_invocation_service::ToolInvocationResult::Direct(value)) => {
+                                let tool_result = serde_json::to_string(&value).unwrap_or_default();
+                                // A preview only: a whole result can be megabytes.
                                 tracing::debug!(
                                     execution_id = %execution_id_str,
                                     tool = %tool_call.name,
                                     tool_call_id = %tool_call.id,
-                                    result = %serde_json::to_string(&value).unwrap_or_default(),
+                                    result_bytes = tool_result.len(),
+                                    result = %tool_result.chars().take(DIRECT_RESULT_LOG_PREVIEW_CHARS).collect::<String>(),
                                     "Tool returned direct result"
                                 );
-
-                                let tool_result = serde_json::to_string(&value).unwrap_or_default();
                                 let mut next_ctx = {
                                     let lock = self.active_executions.read().await;
                                     lock.get(execution_id_str)
