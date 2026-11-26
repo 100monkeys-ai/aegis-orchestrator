@@ -20,7 +20,7 @@
 use aegis_orchestrator_core::domain::secrets::SensitiveString;
 use anyhow::{Context, Result};
 use chrono::Utc;
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -111,13 +111,12 @@ pub(crate) fn signed_envelope(
 ) -> SealNodeEnvelope {
     let ts = Utc::now().timestamp_millis();
     let payload = canonical_envelope_payload(kind, node_id, stream_id, ts, inner);
-    let signature = signing_key.sign(&payload).to_bytes().to_vec();
-    SealNodeEnvelope {
-        // Sent to the controller, which authenticates the node by it.
-        node_security_token: node_security_token.expose().to_string(),
-        signature,
+    // Sent to the controller, which authenticates the node by it.
+    aegis_orchestrator_core::infrastructure::cluster::node_envelope::seal(
+        signing_key,
+        node_security_token.expose().to_string(),
         payload,
-    }
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -828,6 +827,15 @@ async fn send_progress_inline(
 
 #[cfg(test)]
 mod tests {
+    /// The bytes an envelope's signature covers.
+    fn sealed(env: &SealNodeEnvelope) -> Vec<u8> {
+        aegis_orchestrator_core::infrastructure::cluster::node_envelope::signed_bytes(
+            env.issued_at_ms,
+            &env.nonce,
+            &env.payload,
+        )
+    }
+
     use super::*;
     use aegis_orchestrator_core::domain::security_context::{Capability, SecurityContextMetadata};
     use ed25519_dalek::{Verifier, VerifyingKey};
@@ -916,7 +924,7 @@ mod tests {
         let sig =
             ed25519_dalek::Signature::from_slice(&envelope.signature).expect("signature parses");
         verifying_key
-            .verify(&envelope.payload, &sig)
+            .verify(&sealed(&envelope), &sig)
             .expect("daemon signature must verify against its own VerifyingKey");
     }
 
@@ -933,7 +941,7 @@ mod tests {
             &[],
         );
         let sig = ed25519_dalek::Signature::from_slice(&envelope.signature).unwrap();
-        verifying_key.verify(&envelope.payload, &sig).unwrap();
+        verifying_key.verify(&sealed(&envelope), &sig).unwrap();
     }
 
     #[test]
@@ -962,9 +970,9 @@ mod tests {
         );
         let sig_a = ed25519_dalek::Signature::from_slice(&env_a.signature).unwrap();
         verifying_key
-            .verify(&env_a.payload, &sig_a)
+            .verify(&sealed(&env_a), &sig_a)
             .expect("env_a verifies");
-        let cross = verifying_key.verify(&env_b.payload, &sig_a);
+        let cross = verifying_key.verify(&sealed(&env_b), &sig_a);
         assert!(
             cross.is_err(),
             "command_id is bound into the canonical payload — cross-verify must fail"

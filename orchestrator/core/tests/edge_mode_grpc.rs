@@ -23,7 +23,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use base64::Engine;
 use chrono::Utc;
 use prost_types::Struct;
 use tokio::net::TcpListener;
@@ -34,6 +33,7 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 
+use aegis_orchestrator_core::application::cluster::NodeTokenIssuer;
 use aegis_orchestrator_core::application::edge::connect_edge::ConnectEdgeService;
 use aegis_orchestrator_core::domain::cluster::NodePeerStatus;
 use aegis_orchestrator_core::domain::edge::{
@@ -55,6 +55,7 @@ use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::{
     RouteExecutionResponse, SealEnvelope, SealNodeEnvelope, SyncConfigRequest, SyncConfigResponse,
 };
 use aegis_orchestrator_core::infrastructure::aegis_runtime_proto::ExecutionEvent;
+use aegis_orchestrator_core::infrastructure::cluster::node_envelope::{seal, NodeEnvelopeVerifier};
 use aegis_orchestrator_core::infrastructure::edge::EdgeConnectionRegistry;
 
 /// In-memory `EdgeDaemonRepository` test double for the in-process tonic
@@ -254,15 +255,112 @@ impl NodeClusterService for EdgeOnlyClusterService {
     }
 }
 
-/// Mint a minimal JWT-shaped string with `sub` set to `node_id`. The
-/// orchestrator side base64url-decodes the payload segment looking for
-/// `sub`; the header and signature segments are placeholders.
-fn fake_node_jwt(node_id: NodeId) -> String {
-    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{\"alg\":\"none\"}");
-    let payload_json = format!("{{\"sub\":\"{}\"}}", node_id.0);
-    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload_json.as_bytes());
-    let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"sig");
-    format!("{header}.{payload}.{sig}")
+mod keyed_transit {
+    //! A Transit stand-in that really verifies: it signs with a keyed digest
+    //! and accepts only that signature, so the envelope verifier's token
+    //! check is exercised, not bypassed.
+    use aegis_orchestrator_core::domain::secrets::{
+        DomainDynamicSecret, SecretStore, SecretsError, SensitiveString,
+    };
+    use async_trait::async_trait;
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+
+    pub struct KeyedTransit;
+
+    #[async_trait]
+    impl SecretStore for KeyedTransit {
+        async fn read(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<HashMap<String, SensitiveString>, SecretsError> {
+            unimplemented!("test stub")
+        }
+        async fn write(
+            &self,
+            _: &str,
+            _: &str,
+            _: HashMap<String, SensitiveString>,
+        ) -> Result<(), SecretsError> {
+            unimplemented!("test stub")
+        }
+        async fn generate_dynamic(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<DomainDynamicSecret, SecretsError> {
+            unimplemented!("test stub")
+        }
+        async fn renew_lease(
+            &self,
+            _: &str,
+            _: std::time::Duration,
+        ) -> Result<std::time::Duration, SecretsError> {
+            unimplemented!("test stub")
+        }
+        async fn revoke_lease(&self, _: &str) -> Result<(), SecretsError> {
+            unimplemented!("test stub")
+        }
+        async fn transit_sign(&self, key: &str, data: &[u8]) -> Result<String, SecretsError> {
+            let mac = Sha256::new()
+                .chain_update(key.as_bytes())
+                .chain_update(data)
+                .finalize();
+            Ok(format!(
+                "vault:v1:{}",
+                base64::engine::general_purpose::STANDARD.encode(mac)
+            ))
+        }
+        async fn transit_verify(
+            &self,
+            key: &str,
+            data: &[u8],
+            signature: &str,
+        ) -> Result<bool, SecretsError> {
+            Ok(signature == self.transit_sign(key, data).await?)
+        }
+        async fn transit_encrypt(&self, _: &str, _: &[u8]) -> Result<String, SecretsError> {
+            unimplemented!("test stub")
+        }
+        async fn transit_decrypt(&self, _: &str, _: &str) -> Result<Vec<u8>, SecretsError> {
+            unimplemented!("test stub")
+        }
+    }
+}
+
+const EDGE_TOKEN_KEY: &str = "edge-enrollment-token";
+
+/// The key every test edge enrolled.
+fn edge_signing_key() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+}
+
+/// The envelope verifier of the server under test.
+fn envelope_verifier() -> Arc<NodeEnvelopeVerifier> {
+    Arc::new(NodeEnvelopeVerifier::new(
+        Arc::new(keyed_transit::KeyedTransit),
+        EDGE_TOKEN_KEY.to_string(),
+    ))
+}
+
+/// A `NodeSecurityToken` for `node_id`, signed by the test Transit key.
+async fn edge_token(node_id: NodeId, tenant: &TenantId) -> String {
+    let claims = serde_json::json!({
+        "sub": node_id.0.to_string(),
+        "role": "edge",
+        "tid": tenant.as_str(),
+        "iat": Utc::now().timestamp(),
+        "exp": Utc::now().timestamp() + 3600,
+    });
+    NodeTokenIssuer::new(
+        Arc::new(keyed_transit::KeyedTransit),
+        EDGE_TOKEN_KEY.to_string(),
+    )
+    .issue(&claims)
+    .await
+    .expect("issue test token")
 }
 
 /// Builds a minimal `EdgeDaemon` for the in-process tonic round-trip
@@ -273,7 +371,7 @@ fn make_test_edge(node_id: NodeId, tenant: &TenantId) -> EdgeDaemon {
     EdgeDaemon {
         node_id,
         tenant_id: tenant.clone(),
-        public_key: vec![0; 32],
+        public_key: edge_signing_key().verifying_key().to_bytes().to_vec(),
         capabilities: EdgeCapabilities {
             os: "linux".into(),
             arch: "x86_64".into(),
@@ -306,7 +404,11 @@ async fn spawn_edge_only_server(
     let addr: SocketAddr = listener.local_addr().expect("local_addr");
     let url = format!("http://{addr}");
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let connect_svc = Arc::new(ConnectEdgeService::new(edge_repo, registry));
+    let connect_svc = Arc::new(ConnectEdgeService::new(
+        edge_repo,
+        registry,
+        envelope_verifier(),
+    ));
     tokio::spawn(async move {
         let incoming = TcpListenerStream::new(listener);
         let _ = Server::builder()
@@ -353,14 +455,14 @@ async fn hello_invoke_tool_command_result_round_trip() {
     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<EdgeEvent>(8);
     let outbound = tokio_stream::wrappers::ReceiverStream::new(out_rx);
 
-    let token = fake_node_jwt(node_id);
+    let token = edge_token(node_id, &tenant).await;
     let hello = EdgeEvent {
         event: Some(InEv::Hello(HelloEvent {
-            envelope: Some(SealNodeEnvelope {
-                node_security_token: token.clone(),
-                signature: vec![0; 64],
-                payload: b"hello-payload".to_vec(),
-            }),
+            envelope: Some(seal(
+                &edge_signing_key(),
+                token.clone(),
+                b"hello-payload".to_vec(),
+            )),
             capabilities: Some(ProtoEdgeCapabilities {
                 os: "linux".into(),
                 arch: "x86_64".into(),
@@ -445,11 +547,11 @@ async fn hello_invoke_tool_command_result_round_trip() {
     let result_event = EdgeEvent {
         event: Some(InEv::CommandResult(
             aegis_orchestrator_core::infrastructure::aegis_cluster_proto::CommandResultEvent {
-                envelope: Some(SealNodeEnvelope {
-                    node_security_token: token.clone(),
-                    signature: vec![0; 64],
-                    payload: command_id.to_string().into_bytes(),
-                }),
+                envelope: Some(seal(
+                    &edge_signing_key(),
+                    token.clone(),
+                    command_id.to_string().into_bytes(),
+                )),
                 command_id: command_id.to_string(),
                 result: Some(EdgeResult {
                     ok: true,
@@ -524,16 +626,100 @@ async fn drop_guard_resolves_pending_with_edge_disconnected() {
     }
 }
 
-/// Test 3 — server rejects Hello with mismatched signature.
-///
-/// The orchestrator-side ConnectEdge handler delegates outer envelope
-/// verification to a SEAL middleware that wraps the gRPC layer (see
-/// `application::edge::connect_edge::handle_stream` source comment). In an
-/// isolated tonic test that middleware is not present, so this case is
-/// deferred until we can stand up the middleware in-process.
-#[tokio::test]
-#[ignore = "TODO(adr-117): expand in-process round-trip suite — needs SEAL middleware"]
-async fn mismatched_signature_rejected() {}
+/// Test 3 — the server registers no edge whose Hello does not open: not one
+/// signed by a key other than the one the edge enrolled, not one bearing a
+/// token Transit did not sign, and not the same Hello presented twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mismatched_signature_rejected() {
+    let edge_repo: Arc<dyn EdgeDaemonRepository> = Arc::new(StubEdgeRepo::default());
+    let registry = EdgeConnectionRegistry::new();
+    let tenant = TenantId::new("tenant-a").unwrap();
+    let node_id = NodeId::new();
+    edge_repo
+        .upsert(&make_test_edge(node_id, &tenant))
+        .await
+        .unwrap();
+    let (url, _shutdown) = spawn_edge_only_server(edge_repo.clone(), registry.clone()).await;
+    let token = edge_token(node_id, &tenant).await;
+
+    let stranger = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+    let mut unsigned_token: Vec<&str> = token.split('.').collect();
+    unsigned_token[2] = "AAAA";
+    let unsigned_token = unsigned_token.join(".");
+    let good = seal(
+        &edge_signing_key(),
+        token.clone(),
+        b"hello-payload".to_vec(),
+    );
+
+    // The genuine Hello opens, so the refusals below are the verifier's.
+    assert!(hello_registers(&url, &registry, node_id, good.clone()).await);
+    for refused in [
+        seal(&stranger, token.clone(), b"hello-payload".to_vec()),
+        seal(
+            &edge_signing_key(),
+            unsigned_token,
+            b"hello-payload".to_vec(),
+        ),
+        good,
+    ] {
+        assert!(
+            !hello_registers(&url, &registry, node_id, refused).await,
+            "a Hello that does not open must not register the edge"
+        );
+    }
+}
+
+/// Open a ConnectEdge stream with `envelope` as its Hello; true when the
+/// server registered the edge. The stream is closed before returning.
+async fn hello_registers(
+    url: &str,
+    registry: &EdgeConnectionRegistry,
+    node_id: NodeId,
+    envelope: SealNodeEnvelope,
+) -> bool {
+    let channel = tonic::transport::Channel::from_shared(url.to_string())
+        .unwrap()
+        .connect()
+        .await
+        .expect("connect to in-process server");
+    let mut client = NodeClusterServiceClient::new(channel);
+    let (out_tx, out_rx) = tokio::sync::mpsc::channel::<EdgeEvent>(8);
+    out_tx
+        .send(EdgeEvent {
+            event: Some(InEv::Hello(HelloEvent {
+                envelope: Some(envelope),
+                capabilities: None,
+                stream_id: Uuid::new_v4().to_string(),
+                last_seen_command_id: None,
+            })),
+        })
+        .await
+        .expect("send hello");
+    let response = client
+        .connect_edge(tonic::Request::new(
+            tokio_stream::wrappers::ReceiverStream::new(out_rx),
+        ))
+        .await
+        .expect("ConnectEdge accepted");
+    let mut registered = false;
+    for _ in 0..25 {
+        if registry.get(&node_id).is_some() {
+            registered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(out_tx);
+    drop(response);
+    for _ in 0..50 {
+        if registry.get(&node_id).is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    registered
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Production-handler wiring regression: ADR-117 §B/§C
@@ -1035,9 +1221,14 @@ fn build_prod_handler(
         sync_config_uc,
         push_config_uc,
         cluster_repo,
+        envelope_verifier(),
     );
     if wire_edge {
-        let connect_svc = Arc::new(ConnectEdgeService::new(edge_repo.clone(), registry));
+        let connect_svc = Arc::new(ConnectEdgeService::new(
+            edge_repo.clone(),
+            registry,
+            envelope_verifier(),
+        ));
         let rotate_svc = Arc::new(RotateEdgeKeyService::with_default_ttl(
             edge_repo,
             Arc::new(prod_handler_stubs::NoOpSecretStore),
@@ -1109,15 +1300,11 @@ async fn connect_edge_dispatches_when_edge_services_wired() {
     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<EdgeEvent>(8);
     let outbound = tokio_stream::wrappers::ReceiverStream::new(out_rx);
 
-    let token = fake_node_jwt(node_id);
+    let token = edge_token(node_id, &tenant).await;
     out_tx
         .send(EdgeEvent {
             event: Some(InEv::Hello(HelloEvent {
-                envelope: Some(SealNodeEnvelope {
-                    node_security_token: token,
-                    signature: vec![0; 64],
-                    payload: b"hello-payload".to_vec(),
-                }),
+                envelope: Some(seal(&edge_signing_key(), token, b"hello-payload".to_vec())),
                 capabilities: Some(ProtoEdgeCapabilities {
                     os: "linux".into(),
                     arch: "x86_64".into(),
@@ -1552,6 +1739,7 @@ fn build_handler_with_real_attest() -> (
         bundle.sync_config_uc,
         bundle.push_config_uc,
         bundle.cluster_repo,
+        envelope_verifier(),
     );
     (handler, bundle.challenge_repo)
 }

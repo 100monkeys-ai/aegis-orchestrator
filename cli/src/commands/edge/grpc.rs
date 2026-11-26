@@ -285,6 +285,10 @@ pub fn build_rotate_request(
             node_security_token: String::new(),
             signature: outer_sig,
             payload,
+            // RotateEdgeKey is proven by the old key over its own
+            // nonce-bearing payload, not by a sealed envelope.
+            issued_at_ms: 0,
+            nonce: Vec::new(),
         }),
         new_public_key: new_pub,
         signature_with_new_key: new_sig,

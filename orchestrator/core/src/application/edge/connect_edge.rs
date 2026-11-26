@@ -25,18 +25,25 @@ use crate::domain::shared_kernel::NodeId;
 use crate::infrastructure::aegis_cluster_proto::{
     edge_event::Event as InboundEvent, EdgeCommand, EdgeEvent,
 };
+use crate::infrastructure::cluster::node_envelope::{EdgeDaemonKeys, NodeEnvelopeVerifier};
 use crate::infrastructure::edge::EdgeConnectionRegistry;
 
 pub struct ConnectEdgeService {
     edge_repo: Arc<dyn EdgeDaemonRepository>,
     registry: EdgeConnectionRegistry,
+    envelope_verifier: Arc<NodeEnvelopeVerifier>,
 }
 
 impl ConnectEdgeService {
-    pub fn new(edge_repo: Arc<dyn EdgeDaemonRepository>, registry: EdgeConnectionRegistry) -> Self {
+    pub fn new(
+        edge_repo: Arc<dyn EdgeDaemonRepository>,
+        registry: EdgeConnectionRegistry,
+        envelope_verifier: Arc<NodeEnvelopeVerifier>,
+    ) -> Self {
         Self {
             edge_repo,
             registry,
+            envelope_verifier,
         }
     }
 
@@ -58,15 +65,29 @@ impl ConnectEdgeService {
             .envelope
             .ok_or_else(|| anyhow!("Hello missing SealNodeEnvelope"))?;
 
-        // The outer envelope is verified by the SEAL middleware that wraps
-        // this handler at the gRPC layer; here we extract the node_id from
-        // the JWT claims so we can register the sender.
-        let node_id = node_id_from_seal_token(&envelope.node_security_token)?;
+        // The stream belongs to the edge whose envelope opens: token signed
+        // by the cluster's Transit key, Hello signed by the key that edge
+        // enrolled, fresh and not replayed.
+        let token = self
+            .envelope_verifier
+            .open(&envelope, &EdgeDaemonKeys(self.edge_repo.clone()))
+            .await
+            .map_err(|e| anyhow!("Hello refused: {e}"))?;
+        let node_id = token.node_id;
         let edge = self
             .edge_repo
             .get(&node_id)
             .await?
             .ok_or_else(|| anyhow!("unknown edge {node_id}"))?;
+        if token
+            .tenant_id
+            .as_deref()
+            .is_some_and(|tid| tid != edge.tenant_id.as_str())
+        {
+            return Err(anyhow!(
+                "Hello refused: the token binds edge {node_id} to another tenant"
+            ));
+        }
         if edge.status == NodePeerStatus::Unhealthy {
             // Allow connection but mark active on first heartbeat.
         }
@@ -135,24 +156,6 @@ impl ConnectEdgeService {
         }
         Ok(())
     }
-}
-
-fn node_id_from_seal_token(token: &str) -> Result<NodeId> {
-    use base64::Engine;
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
-        return Err(anyhow!("invalid jwt"));
-    }
-    let claims_b = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(parts[1])
-        .map_err(|e| anyhow!("decode: {e}"))?;
-    #[derive(serde::Deserialize)]
-    struct C {
-        sub: String,
-    }
-    let c: C = serde_json::from_slice(&claims_b)?;
-    let id = uuid::Uuid::parse_str(&c.sub).map_err(|e| anyhow!("invalid node_id: {e}"))?;
-    Ok(NodeId(id))
 }
 
 fn proto_caps_to_domain(
@@ -288,7 +291,14 @@ mod tests {
     async fn heartbeat_event_persists_last_seen_and_marks_active() {
         let node_id = NodeId::new();
         let repo = Arc::new(RecordingRepo::new(seed_edge(node_id)));
-        let svc = ConnectEdgeService::new(repo.clone(), EdgeConnectionRegistry::new());
+        let svc = ConnectEdgeService::new(
+            repo.clone(),
+            EdgeConnectionRegistry::new(),
+            Arc::new(NodeEnvelopeVerifier::new(
+                Arc::new(crate::infrastructure::secrets_manager::TestSecretStore::new()),
+                "unused".to_string(),
+            )),
+        );
 
         let ev = EdgeEvent {
             event: Some(InboundEvent::Heartbeat(HeartbeatEvent {

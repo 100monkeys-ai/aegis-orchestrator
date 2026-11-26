@@ -14,7 +14,7 @@ use crate::application::cluster::{
 use crate::domain::agent::AgentId;
 use crate::domain::cluster::{
     NodeCapabilityAdvertisement, NodeClusterRepository, NodeId, NodePeerStatus,
-    NodeRole as DomainNodeRole, NodeSecurityToken,
+    NodeRole as DomainNodeRole,
 };
 use crate::domain::execution::ExecutionId;
 use crate::domain::volume::TenantId;
@@ -47,6 +47,9 @@ use crate::infrastructure::aegis_cluster_proto::{
 use crate::infrastructure::aegis_cluster_proto::{
     FenceInner, FenceRequest, FenceResponse, ProbeInner, ProbeRequest, ProbeResponse,
 };
+use crate::infrastructure::cluster::node_envelope::{
+    ClusterNodeKeys, EnvelopeError, NodeEnvelopeVerifier,
+};
 use crate::infrastructure::cluster::peer_transport::member_state_to_proto;
 use crate::infrastructure::edge::grpc_stream::{handle_connect_edge, handle_rotate_edge_key};
 use crate::presentation::grpc::auth_interceptor::{validate_grpc_request, GrpcIamAuthInterceptor};
@@ -65,6 +68,9 @@ pub struct NodeClusterServiceHandler {
     sync_config_use_case: Arc<SyncConfigUseCase>,
     push_config_use_case: Arc<PushConfigUseCase>,
     cluster_repo: Arc<dyn NodeClusterRepository>,
+    /// Opens every node RPC's `SealNodeEnvelope`; shared with the other
+    /// receivers in this process.
+    envelope_verifier: Arc<NodeEnvelopeVerifier>,
     /// ADR-117: present when this node serves Controller/Hybrid/RelayCoordinator
     /// roles. None on pure-worker nodes; calling ConnectEdge in that case
     /// returns FailedPrecondition.
@@ -99,6 +105,7 @@ impl NodeClusterServiceHandler {
         sync_config_use_case: Arc<SyncConfigUseCase>,
         push_config_use_case: Arc<PushConfigUseCase>,
         cluster_repo: Arc<dyn NodeClusterRepository>,
+        envelope_verifier: Arc<NodeEnvelopeVerifier>,
     ) -> Self {
         Self {
             attest_node_use_case,
@@ -110,6 +117,7 @@ impl NodeClusterServiceHandler {
             sync_config_use_case,
             push_config_use_case,
             cluster_repo,
+            envelope_verifier,
             connect_edge_service: None,
             rotate_edge_key_service: None,
             issue_enrollment_token_use_case: None,
@@ -156,54 +164,20 @@ impl NodeClusterServiceHandler {
             .ok_or_else(|| Status::failed_precondition("this node has not joined a cluster"))
     }
 
+    /// Open a SEAL node envelope (see `node_envelope`) and decode its payload.
     async fn authenticate_node<T: Message + Default>(
         &self,
         proto_envelope: Option<ProtoEnvelope>,
     ) -> Result<(NodeId, T), Status> {
-        let proto_envelope =
-            proto_envelope.ok_or_else(|| Status::unauthenticated("Missing security envelope"))?;
-
-        // 1. Parse token and extract claims
-        let token = NodeSecurityToken(proto_envelope.node_security_token.clone().into());
-        let claims = token
-            .claims()
-            .map_err(|e| Status::unauthenticated(format!("Invalid token: {}", e)))?;
-        let node_id = claims.node_id;
-
-        // 2. Retrieve node's public key
-        let peer = self
-            .cluster_repo
-            .find_peer(&node_id)
-            .await
-            .map_err(|e| Status::internal(format!("Database error: {}", e)))?
-            .ok_or_else(|| Status::unauthenticated("Node not registered"))?;
-
-        // 3. Verify Ed25519 signature over payload
-        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-        let verifying_key = VerifyingKey::from_bytes(
-            &peer
-                .public_key
-                .clone()
-                .try_into()
-                .map_err(|_| Status::internal("Invalid stored public key length"))?,
-        )
-        .map_err(|e| Status::internal(format!("Invalid stored public key: {}", e)))?;
-
-        let signature = Signature::from_slice(&proto_envelope.signature)
-            .map_err(|e| Status::unauthenticated(format!("Invalid signature format: {}", e)))?;
-
-        verifying_key
-            .verify(&proto_envelope.payload, &signature)
-            .map_err(|e| {
-                Status::unauthenticated(format!("Signature verification failed: {}", e))
-            })?;
-
-        // 4. Deserialize payload
-        let inner = T::decode(&proto_envelope.payload[..]).map_err(|e| {
+        let envelope = proto_envelope.ok_or(EnvelopeError::Missing)?;
+        let token = self
+            .envelope_verifier
+            .open(&envelope, &ClusterNodeKeys(self.cluster_repo.clone()))
+            .await?;
+        let inner = T::decode(&envelope.payload[..]).map_err(|e| {
             Status::invalid_argument(format!("Failed to deserialize inner payload: {}", e))
         })?;
-
-        Ok((node_id, inner))
+        Ok((token.node_id, inner))
     }
 }
 
