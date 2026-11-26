@@ -693,7 +693,9 @@ impl ExecutionRepository for InMemoryExecutionRepository {
             .cloned())
     }
 
-    async fn find_unfinished_unscoped(&self) -> Result<Vec<Execution>, RepositoryError> {
+    async fn take_unfinished_left_by_earlier_process(
+        &self,
+    ) -> Result<Vec<Execution>, RepositoryError> {
         let executions = self.executions.read().unwrap();
         let mut unfinished: Vec<Execution> = executions
             .values()

@@ -245,20 +245,6 @@ fn temporal_connection_max_retries(raw_value: Option<i32>) -> i32 {
     raw_value.unwrap_or(30).max(1)
 }
 
-/// Whether this node ends, at start-up, the executions an earlier process
-/// left unfinished.
-///
-/// An execution record names no node, so the start-up pass cannot tell an
-/// execution an earlier process of this node left running from one another
-/// live node is running against the same database. It therefore runs only
-/// on a standalone node (`spec.cluster` absent or `enabled: false`), where
-/// this process is the only one that runs executions against its database.
-/// A clustered node skips it and says so; making it safe there needs the
-/// running node's identity on the record.
-pub(crate) fn restart_pass_applies(config: &NodeConfigManifest) -> bool {
-    !config.spec.cluster.as_ref().is_some_and(|c| c.enabled)
-}
-
 /// The start-up pass: end, as failed, every execution an earlier orchestrator
 /// process left pending or running
 /// ([`aegis_orchestrator_core::application::execution::fail_executions_cut_by_restart`]).
@@ -269,18 +255,9 @@ pub(crate) fn restart_pass_applies(config: &NodeConfigManifest) -> bool {
 /// supervises an execution yet, and the reaper's first pass removes the
 /// containers of the executions this pass ended). Returns the ids it ended.
 pub(crate) async fn end_executions_cut_by_restart(
-    config: &NodeConfigManifest,
     execution_repo: &dyn aegis_orchestrator_core::domain::repository::ExecutionRepository,
     event_bus: &EventBus,
 ) -> Vec<aegis_orchestrator_core::domain::execution::ExecutionId> {
-    if !restart_pass_applies(config) {
-        info!(
-            "Skipping the startup pass over executions an earlier process left unfinished: \
-             clustering is enabled, and an execution record names no node, so an execution \
-             another live node runs cannot be told apart"
-        );
-        return Vec::new();
-    }
     info!("Running startup pass over executions an earlier process left unfinished");
     match aegis_orchestrator_core::application::execution::fail_executions_cut_by_restart(
         execution_repo,
@@ -723,12 +700,17 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     let db_pool: Option<PgPool> = connect_postgres(&config).await?;
 
+    // ADR-152 D5: on a cluster node, executions are claimed for this process
+    // once it has joined, and a write that finds one adopted stops it.
+    let execution_ownership = Arc::new(
+        aegis_orchestrator_core::domain::cluster_membership::ExecutionOwnership::default(),
+    );
     let (agent_repo, workflow_repo, execution_repo, workflow_execution_repo): RepositoryTuple =
         if let Some(db_pool) = db_pool.as_ref() {
             (
             Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_agent::PostgresAgentRepository::new(db_pool.clone())),
             Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_workflow::PostgresWorkflowRepository::new_with_pool(db_pool.clone())),
-            Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_execution::PostgresExecutionRepository::new(db_pool.clone())),
+            Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_execution::PostgresExecutionRepository::new(db_pool.clone()).with_ownership(execution_ownership.clone())),
             Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_workflow_execution::PostgresWorkflowExecutionRepository::new(db_pool.clone())),
         )
         } else {
@@ -912,6 +894,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         &cluster_bind_addr,
     )
     .await?;
+    if let Some(joined) = joined_cluster.as_ref() {
+        execution_ownership.claim_for(joined.membership.process())?;
+    }
     let mut duty_runner = aegis_orchestrator_core::application::cluster::ClusterDutyRunner::new(
         crate::daemon::cluster_membership::duty_leasing(joined_cluster.as_ref()),
     );
@@ -1207,7 +1192,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // End the executions an earlier process left running, now that their
     // failure events are recorded and before the container reaper's first
     // pass and any listener: see `end_executions_cut_by_restart`.
-    end_executions_cut_by_restart(&config, execution_repo.as_ref(), &event_bus).await;
+    end_executions_cut_by_restart(execution_repo.as_ref(), &event_bus).await;
 
     // Initialize NFS Server Gateway (ADR-036)
     info!("Initializing NFS Server Gateway...");
@@ -1861,6 +1846,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .with_seal_session_precreation(seal_gateway_client, token_issuer.clone());
 
     let execution_service = Arc::new(execution_service_builder);
+    execution_ownership.on_fenced(execution_service.fence_handler())?;
     // Wire the self-reference so judge agents can be spawned as child executions (ADR-016).
     execution_service.set_child_execution_service(execution_service.clone());
 
@@ -5105,7 +5091,7 @@ models:
     // ── The start-up pass over executions an earlier process left running ──
 
     mod restart_pass {
-        use super::super::{end_executions_cut_by_restart, restart_pass_applies};
+        use super::super::end_executions_cut_by_restart;
         use crate::daemon::container_helpers::managed_container_reap_reason;
         use crate::daemon::handlers::executions::execution_status;
         use crate::daemon::handlers::test_support::service_account;
@@ -5115,7 +5101,6 @@ models:
             Execution, ExecutionId, ExecutionInput, ExecutionStatus, IterationStatus,
             ORCHESTRATOR_RESTART_FAILURE_REASON,
         };
-        use aegis_orchestrator_core::domain::node_config::{ClusterConfig, NodeConfigManifest};
         use aegis_orchestrator_core::domain::repository::{
             ExecutionRepository, WorkflowExecutionRepository,
         };
@@ -5123,7 +5108,6 @@ models:
         use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
         use aegis_orchestrator_core::infrastructure::repositories::postgres_execution::PostgresExecutionRepository;
         use aegis_orchestrator_core::infrastructure::repositories::postgres_workflow_execution::PostgresWorkflowExecutionRepository;
-        use aegis_orchestrator_core::infrastructure::repositories::InMemoryExecutionRepository;
         use aegis_orchestrator_core::infrastructure::runtime::ManagedAgentContainer;
         use chrono::Utc;
         use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
@@ -5321,8 +5305,7 @@ models:
                 bus.clone(),
             ))
             .start();
-            let config = NodeConfigManifest::default();
-            let ended = end_executions_cut_by_restart(&config, &repo, &bus).await;
+            let ended = end_executions_cut_by_restart(&repo, &bus).await;
             assert_eq!(ended, vec![judge.id, worker.id]);
 
             for id in [judge.id, worker.id] {
@@ -5414,7 +5397,7 @@ models:
             let failed_count = |v: &Vec<(i64, String, serde_json::Value)>| {
                 v.iter().filter(|(_, t, _)| t == "ExecutionFailed").count()
             };
-            let ended_again = end_executions_cut_by_restart(&config, &repo, &bus).await;
+            let ended_again = end_executions_cut_by_restart(&repo, &bus).await;
             assert!(
                 ended_again.is_empty(),
                 "the second pass ended {ended_again:?}"
@@ -5424,29 +5407,6 @@ models:
             assert_eq!(failed_count(&events_of(&events, judge.id).await), 1);
 
             db.remove().await;
-        }
-
-        /// On a node with clustering enabled the pass does not run: an
-        /// execution record names no node, so a running execution of another
-        /// live node would be failed. The record stays as it is.
-        #[tokio::test]
-        async fn a_clustered_node_skips_the_startup_pass() {
-            let mut config = NodeConfigManifest::default();
-            assert!(restart_pass_applies(&config));
-            let cluster: ClusterConfig =
-                serde_json::from_value(serde_json::json!({ "enabled": true })).unwrap();
-            config.spec.cluster = Some(cluster);
-            assert!(!restart_pass_applies(&config));
-
-            let repo = InMemoryExecutionRepository::new();
-            let tenant = TenantId::for_consumer_user("cluster-owner").unwrap();
-            let running = left_running(AgentId::new(), &tenant, Utc::now());
-            repo.save_for_tenant(&tenant, &running).await.unwrap();
-            let bus = EventBus::with_default_capacity();
-            assert!(end_executions_cut_by_restart(&config, &repo, &bus)
-                .await
-                .is_empty());
-            assert_eq!(status_of(&repo, running.id).await, ExecutionStatus::Running);
         }
     }
 }

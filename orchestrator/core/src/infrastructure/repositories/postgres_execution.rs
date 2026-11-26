@@ -43,6 +43,7 @@
 //! ```
 
 use crate::domain::agent::AgentId;
+use crate::domain::cluster_membership::{ExecutionOwnership, NodeProcess};
 use crate::domain::execution::{
     Execution, ExecutionHierarchy, ExecutionId, ExecutionInput, ExecutionStatus, Iteration,
 };
@@ -55,13 +56,87 @@ use sqlx::Row;
 
 pub struct PostgresExecutionRepository {
     pool: PgPool,
+    ownership: Option<std::sync::Arc<ExecutionOwnership>>,
 }
 
 impl PostgresExecutionRepository {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            ownership: None,
+        }
+    }
+
+    /// Claim and fence executions for this process once `ownership` names
+    /// it (ADR-152 D5.1, D5.2); until then, and outside a cluster, writes
+    /// are unconditional.
+    pub fn with_ownership(mut self, ownership: std::sync::Arc<ExecutionOwnership>) -> Self {
+        self.ownership = Some(ownership);
+        self
+    }
+
+    fn owner(&self) -> Option<NodeProcess> {
+        self.ownership.as_ref().and_then(|o| o.process().copied())
     }
 }
+
+/// The columns and values every save writes; the owner columns follow as
+/// $19 and $20 when this process claims its executions.
+const SAVE_INSERT: &str = r#"
+            INSERT INTO executions (
+                id, tenant_id, agent_id, input, status, iterations,
+                current_iteration, max_iterations, final_output, error_message,
+                container_uid, container_gid,
+                started_at, completed_at, parent_execution_id,
+                security_context_name, initiating_user_sub, timeout_seconds"#;
+
+const SAVE_UPDATE: &str = r#"
+            ON CONFLICT (id) DO UPDATE SET
+                tenant_id = EXCLUDED.tenant_id,
+                status = EXCLUDED.status,
+                iterations = EXCLUDED.iterations,
+                current_iteration = EXCLUDED.current_iteration,
+                final_output = EXCLUDED.final_output,
+                error_message = EXCLUDED.error_message,
+                container_uid = EXCLUDED.container_uid,
+                container_gid = EXCLUDED.container_gid,
+                completed_at = EXCLUDED.completed_at,
+                parent_execution_id = EXCLUDED.parent_execution_id,
+                security_context_name = EXCLUDED.security_context_name,
+                initiating_user_sub = EXCLUDED.initiating_user_sub,
+                timeout_seconds = EXCLUDED.timeout_seconds"#;
+
+/// A save by a process outside a cluster: unconditional, no owner.
+pub fn unowned_save_sql() -> String {
+    format!(
+        "{SAVE_INSERT}\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18){SAVE_UPDATE}"
+    )
+}
+
+/// A save by a cluster node (ADR-152 D5.1, D5.2): the INSERT claims the
+/// execution for the process ($19, $20); the update applies only while that
+/// process still owns it at epoch 0. Claims happen only here, when a process
+/// creates an execution, so an owner's epoch is always 0; adoption
+/// increments it and names the adopter, after which this statement affects
+/// zero rows.
+pub fn owned_save_sql() -> String {
+    format!(
+        "{SAVE_INSERT},\n                owner_node_id, owner_incarnation\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20){SAVE_UPDATE}\n            WHERE executions.owner_node_id = $19\n              AND executions.owner_incarnation = $20\n              AND executions.owner_epoch = 0"
+    )
+}
+
+/// The restart pass on a cluster node (ADR-152 D5.6): this node's unfinished
+/// executions an earlier incarnation of it left, taken by the current
+/// incarnation so that its writes ending them apply.
+pub const TAKE_OWN_UNFINISHED_SQL: &str = r#"
+            UPDATE executions
+            SET owner_incarnation = $2
+            WHERE owner_node_id = $1
+              AND owner_incarnation < $2
+              AND owner_epoch = 0
+              AND status IN ('running', 'pending')
+            RETURNING id
+            "#;
 
 #[async_trait]
 impl ExecutionRepository for PostgresExecutionRepository {
@@ -96,53 +171,45 @@ impl ExecutionRepository for PostgresExecutionRepository {
 
         let parent_execution_id = execution.hierarchy.parent_execution_id.map(|id| id.0);
 
-        sqlx::query(
-            r#"
-            INSERT INTO executions (
-                id, tenant_id, agent_id, input, status, iterations,
-                current_iteration, max_iterations, final_output, error_message,
-                container_uid, container_gid,
-                started_at, completed_at, parent_execution_id,
-                security_context_name, initiating_user_sub, timeout_seconds
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-            ON CONFLICT (id) DO UPDATE SET
-                tenant_id = EXCLUDED.tenant_id,
-                status = EXCLUDED.status,
-                iterations = EXCLUDED.iterations,
-                current_iteration = EXCLUDED.current_iteration,
-                final_output = EXCLUDED.final_output,
-                error_message = EXCLUDED.error_message,
-                container_uid = EXCLUDED.container_uid,
-                container_gid = EXCLUDED.container_gid,
-                completed_at = EXCLUDED.completed_at,
-                parent_execution_id = EXCLUDED.parent_execution_id,
-                security_context_name = EXCLUDED.security_context_name,
-                initiating_user_sub = EXCLUDED.initiating_user_sub,
-                timeout_seconds = EXCLUDED.timeout_seconds
-            "#,
-        )
-        .bind(execution.id.0)
-        .bind(tenant_id.as_str())
-        .bind(execution.agent_id.0)
-        .bind(input_json)
-        .bind(status_str)
-        .bind(iterations_json)
-        .bind(execution.iterations().len() as i32)
-        .bind(execution.max_iterations as i32)
-        .bind(final_output)
-        .bind(error_message)
-        .bind(execution.container_uid as i32)
-        .bind(execution.container_gid as i32)
-        .bind(execution.started_at)
-        .bind(execution.ended_at)
-        .bind(parent_execution_id)
-        .bind(&execution.security_context_name)
-        .bind(&execution.initiating_user_sub)
-        .bind(execution.timeout_seconds.map(|s| s as i64))
-        .execute(&self.pool)
-        .await
-        .map_err(|e| RepositoryError::Database(format!("Failed to save execution: {e}")))?;
+        let owner = self.owner();
+        let sql = if owner.is_some() {
+            owned_save_sql()
+        } else {
+            unowned_save_sql()
+        };
+        let mut query = sqlx::query(&sql)
+            .bind(execution.id.0)
+            .bind(tenant_id.as_str())
+            .bind(execution.agent_id.0)
+            .bind(input_json)
+            .bind(status_str)
+            .bind(iterations_json)
+            .bind(execution.iterations().len() as i32)
+            .bind(execution.max_iterations as i32)
+            .bind(final_output)
+            .bind(error_message)
+            .bind(execution.container_uid as i32)
+            .bind(execution.container_gid as i32)
+            .bind(execution.started_at)
+            .bind(execution.ended_at)
+            .bind(parent_execution_id)
+            .bind(&execution.security_context_name)
+            .bind(&execution.initiating_user_sub)
+            .bind(execution.timeout_seconds.map(|s| s as i64));
+        if let Some(owner) = owner {
+            query = query.bind(owner.node_id.0).bind(owner.incarnation.0);
+        }
+        let result = query
+            .execute(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Database(format!("Failed to save execution: {e}")))?;
+
+        if owner.is_some() && result.rows_affected() == 0 {
+            if let Some(ownership) = &self.ownership {
+                ownership.fenced(execution.id);
+            }
+            return Err(RepositoryError::Fenced(execution.id.to_string()));
+        }
 
         Ok(())
     }
@@ -991,17 +1058,27 @@ impl ExecutionRepository for PostgresExecutionRepository {
         Ok(count.max(0) as u64)
     }
 
-    async fn find_unfinished_unscoped(&self) -> Result<Vec<Execution>, RepositoryError> {
-        let ids: Vec<uuid::Uuid> = sqlx::query_scalar(
-            r#"
-            SELECT id FROM executions
-            WHERE status IN ('running', 'pending')
-            ORDER BY started_at DESC
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+    async fn take_unfinished_left_by_earlier_process(
+        &self,
+    ) -> Result<Vec<Execution>, RepositoryError> {
+        let ids: Vec<uuid::Uuid> = match self.owner() {
+            Some(owner) => sqlx::query_scalar(TAKE_OWN_UNFINISHED_SQL)
+                .bind(owner.node_id.0)
+                .bind(owner.incarnation.0)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| RepositoryError::Database(e.to_string()))?,
+            None => sqlx::query_scalar(
+                r#"
+                SELECT id FROM executions
+                WHERE status IN ('running', 'pending')
+                ORDER BY started_at DESC
+                "#,
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Database(e.to_string()))?,
+        };
 
         let mut executions = Vec::with_capacity(ids.len());
         for id in ids {

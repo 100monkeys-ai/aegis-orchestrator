@@ -260,3 +260,64 @@ mod tests {
         );
     }
 }
+
+/// This process's claim on the executions it runs (ADR-152 D5.1, D5.2).
+///
+/// Shared by the execution repository and the execution service. Outside a
+/// cluster it stays empty and the repository writes as one process always
+/// has. On a cluster node the daemon sets the [`NodeProcess`] once it has
+/// joined, before any work is accepted: from then on every execution this
+/// process creates is claimed for it in the creating `INSERT`, and every
+/// later write applies only while this process still owns the row at epoch
+/// 0. A write that affects no row means the execution was adopted from
+/// under this process (it was fenced); the repository reports it here, and
+/// the execution service stops that execution's supervisor, which removes
+/// its container.
+#[derive(Default)]
+pub struct ExecutionOwnership {
+    process: std::sync::OnceLock<NodeProcess>,
+    on_fenced:
+        std::sync::OnceLock<Box<dyn Fn(crate::domain::execution::ExecutionId) + Send + Sync>>,
+}
+
+impl ExecutionOwnership {
+    /// Claim executions for `process` from now on; once.
+    pub fn claim_for(&self, process: NodeProcess) -> anyhow::Result<()> {
+        self.process.set(process).map_err(|_| {
+            anyhow::anyhow!("this process already claims executions as a cluster node")
+        })
+    }
+
+    /// The process executions are claimed for, on a cluster node.
+    pub fn process(&self) -> Option<&NodeProcess> {
+        self.process.get()
+    }
+
+    /// What to do when a write finds an execution fenced off this process;
+    /// once.
+    pub fn on_fenced(
+        &self,
+        f: impl Fn(crate::domain::execution::ExecutionId) + Send + Sync + 'static,
+    ) -> anyhow::Result<()> {
+        self.on_fenced
+            .set(Box::new(f))
+            .map_err(|_| anyhow::anyhow!("the fenced-execution handler is already set"))
+    }
+
+    /// A write found `id` fenced off this process.
+    pub fn fenced(&self, id: crate::domain::execution::ExecutionId) {
+        tracing::warn!(execution_id = %id, "This node no longer owns the execution (fenced): stopping it");
+        metrics::counter!("aegis_cluster_executions_fenced_total").increment(1);
+        if let Some(f) = self.on_fenced.get() {
+            f(id);
+        }
+    }
+}
+
+impl fmt::Debug for ExecutionOwnership {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExecutionOwnership")
+            .field("process", &self.process.get())
+            .finish_non_exhaustive()
+    }
+}
