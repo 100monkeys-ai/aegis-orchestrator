@@ -20,9 +20,7 @@ const MAX_FETCH_BODY_BYTES: usize = 5 * 1024 * 1024;
 
 /// The most characters of content `web.fetch` returns to the caller, after
 /// conversion. A tool result is copied into the execution's context, its
-/// trajectory and the LLM request, so it must stay small: 2026-11-25/26 a
-/// 73 KB bizapedia.com page became 9.1 MB of `html2md` table padding and the
-/// orchestrator grew to 30 GB and was OOM-killed three times.
+/// trajectory and the LLM request, so it must stay small whatever the page.
 const MAX_FETCH_CONTENT_CHARS: usize = 200_000;
 
 /// Maximum number of attempts for a Brave Search request when the upstream
@@ -234,8 +232,7 @@ impl ExternalWebToolPort for ReqwestWebToolAdapter {
                 // html2md is synchronous and CPU-bound: off the async workers.
                 let (content, content_format) = tokio::task::spawn_blocking(move || {
                     if to_markdown {
-                        let (content, format) = html_to_markdown_or_fallback(&body);
-                        (collapse_padding(&content), format)
+                        html_to_markdown_or_fallback(&body)
                     } else if is_html {
                         (body, "html")
                     } else {
@@ -333,22 +330,6 @@ async fn perform_fetch(
     Ok((status, is_html, body, truncated))
 }
 
-/// Collapse the padding `html2md` emits for tables: runs of three or more
-/// spaces become one space, and runs of four or more `-` become `---`.
-/// html2md pads every column to its widest cell, so nested layout tables
-/// grow quadratically (a 10 KB page became 9.1 MB, 8.4 MB of it spaces).
-fn collapse_padding(markdown: &str) -> String {
-    use std::sync::OnceLock;
-    static SPACES_RE: OnceLock<regex::Regex> = OnceLock::new();
-    static DASHES_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let spaces =
-        SPACES_RE.get_or_init(|| regex::Regex::new(r" {3,}").expect("static regex compiles"));
-    let dashes =
-        DASHES_RE.get_or_init(|| regex::Regex::new(r"-{4,}").expect("static regex compiles"));
-    let stage1 = spaces.replace_all(markdown, " ");
-    dashes.replace_all(&stage1, "---").into_owned()
-}
-
 /// `content` cut to at most `max_chars` characters (on a char boundary), with
 /// a note saying so; and whether it was cut.
 fn truncate_chars(content: String, max_chars: usize) -> (String, bool) {
@@ -420,7 +401,39 @@ fn strip_non_visible_tags(html: &str) -> String {
 
     let stage1 = script.replace_all(html, "");
     let stage2 = style.replace_all(&stage1, "");
-    comment.replace_all(&stage2, "").into_owned()
+    let stage3 = comment.replace_all(&stage2, "");
+    flatten_tables(&stage3)
+}
+
+/// Rewrite table markup as plain blocks before `html2md` sees it: each row a
+/// paragraph, each cell a span followed by a space, every other table element
+/// a div. `html2md` pads a table's columns to their widest cell, and a nested
+/// table is a cell whose width is the padded width of the table inside it, so
+/// its output grows about tenfold per level of nesting (2026-11-26: a 19 KB
+/// bizapedia.com page made it allocate 9.5 GB, and the production
+/// orchestrator was OOM-killed three times). No cap after the conversion can
+/// help, because the allocation happens inside it. The text is kept; only
+/// the table layout is lost, and nothing downstream needs it.
+fn flatten_tables(html: &str) -> String {
+    use std::sync::OnceLock;
+    static CELL_OPEN_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static CELL_CLOSE_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static ROW_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static BLOCK_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let cell_open = CELL_OPEN_RE
+        .get_or_init(|| regex::Regex::new(r"(?i)<t[dh]\b[^>]*>").expect("static regex compiles"));
+    let cell_close = CELL_CLOSE_RE
+        .get_or_init(|| regex::Regex::new(r"(?i)</t[dh]\s*>").expect("static regex compiles"));
+    let row = ROW_RE
+        .get_or_init(|| regex::Regex::new(r"(?i)<(/?)tr\b[^>]*>").expect("static regex compiles"));
+    let block = BLOCK_RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)<(/?)(?:table|thead|tbody|tfoot|caption|colgroup|col)\b[^>]*>")
+            .expect("static regex compiles")
+    });
+    let stage1 = cell_open.replace_all(html, "<span>");
+    let stage2 = cell_close.replace_all(&stage1, "</span> ");
+    let stage3 = row.replace_all(&stage2, "<${1}p>");
+    block.replace_all(&stage3, "<${1}div>").into_owned()
 }
 
 #[cfg(test)]
@@ -730,28 +743,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Regression: html2md silently emits an empty string for some valid HTML
-    // (e.g. content entirely inside <script> tags). The fetch path must
-    // detect this case and fall back to the original HTML so callers do not
-    // receive empty content for pages that returned real bytes.
-    // -----------------------------------------------------------------------
-    #[test]
-    fn web_fetch_collapses_html2md_table_padding() {
-        // Nested layout tables: html2md pads each column to its widest cell.
-        let wide = "x".repeat(400);
-        let html = format!(
-            "<table><tr><td><table><tr><td>{wide}</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table></td><td>e</td></tr><tr><td>f</td><td>g</td></tr></table>"
-        );
-        let (md, fmt) = html_to_markdown_or_fallback(&html);
-        let collapsed = collapse_padding(&md);
-        assert_eq!(fmt, "markdown");
-        assert!(collapsed.contains(&wide), "the content survives");
-        assert!(!collapsed.contains("   "), "no run of three spaces remains");
-        assert!(!collapsed.contains("----"), "no run of four dashes remains");
-        assert!(collapsed.len() < md.len(), "the padding is gone");
-    }
-
     /// 2026-11-25/26: three OOM kills of production's orchestrator, each a
     /// `web.fetch` whose converted page was megabytes. The result handed back
     /// must stay within the caps whatever the page.
@@ -800,6 +791,37 @@ mod tests {
         assert!(content.ends_with("and was cut here."));
     }
 
+    /// 2026-11-26: html2md's output grows about tenfold per level of table
+    /// nesting; six levels (under 1 KB of HTML) made 19.7 MB before tables
+    /// were flattened, and a real page made it allocate 9.5 GB.
+    #[test]
+    fn web_fetch_nested_tables_convert_small_and_keep_their_text() {
+        let mut html = "x".repeat(80);
+        for _ in 0..6 {
+            html = format!(
+                "<table><tr><td>{html}</td><td>{}</td></tr><tr><td>a</td><td>b</td></tr></table>",
+                "y".repeat(40)
+            );
+        }
+        let html = format!("<html><body>{html}</body></html>");
+        let (md, fmt) = html_to_markdown_or_fallback(&html);
+        assert_eq!(fmt, "markdown");
+        assert!(md.len() < 10_000, "nested tables made {} bytes", md.len());
+        assert!(md.contains(&"x".repeat(80)), "the innermost text survives");
+        assert!(md.contains(&"y".repeat(40)), "the cell text survives");
+    }
+
+    #[test]
+    fn web_fetch_flatten_tables_rewrites_table_markup_only() {
+        let out = flatten_tables(
+            r#"<TABLE class="t"><thead><tr><th>H</th></tr></thead><tbody><tr><td colspan="2">C</td></tr></tbody></TABLE><p>keep</p><tdx>"#,
+        );
+        assert_eq!(
+            out,
+            "<div><div><p><span>H</span> </p></div><div><p><span>C</span> </p></div></div><p>keep</p><tdx>"
+        );
+    }
+
     #[test]
     fn web_fetch_truncates_content_on_a_char_boundary() {
         let (same, cut) = truncate_chars("héllo".to_string(), 5);
@@ -810,6 +832,12 @@ mod tests {
         assert!(short.contains("longer than 2 characters"));
     }
 
+    // -----------------------------------------------------------------------
+    // Regression: html2md silently emits an empty string for some valid HTML
+    // (e.g. content entirely inside <script> tags). The fetch path must
+    // detect this case and fall back to the original HTML so callers do not
+    // receive empty content for pages that returned real bytes.
+    // -----------------------------------------------------------------------
     #[test]
     fn web_fetch_html_to_markdown_fallback_on_empty_conversion() {
         // Empty input → empty html (no fallback drama, format is "html").
