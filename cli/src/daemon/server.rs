@@ -3525,7 +3525,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             );
             // ADR-152 D1.3, D6: a joined node answers Probe and takes Fence.
             if let Some(joined) = joined_cluster.as_ref() {
-                handler = handler.with_membership(joined.membership.clone());
+                handler = handler
+                    .with_membership(joined.membership.clone())
+                    // ADR-152 D5.4: a peer forwards here the cancel of a run
+                    // this node owns.
+                    .with_execution_canceller(execution_service.clone());
             }
 
             // ADR-117: the relay-coordinator (and Hybrid / Controller-without-relay
@@ -3770,6 +3774,21 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     )
                     .with_tls(cluster_tls.clone()),
                 );
+                // ADR-152 D5.4: a cancel of a run another node owns is
+                // forwarded to it over the same transport.
+                execution_service.set_cluster_cancel(
+                    joined.membership.process().node_id,
+                    Arc::new(
+                        aegis_orchestrator_core::infrastructure::cluster::GrpcCancelForwarder::new(
+                            transport.clone(),
+                            Arc::new(
+                                aegis_orchestrator_core::infrastructure::cluster::PgNodeClusterRepository::new(
+                                    joined.pool.clone(),
+                                ),
+                            ),
+                        ),
+                    ),
+                )?;
                 let prober = Arc::new(
                     aegis_orchestrator_core::application::cluster::PeerProber::new(
                         joined.membership.clone(),

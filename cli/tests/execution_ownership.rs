@@ -546,3 +546,61 @@ async fn a_holder_whose_duty_epoch_moved_on_adopts_nothing() {
         .unwrap());
     db.drop().await;
 }
+
+// ---------------------------------------------------------------------------
+// The recorded cancel (D5.4)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_cancel_statement_passes_pg_strict() {
+    use aegis_orchestrator_core::infrastructure::repositories::postgres_execution::REQUEST_CANCEL_SQL;
+    assert!(unbounded_writes(REQUEST_CANCEL_SQL).is_empty());
+}
+
+#[tokio::test]
+async fn a_cancel_is_recorded_on_an_unfinished_run_once_and_answers_its_owner() {
+    let Some(db) = Db::new().await else { return };
+    let tenant = TenantId::for_consumer_user("cancel-record").unwrap();
+    let other = TenantId::for_consumer_user("cancel-other").unwrap();
+    let owner = process(NodeId::new(), 1);
+    let (repo, _) = owned(&db.pool, owner);
+    let run = running(&db.pool, &tenant).await;
+    repo.save_for_tenant(&tenant, &run).await.unwrap();
+    assert!(!repo.cancel_requested(run.id).await.unwrap());
+
+    assert_eq!(
+        repo.request_cancel(&other, run.id).await.unwrap(),
+        None,
+        "another tenant records nothing"
+    );
+    assert_eq!(
+        repo.request_cancel(&tenant, run.id).await.unwrap(),
+        Some(Some(owner.node_id)),
+        "recorded, and its owner answered"
+    );
+    let first: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT cancel_requested_at FROM executions WHERE id = $1")
+            .bind(run.id.0)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    repo.request_cancel(&tenant, run.id).await.unwrap();
+    let again: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT cancel_requested_at FROM executions WHERE id = $1")
+            .bind(run.id.0)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(first, again, "the first request's time is kept");
+    assert!(repo.cancel_requested(run.id).await.unwrap());
+
+    let mut done = running(&db.pool, &tenant).await;
+    done.complete();
+    repo.save_for_tenant(&tenant, &done).await.unwrap();
+    assert_eq!(
+        repo.request_cancel(&tenant, done.id).await.unwrap(),
+        None,
+        "an ended run records no cancel"
+    );
+    db.drop().await;
+}

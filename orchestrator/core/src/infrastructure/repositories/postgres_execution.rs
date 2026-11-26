@@ -125,6 +125,15 @@ pub fn owned_save_sql() -> String {
     )
 }
 
+/// A cancel recorded on an unfinished execution of the tenant (ADR-152
+/// D5.4); the first request's time is kept. Answers the owner.
+pub const REQUEST_CANCEL_SQL: &str = r#"
+            UPDATE executions
+            SET cancel_requested_at = COALESCE(cancel_requested_at, now())
+            WHERE tenant_id = $1 AND id = $2 AND status IN ('pending', 'running')
+            RETURNING owner_node_id
+            "#;
+
 /// The restart pass on a cluster node (ADR-152 D5.6): this node's unfinished
 /// executions an earlier incarnation of it left, taken by the current
 /// incarnation so that its writes ending them apply.
@@ -1056,6 +1065,31 @@ impl ExecutionRepository for PostgresExecutionRepository {
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
         Ok(count.max(0) as u64)
+    }
+
+    async fn request_cancel(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> Result<Option<Option<crate::domain::cluster::NodeId>>, RepositoryError> {
+        let owner: Option<Option<uuid::Uuid>> = sqlx::query_scalar(REQUEST_CANCEL_SQL)
+            .bind(tenant_id.as_str())
+            .bind(id.0)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(owner.map(|o| o.map(crate::domain::cluster::NodeId)))
+    }
+
+    async fn cancel_requested(&self, id: ExecutionId) -> Result<bool, RepositoryError> {
+        let requested: Option<bool> = sqlx::query_scalar(
+            "SELECT cancel_requested_at IS NOT NULL FROM executions WHERE id = $1",
+        )
+        .bind(id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(requested.unwrap_or(false))
     }
 
     async fn take_unfinished_left_by_earlier_process(

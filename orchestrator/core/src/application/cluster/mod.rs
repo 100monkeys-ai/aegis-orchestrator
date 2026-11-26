@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0
 
 pub mod attest_node;
+pub mod cancel;
 pub mod challenge_node;
 pub mod cluster_aware_execution;
 pub mod duty_runner;
@@ -18,6 +19,7 @@ pub mod route_execution;
 pub mod sync_config;
 
 pub use attest_node::*;
+pub use cancel::{CancelForwarder, OwnedExecutionCanceller};
 pub use challenge_node::*;
 pub use cluster_aware_execution::{ClusterAwareExecutionService, ClusterForwardingConfig};
 pub use duty_runner::{ClusterDutyRunner, DutyLeasing, DutyRunnerHandle, DutySchedule};

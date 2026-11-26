@@ -91,6 +91,9 @@ pub struct NodeClusterServiceHandler {
     /// and takes `Fence`. None on nodes that have not joined a cluster; the
     /// RPCs then return FailedPrecondition.
     membership: Option<Arc<NodeMembership>>,
+    /// The owner's side of a forwarded cancel (ADR-152 D5.4): present on a
+    /// node that runs executions.
+    canceller: Option<Arc<dyn crate::application::cluster::OwnedExecutionCanceller>>,
 }
 
 impl NodeClusterServiceHandler {
@@ -123,6 +126,7 @@ impl NodeClusterServiceHandler {
             issue_enrollment_token_use_case: None,
             grpc_auth: None,
             membership: None,
+            canceller: None,
         }
     }
 
@@ -153,6 +157,14 @@ impl NodeClusterServiceHandler {
     }
 
     /// ADR-152: answer `Probe` and take `Fence` for this process.
+    pub fn with_execution_canceller(
+        mut self,
+        canceller: Arc<dyn crate::application::cluster::OwnedExecutionCanceller>,
+    ) -> Self {
+        self.canceller = Some(canceller);
+        self
+    }
+
     pub fn with_membership(mut self, membership: Arc<NodeMembership>) -> Self {
         self.membership = Some(membership);
         self
@@ -233,6 +245,36 @@ impl NodeClusterService for NodeClusterServiceHandler {
             fenced,
             incarnation: me.incarnation.0,
         }))
+    }
+
+    async fn cancel_execution(
+        &self,
+        request: Request<crate::infrastructure::aegis_cluster_proto::CancelExecutionRequest>,
+    ) -> Result<Response<crate::infrastructure::aegis_cluster_proto::CancelExecutionResponse>, Status>
+    {
+        let (caller, inner): (
+            NodeId,
+            crate::infrastructure::aegis_cluster_proto::CancelExecutionInner,
+        ) = self
+            .authenticate_node(request.into_inner().envelope)
+            .await?;
+        let Some(canceller) = self.canceller.as_ref() else {
+            return Err(Status::failed_precondition("this node runs no executions"));
+        };
+        let execution_id = crate::domain::execution::ExecutionId(
+            uuid::Uuid::parse_str(&inner.execution_id)
+                .map_err(|_| Status::invalid_argument("execution_id is not a UUID"))?,
+        );
+        let tenant_id = crate::domain::tenant::TenantId::from_string(&inner.tenant_id)
+            .map_err(|_| Status::invalid_argument("tenant_id is not a tenant"))?;
+        let accepted = canceller
+            .cancel_if_owned(&tenant_id, execution_id)
+            .await
+            .map_err(|e| Status::internal(format!("cancel: {e}")))?;
+        tracing::info!(by = %caller, execution_id = %execution_id, accepted, "Forwarded cancel received");
+        Ok(Response::new(
+            crate::infrastructure::aegis_cluster_proto::CancelExecutionResponse { accepted },
+        ))
     }
 
     async fn attest_node(
