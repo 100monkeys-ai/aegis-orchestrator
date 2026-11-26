@@ -265,6 +265,20 @@ impl NodeClusterService for ScriptedStub {
     > {
         Err(Status::unimplemented("fence"))
     }
+
+    async fn cancel_execution(
+        &self,
+        _r: tonic::Request<
+            aegis_orchestrator_core::infrastructure::aegis_cluster_proto::CancelExecutionRequest,
+        >,
+    ) -> Result<
+        tonic::Response<
+            aegis_orchestrator_core::infrastructure::aegis_cluster_proto::CancelExecutionResponse,
+        >,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented("cancel_execution"))
+    }
 }
 
 // ---------------------------------------------------------------------------

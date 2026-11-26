@@ -548,6 +548,9 @@ pub struct StandardExecutionService {
     /// Inserting a token on `start_execution` and calling `cancel()` on
     /// `cancel_execution` lets the Supervisor cooperatively terminate.
     cancellation_tokens: Arc<dashmap::DashMap<ExecutionId, CancellationToken>>,
+    /// On a cluster node: this node, and how a cancel reaches another owner
+    /// (ADR-152 D5.4). Set once the node has joined.
+    cluster_cancel: Arc<std::sync::OnceLock<ClusterCancel>>,
     /// Self-reference used by judge validators to spawn child executions (ADR-016, ADR-039).
     /// Set once at composition root via `set_child_execution_service()`.
     child_executor: std::sync::OnceLock<Arc<dyn ExecutionService>>,
@@ -826,6 +829,43 @@ impl StandardExecutionService {
         }
     }
 
+    /// Cancels reach the owner of a run this node does not supervise
+    /// (ADR-152 D5.4): `me` is this node, `forwarder` dials the owner.
+    pub fn set_cluster_cancel(
+        &self,
+        me: crate::domain::cluster::NodeId,
+        forwarder: Arc<dyn crate::application::cluster::CancelForwarder>,
+    ) -> Result<()> {
+        self.cluster_cancel
+            .set(ClusterCancel { me, forwarder })
+            .map_err(|_| anyhow!("cluster cancel is already set"))
+    }
+
+    /// On a cluster node, while a run is live: stop it when a cancel is
+    /// recorded on it (ADR-152 D5.4), which is how a cancel whose forward
+    /// never arrived still reaches its supervisor. Polls every
+    /// [`RECORDED_CANCEL_POLL`] until the run ends (its token leaves the map).
+    fn watch_recorded_cancel(&self, id: ExecutionId, token: CancellationToken) {
+        if self.cluster_cancel.get().is_none() {
+            return;
+        }
+        let repository = self.repository.clone();
+        let tokens = self.cancellation_tokens.clone();
+        tokio::spawn(async move {
+            while tokens.contains_key(&id) && !token.is_cancelled() {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = tokio::time::sleep(RECORDED_CANCEL_POLL) => {}
+                }
+                if matches!(repository.cancel_requested(id).await, Ok(true)) {
+                    tracing::info!(execution_id = %id, "A cancel recorded on this run: stopping it");
+                    token.cancel();
+                    break;
+                }
+            }
+        });
+    }
+
     pub async fn cancel_execution_for_tenant(
         &self,
         tenant_id: &TenantId,
@@ -834,6 +874,30 @@ impl StandardExecutionService {
         // The tenant is checked before the run is touched: a cancel naming a
         // tenant the execution is not in trips no other tenant's run.
         let mut execution = self.get_execution_for_tenant(tenant_id, id).await?;
+        // ADR-152 D5.4: a run another node owns is cancelled by its owner.
+        // The cancel is recorded first, so the owner stops it even when the
+        // forward does not arrive; a run this process supervises, or one no
+        // other node owns, is cancelled here as before.
+        if let Some(cluster) = self.cluster_cancel.get() {
+            if !execution.is_completed() && !self.cancellation_tokens.contains_key(&id) {
+                if let Some(Some(owner)) = self.repository.request_cancel(tenant_id, id).await? {
+                    if owner != cluster.me {
+                        match cluster.forwarder.forward(owner, id, tenant_id).await {
+                            Ok(true) => {
+                                tracing::info!(execution_id = %id, owner = %owner, "Cancel forwarded to the owner")
+                            }
+                            Ok(false) => {
+                                tracing::warn!(execution_id = %id, owner = %owner, "The owner does not run it; the recorded cancel stands")
+                            }
+                            Err(e) => {
+                                tracing::warn!(execution_id = %id, owner = %owner, error = %e, "Cancel not forwarded; the owner stops it at its next check of the record")
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
         if let Some(token) = self.cancellation_tokens.get(&id) {
             token.cancel();
         }
@@ -925,6 +989,7 @@ impl StandardExecutionService {
             nfs_gateway: None,
             runtime_registry: None,
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
+            cluster_cancel: Arc::new(std::sync::OnceLock::new()),
             child_executor: std::sync::OnceLock::new(),
             context_bindings: std::sync::OnceLock::new(),
             run_profiles: std::sync::OnceLock::new(),
@@ -1190,6 +1255,36 @@ pub(crate) fn person_sub(identity: Option<&UserIdentity>) -> Option<String> {
         | crate::domain::iam::IdentityKind::Operator { .. }
         | crate::domain::iam::IdentityKind::TenantUser { .. } => Some(id.sub.clone()),
     })
+}
+
+/// How often a live run on a cluster node reads whether a cancel was
+/// recorded on it (ADR-152 D5.4).
+pub const RECORDED_CANCEL_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// This node, and how a cancel reaches another owner (ADR-152 D5.4).
+struct ClusterCancel {
+    me: crate::domain::cluster::NodeId,
+    forwarder: Arc<dyn crate::application::cluster::CancelForwarder>,
+}
+
+#[async_trait]
+impl crate::application::cluster::OwnedExecutionCanceller for StandardExecutionService {
+    async fn cancel_if_owned(
+        &self,
+        tenant_id: &TenantId,
+        execution_id: ExecutionId,
+    ) -> Result<bool> {
+        if self.cancellation_tokens.contains_key(&execution_id) {
+            // Supervised here: the local cancel stops the container.
+            self.cancel_execution_for_tenant(tenant_id, execution_id)
+                .await?;
+            return Ok(true);
+        }
+        Ok(self
+            .get_execution_for_tenant(tenant_id, execution_id)
+            .await?
+            .is_completed())
+    }
 }
 
 #[cfg(test)]
@@ -6427,6 +6522,275 @@ mod tests {
 
     // Zaru ADR-0071 D3 and D1 (d): a child never widens its parent's
     // choice; a repository by URL only through the run's GitHub binding.
+    /// ADR-152 D5.4: an execution repository whose runs one other node owns,
+    /// recording cancels; everything else delegates to the in-memory one.
+    use crate::domain::repository::RepositoryError;
+
+    struct OwnedElsewhere {
+        inner: InMemoryExecutionRepository,
+        owner: Option<crate::domain::cluster::NodeId>,
+        requested: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl ExecutionRepository for OwnedElsewhere {
+        async fn save_for_tenant(
+            &self,
+            t: &CoreTenantId,
+            e: &Execution,
+        ) -> Result<(), RepositoryError> {
+            self.inner.save_for_tenant(t, e).await
+        }
+        async fn find_by_id_for_tenant(
+            &self,
+            t: &CoreTenantId,
+            id: ExecutionId,
+        ) -> Result<Option<Execution>, RepositoryError> {
+            self.inner.find_by_id_for_tenant(t, id).await
+        }
+        async fn find_by_agent_for_tenant(
+            &self,
+            t: &CoreTenantId,
+            a: AgentId,
+            l: usize,
+            o: usize,
+        ) -> Result<Vec<Execution>, RepositoryError> {
+            self.inner.find_by_agent_for_tenant(t, a, l, o).await
+        }
+        async fn find_by_workflow_for_tenant(
+            &self,
+            t: &CoreTenantId,
+            w: crate::domain::workflow::WorkflowId,
+            l: usize,
+            o: usize,
+        ) -> Result<Vec<Execution>, RepositoryError> {
+            self.inner.find_by_workflow_for_tenant(t, w, l, o).await
+        }
+        async fn find_by_workflow_execution_for_tenant(
+            &self,
+            t: &CoreTenantId,
+            w: uuid::Uuid,
+        ) -> Result<Vec<Execution>, RepositoryError> {
+            self.inner.find_by_workflow_execution_for_tenant(t, w).await
+        }
+        async fn find_recent_for_tenant(
+            &self,
+            t: &CoreTenantId,
+            l: usize,
+            o: usize,
+        ) -> Result<Vec<Execution>, RepositoryError> {
+            self.inner.find_recent_for_tenant(t, l, o).await
+        }
+        async fn list_recent_all_paginated(
+            &self,
+            l: usize,
+            o: usize,
+        ) -> Result<Vec<Execution>, RepositoryError> {
+            self.inner.list_recent_all_paginated(l, o).await
+        }
+        async fn delete_for_tenant(
+            &self,
+            t: &CoreTenantId,
+            id: ExecutionId,
+        ) -> Result<(), RepositoryError> {
+            self.inner.delete_for_tenant(t, id).await
+        }
+        async fn count_by_agent_for_tenant(
+            &self,
+            t: &CoreTenantId,
+            a: AgentId,
+        ) -> Result<i64, RepositoryError> {
+            self.inner.count_by_agent_for_tenant(t, a).await
+        }
+        async fn find_by_id_unscoped(
+            &self,
+            id: ExecutionId,
+        ) -> Result<Option<Execution>, RepositoryError> {
+            self.inner.find_by_id_unscoped(id).await
+        }
+        async fn count_running(&self, t: &CoreTenantId) -> Result<u64, RepositoryError> {
+            self.inner.count_running(t).await
+        }
+        async fn request_cancel(
+            &self,
+            _t: &CoreTenantId,
+            _id: ExecutionId,
+        ) -> Result<Option<Option<crate::domain::cluster::NodeId>>, RepositoryError> {
+            self.requested
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(self.owner))
+        }
+        async fn cancel_requested(&self, _id: ExecutionId) -> Result<bool, RepositoryError> {
+            Ok(self.requested.load(std::sync::atomic::Ordering::SeqCst))
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingForwarder {
+        forwarded: std::sync::Mutex<Vec<(crate::domain::cluster::NodeId, ExecutionId)>>,
+    }
+
+    #[async_trait]
+    impl crate::application::cluster::CancelForwarder for RecordingForwarder {
+        async fn forward(
+            &self,
+            owner: crate::domain::cluster::NodeId,
+            id: ExecutionId,
+            _t: &CoreTenantId,
+        ) -> anyhow::Result<bool> {
+            self.forwarded.lock().unwrap().push((owner, id));
+            Ok(true)
+        }
+    }
+
+    fn cluster_service(repo: Arc<OwnedElsewhere>) -> StandardExecutionService {
+        StandardExecutionService::new(
+            Arc::new(InMemoryAgentRepository::new()),
+            Arc::new(TestVolumeService {
+                volumes: HashMap::new(),
+            }),
+            Arc::new(Supervisor::new(Arc::new(TestRuntime::default()))),
+            repo,
+            Arc::new(EventBus::new(16)),
+            Arc::new(crate::domain::node_config::NodeConfigManifest::default()),
+        )
+    }
+
+    async fn running_in(repo: &OwnedElsewhere, tenant: &CoreTenantId) -> Execution {
+        let mut e = Execution::new(
+            AgentId::new(),
+            ExecutionInput {
+                intent: Some("work".to_string()),
+                input: serde_json::json!({}),
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
+                workspace_remote_path: None,
+                workflow_execution_id: None,
+                attachments: Vec::new(),
+            },
+            3,
+            "aegis-system-operator".to_string(),
+        );
+        e.tenant_id = tenant.clone();
+        e.start();
+        repo.inner.save_for_tenant(tenant, &e).await.unwrap();
+        e
+    }
+
+    /// A cancel of a run another node owns is recorded and forwarded to the
+    /// owner; this node does not end it (the owner does).
+    #[tokio::test]
+    async fn a_cancel_of_a_run_another_node_owns_is_recorded_and_forwarded() {
+        let tenant = CoreTenantId::for_consumer_user("cancel-forward").unwrap();
+        let (me, owner) = (
+            crate::domain::cluster::NodeId::new(),
+            crate::domain::cluster::NodeId::new(),
+        );
+        let repo = Arc::new(OwnedElsewhere {
+            inner: InMemoryExecutionRepository::new(),
+            owner: Some(owner),
+            requested: Default::default(),
+        });
+        let run = running_in(&repo, &tenant).await;
+        let service = cluster_service(repo.clone());
+        let forwarder = Arc::new(RecordingForwarder::default());
+        service.set_cluster_cancel(me, forwarder.clone()).unwrap();
+
+        service
+            .cancel_execution_for_tenant(&tenant, run.id)
+            .await
+            .unwrap();
+
+        assert!(
+            repo.requested.load(std::sync::atomic::Ordering::SeqCst),
+            "the cancel is recorded"
+        );
+        assert_eq!(
+            *forwarder.forwarded.lock().unwrap(),
+            vec![(owner, run.id)],
+            "forwarded to the owner"
+        );
+        assert_eq!(
+            repo.find_by_id_unscoped(run.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionStatus::Running,
+            "the owner ends it, not this node"
+        );
+    }
+
+    /// A run this process supervises is cancelled here, as before.
+    #[tokio::test]
+    async fn a_cancel_of_a_run_supervised_here_is_not_forwarded() {
+        let tenant = CoreTenantId::for_consumer_user("cancel-local").unwrap();
+        let repo = Arc::new(OwnedElsewhere {
+            inner: InMemoryExecutionRepository::new(),
+            owner: Some(crate::domain::cluster::NodeId::new()),
+            requested: Default::default(),
+        });
+        let run = running_in(&repo, &tenant).await;
+        let service = cluster_service(repo.clone());
+        let forwarder = Arc::new(RecordingForwarder::default());
+        service
+            .set_cluster_cancel(crate::domain::cluster::NodeId::new(), forwarder.clone())
+            .unwrap();
+        let token = CancellationToken::new();
+        service.cancellation_tokens.insert(run.id, token.clone());
+
+        service
+            .cancel_execution_for_tenant(&tenant, run.id)
+            .await
+            .unwrap();
+
+        assert!(token.is_cancelled(), "the local supervisor is told to stop");
+        assert!(
+            forwarder.forwarded.lock().unwrap().is_empty(),
+            "nothing forwarded"
+        );
+        assert_eq!(
+            repo.find_by_id_unscoped(run.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionStatus::Cancelled
+        );
+    }
+
+    /// The owner stops a live run when a cancel is recorded on it, even when
+    /// no forward arrived: within one poll of the record.
+    #[tokio::test(start_paused = true)]
+    async fn a_recorded_cancel_stops_a_live_run_on_its_owner() {
+        let repo = Arc::new(OwnedElsewhere {
+            inner: InMemoryExecutionRepository::new(),
+            owner: None,
+            requested: Default::default(),
+        });
+        let service = cluster_service(repo.clone());
+        service
+            .set_cluster_cancel(
+                crate::domain::cluster::NodeId::new(),
+                Arc::new(RecordingForwarder::default()),
+            )
+            .unwrap();
+        let id = ExecutionId::new();
+        let token = CancellationToken::new();
+        service.cancellation_tokens.insert(id, token.clone());
+        service.watch_recorded_cancel(id, token.clone());
+
+        tokio::time::sleep(RECORDED_CANCEL_POLL * 2).await;
+        assert!(!token.is_cancelled(), "nothing recorded: the run goes on");
+        repo.requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(RECORDED_CANCEL_POLL + std::time::Duration::from_millis(100)).await;
+        assert!(
+            token.is_cancelled(),
+            "stopped within one poll of the record"
+        );
+    }
+
     /// ADR-152 D5.2: when a write finds an execution adopted from under
     /// this node, the fence handler cancels that execution's token, which
     /// stops its supervisor and removes its container; no other run is
@@ -8832,6 +9196,7 @@ impl StandardExecutionService {
         let cancellation_token = CancellationToken::new();
         self.cancellation_tokens
             .insert(execution_id, cancellation_token.clone());
+        self.watch_recorded_cancel(execution_id, cancellation_token.clone());
         let tokens_map = self.cancellation_tokens.clone();
         let cortex_client = self.cortex_client.clone();
         let start_time = Utc::now();
@@ -9638,6 +10003,7 @@ impl ExecutionService for StandardExecutionService {
         let cancellation_token = CancellationToken::new();
         self.cancellation_tokens
             .insert(child_execution_id, cancellation_token.clone());
+        self.watch_recorded_cancel(child_execution_id, cancellation_token.clone());
         let tokens_map = self.cancellation_tokens.clone();
         let cortex_client = self.cortex_client.clone();
         let tenant_id_for_task = tenant_id.clone();

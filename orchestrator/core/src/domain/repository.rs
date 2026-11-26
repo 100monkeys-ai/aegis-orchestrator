@@ -567,6 +567,24 @@ pub trait ExecutionRepository: Send + Sync {
     /// A repository that cannot list them answers an error rather than an
     /// empty list, so the pass reports that it could not run instead of
     /// reporting that there was nothing to end.
+    /// Record that a cancel was asked for (ADR-152 D5.4): an execution of
+    /// the tenant still `pending` or `running` gets `cancel_requested_at`.
+    /// `Some(owner)` when it was recorded, the owner being `None` for a run
+    /// no cluster node claimed; `None` when there is no such unfinished
+    /// execution or the repository does not record cancels.
+    async fn request_cancel(
+        &self,
+        _tenant_id: &TenantId,
+        _id: ExecutionId,
+    ) -> Result<Option<Option<crate::domain::cluster::NodeId>>, RepositoryError> {
+        Ok(None)
+    }
+
+    /// Whether a cancel was recorded for the execution (ADR-152 D5.4).
+    async fn cancel_requested(&self, _id: ExecutionId) -> Result<bool, RepositoryError> {
+        Ok(false)
+    }
+
     async fn take_unfinished_left_by_earlier_process(
         &self,
     ) -> Result<Vec<Execution>, RepositoryError> {

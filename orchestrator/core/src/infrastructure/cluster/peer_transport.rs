@@ -201,3 +201,72 @@ impl PeerTransport for GrpcPeerTransport {
         })
     }
 }
+
+impl GrpcPeerTransport {
+    /// Ask the node at `address` to cancel an execution it owns (ADR-152
+    /// D5.4). `Ok(true)` when it accepted.
+    pub async fn cancel_execution(
+        &self,
+        address: &str,
+        execution_id: crate::domain::execution::ExecutionId,
+        tenant_id: &crate::domain::tenant::TenantId,
+    ) -> Result<bool> {
+        let inner = crate::infrastructure::aegis_cluster_proto::CancelExecutionInner {
+            execution_id: execution_id.0.to_string(),
+            tenant_id: tenant_id.as_str().to_string(),
+        };
+        let envelope = self.envelope(inner.encode_to_vec()).await?;
+        let answer = self
+            .client(address)
+            .await?
+            .cancel_execution(
+                crate::infrastructure::aegis_cluster_proto::CancelExecutionRequest {
+                    envelope: Some(envelope),
+                },
+            )
+            .await
+            .with_context(|| format!("CancelExecution {address}"))?
+            .into_inner();
+        Ok(answer.accepted)
+    }
+}
+
+/// Forwards a cancel to the owner at the cluster address it registered
+/// (`cluster_nodes.grpc_address`), over the peer transport's mutual TLS and
+/// SEAL node envelope (ADR-152 D5.4).
+pub struct GrpcCancelForwarder {
+    transport: Arc<GrpcPeerTransport>,
+    nodes: Arc<dyn crate::domain::cluster::NodeClusterRepository>,
+}
+
+impl GrpcCancelForwarder {
+    pub fn new(
+        transport: Arc<GrpcPeerTransport>,
+        nodes: Arc<dyn crate::domain::cluster::NodeClusterRepository>,
+    ) -> Self {
+        Self { transport, nodes }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::application::cluster::CancelForwarder for GrpcCancelForwarder {
+    async fn forward(
+        &self,
+        owner: NodeId,
+        execution_id: crate::domain::execution::ExecutionId,
+        tenant_id: &crate::domain::tenant::TenantId,
+    ) -> Result<bool> {
+        let peer = self
+            .nodes
+            .find_peer(&owner)
+            .await?
+            .with_context(|| format!("the owner {owner} is not a registered node"))?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.transport
+                .cancel_execution(&peer.grpc_address, execution_id, tenant_id),
+        )
+        .await
+        .context("the owner did not answer the cancel within 2 s")?
+    }
+}

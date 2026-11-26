@@ -253,6 +253,20 @@ impl NodeClusterService for EdgeOnlyClusterService {
     > {
         Err(Status::unimplemented("test mock does not implement fence"))
     }
+
+    async fn cancel_execution(
+        &self,
+        _r: tonic::Request<
+            aegis_orchestrator_core::infrastructure::aegis_cluster_proto::CancelExecutionRequest,
+        >,
+    ) -> Result<
+        tonic::Response<
+            aegis_orchestrator_core::infrastructure::aegis_cluster_proto::CancelExecutionResponse,
+        >,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented("cancel_execution"))
+    }
 }
 
 mod keyed_transit {
