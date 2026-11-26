@@ -3370,6 +3370,16 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // When clustering is enabled, start a second gRPC server on the dedicated
     // cluster port (default 50056) that exposes the inter-node
     // NodeClusterService (attestation, heartbeat, execution routing, etc.).
+    // `spec.cluster.tls`: every node-to-node connection is mutual TLS when
+    // configured; the SEAL envelope still authenticates each request.
+    let cluster_tls = aegis_orchestrator_core::infrastructure::cluster::ClusterTls::load(
+        config
+            .spec
+            .cluster
+            .as_ref()
+            .filter(|c| c.enabled)
+            .and_then(|c| c.tls.as_ref()),
+    )?;
     if config.spec.cluster.as_ref().is_some_and(|c| c.enabled) {
         let cluster_grpc_port = config
             .spec
@@ -3683,8 +3693,15 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             let cluster_readiness =
                 vec![postgres_readiness(pool.clone(), DATABASE_READINESS_TIMEOUT)];
 
+            let mut cluster_server_builder = tonic::transport::Server::builder();
+            if let Some(tls) = cluster_tls.as_ref() {
+                cluster_server_builder = cluster_server_builder
+                    .tls_config(tls.server())
+                    .context("configuring cluster gRPC server TLS")?;
+            }
+            let cluster_mtls = cluster_tls.is_some();
             tokio::spawn(async move {
-                tracing::info!(address = %cluster_addr, "Starting cluster gRPC server on port {cluster_grpc_port}");
+                tracing::info!(address = %cluster_addr, mtls = cluster_mtls, "Starting cluster gRPC server on port {cluster_grpc_port}");
                 let cluster_server = NodeClusterServiceServer::new(handler);
                 let storage_server = RemoteStorageServiceServer::new(storage_handler);
                 let (health, health_server) = GrpcHealth::new(&[
@@ -3693,7 +3710,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 ])
                 .await;
                 let monitor = health.spawn_monitor(cluster_readiness, READINESS_INTERVAL);
-                if let Err(e) = tonic::transport::Server::builder()
+                if let Err(e) = cluster_server_builder
                     .add_service(health_server)
                     .add_service(cluster_server)
                     .add_service(storage_server)
@@ -3764,7 +3781,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     aegis_orchestrator_core::infrastructure::cluster::GrpcPeerTransport::new(
                         joined.signing_key.clone(),
                         token,
-                    ),
+                    )
+                    .with_tls(cluster_tls.clone()),
                 );
                 Arc::new(
                     aegis_orchestrator_core::application::cluster::PeerProber::new(
@@ -3917,7 +3935,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                                             controller.endpoint.expose().to_string(),
                                             signing_key.clone(),
                                             worker_node_id,
-                                        );
+                                        )
+                                        .with_tls(cluster_tls.clone());
 
                                     // Audit 002 §4.9: cluster admission token
                                     // sourced from the controller config block.

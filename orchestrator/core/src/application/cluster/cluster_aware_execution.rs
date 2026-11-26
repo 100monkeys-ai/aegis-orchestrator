@@ -25,6 +25,7 @@ use crate::domain::execution::{
 use crate::domain::iam::UserIdentity;
 use crate::domain::node_config::NodeRole;
 use crate::domain::volume::TenantId;
+use crate::infrastructure::cluster::ClusterTls;
 use crate::infrastructure::cluster::NodeClusterClient;
 use crate::infrastructure::event_bus::DomainEvent;
 use anyhow::Result;
@@ -40,6 +41,8 @@ pub struct ClusterForwardingConfig {
     pub controller_node_id: NodeId,
     /// The controller's own security token for authenticating with workers.
     pub security_token: String,
+    /// Mutual TLS to workers (`spec.cluster.tls`), when configured.
+    pub tls: Option<ClusterTls>,
 }
 
 /// Execution service decorator that adds cluster-aware routing and forwarding.
@@ -120,6 +123,7 @@ impl ClusterAwareExecutionService {
             self.forwarding_config.signing_key.clone(),
             self.forwarding_config.controller_node_id,
             self.forwarding_config.security_token.clone(),
+            self.forwarding_config.tls.as_ref(),
         )
         .await?;
 

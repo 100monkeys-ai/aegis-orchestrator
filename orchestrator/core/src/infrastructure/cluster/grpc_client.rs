@@ -16,6 +16,7 @@ use prost::Message;
 use tonic::transport::Channel;
 
 use crate::domain::cluster::NodeSecurityToken;
+use crate::infrastructure::cluster::cluster_tls::{self, ClusterTls};
 
 use crate::domain::agent::AgentId;
 use crate::domain::cluster::NodeId;
@@ -39,6 +40,7 @@ pub struct NodeClusterClient {
     signing_key: Arc<ed25519_dalek::SigningKey>,
     token: Arc<tokio::sync::RwLock<Option<String>>>,
     node_id: NodeId,
+    tls: Option<ClusterTls>,
 }
 
 impl NodeClusterClient {
@@ -53,13 +55,19 @@ impl NodeClusterClient {
             signing_key,
             token: Arc::new(tokio::sync::RwLock::new(None)),
             node_id,
+            tls: None,
         }
+    }
+
+    /// Dial the controller over mutual TLS (`spec.cluster.tls`).
+    pub fn with_tls(mut self, tls: Option<ClusterTls>) -> Self {
+        self.tls = tls;
+        self
     }
 
     /// Establish a gRPC channel to the controller endpoint.
     pub async fn connect(&mut self) -> Result<()> {
-        let channel = Channel::from_shared(self.endpoint.clone())
-            .context("Invalid endpoint URL")?
+        let channel = cluster_tls::endpoint(&self.endpoint, self.tls.as_ref())?
             .connect()
             .await
             .context("Failed to connect to cluster controller")?;
@@ -213,9 +221,9 @@ impl NodeClusterClient {
         signing_key: Arc<ed25519_dalek::SigningKey>,
         node_id: NodeId,
         security_token: String,
+        tls: Option<&ClusterTls>,
     ) -> Result<Self> {
-        let channel = Channel::from_shared(endpoint.to_string())
-            .context("Invalid worker endpoint URL")?
+        let channel = cluster_tls::endpoint(endpoint, tls)?
             .connect()
             .await
             .context("Failed to connect to worker node")?;
@@ -226,6 +234,7 @@ impl NodeClusterClient {
             signing_key,
             token: Arc::new(tokio::sync::RwLock::new(Some(security_token))),
             node_id,
+            tls: tls.cloned(),
         })
     }
 
