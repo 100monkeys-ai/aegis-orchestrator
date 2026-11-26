@@ -553,11 +553,13 @@ pub trait ExecutionRepository: Send + Sync {
     /// Count executions with `status IN ('running', 'pending')` for a tenant (quota enforcement).
     async fn count_running(&self, tenant_id: &TenantId) -> Result<u64, RepositoryError>;
 
-    /// Every execution of every tenant whose status is `pending` or
-    /// `running`, newest first.
+    /// The executions an earlier orchestrator process left `pending` or
+    /// `running`, newest first: outside a cluster every such execution of
+    /// every tenant; on a cluster node only those an earlier incarnation of
+    /// this node owns, which the current incarnation takes (ADR-152 D5.6),
+    /// never another live node's.
     ///
-    /// Read once, at start-up, by the pass that ends the executions an
-    /// earlier orchestrator process left unfinished
+    /// Called once, at start-up, by the pass that ends them
     /// ([`crate::application::execution::fail_executions_cut_by_restart`]).
     /// Each returned [`Execution`] carries its own `tenant_id`, which the
     /// caller MUST use for the write that follows.
@@ -565,7 +567,9 @@ pub trait ExecutionRepository: Send + Sync {
     /// A repository that cannot list them answers an error rather than an
     /// empty list, so the pass reports that it could not run instead of
     /// reporting that there was nothing to end.
-    async fn find_unfinished_unscoped(&self) -> Result<Vec<Execution>, RepositoryError> {
+    async fn take_unfinished_left_by_earlier_process(
+        &self,
+    ) -> Result<Vec<Execution>, RepositoryError> {
         Err(RepositoryError::Unknown(
             "this execution repository does not list unfinished executions".to_string(),
         ))
@@ -1247,6 +1251,11 @@ pub enum RepositoryError {
 
     #[error("Unknown error: {0}")]
     Unknown(String),
+
+    /// A cluster node's write found the execution owned by another process
+    /// (ADR-152 D5.2): it was adopted, so this process stops it.
+    #[error("Execution {0} is no longer owned by this node (fenced)")]
+    Fenced(String),
 }
 
 impl From<sqlx::Error> for RepositoryError {

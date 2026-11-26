@@ -377,7 +377,7 @@ pub async fn fail_executions_cut_by_restart(
     event_bus: &EventBus,
 ) -> Result<Vec<ExecutionId>> {
     let unfinished = repository
-        .find_unfinished_unscoped()
+        .take_unfinished_left_by_earlier_process()
         .await
         .context("list the executions an earlier process left unfinished")?;
 
@@ -810,6 +810,20 @@ impl StandardExecutionService {
     ) -> Result<Vec<Iteration>> {
         let execution = self.get_execution_for_tenant(tenant_id, exec_id).await?;
         Ok(execution.iterations().to_vec())
+    }
+
+    /// What a cluster node does when a write finds one of its executions
+    /// adopted by another node (ADR-152 D5.2): the execution's cancellation
+    /// token is cancelled, so its supervisor stops and removes the
+    /// container; the run's later writes affect no row, so nothing of it is
+    /// recorded after the adopter ended it.
+    pub fn fence_handler(&self) -> impl Fn(ExecutionId) + Send + Sync + 'static {
+        let tokens = self.cancellation_tokens.clone();
+        move |id| {
+            if let Some(token) = tokens.get(&id) {
+                token.cancel();
+            }
+        }
     }
 
     pub async fn cancel_execution_for_tenant(
@@ -6413,6 +6427,42 @@ mod tests {
 
     // Zaru ADR-0071 D3 and D1 (d): a child never widens its parent's
     // choice; a repository by URL only through the run's GitHub binding.
+    /// ADR-152 D5.2: when a write finds an execution adopted from under
+    /// this node, the fence handler cancels that execution's token, which
+    /// stops its supervisor and removes its container; no other run is
+    /// touched.
+    #[tokio::test]
+    async fn the_fence_handler_stops_the_fenced_execution_only() {
+        let service = StandardExecutionService::new(
+            Arc::new(InMemoryAgentRepository::new()),
+            Arc::new(TestVolumeService {
+                volumes: HashMap::new(),
+            }),
+            Arc::new(Supervisor::new(Arc::new(TestRuntime::default()))),
+            Arc::new(InMemoryExecutionRepository::new()),
+            Arc::new(EventBus::new(16)),
+            Arc::new(crate::domain::node_config::NodeConfigManifest::default()),
+        );
+        let (fenced, other) = (ExecutionId::new(), ExecutionId::new());
+        let (fenced_token, other_token) = (CancellationToken::new(), CancellationToken::new());
+        service
+            .cancellation_tokens
+            .insert(fenced, fenced_token.clone());
+        service
+            .cancellation_tokens
+            .insert(other, other_token.clone());
+
+        let handler = service.fence_handler();
+        handler(fenced);
+        handler(ExecutionId::new());
+
+        assert!(
+            fenced_token.is_cancelled(),
+            "the fenced run's supervisor is told to stop"
+        );
+        assert!(!other_token.is_cancelled(), "another run keeps going");
+    }
+
     mod deny_by_default_orchestrator_2 {
         use super::*;
         include!("deny_by_default_orchestrator_2_execution_tests.rs");
