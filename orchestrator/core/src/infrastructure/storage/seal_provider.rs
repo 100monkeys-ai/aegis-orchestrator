@@ -18,7 +18,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ed25519_dalek::Signer;
 use tonic::transport::Channel;
 
 use crate::domain::cluster::NodeClusterRepository;
@@ -175,13 +174,11 @@ impl SealStorageProvider {
             )
         })?;
 
-        let signature = signing_key.sign(payload);
-
-        Ok(ProtoEnvelope {
-            node_security_token: token_str.clone(),
-            signature: signature.to_bytes().to_vec(),
-            payload: payload.to_vec(),
-        })
+        Ok(crate::infrastructure::cluster::node_envelope::seal(
+            signing_key,
+            token_str.clone(),
+            payload.to_vec(),
+        ))
     }
 
     /// Convert a tonic Status into a StorageError.

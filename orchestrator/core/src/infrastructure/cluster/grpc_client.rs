@@ -288,13 +288,11 @@ impl NodeClusterClient {
             .ok_or_else(|| anyhow::anyhow!("No security token -- call attest_and_challenge first"))?
             .clone();
 
-        let signature = self.signing_key.sign(payload);
-
-        Ok(ProtoEnvelope {
-            node_security_token: token_str,
-            signature: signature.to_bytes().to_vec(),
-            payload: payload.to_vec(),
-        })
+        Ok(crate::infrastructure::cluster::node_envelope::seal(
+            &self.signing_key,
+            token_str,
+            payload.to_vec(),
+        ))
     }
 
     /// Return a mutable reference to the connected client, or error if not connected.

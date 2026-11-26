@@ -37,6 +37,11 @@ pub enum TransitParseError {
 /// Parse a Vault Transit signature envelope of the form
 /// `vault:v<digits>:<base64sig>` and return the signature segment.
 pub fn parse_vault_signature(raw: &str) -> Result<&str, TransitParseError> {
+    parse_vault_signature_versioned(raw).map(|(_, sig)| sig)
+}
+
+/// As [`parse_vault_signature`], also returning the key version (`v<digits>`).
+pub fn parse_vault_signature_versioned(raw: &str) -> Result<(&str, &str), TransitParseError> {
     let mut parts = raw.splitn(3, ':');
     let prefix = parts.next();
     let version = parts.next();
@@ -48,7 +53,7 @@ pub fn parse_vault_signature(raw: &str) -> Result<&str, TransitParseError> {
                 && v.len() > 1
                 && v[1..].chars().all(|ch| ch.is_ascii_digit()) =>
         {
-            Ok(s)
+            Ok((v, s))
         }
         _ => Err(TransitParseError::Malformed {
             prefix: version.map(|v| format!("vault:{v}")),

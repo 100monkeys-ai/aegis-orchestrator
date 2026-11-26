@@ -217,14 +217,14 @@ pub struct NodeSecurityToken(pub crate::domain::secrets::SensitiveString);
 
 impl NodeSecurityToken {
     pub fn claims(&self) -> Result<NodeTokenClaims, String> {
-        // Read to decode the claims; the signature is checked elsewhere.
+        // Decodes the claims without verifying the token: for a holder
+        // reading its own token's expiry. A receiver authenticates a token
+        // only through `infrastructure::cluster::node_envelope`.
         let parts: Vec<&str> = self.0.expose().split('.').collect();
         if parts.len() != 3 {
             return Err("Invalid JWT format".to_string());
         }
 
-        // We use manual decode here because the domain object doesn't hold the public key.
-        // Verification happens at the application/infrastructure layer (e.g. gRPC interceptor).
         let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(parts[1])
             .map_err(|e: base64::DecodeError| e.to_string())?;

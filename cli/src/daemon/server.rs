@@ -3408,6 +3408,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             > = Arc::new(PgNodeChallengeRepository::new(pool.clone()));
 
             let secret_store = secrets_manager.secret_store();
+            // One per process: every node RPC receiver opens its envelopes
+            // through it, so a nonce accepted by one is refused by all.
+            let envelope_verifier = Arc::new(
+                aegis_orchestrator_core::infrastructure::cluster::NodeEnvelopeVerifier::new(
+                    secret_store.clone(),
+                    aegis_orchestrator_core::application::edge::issue_enrollment_token::EDGE_ENROLLMENT_SIGNING_KEY.to_string(),
+                ),
+            );
 
             // Audit 002 §4.9: cluster admission gate — single-use enrolment
             // token, scoped to a node identity, redeemed atomically at attest
@@ -3517,6 +3525,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 sync_config_uc,
                 push_config_uc,
                 cluster_repo.clone(),
+                envelope_verifier.clone(),
             );
             // ADR-152 D1.3, D6: a joined node answers Probe and takes Fence.
             if let Some(joined) = joined_cluster.as_ref() {
@@ -3599,6 +3608,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 let connect_edge_service = Arc::new(ConnectEdgeService::new(
                     edge_repo.clone(),
                     conn_registry.clone(),
+                    envelope_verifier.clone(),
                 ));
                 let rotate_edge_key_service = Arc::new(RotateEdgeKeyService::with_default_ttl(
                     edge_repo.clone(),
@@ -3661,8 +3671,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 ))
             };
 
-            let storage_handler =
-                RemoteStorageServiceHandler::new(remote_fsal, cluster_repo, controller_node_id);
+            let storage_handler = RemoteStorageServiceHandler::new(
+                remote_fsal,
+                cluster_repo,
+                envelope_verifier,
+                controller_node_id,
+            );
 
             // The cluster server is ready while its database answers: every
             // NodeClusterService RPC reads or writes the cluster tables.

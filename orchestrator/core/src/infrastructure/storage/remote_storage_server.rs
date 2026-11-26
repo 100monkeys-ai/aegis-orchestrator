@@ -32,7 +32,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use tonic::{Request, Response, Status};
 
-use crate::domain::cluster::{NodeClusterRepository, NodeId, NodeSecurityToken};
+use crate::domain::cluster::{NodeClusterRepository, NodeId};
 use crate::domain::fsal::{
     AegisFSAL, FsalAccessPolicy, FsalError, NodeStorageRequest, RenameFsalRequest,
 };
@@ -47,6 +47,9 @@ use crate::infrastructure::aegis_remote_storage_proto::{
     OpenFileResponse, ReadAtRequest, ReadAtResponse, ReaddirResponse, RemoteStorageRequest,
     RemoteStorageResponse, RenameRequest, SetQuotaRequest, StatResponse, WriteAtRequest,
     WriteAtResponse,
+};
+use crate::infrastructure::cluster::node_envelope::{
+    ClusterNodeKeys, EnvelopeError, NodeEnvelopeVerifier,
 };
 
 /// Metadata tracked for each open file handle so we can emit provenance-rich
@@ -65,6 +68,7 @@ struct OpenHandleMeta {
 pub struct RemoteStorageServiceHandler {
     fsal: Arc<AegisFSAL>,
     cluster_repo: Arc<dyn NodeClusterRepository>,
+    envelope_verifier: Arc<NodeEnvelopeVerifier>,
     host_node_id: NodeId,
     /// Path sanitizer for administrative operations (`set_quota`,
     /// `get_usage`) that bypass the FSAL and for sanitizing paths
@@ -79,59 +83,28 @@ impl RemoteStorageServiceHandler {
     pub fn new(
         fsal: Arc<AegisFSAL>,
         cluster_repo: Arc<dyn NodeClusterRepository>,
+        envelope_verifier: Arc<NodeEnvelopeVerifier>,
         host_node_id: NodeId,
     ) -> Self {
         Self {
             fsal,
             cluster_repo,
+            envelope_verifier,
             host_node_id,
             path_sanitizer: PathSanitizer::new(),
             open_handles: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Authenticate the caller by verifying the SEAL node envelope:
-    /// 1. Parse JWT to extract node_id
-    /// 2. Look up registered public key
-    /// 3. Verify Ed25519 signature over payload
+    /// Authenticate the caller by opening its SEAL node envelope (see
+    /// `node_envelope`).
     async fn authenticate(&self, envelope: Option<ProtoEnvelope>) -> Result<NodeId, Status> {
-        let envelope =
-            envelope.ok_or_else(|| Status::unauthenticated("Missing security envelope"))?;
-
-        // 1. Parse token and extract claims
-        let token = NodeSecurityToken(envelope.node_security_token.clone().into());
-        let claims = token
-            .claims()
-            .map_err(|e| Status::unauthenticated(format!("Invalid token: {e}")))?;
-        let node_id = claims.node_id;
-
-        // 2. Retrieve node's public key
-        let peer = self
-            .cluster_repo
-            .find_peer(&node_id)
-            .await
-            .map_err(|e| Status::internal(format!("Database error: {e}")))?
-            .ok_or_else(|| Status::unauthenticated("Node not registered"))?;
-
-        // 3. Verify Ed25519 signature over payload
-        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-        let verifying_key = VerifyingKey::from_bytes(
-            &peer
-                .public_key
-                .clone()
-                .try_into()
-                .map_err(|_| Status::internal("Invalid stored public key length"))?,
-        )
-        .map_err(|e| Status::internal(format!("Invalid stored public key: {e}")))?;
-
-        let signature = Signature::from_slice(&envelope.signature)
-            .map_err(|e| Status::unauthenticated(format!("Invalid signature format: {e}")))?;
-
-        verifying_key
-            .verify(&envelope.payload, &signature)
-            .map_err(|e| Status::unauthenticated(format!("Signature verification failed: {e}")))?;
-
-        Ok(node_id)
+        let envelope = envelope.ok_or(EnvelopeError::Missing)?;
+        let token = self
+            .envelope_verifier
+            .open(&envelope, &ClusterNodeKeys(self.cluster_repo.clone()))
+            .await?;
+        Ok(token.node_id)
     }
 
     /// Build the full POSIX path from volume_id and internal path.

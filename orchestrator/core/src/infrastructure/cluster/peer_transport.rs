@@ -14,7 +14,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use ed25519_dalek::Signer;
 use prost::Message;
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
@@ -121,11 +120,11 @@ impl GrpcPeerTransport {
     }
 
     async fn envelope(&self, payload: Vec<u8>) -> Result<SealNodeEnvelope> {
-        Ok(SealNodeEnvelope {
-            node_security_token: self.token.token().await?,
-            signature: self.signing_key.sign(&payload).to_bytes().to_vec(),
+        Ok(crate::infrastructure::cluster::node_envelope::seal(
+            &self.signing_key,
+            self.token.token().await?,
             payload,
-        })
+        ))
     }
 
     async fn client(&self, address: &str) -> Result<NodeClusterServiceClient<Channel>> {
