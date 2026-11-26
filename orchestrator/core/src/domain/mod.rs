@@ -52,6 +52,7 @@ pub mod api_scope;
 pub mod billing;
 pub mod canvas;
 pub mod cluster;
+pub mod cluster_membership;
 pub mod credential;
 pub mod discovery;
 pub mod dispatch;

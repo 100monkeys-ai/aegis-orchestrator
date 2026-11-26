@@ -533,6 +533,20 @@ mod tests {
             ) -> Result<Response<ListPeersResponse>, Status> {
                 Err(Status::unimplemented(""))
             }
+            async fn probe(
+                &self,
+                _: Request<crate::infrastructure::aegis_cluster_proto::ProbeRequest>,
+            ) -> Result<Response<crate::infrastructure::aegis_cluster_proto::ProbeResponse>, Status>
+            {
+                Err(Status::unimplemented(""))
+            }
+            async fn fence(
+                &self,
+                _: Request<crate::infrastructure::aegis_cluster_proto::FenceRequest>,
+            ) -> Result<Response<crate::infrastructure::aegis_cluster_proto::FenceResponse>, Status>
+            {
+                Err(Status::unimplemented(""))
+            }
             type ConnectEdgeStream =
                 Pin<Box<dyn Stream<Item = Result<EdgeCommand, Status>> + Send>>;
             async fn connect_edge(

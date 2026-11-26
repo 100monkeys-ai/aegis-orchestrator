@@ -28,6 +28,7 @@ pub(crate) mod api_key_identity;
 pub mod billing_service;
 pub mod client;
 pub(crate) mod cluster_helpers;
+pub(crate) mod cluster_membership;
 pub(crate) mod container_helpers;
 #[cfg(test)]
 mod credential_log_tests;

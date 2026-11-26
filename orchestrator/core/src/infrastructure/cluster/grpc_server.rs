@@ -35,13 +35,19 @@ use std::sync::Arc;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::application::cluster::membership::NodeMembership;
 use crate::application::edge::connect_edge::ConnectEdgeService;
 use crate::application::edge::issue_enrollment_token::IssueEnrollmentToken;
 use crate::application::edge::rotate_edge_key::RotateEdgeKeyService;
+use crate::domain::cluster_membership::NodeIncarnation;
 use crate::infrastructure::aegis_cluster_proto::{
     EdgeCommand, EdgeEvent, IssueEnrollmentTokenRequest, IssueEnrollmentTokenResponse,
     RotateEdgeKeyRequest, RotateEdgeKeyResponse,
 };
+use crate::infrastructure::aegis_cluster_proto::{
+    FenceInner, FenceRequest, FenceResponse, ProbeInner, ProbeRequest, ProbeResponse,
+};
+use crate::infrastructure::cluster::peer_transport::member_state_to_proto;
 use crate::infrastructure::edge::grpc_stream::{handle_connect_edge, handle_rotate_edge_key};
 use crate::presentation::grpc::auth_interceptor::{validate_grpc_request, GrpcIamAuthInterceptor};
 
@@ -75,6 +81,10 @@ pub struct NodeClusterServiceHandler {
     /// the handler struct and invoked only inside the user-facing
     /// IssueEnrollmentToken handler. None when grpc_auth is disabled.
     grpc_auth: Option<GrpcIamAuthInterceptor>,
+    /// ADR-152: this process's cluster membership, which answers `Probe`
+    /// and takes `Fence`. None on nodes that have not joined a cluster; the
+    /// RPCs then return FailedPrecondition.
+    membership: Option<Arc<NodeMembership>>,
 }
 
 impl NodeClusterServiceHandler {
@@ -104,6 +114,7 @@ impl NodeClusterServiceHandler {
             rotate_edge_key_service: None,
             issue_enrollment_token_use_case: None,
             grpc_auth: None,
+            membership: None,
         }
     }
 
@@ -131,6 +142,18 @@ impl NodeClusterServiceHandler {
         self.issue_enrollment_token_use_case = Some(use_case);
         self.grpc_auth = grpc_auth;
         self
+    }
+
+    /// ADR-152: answer `Probe` and take `Fence` for this process.
+    pub fn with_membership(mut self, membership: Arc<NodeMembership>) -> Self {
+        self.membership = Some(membership);
+        self
+    }
+
+    fn membership(&self) -> Result<&Arc<NodeMembership>, Status> {
+        self.membership
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("this node has not joined a cluster"))
     }
 
     async fn authenticate_node<T: Message + Default>(
@@ -186,6 +209,58 @@ impl NodeClusterServiceHandler {
 
 #[tonic::async_trait]
 impl NodeClusterService for NodeClusterServiceHandler {
+    /// ADR-152 D1.3: which process of this node answers, in what state, and
+    /// when it last renewed its lease.
+    async fn probe(
+        &self,
+        request: Request<ProbeRequest>,
+    ) -> Result<Response<ProbeResponse>, Status> {
+        let membership = self.membership()?.clone();
+        let (caller, inner): (NodeId, ProbeInner) = self
+            .authenticate_node(request.into_inner().envelope)
+            .await?;
+        if inner.node_id != caller.0.to_string() {
+            return Err(Status::permission_denied(
+                "the probe names a node other than the one that signed it",
+            ));
+        }
+        let me = membership.process();
+        Ok(Response::new(ProbeResponse {
+            node_id: me.node_id.0.to_string(),
+            incarnation: me.incarnation.0,
+            state: member_state_to_proto(membership.state()).into(),
+            last_renewed_at: membership
+                .last_renewed_at()
+                .map(|t| prost_types::Timestamp {
+                    seconds: t.timestamp(),
+                    nanos: t.timestamp_subsec_nanos() as i32,
+                }),
+        }))
+    }
+
+    /// ADR-152 D6: a peer fences this node's named incarnation.
+    async fn fence(
+        &self,
+        request: Request<FenceRequest>,
+    ) -> Result<Response<FenceResponse>, Status> {
+        let membership = self.membership()?.clone();
+        let (caller, inner): (NodeId, FenceInner) = self
+            .authenticate_node(request.into_inner().envelope)
+            .await?;
+        let me = membership.process();
+        if inner.target_node_id != me.node_id.0.to_string() {
+            return Err(Status::invalid_argument(
+                "the fence names another node; it is sent to the node it fences",
+            ));
+        }
+        tracing::warn!(by = %caller, reason = %inner.reason, "Fence received");
+        let fenced = membership.fence(NodeIncarnation(inner.target_incarnation), &inner.reason);
+        Ok(Response::new(FenceResponse {
+            fenced,
+            incarnation: me.incarnation.0,
+        }))
+    }
+
     async fn attest_node(
         &self,
         request: Request<AttestNodeRequest>,

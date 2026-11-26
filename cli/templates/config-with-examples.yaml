@@ -539,6 +539,21 @@ spec:
     heartbeat_interval_secs: 30
     token_refresh_margin_secs: 120
 
+    # Active-active membership (ADR-152). A clustered controller, worker or
+    # hybrid with a database joins cluster_nodes under a new incarnation at
+    # start, renews its lease by the database clock, runs each singleton
+    # background duty only while it holds that duty's lease in
+    # cluster_duties, and probes its peers over the private network.
+    membership:
+      # This node's private-network address; peers dial
+      # <vrack_address>:<cluster_grpc_port>. Required when the bind address
+      # is 0.0.0.0.
+      vrack_address: "env:AEGIS_NODE_IP"
+      lease_renew_secs: 3          # default 3
+      lease_ttl_secs: 15           # default 15; at least twice lease_renew_secs
+      probe_interval_ms: 1000      # default 1000
+      probe_failures_to_suspect: 5 # default 5
+
     # Cluster-level security (mTLS recommended for inter-node gRPC)
     tls:
       enabled: true

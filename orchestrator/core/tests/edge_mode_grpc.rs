@@ -232,6 +232,26 @@ impl NodeClusterService for EdgeOnlyClusterService {
             "test mock does not implement issue_enrollment_token",
         ))
     }
+
+    async fn probe(
+        &self,
+        _r: Request<aegis_orchestrator_core::infrastructure::aegis_cluster_proto::ProbeRequest>,
+    ) -> Result<
+        Response<aegis_orchestrator_core::infrastructure::aegis_cluster_proto::ProbeResponse>,
+        Status,
+    > {
+        Err(Status::unimplemented("test mock does not implement probe"))
+    }
+
+    async fn fence(
+        &self,
+        _r: Request<aegis_orchestrator_core::infrastructure::aegis_cluster_proto::FenceRequest>,
+    ) -> Result<
+        Response<aegis_orchestrator_core::infrastructure::aegis_cluster_proto::FenceResponse>,
+        Status,
+    > {
+        Err(Status::unimplemented("test mock does not implement fence"))
+    }
 }
 
 /// Mint a minimal JWT-shaped string with `sub` set to `node_id`. The
@@ -578,7 +598,11 @@ mod prod_handler_stubs {
         ) -> anyhow::Result<()> {
             unimplemented!("test stub")
         }
-        async fn mark_unhealthy(&self, _node_id: &NodeId) -> anyhow::Result<()> {
+        async fn mark_unhealthy(
+            &self,
+            _: &NodeId,
+            _: aegis_orchestrator_core::domain::cluster_membership::DutyFence,
+        ) -> anyhow::Result<bool> {
             unimplemented!("test stub")
         }
         async fn start_drain(&self, _node_id: &NodeId) -> anyhow::Result<()> {
