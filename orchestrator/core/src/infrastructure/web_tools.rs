@@ -14,6 +14,17 @@ use super::log_sanitizer::sanitize_url;
 
 const MAX_SEARCH_RESULTS: u32 = 20;
 
+/// The most bytes of a response body `web.fetch` reads; the rest is dropped
+/// and the result says `truncated`.
+const MAX_FETCH_BODY_BYTES: usize = 5 * 1024 * 1024;
+
+/// The most characters of content `web.fetch` returns to the caller, after
+/// conversion. A tool result is copied into the execution's context, its
+/// trajectory and the LLM request, so it must stay small: 2026-11-25/26 a
+/// 73 KB bizapedia.com page became 9.1 MB of `html2md` table padding and the
+/// orchestrator grew to 30 GB and was OOM-killed three times.
+const MAX_FETCH_CONTENT_CHARS: usize = 200_000;
+
 /// Maximum number of attempts for a Brave Search request when the upstream
 /// returns a transient failure (HTTP 429 / 5xx). The first attempt counts
 /// as attempt 1, so total attempts (initial + retries) equals this value.
@@ -218,14 +229,35 @@ impl ExternalWebToolPort for ReqwestWebToolAdapter {
         )
         .await
         {
-            Ok((status, is_html, body)) => {
-                let (content, content_format) = if request.to_markdown && is_html {
-                    html_to_markdown_or_fallback(&body)
-                } else if is_html {
-                    (body, "html")
-                } else {
-                    (body, "text")
-                };
+            Ok((status, is_html, body, body_truncated)) => {
+                let to_markdown = request.to_markdown && is_html;
+                // html2md is synchronous and CPU-bound: off the async workers.
+                let (content, content_format) = tokio::task::spawn_blocking(move || {
+                    if to_markdown {
+                        let (content, format) = html_to_markdown_or_fallback(&body);
+                        (collapse_padding(&content), format)
+                    } else if is_html {
+                        (body, "html")
+                    } else {
+                        (body, "text")
+                    }
+                })
+                .await
+                .map_err(|e| {
+                    SealSessionError::UpstreamUnavailable(format!(
+                        "Web fetch failed: content conversion did not finish: {e}"
+                    ))
+                })?;
+                let (content, content_truncated) = truncate_chars(content, MAX_FETCH_CONTENT_CHARS);
+                let truncated = body_truncated || content_truncated;
+                if truncated {
+                    warn!(
+                        url = %sanitize_url(&request.url),
+                        body_truncated,
+                        content_truncated,
+                        "web.fetch result cut to its size caps"
+                    );
+                }
 
                 Ok(ToolInvocationResult::Direct(serde_json::json!({
                     "status": "success",
@@ -233,6 +265,7 @@ impl ExternalWebToolPort for ReqwestWebToolAdapter {
                     "http_status": status,
                     "content_length": content.len(),
                     "content_format": content_format,
+                    "truncated": truncated,
                     "content": content
                 })))
             }
@@ -247,7 +280,7 @@ async fn perform_fetch(
     url: &str,
     timeout: Duration,
     follow_redirects: bool,
-) -> Result<(u16, bool, String), String> {
+) -> Result<(u16, bool, String, bool), String> {
     info!("Web fetch requested: {}", sanitize_url(url));
     debug!("Fetching: {}", sanitize_url(url));
 
@@ -276,12 +309,59 @@ async fn perform_fetch(
         .map(|ct| ct.contains("text/html"))
         .unwrap_or(false);
 
-    let body = response
-        .text()
+    let mut response = response;
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| format!("Failed to read response body: {e}"))?;
+        .map_err(|e| format!("Failed to read response body: {e}"))?
+    {
+        let room = MAX_FETCH_BODY_BYTES - bytes.len();
+        if chunk.len() >= room {
+            bytes.extend_from_slice(&chunk[..room]);
+            truncated = chunk.len() > room;
+            if truncated {
+                break;
+            }
+        } else {
+            bytes.extend_from_slice(&chunk);
+        }
+    }
+    let body = String::from_utf8_lossy(&bytes).into_owned();
 
-    Ok((status, is_html, body))
+    Ok((status, is_html, body, truncated))
+}
+
+/// Collapse the padding `html2md` emits for tables: runs of three or more
+/// spaces become one space, and runs of four or more `-` become `---`.
+/// html2md pads every column to its widest cell, so nested layout tables
+/// grow quadratically (a 10 KB page became 9.1 MB, 8.4 MB of it spaces).
+fn collapse_padding(markdown: &str) -> String {
+    use std::sync::OnceLock;
+    static SPACES_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static DASHES_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let spaces =
+        SPACES_RE.get_or_init(|| regex::Regex::new(r" {3,}").expect("static regex compiles"));
+    let dashes =
+        DASHES_RE.get_or_init(|| regex::Regex::new(r"-{4,}").expect("static regex compiles"));
+    let stage1 = spaces.replace_all(markdown, " ");
+    dashes.replace_all(&stage1, "---").into_owned()
+}
+
+/// `content` cut to at most `max_chars` characters (on a char boundary), with
+/// a note saying so; and whether it was cut.
+fn truncate_chars(content: String, max_chars: usize) -> (String, bool) {
+    match content.char_indices().nth(max_chars) {
+        None => (content, false),
+        Some((end, _)) => {
+            let mut cut = content[..end].to_string();
+            cut.push_str(&format!(
+                "\n\n[AEGIS] The page's content was longer than {max_chars} characters and was cut here."
+            ));
+            (cut, true)
+        }
+    }
 }
 
 /// Convert HTML to Markdown via `html2md`, falling back to the original HTML
@@ -656,6 +736,80 @@ mod tests {
     // detect this case and fall back to the original HTML so callers do not
     // receive empty content for pages that returned real bytes.
     // -----------------------------------------------------------------------
+    #[test]
+    fn web_fetch_collapses_html2md_table_padding() {
+        // Nested layout tables: html2md pads each column to its widest cell.
+        let wide = "x".repeat(400);
+        let html = format!(
+            "<table><tr><td><table><tr><td>{wide}</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table></td><td>e</td></tr><tr><td>f</td><td>g</td></tr></table>"
+        );
+        let (md, fmt) = html_to_markdown_or_fallback(&html);
+        let collapsed = collapse_padding(&md);
+        assert_eq!(fmt, "markdown");
+        assert!(collapsed.contains(&wide), "the content survives");
+        assert!(!collapsed.contains("   "), "no run of three spaces remains");
+        assert!(!collapsed.contains("----"), "no run of four dashes remains");
+        assert!(collapsed.len() < md.len(), "the padding is gone");
+    }
+
+    /// 2026-11-25/26: three OOM kills of production's orchestrator, each a
+    /// `web.fetch` whose converted page was megabytes. The result handed back
+    /// must stay within the caps whatever the page.
+    #[tokio::test]
+    async fn web_fetch_result_stays_within_its_caps() {
+        let mut server = mockito::Server::new_async().await;
+        let cell = "y".repeat(300);
+        let row = format!(
+            "<tr><td><table><tr><td>{cell}</td><td>z</td></tr></table></td><td>w</td></tr>"
+        );
+        let page = format!(
+            "<html><body><table>{}</table></body></html>",
+            row.repeat(4_000)
+        );
+        let _m = server
+            .mock("GET", "/big")
+            .with_status(200)
+            .with_header("content-type", "text/html; charset=utf-8")
+            .with_body(page.clone())
+            .create_async()
+            .await;
+        let adapter = ReqwestWebToolAdapter::with_base_url(None, server.url());
+        let result = adapter
+            .fetch(WebFetchRequest {
+                url: format!("{}/big", server.url()),
+                to_markdown: true,
+                follow_redirects: false,
+                timeout_secs: 30,
+            })
+            .await
+            .expect("fetch succeeds");
+        let ToolInvocationResult::Direct(value) = result else {
+            panic!("a direct result");
+        };
+        let content = value["content"].as_str().expect("content");
+        assert!(
+            page.len() > MAX_FETCH_CONTENT_CHARS,
+            "the page is over the cap"
+        );
+        assert!(
+            content.chars().count() <= MAX_FETCH_CONTENT_CHARS + 200,
+            "content is {} characters",
+            content.chars().count()
+        );
+        assert_eq!(value["truncated"], true);
+        assert!(content.ends_with("and was cut here."));
+    }
+
+    #[test]
+    fn web_fetch_truncates_content_on_a_char_boundary() {
+        let (same, cut) = truncate_chars("héllo".to_string(), 5);
+        assert_eq!((same.as_str(), cut), ("héllo", false));
+        let (short, cut) = truncate_chars("ééééé".to_string(), 2);
+        assert!(cut);
+        assert!(short.starts_with("éé\n\n[AEGIS] "), "{short}");
+        assert!(short.contains("longer than 2 characters"));
+    }
+
     #[test]
     fn web_fetch_html_to_markdown_fallback_on_empty_conversion() {
         // Empty input → empty html (no fallback drama, format is "html").
