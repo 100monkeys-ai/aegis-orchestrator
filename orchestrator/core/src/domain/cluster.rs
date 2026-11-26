@@ -504,7 +504,14 @@ pub trait NodeClusterRepository: Send + Sync {
         node_id: &NodeId,
         snapshot: ResourceSnapshot,
     ) -> anyhow::Result<()>;
-    async fn mark_unhealthy(&self, node_id: &NodeId) -> anyhow::Result<()>;
+    /// Mark an active node unhealthy, under the health sweep's fence
+    /// (ADR-152 D2.3): `false` when nothing changed, because the node was
+    /// not active or the sweep's epoch was superseded.
+    async fn mark_unhealthy(
+        &self,
+        node_id: &NodeId,
+        fence: crate::domain::cluster_membership::DutyFence,
+    ) -> anyhow::Result<bool>;
     /// Transition a node to Draining status without marking it unhealthy.
     async fn start_drain(&self, node_id: &NodeId) -> anyhow::Result<()>;
     async fn deregister(&self, node_id: &NodeId, reason: &str) -> anyhow::Result<()>;

@@ -621,18 +621,6 @@ impl OperatorEscalationService {
             Err(e) => tracing::warn!(error = %e, "Operator escalation role re-check failed"),
         }
     }
-
-    /// Sweep every `interval` for the life of the process (the daemon passes
-    /// [`EXPIRY_SWEEP_INTERVAL`]).
-    pub fn spawn_expiry_sweep(self: Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            loop {
-                ticker.tick().await;
-                self.sweep().await;
-            }
-        })
-    }
 }
 
 #[cfg(test)]

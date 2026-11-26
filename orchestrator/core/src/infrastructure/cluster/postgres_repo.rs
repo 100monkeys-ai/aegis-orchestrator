@@ -41,6 +41,19 @@ pub(crate) fn parse_role_str(s: &str) -> anyhow::Result<NodeRole> {
     }
 }
 
+/// Mark an active node unhealthy (a node running alone).
+pub const MARK_UNHEALTHY_SQL: &str =
+    "UPDATE cluster_nodes SET status = 'unhealthy' WHERE node_id = $1 AND status = 'active'";
+
+/// Mark an active node unhealthy only while the health sweep is still at
+/// the epoch its holder was granted (ADR-152 D2.3).
+pub fn mark_unhealthy_fenced_sql() -> String {
+    format!(
+        "{MARK_UNHEALTHY_SQL} AND {}",
+        crate::infrastructure::cluster::membership_repo::under_duty_epoch(2, 3)
+    )
+}
+
 pub struct PgNodeClusterRepository {
     pool: PgPool,
 }
@@ -152,12 +165,29 @@ impl NodeClusterRepository for PgNodeClusterRepository {
         Ok(())
     }
 
-    async fn mark_unhealthy(&self, node_id: &NodeId) -> anyhow::Result<()> {
-        sqlx::query("UPDATE cluster_nodes SET status = 'unhealthy' WHERE node_id = $1")
-            .bind(node_id.0)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+    async fn mark_unhealthy(
+        &self,
+        node_id: &NodeId,
+        fence: crate::domain::cluster_membership::DutyFence,
+    ) -> anyhow::Result<bool> {
+        use crate::domain::cluster_membership::DutyFence;
+        let done = match fence {
+            DutyFence::Solo => {
+                sqlx::query(MARK_UNHEALTHY_SQL)
+                    .bind(node_id.0)
+                    .execute(&self.pool)
+                    .await?
+            }
+            DutyFence::Leased { duty, epoch } => {
+                sqlx::query(&mark_unhealthy_fenced_sql())
+                    .bind(node_id.0)
+                    .bind(duty.as_str())
+                    .bind(epoch.0)
+                    .execute(&self.pool)
+                    .await?
+            }
+        };
+        Ok(done.rows_affected() == 1)
     }
 
     async fn start_drain(&self, node_id: &NodeId) -> anyhow::Result<()> {

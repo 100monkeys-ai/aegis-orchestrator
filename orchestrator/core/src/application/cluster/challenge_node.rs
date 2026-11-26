@@ -1,6 +1,7 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 
+use crate::application::cluster::node_token::{NodeTokenIssuer, NODE_TOKEN_TTL};
 use crate::application::edge::enroll_edge::{EnrollEdgeError, EnrollEdgeService};
 use crate::domain::cluster::{
     NodeChallengeRepository, NodeClusterRepository, NodeId, NodePeer, NodePeerStatus, NodeRole,
@@ -8,7 +9,6 @@ use crate::domain::cluster::{
 };
 use crate::domain::secrets::{SecretStore, SensitiveString};
 use anyhow::{anyhow, Result};
-use base64::Engine;
 use chrono::Utc;
 use std::sync::Arc;
 
@@ -167,7 +167,7 @@ impl ChallengeNodeUseCase {
 
         // 4. Issue NodeSecurityToken (RS256 JWT)
         // ADR-059: Signed by controller's OpenBao Transit key.
-        let exp = (Utc::now() + chrono::Duration::hours(1)).timestamp();
+        let exp = (Utc::now() + NODE_TOKEN_TTL).timestamp();
         let iat = Utc::now().timestamp();
 
         let claims = NodeTokenClaims {
@@ -180,30 +180,12 @@ impl ChallengeNodeUseCase {
             cep: edge_cep,
         };
 
-        // Construct JWT header and payload
-        let header = serde_json::json!({ "alg": "RS256", "typ": "JWT" });
-        let header_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(serde_json::to_string(&header)?);
-        let claims_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(serde_json::to_string(&claims)?);
-        let signing_input = format!("{}.{}", header_b64, claims_b64);
-
-        // Sign with OpenBao Transit. ADR-117: shares the
+        // Signed with OpenBao Transit. ADR-117: shares the
         // `EDGE_ENROLLMENT_SIGNING_KEY` Transit key with the enrollment JWT
         // so a single relay-coordinator AppRole policy grant covers both.
-        let raw_sig = self
-            .secret_store
-            .transit_sign(&self.signing_key_path, signing_input.as_bytes())
-            .await
-            .map_err(|e| anyhow!("transit_sign failed: {e}"))?;
-        // Vault Transit returns `vault:v<version>:<base64sig>` — use the
-        // shared strict parser so arbitrary version numbers and malformed
-        // envelopes are handled identically to `IssueEnrollmentToken`.
-        let signature_b64 = crate::application::edge::transit::parse_vault_signature(&raw_sig)
-            .map_err(|e| anyhow!("transit_sign parse: {e}"))?
-            .to_string();
-
-        let token = format!("{}.{}", signing_input, signature_b64);
+        let token = NodeTokenIssuer::new(self.secret_store.clone(), self.signing_key_path.clone())
+            .issue(&claims)
+            .await?;
 
         // 5. Cleanup challenge
         self.challenge_repo
@@ -229,7 +211,7 @@ impl ChallengeNodeUseCase {
 
         Ok(ChallengeNodeResponse {
             node_security_token: token,
-            expires_at: Utc::now() + chrono::Duration::hours(1),
+            expires_at: Utc::now() + NODE_TOKEN_TTL,
         })
     }
 }
@@ -373,8 +355,12 @@ mod tests {
         async fn record_heartbeat(&self, _: &NodeId, _: ResourceSnapshot) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn mark_unhealthy(&self, _: &NodeId) -> anyhow::Result<()> {
-            Ok(())
+        async fn mark_unhealthy(
+            &self,
+            _: &NodeId,
+            _: crate::domain::cluster_membership::DutyFence,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
         }
         async fn start_drain(&self, _: &NodeId) -> anyhow::Result<()> {
             Ok(())
@@ -657,6 +643,7 @@ mod tests {
             "iss": issuer,
             "cep": "relay.example:50056",
         });
+        use base64::Engine as _;
         let h = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_string(&header).unwrap());
         let p = base64::engine::general_purpose::URL_SAFE_NO_PAD

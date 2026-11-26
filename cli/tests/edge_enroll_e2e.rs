@@ -245,6 +245,26 @@ impl NodeClusterService for ScriptedStub {
     ) -> Result<Response<IssueEnrollmentTokenResponse>, Status> {
         Err(Status::unimplemented("issue_enrollment_token"))
     }
+
+    async fn probe(
+        &self,
+        _r: Request<aegis_orchestrator_core::infrastructure::aegis_cluster_proto::ProbeRequest>,
+    ) -> Result<
+        Response<aegis_orchestrator_core::infrastructure::aegis_cluster_proto::ProbeResponse>,
+        Status,
+    > {
+        Err(Status::unimplemented("probe"))
+    }
+
+    async fn fence(
+        &self,
+        _r: Request<aegis_orchestrator_core::infrastructure::aegis_cluster_proto::FenceRequest>,
+    ) -> Result<
+        Response<aegis_orchestrator_core::infrastructure::aegis_cluster_proto::FenceResponse>,
+        Status,
+    > {
+        Err(Status::unimplemented("fence"))
+    }
 }
 
 // ---------------------------------------------------------------------------

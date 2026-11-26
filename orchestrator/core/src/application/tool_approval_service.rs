@@ -19,7 +19,7 @@
 //!   policy. A policy written replaces any standing choice on the same key.
 //! - [`ToolApprovalService::expire_stale`] expires requests pending for
 //!   72 hours; the daemon runs it every ten minutes
-//!   ([`ToolApprovalService::spawn_expiry_sweep`]).
+//!   ([`ToolApprovalService::sweep_expired`], run by the `tool-approval-expiry` cluster duty).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -460,22 +460,15 @@ impl ToolApprovalService {
         Ok(expired.len())
     }
 
-    /// Run [`Self::expire_stale`] every `interval` for the life of the
-    /// process (the daemon passes [`EXPIRY_SWEEP_INTERVAL`]).
-    pub fn spawn_expiry_sweep(self: Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            loop {
-                ticker.tick().await;
-                match self.expire_stale(Utc::now()).await {
-                    Ok(0) => {}
-                    Ok(n) => tracing::info!(expired = n, "Expired stale tool approval requests"),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Tool approval expiry sweep failed")
-                    }
-                }
-            }
-        })
+    /// One expiry sweep: [`Self::expire_stale`] now, as the
+    /// `tool-approval-expiry` cluster duty runs it every
+    /// [`EXPIRY_SWEEP_INTERVAL`] (ADR-152 D2).
+    pub async fn sweep_expired(&self) {
+        match self.expire_stale(Utc::now()).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(expired = n, "Expired stale tool approval requests"),
+            Err(e) => tracing::warn!(error = %e, "Tool approval expiry sweep failed"),
+        }
     }
 
     fn publish_decided(&self, request: &ToolApprovalRequest) {

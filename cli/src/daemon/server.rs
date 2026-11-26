@@ -892,6 +892,30 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .await;
     }
 
+    // ─── Cluster membership and duties (AEGIS ADR-152 D1, D2) ──────────────
+    // A clustered controller, worker or hybrid with a database joins
+    // cluster_nodes under a new incarnation and renews its lease from here
+    // on; its singleton background loops run as duties under leases in
+    // cluster_duties, so one process in the cluster runs each. Every other
+    // node runs each duty alone. Every background loop below is registered
+    // with the runner instead of spawning itself; the runner starts once
+    // all are registered.
+    let cluster_bind_addr = config
+        .spec
+        .network
+        .as_ref()
+        .map(|n| n.bind_address.clone())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let joined_cluster = crate::daemon::cluster_membership::join_cluster(
+        &config,
+        db_pool.as_ref(),
+        &cluster_bind_addr,
+    )
+    .await?;
+    let mut duty_runner = aegis_orchestrator_core::application::cluster::ClusterDutyRunner::new(
+        crate::daemon::cluster_membership::duty_leasing(joined_cluster.as_ref()),
+    );
+
     info!("Initializing LLM registry...");
     let llm_registry = Arc::new(
         ProviderRegistry::from_config(&config).context("Failed to initialize LLM providers")?,
@@ -1117,26 +1141,31 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     info!(mode = %storage_config.backend, "Volume service initialized");
 
-    // Spawn TTL cleanup background task for ephemeral volumes
-    let volume_service_cleanup = volume_service.clone();
-    tokio::spawn(async move {
-        use aegis_orchestrator_core::application::volume_manager::VolumeService as _;
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300)); // 5 minutes
-        loop {
-            interval.tick().await;
-            match volume_service_cleanup.cleanup_expired_volumes().await {
-                Ok(count) => {
-                    if count > 0 {
-                        tracing::info!("Volume cleanup: {} expired volumes deleted", count);
+    // TTL cleanup of ephemeral volumes, every 5 minutes: the
+    // `volume-ttl-cleanup` cluster duty (ADR-152 D2). Deleting an expired
+    // volume twice deletes nothing the second time, so it carries no fence.
+    {
+        let volume_service_cleanup = volume_service.clone();
+        duty_runner.register(
+            aegis_orchestrator_core::domain::cluster_membership::ClusterDutyName::VOLUME_TTL_CLEANUP,
+            aegis_orchestrator_core::application::cluster::DutySchedule::every(
+                std::time::Duration::from_secs(300),
+            ),
+            move |_fence| {
+                let volume_service_cleanup = volume_service_cleanup.clone();
+                async move {
+                    use aegis_orchestrator_core::application::volume_manager::VolumeService as _;
+                    match volume_service_cleanup.cleanup_expired_volumes().await {
+                        Ok(0) => {}
+                        Ok(count) => {
+                            tracing::info!("Volume cleanup: {} expired volumes deleted", count)
+                        }
+                        Err(e) => tracing::error!("Volume cleanup failed: {}", e),
                     }
                 }
-                Err(e) => {
-                    tracing::error!("Volume cleanup failed: {}", e);
-                }
-            }
-        }
-    });
-    info!("Volume cleanup background task spawned (interval: 5 minutes)");
+            },
+        );
+    }
 
     // Initialize Storage Event Persister for audit trail (ADR-036)
     info!("Initializing Storage Event Persister...");
@@ -1269,51 +1298,62 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         Supervisor::new(runtime.clone()).with_execution_repository(execution_repo.clone()),
     );
 
-    let agent_container_reaper_runtime = runtime.clone();
-    let agent_container_reaper_execution_repo = execution_repo.clone();
-    // The reaper publishes the failure events of an execution it ends
-    // because it outlived its bound (ADR-040, Update of 2026-10-04).
-    let agent_container_reaper_event_bus = event_bus.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
-        // First tick fires immediately — clean up any orphans left from a prior crash.
-        let mut first_run = true;
-        // Per-container reaper bookkeeping: tracks consecutive Unkillable
-        // failures, the next-eligible attempt time, and the quarantine bit.
-        // Owned by this task — no synchronization needed.
-        let mut attempt_states: std::collections::HashMap<
-            String,
-            crate::daemon::container_helpers::ReapAttemptState,
-        > = std::collections::HashMap::new();
-        loop {
-            interval.tick().await;
-            if first_run {
-                tracing::info!("Running startup orphan container cleanup");
-                first_run = false;
-            }
-            match cleanup_orphaned_agent_containers(
-                agent_container_reaper_runtime.clone(),
-                agent_container_reaper_execution_repo.clone(),
-                &agent_container_reaper_event_bus,
-                &mut attempt_states,
-            )
-            .await
-            {
-                Ok(count) => {
-                    if count > 0 {
-                        tracing::info!(
+    // The agent container reaper, every 5 minutes, the first at once (the
+    // orphans a prior crash left): a node duty, since what it reaps is this
+    // node's own Podman (ADR-152 D2.4). The reaper publishes the failure
+    // events of an execution it ends because it outlived its bound (ADR-040,
+    // Update of 2026-10-04).
+    {
+        let reaper_runtime = runtime.clone();
+        let reaper_execution_repo = execution_repo.clone();
+        let reaper_event_bus = event_bus.clone();
+        // Per-container reaper bookkeeping: consecutive Unkillable failures,
+        // the next-eligible attempt time, and the quarantine bit. Ticks of
+        // one duty never overlap, so the lock is never contended.
+        let attempt_states: Arc<
+            tokio::sync::Mutex<
+                std::collections::HashMap<
+                    String,
+                    crate::daemon::container_helpers::ReapAttemptState,
+                >,
+            >,
+        > = Arc::default();
+        let first_run = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        duty_runner.register_node_duty(
+            "agent-container-reaper",
+            aegis_orchestrator_core::application::cluster::DutySchedule::every(
+                std::time::Duration::from_secs(300),
+            ),
+            move || {
+                let reaper_runtime = reaper_runtime.clone();
+                let reaper_execution_repo = reaper_execution_repo.clone();
+                let reaper_event_bus = reaper_event_bus.clone();
+                let attempt_states = attempt_states.clone();
+                let first_run = first_run.clone();
+                async move {
+                    if first_run.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        tracing::info!("Running startup orphan container cleanup");
+                    }
+                    let mut attempt_states = attempt_states.lock().await;
+                    match cleanup_orphaned_agent_containers(
+                        reaper_runtime,
+                        reaper_execution_repo,
+                        &reaper_event_bus,
+                        &mut attempt_states,
+                    )
+                    .await
+                    {
+                        Ok(0) => {}
+                        Ok(count) => tracing::info!(
                             "Agent container cleanup: {} orphaned container(s) deleted",
                             count
-                        );
+                        ),
+                        Err(e) => tracing::error!("Agent container cleanup failed: {}", e),
                     }
                 }
-                Err(e) => {
-                    tracing::error!("Agent container cleanup failed: {}", e);
-                }
-            }
-        }
-    });
-    info!("Agent container cleanup background task spawned (interval: 5 minutes)");
+            },
+        );
+    }
 
     // Initialize security context repository early — needed by StandardAgentLifecycleService (ADR-102).
     let security_context_repo: Arc<
@@ -1562,27 +1602,29 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         (None, None)
     };
 
-    // Rate limit counter cleanup task (ADR-072)
+    // Rate limit counter cleanup (ADR-072), hourly: the
+    // `rate-limit-counter-cleanup` cluster duty (ADR-152 D2). Deleting
+    // expired counters is idempotent, so it carries no fence.
     if let Some(ref pool) = db_pool {
         let cleanup_pool = pool.clone();
-        tokio::spawn(async move {
-            let enforcer = PostgresWindowEnforcer::new(cleanup_pool);
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600)); // hourly
-            loop {
-                interval.tick().await;
-                match enforcer.cleanup_expired_counters().await {
-                    Ok(deleted) => {
-                        if deleted > 0 {
-                            tracing::info!(deleted, "rate limit counter cleanup completed");
+        duty_runner.register(
+            aegis_orchestrator_core::domain::cluster_membership::ClusterDutyName::RATE_LIMIT_COUNTER_CLEANUP,
+            aegis_orchestrator_core::application::cluster::DutySchedule::every(
+                std::time::Duration::from_secs(3600),
+            ),
+            move |_fence| {
+                let enforcer = PostgresWindowEnforcer::new(cleanup_pool.clone());
+                async move {
+                    match enforcer.cleanup_expired_counters().await {
+                        Ok(0) => {}
+                        Ok(deleted) => {
+                            tracing::info!(deleted, "rate limit counter cleanup completed")
                         }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "rate limit counter cleanup failed");
+                        Err(e) => tracing::warn!(error = %e, "rate limit counter cleanup failed"),
                     }
                 }
-            }
-        });
-        info!("Rate limit counter cleanup background task spawned (interval: 1 hour)");
+            },
+        );
     }
 
     // Initialize SEAL / Tool Routing Services (now hoisted for ExecutionService dependency)
@@ -1690,22 +1732,31 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         );
         handler.clone().spawn();
 
-        // Backfill on startup
-        let handler_bg = handler.clone();
-        tokio::spawn(async move {
-            match handler_bg.backfill().await {
-                Ok((agents, workflows)) => {
-                    tracing::info!(
-                        agents_indexed = agents,
-                        workflows_indexed = workflows,
-                        "Cortex discovery index backfill complete"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Cortex discovery index backfill failed");
-                }
-            }
-        });
+        // Backfill once, by whichever node holds the `discovery-backfill`
+        // cluster duty when it gains it (ADR-152 D2): re-indexing every
+        // record is idempotent, so it carries no fence.
+        {
+            let handler_bg = handler.clone();
+            duty_runner.register(
+                aegis_orchestrator_core::domain::cluster_membership::ClusterDutyName::DISCOVERY_BACKFILL,
+                aegis_orchestrator_core::application::cluster::DutySchedule::on_acquire(),
+                move |_fence| {
+                    let handler_bg = handler_bg.clone();
+                    async move {
+                        match handler_bg.backfill().await {
+                            Ok((agents, workflows)) => tracing::info!(
+                                agents_indexed = agents,
+                                workflows_indexed = workflows,
+                                "Cortex discovery index backfill complete"
+                            ),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Cortex discovery index backfill failed")
+                            }
+                        }
+                    }
+                },
+            );
+        }
 
         // Periodic reconciliation — catches index drift from event lag or transient Cortex failures
         handler
@@ -2110,17 +2161,28 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             ),
         ),
     );
+    // Re-create the Temporal Schedules a stored schedule has and Temporal
+    // lacks, once, by whichever node holds the `temporal-schedules-reconcile`
+    // cluster duty when it gains it (ADR-152 D2). Creating a missing
+    // schedule is checked against Temporal, so it carries no fence.
     if temporal_required {
         let schedules = schedule_service.clone();
-        tokio::spawn(async move {
-            match schedules.recreate_missing().await {
-                Ok(0) => {}
-                Ok(made) => info!(made, "Re-created missing Temporal Schedules"),
-                Err(e) => {
-                    tracing::error!(error = %e, "Re-creating missing Temporal Schedules failed")
+        duty_runner.register(
+            aegis_orchestrator_core::domain::cluster_membership::ClusterDutyName::TEMPORAL_SCHEDULES_RECONCILE,
+            aegis_orchestrator_core::application::cluster::DutySchedule::on_acquire(),
+            move |_fence| {
+                let schedules = schedules.clone();
+                async move {
+                    match schedules.recreate_missing().await {
+                        Ok(0) => {}
+                        Ok(made) => info!(made, "Re-created missing Temporal Schedules"),
+                        Err(e) => {
+                            tracing::error!(error = %e, "Re-creating missing Temporal Schedules failed")
+                        }
+                    }
                 }
-            }
-        });
+            },
+        );
     }
 
     // ─── Profiles (AEGIS ADR-140) ───────────────────────────────────────────
@@ -2340,9 +2402,19 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         )
         .with_former_names(daemon_former_names(config.spec.seal_gateway.as_ref())),
     );
-    tool_approval_service.clone().spawn_expiry_sweep(
-        aegis_orchestrator_core::application::tool_approval_service::EXPIRY_SWEEP_INTERVAL,
-    );
+    {
+        let sweeper = tool_approval_service.clone();
+        duty_runner.register(
+            aegis_orchestrator_core::domain::cluster_membership::ClusterDutyName::TOOL_APPROVAL_EXPIRY,
+            aegis_orchestrator_core::application::cluster::DutySchedule::every(
+                aegis_orchestrator_core::application::tool_approval_service::EXPIRY_SWEEP_INTERVAL,
+            ),
+            move |_fence| {
+                let sweeper = sweeper.clone();
+                async move { sweeper.sweep_expired().await }
+            },
+        );
+    }
     // Deleting a profile revokes the standing choices made in it (AEGIS
     // ADR-140 D9); a call carrying a profile is admitted by it (D7).
     if let Some(profiles) = &profile_service {
@@ -2458,9 +2530,19 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         operator_escalation_service = operator_escalation_service.with_role_lookup(lookup);
     }
     let operator_escalations = Arc::new(operator_escalation_service);
-    operator_escalations.clone().spawn_expiry_sweep(
-        aegis_orchestrator_core::application::operator_escalation_service::EXPIRY_SWEEP_INTERVAL,
-    );
+    {
+        let sweeper = operator_escalations.clone();
+        duty_runner.register(
+            aegis_orchestrator_core::domain::cluster_membership::ClusterDutyName::OPERATOR_ESCALATION_EXPIRY,
+            aegis_orchestrator_core::application::cluster::DutySchedule::every(
+                aegis_orchestrator_core::application::operator_escalation_service::EXPIRY_SWEEP_INTERVAL,
+            ),
+            move |_fence| {
+                let sweeper = sweeper.clone();
+                async move { sweeper.sweep().await }
+            },
+        );
+    }
     tool_invocation_service_builder = tool_invocation_service_builder
         .with_operator_escalations(operator_escalations.clone())
         .with_execution_repository(execution_repo.clone());
@@ -2485,9 +2567,19 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         &config,
         judge_context.clone(),
     ));
-    goal_service.clone().spawn_expiry_sweep(
-        aegis_orchestrator_core::application::goal_service::EXPIRY_SWEEP_INTERVAL,
-    );
+    {
+        let sweeper = goal_service.clone();
+        duty_runner.register(
+            aegis_orchestrator_core::domain::cluster_membership::ClusterDutyName::GOAL_EXPIRY,
+            aegis_orchestrator_core::application::cluster::DutySchedule::every(
+                aegis_orchestrator_core::application::goal_service::EXPIRY_SWEEP_INTERVAL,
+            ),
+            move |_fence| {
+                let sweeper = sweeper.clone();
+                async move { sweeper.sweep_expired().await }
+            },
+        );
+    }
     tool_invocation_service_builder = tool_invocation_service_builder.with_goals(goal_service);
     // AEGIS ADR-139 N11: the schedule tools use the service the
     // `/v1/schedules` routes use.
@@ -2609,17 +2701,24 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             catalog.refresh_from(tools).await;
             tracing::info!("Tool catalog populated with initial tool set");
         }
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            interval.tick().await; // skip immediate first tick (already populated above)
-            loop {
-                interval.tick().await;
-                if let Ok(tools) = tis.get_available_tools().await {
-                    catalog.refresh_from(tools).await;
-                    tracing::debug!("Tool catalog refreshed");
+        // Refreshed every 60 s from here on: a node duty, since the catalog
+        // is this node's own (ADR-152 D2.4).
+        duty_runner.register_node_duty(
+            "tool-catalog-refresh",
+            aegis_orchestrator_core::application::cluster::DutySchedule::every_after_first_interval(
+                std::time::Duration::from_secs(60),
+            ),
+            move || {
+                let tis = tis.clone();
+                let catalog = catalog.clone();
+                async move {
+                    if let Ok(tools) = tis.get_available_tools().await {
+                        catalog.refresh_from(tools).await;
+                        tracing::debug!("Tool catalog refreshed");
+                    }
                 }
-            }
-        });
+            },
+        );
     }
 
     let (inner_loop_service, llm_registry) = share_llm_registry(llm_registry, |registry| {
@@ -3267,9 +3366,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         }
     });
 
-    // Keep sweeper shutdown sender alive until daemon shutdown.
-    let mut _health_sweeper_shutdown: Option<tokio::sync::watch::Sender<bool>> = None;
-
     // ─── Cluster gRPC server (ADR-059) ─────────────────────────────────────
     // When clustering is enabled, start a second gRPC server on the dedicated
     // cluster port (default 50056) that exposes the inter-node
@@ -3422,6 +3518,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 push_config_uc,
                 cluster_repo.clone(),
             );
+            // ADR-152 D1.3, D6: a joined node answers Probe and takes Fence.
+            if let Some(joined) = joined_cluster.as_ref() {
+                handler = handler.with_membership(joined.membership.clone());
+            }
 
             // ADR-117: the relay-coordinator (and Hybrid / Controller-without-relay
             // deployments) hold the OpenBao policy
@@ -3591,41 +3691,80 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 monitor.abort();
             });
 
-            // ADR-062: Spawn health sweeper for stale heartbeat detection
+            // ADR-062: the health sweep marks nodes whose heartbeat went
+            // stale unhealthy. It is the `cluster-health-sweep` cluster duty
+            // (ADR-152 D2), and its write is fenced by the duty's epoch: a
+            // holder that stalled past its lease marks and announces nothing.
             {
+                let cluster = config.spec.cluster.as_ref();
                 let stale_threshold = std::time::Duration::from_secs(
-                    config
-                        .spec
-                        .cluster
-                        .as_ref()
-                        .and_then(|c| c.stale_threshold_secs)
-                        .unwrap_or(90),
+                    cluster.and_then(|c| c.stale_threshold_secs).unwrap_or(90),
                 );
                 let sweep_interval = std::time::Duration::from_secs(
-                    config
-                        .spec
-                        .cluster
-                        .as_ref()
-                        .and_then(|c| c.sweep_interval_secs)
-                        .unwrap_or(30),
+                    cluster.and_then(|c| c.sweep_interval_secs).unwrap_or(30),
                 );
-                let sweeper = aegis_orchestrator_core::application::cluster::HealthSweeper::new(
-                    health_sweeper_repo,
-                    event_bus.clone(),
-                    stale_threshold,
-                    sweep_interval,
+                let sweeper = Arc::new(
+                    aegis_orchestrator_core::application::cluster::HealthSweeper::new(
+                        health_sweeper_repo,
+                        event_bus.clone(),
+                        stale_threshold,
+                    ),
                 );
-                let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-                tokio::spawn(async move {
-                    sweeper.run(shutdown_rx).await;
-                });
-                // Keep sender in lifecycle state so it is dropped during daemon
-                // shutdown, allowing the sweeper to exit cleanly.
-                _health_sweeper_shutdown = Some(shutdown_tx);
+                duty_runner.register(
+                    aegis_orchestrator_core::domain::cluster_membership::ClusterDutyName::CLUSTER_HEALTH_SWEEP,
+                    aegis_orchestrator_core::application::cluster::DutySchedule::every(sweep_interval),
+                    move |fence| {
+                        let sweeper = sweeper.clone();
+                        async move { sweeper.run_once(fence).await }
+                    },
+                );
                 tracing::info!(
                     stale_threshold_secs = stale_threshold.as_secs(),
                     sweep_interval_secs = sweep_interval.as_secs(),
-                    "Health sweeper started"
+                    "Health sweep registered as a cluster duty"
+                );
+            }
+
+            // ADR-152 D1.3: probe every peer over the private network with
+            // this node's own NodeSecurityToken, issued with the cluster's
+            // Transit key.
+            if let Some(joined) = joined_cluster.as_ref() {
+                let m = &config
+                    .spec
+                    .cluster
+                    .as_ref()
+                    .expect("a joined node has a cluster block")
+                    .membership;
+                let token = Arc::new(
+                    aegis_orchestrator_core::infrastructure::cluster::SelfIssuedToken::new(
+                        aegis_orchestrator_core::application::cluster::NodeTokenIssuer::new(
+                            secrets_manager.secret_store(),
+                            aegis_orchestrator_core::application::edge::issue_enrollment_token::EDGE_ENROLLMENT_SIGNING_KEY.to_string(),
+                        ),
+                        joined.membership.process().node_id,
+                        joined.role,
+                        aegis_orchestrator_core::domain::cluster::NodeCapabilityAdvertisement::default().hash(),
+                    ),
+                );
+                let transport = Arc::new(
+                    aegis_orchestrator_core::infrastructure::cluster::GrpcPeerTransport::new(
+                        joined.signing_key.clone(),
+                        token,
+                    ),
+                );
+                Arc::new(
+                    aegis_orchestrator_core::application::cluster::PeerProber::new(
+                        joined.membership.clone(),
+                        joined.leases.clone(),
+                        transport,
+                        std::time::Duration::from_millis(m.probe_interval_ms.max(100)),
+                        m.probe_failures_to_suspect,
+                    ),
+                )
+                .spawn();
+                tracing::info!(
+                    probe_interval_ms = m.probe_interval_ms,
+                    "Probing cluster peers"
                 );
             }
         } else {
@@ -3635,6 +3774,13 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             );
         }
     }
+
+    // ─── Start the duties (AEGIS ADR-152 D2) ────────────────────────────────
+    // Every background loop has been registered above; from here the runner
+    // owns their ticks. The handle lives until the daemon exits, and its
+    // shutdown releases the duties this process holds, so a peer takes them
+    // at once instead of after their leases run out.
+    let duty_runner = duty_runner.spawn();
 
     // ─── Worker lifecycle task (ADR-059) ─────────────────────────────────────
     // When the node's cluster role is Worker or Hybrid AND a controller
@@ -4062,6 +4208,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .context("HTTP server failed")?;
 
     info!("Daemon shutting down");
+    duty_runner.shutdown().await;
 
     Ok(())
 }

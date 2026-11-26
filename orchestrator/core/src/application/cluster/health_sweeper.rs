@@ -13,70 +13,49 @@ use chrono::Utc;
 use crate::domain::cluster::{
     ClusterEvent, ClusterSummaryStatus, NodeClusterRepository, NodePeerStatus,
 };
+use crate::domain::cluster_membership::DutyFence;
 use crate::infrastructure::event_bus::EventBus;
 
 pub struct HealthSweeper {
     cluster_repo: Arc<dyn NodeClusterRepository>,
     event_bus: Arc<EventBus>,
     stale_threshold: Duration,
-    sweep_interval: Duration,
 }
+
+/// Default interval of the `cluster-health-sweep` duty.
+pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+/// Default staleness after which a node is marked unhealthy (3x a 30 s
+/// heartbeat).
+pub const DEFAULT_STALE_THRESHOLD: Duration = Duration::from_secs(90);
 
 impl HealthSweeper {
     pub fn new(
         cluster_repo: Arc<dyn NodeClusterRepository>,
         event_bus: Arc<EventBus>,
         stale_threshold: Duration,
-        sweep_interval: Duration,
     ) -> Self {
         Self {
             cluster_repo,
             event_bus,
             stale_threshold,
-            sweep_interval,
         }
-    }
-
-    /// Default sweeper: stale after 90s (3x 30s heartbeat), sweep every 30s
-    pub fn with_defaults(
-        cluster_repo: Arc<dyn NodeClusterRepository>,
-        event_bus: Arc<EventBus>,
-    ) -> Self {
-        Self::new(
-            cluster_repo,
-            event_bus,
-            Duration::from_secs(90),
-            Duration::from_secs(30),
-        )
     }
 
     pub fn stale_threshold(&self) -> Duration {
         self.stale_threshold
     }
 
-    pub fn sweep_interval(&self) -> Duration {
-        self.sweep_interval
-    }
-
-    /// Run the sweeper loop until shutdown signal received.
-    pub async fn run(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-        let mut interval = tokio::time::interval(self.sweep_interval);
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    if let Err(e) = self.sweep().await {
-                        tracing::error!(error = %e, "Health sweeper failed");
-                    }
-                }
-                _ = shutdown.changed() => {
-                    tracing::info!("Health sweeper shutting down");
-                    break;
-                }
-            }
+    /// One sweep, as the `cluster-health-sweep` duty (ADR-152 D2) runs it
+    /// under `fence`: a node is marked unhealthy, and the event published,
+    /// only when the write lands, so a holder whose epoch was superseded
+    /// marks and publishes nothing.
+    pub async fn run_once(&self, fence: DutyFence) {
+        if let Err(e) = self.sweep(fence).await {
+            tracing::error!(error = %e, "Health sweeper failed");
         }
     }
 
-    async fn sweep(&self) -> anyhow::Result<()> {
+    async fn sweep(&self, fence: DutyFence) -> anyhow::Result<()> {
         let active_peers = self
             .cluster_repo
             .list_peers_by_status(NodePeerStatus::Active)
@@ -95,7 +74,13 @@ impl HealthSweeper {
                     staleness_secs = staleness.num_seconds(),
                     "Marking stale node as unhealthy"
                 );
-                self.cluster_repo.mark_unhealthy(&peer.node_id).await?;
+                if !self
+                    .cluster_repo
+                    .mark_unhealthy(&peer.node_id, fence)
+                    .await?
+                {
+                    continue;
+                }
                 self.event_bus
                     .publish_cluster_event(ClusterEvent::NodeUnhealthy {
                         node_id: peer.node_id,
@@ -153,15 +138,21 @@ impl HealthSweeper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::cluster::{NodeId, NodePeer, ResourceSnapshot};
+    use crate::domain::cluster::{NodeId, NodePeer, NodeRole, ResourceSnapshot};
+    use crate::domain::cluster_membership::{ClusterDutyName, DutyEpoch};
     use std::collections::HashMap;
+    use std::sync::Mutex;
 
-    /// Stub repository that panics on every method — only used to construct
-    /// a `HealthSweeper` without exercising the sweep loop.
-    struct StubClusterRepo;
+    /// One stale active peer; `mark_unhealthy` lands unless the fence is
+    /// superseded.
+    struct OneStalePeer {
+        peer: NodePeer,
+        current_epoch: DutyEpoch,
+        marked: Mutex<u32>,
+    }
 
     #[async_trait::async_trait]
-    impl NodeClusterRepository for StubClusterRepo {
+    impl NodeClusterRepository for OneStalePeer {
         async fn upsert_peer(&self, _: &NodePeer) -> anyhow::Result<()> {
             unimplemented!()
         }
@@ -169,13 +160,20 @@ mod tests {
             unimplemented!()
         }
         async fn list_peers_by_status(&self, _: NodePeerStatus) -> anyhow::Result<Vec<NodePeer>> {
-            unimplemented!()
+            Ok(vec![self.peer.clone()])
         }
         async fn record_heartbeat(&self, _: &NodeId, _: ResourceSnapshot) -> anyhow::Result<()> {
             unimplemented!()
         }
-        async fn mark_unhealthy(&self, _: &NodeId) -> anyhow::Result<()> {
-            unimplemented!()
+        async fn mark_unhealthy(&self, _: &NodeId, fence: DutyFence) -> anyhow::Result<bool> {
+            let lands = match fence {
+                DutyFence::Solo => true,
+                DutyFence::Leased { epoch, .. } => epoch == self.current_epoch,
+            };
+            if lands {
+                *self.marked.lock().unwrap() += 1;
+            }
+            Ok(lands)
         }
         async fn start_drain(&self, _: &NodeId) -> anyhow::Result<()> {
             unimplemented!()
@@ -193,30 +191,72 @@ mod tests {
             unimplemented!()
         }
         async fn count_by_status(&self) -> anyhow::Result<HashMap<NodePeerStatus, usize>> {
-            unimplemented!()
+            Ok(HashMap::new())
         }
     }
 
-    #[test]
-    fn custom_thresholds_are_stored() {
-        let repo = Arc::new(StubClusterRepo);
-        let bus = Arc::new(EventBus::new(1));
-
-        let sweeper =
-            HealthSweeper::new(repo, bus, Duration::from_secs(120), Duration::from_secs(15));
-
-        assert_eq!(sweeper.stale_threshold(), Duration::from_secs(120));
-        assert_eq!(sweeper.sweep_interval(), Duration::from_secs(15));
+    fn stale_peer() -> NodePeer {
+        NodePeer {
+            node_id: NodeId::new(),
+            role: NodeRole::Hybrid,
+            public_key: vec![0; 32],
+            capabilities: Default::default(),
+            grpc_address: "10.0.0.2:50056".to_string(),
+            status: NodePeerStatus::Active,
+            last_heartbeat_at: Utc::now() - chrono::Duration::seconds(600),
+            registered_at: Utc::now() - chrono::Duration::seconds(3600),
+        }
     }
 
-    #[test]
-    fn with_defaults_uses_90s_stale_and_30s_sweep() {
-        let repo = Arc::new(StubClusterRepo);
-        let bus = Arc::new(EventBus::new(1));
+    fn sweeper(
+        repo: Arc<OneStalePeer>,
+    ) -> (
+        HealthSweeper,
+        crate::infrastructure::event_bus::EventReceiver,
+    ) {
+        let bus = Arc::new(EventBus::new(16));
+        let events = bus.subscribe();
+        (
+            HealthSweeper::new(repo, bus, DEFAULT_STALE_THRESHOLD),
+            events,
+        )
+    }
 
-        let sweeper = HealthSweeper::with_defaults(repo, bus);
+    #[tokio::test]
+    async fn a_stale_peer_is_marked_and_announced() {
+        let repo = Arc::new(OneStalePeer {
+            peer: stale_peer(),
+            current_epoch: DutyEpoch(4),
+            marked: Mutex::new(0),
+        });
+        let (sweeper, mut events) = sweeper(repo.clone());
+        sweeper
+            .run_once(DutyFence::Leased {
+                duty: ClusterDutyName::CLUSTER_HEALTH_SWEEP,
+                epoch: DutyEpoch(4),
+            })
+            .await;
+        assert_eq!(*repo.marked.lock().unwrap(), 1);
+        assert!(events.try_recv().is_ok(), "NodeUnhealthy is published");
+    }
 
-        assert_eq!(sweeper.stale_threshold(), Duration::from_secs(90));
-        assert_eq!(sweeper.sweep_interval(), Duration::from_secs(30));
+    /// A holder whose epoch was superseded marks nothing and publishes
+    /// nothing (ADR-152 D2.3).
+    #[tokio::test]
+    async fn a_superseded_holder_marks_and_announces_nothing() {
+        let repo = Arc::new(OneStalePeer {
+            peer: stale_peer(),
+            current_epoch: DutyEpoch(5),
+            marked: Mutex::new(0),
+        });
+        let (sweeper, mut events) = sweeper(repo.clone());
+        sweeper
+            .run_once(DutyFence::Leased {
+                duty: ClusterDutyName::CLUSTER_HEALTH_SWEEP,
+                epoch: DutyEpoch(4),
+            })
+            .await;
+        assert_eq!(*repo.marked.lock().unwrap(), 0);
+        assert!(events.try_recv().is_err(), "nothing is published");
     }
 }

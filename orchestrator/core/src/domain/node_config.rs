@@ -1481,6 +1481,64 @@ pub struct ClusterConfig {
     /// e.g. `http://aegis-relay-coordinator:50056`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_coordinator_endpoint: Option<SensitiveUrl>,
+    /// ADR-152: active-active membership (leases, duties, probes).
+    #[serde(default)]
+    pub membership: ClusterMembershipConfig,
+}
+
+/// Active-active membership of a peer node (ADR-152 D1, D2). Applies to an
+/// enabled cluster node with role controller, worker or hybrid and a
+/// database: such a node joins `cluster_nodes` under a new incarnation at
+/// start, renews its lease, holds its singleton duties under leases in
+/// `cluster_duties`, and probes its peers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterMembershipConfig {
+    /// This node's address on the private network (vRack); peers dial its
+    /// NodeClusterService at this address and `cluster_grpc_port`.
+    /// `env:VAR` is read from the environment. Absent: the bind address,
+    /// which must then not be unspecified (0.0.0.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vrack_address: Option<String>,
+    /// How often the node's lease, and each duty it holds, is renewed.
+    #[serde(default = "default_lease_renew_secs")]
+    pub lease_renew_secs: u64,
+    /// How long a renewal lasts, by the database clock. At least twice
+    /// `lease_renew_secs`.
+    #[serde(default = "default_lease_ttl_secs")]
+    pub lease_ttl_secs: u64,
+    /// How often each peer is probed over the private network.
+    #[serde(default = "default_probe_interval_ms")]
+    pub probe_interval_ms: u64,
+    /// Consecutive failed probes, together with an expired lease, after
+    /// which a peer is judged dead.
+    #[serde(default = "default_probe_failures_to_suspect")]
+    pub probe_failures_to_suspect: u32,
+}
+
+fn default_lease_renew_secs() -> u64 {
+    3
+}
+fn default_lease_ttl_secs() -> u64 {
+    15
+}
+fn default_probe_interval_ms() -> u64 {
+    1000
+}
+fn default_probe_failures_to_suspect() -> u32 {
+    5
+}
+
+impl Default for ClusterMembershipConfig {
+    fn default() -> Self {
+        Self {
+            vrack_address: None,
+            lease_renew_secs: default_lease_renew_secs(),
+            lease_ttl_secs: default_lease_ttl_secs(),
+            probe_interval_ms: default_probe_interval_ms(),
+            probe_failures_to_suspect: default_probe_failures_to_suspect(),
+        }
+    }
 }
 
 impl ClusterConfig {
@@ -3555,6 +3613,7 @@ mod tests {
             edge: None,
             ingress: None,
             relay_coordinator_endpoint: None,
+            membership: Default::default(),
         });
 
         let bootstrap = manifest.bootstrap();
@@ -3661,6 +3720,7 @@ mod tests {
             edge: None,
             ingress: None,
             relay_coordinator_endpoint: None,
+            membership: Default::default(),
         };
         assert!(cfg.validate_roles().is_err());
     }
@@ -3685,6 +3745,7 @@ mod tests {
             edge: Some(EdgeConfig::default()),
             ingress: None,
             relay_coordinator_endpoint: None,
+            membership: Default::default(),
         };
         assert!(cfg.validate_roles().is_ok());
     }
@@ -3706,6 +3767,7 @@ mod tests {
             edge: None,
             ingress: None,
             relay_coordinator_endpoint: None,
+            membership: Default::default(),
         };
         assert!(cfg.validate_roles().is_err());
     }
@@ -4021,6 +4083,7 @@ grpc_port: 50051
             edge: None,
             ingress: None,
             relay_coordinator_endpoint: None,
+            membership: Default::default(),
         });
         let err = manifest
             .validate()
@@ -4062,6 +4125,7 @@ grpc_port: 50051
             edge: None,
             ingress: None,
             relay_coordinator_endpoint: None,
+            membership: Default::default(),
         });
         manifest
             .validate()
@@ -4547,5 +4611,37 @@ goals:
                 "{names:?}: {error}"
             );
         }
+    }
+
+    /// ADR-152: a cluster block with no `membership` takes the record's
+    /// defaults; one that names the fields keeps them; a misspelt field is
+    /// refused rather than ignored.
+    #[test]
+    fn cluster_membership_defaults_and_overrides() {
+        let c: ClusterConfig = serde_yaml::from_str("enabled: true\nrole: hybrid\n").unwrap();
+        assert_eq!(c.membership, ClusterMembershipConfig::default());
+        assert_eq!(
+            (
+                c.membership.lease_renew_secs,
+                c.membership.lease_ttl_secs,
+                c.membership.probe_interval_ms,
+                c.membership.probe_failures_to_suspect
+            ),
+            (3, 15, 1000, 5)
+        );
+        let c: ClusterConfig = serde_yaml::from_str(
+            "enabled: true\nmembership:\n  vrack_address: \"env:AEGIS_NODE_IP\"\n  lease_ttl_secs: 20\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.membership.vrack_address.as_deref(),
+            Some("env:AEGIS_NODE_IP")
+        );
+        assert_eq!(c.membership.lease_ttl_secs, 20);
+        assert_eq!(c.membership.lease_renew_secs, 3);
+        assert!(serde_yaml::from_str::<ClusterConfig>(
+            "enabled: true\nmembership:\n  lease_tll_secs: 20\n"
+        )
+        .is_err());
     }
 }

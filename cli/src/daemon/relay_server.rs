@@ -172,16 +172,28 @@ pub async fn run_relay_coordinator(
             .and_then(|c| c.sweep_interval_secs)
             .unwrap_or(30),
     );
-    let sweeper = aegis_orchestrator_core::application::cluster::HealthSweeper::new(
-        cluster_repo,
-        event_bus,
-        stale_threshold,
-        sweep_interval,
+    // Its only background loop, under the duty runner like every other
+    // node's. The relay runs it alone (Solo): its lease joins with the
+    // Relay Coordinator's own clustering (ADR-152 P5).
+    let sweeper = Arc::new(
+        aegis_orchestrator_core::application::cluster::HealthSweeper::new(
+            cluster_repo,
+            event_bus,
+            stale_threshold,
+        ),
     );
-    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    tokio::spawn(async move {
-        sweeper.run(shutdown_rx).await;
-    });
+    let mut duty_runner = aegis_orchestrator_core::application::cluster::ClusterDutyRunner::new(
+        aegis_orchestrator_core::application::cluster::DutyLeasing::Solo,
+    );
+    duty_runner.register(
+        aegis_orchestrator_core::domain::cluster_membership::ClusterDutyName::CLUSTER_HEALTH_SWEEP,
+        aegis_orchestrator_core::application::cluster::DutySchedule::every(sweep_interval),
+        move |fence| {
+            let sweeper = sweeper.clone();
+            async move { sweeper.run_once(fence).await }
+        },
+    );
+    let _duty_runner = duty_runner.spawn();
 
     info!(
         "RelayCoordinator role: skipping HTTP listener — gRPC NodeClusterService is the only \

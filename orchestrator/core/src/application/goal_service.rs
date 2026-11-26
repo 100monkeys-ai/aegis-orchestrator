@@ -1510,21 +1510,15 @@ impl GoalService {
         Ok(closed)
     }
 
-    /// Run [`Self::close_expired`] every `interval` for the life of the
-    /// process (the daemon passes [`EXPIRY_SWEEP_INTERVAL`]).
-    pub fn spawn_expiry_sweep(self: Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            loop {
-                ticker.tick().await;
-                let now = (self.clock)();
-                match self.close_expired(now).await {
-                    Ok(0) => {}
-                    Ok(n) => tracing::info!(expired = n, "Closed goals open past their lifetime"),
-                    Err(e) => tracing::warn!(error = %e, "Goal expiry sweep failed"),
-                }
-            }
-        })
+    /// One expiry sweep: [`Self::close_expired`] now, as the `goal-expiry`
+    /// cluster duty runs it every [`EXPIRY_SWEEP_INTERVAL`] (ADR-152 D2).
+    pub async fn sweep_expired(&self) {
+        let now = (self.clock)();
+        match self.close_expired(now).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(expired = n, "Closed goals open past their lifetime"),
+            Err(e) => tracing::warn!(error = %e, "Goal expiry sweep failed"),
+        }
     }
 
     async fn close(

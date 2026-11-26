@@ -159,8 +159,12 @@ mod tests {
         ) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn mark_unhealthy(&self, _node_id: &NodeId) -> anyhow::Result<()> {
-            Ok(())
+        async fn mark_unhealthy(
+            &self,
+            _: &NodeId,
+            _: crate::domain::cluster_membership::DutyFence,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
         }
         async fn start_drain(&self, _node_id: &NodeId) -> anyhow::Result<()> {
             Ok(())
