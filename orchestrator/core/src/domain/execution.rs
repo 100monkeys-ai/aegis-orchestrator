@@ -509,6 +509,13 @@ pub struct AttachmentRef {
 pub const ORCHESTRATOR_RESTART_FAILURE_REASON: &str =
     "owner_restarted: The orchestrator restarted while this execution was running; no process supervises it any more, so it was ended as failed";
 
+/// The reason an execution fails with when its node drained before it ended
+/// (ADR-152 D5.9): the node was stopping and its drain time ran out. Like the
+/// reasons below it starts with the token a retrying caller matches
+/// (`node_drained`, D5.8); the run is not resumed.
+pub const NODE_DRAINED_FAILURE_REASON: &str =
+    "node_drained: The cluster node running this execution was stopping and its drain time ran out; the execution was ended as failed and not resumed";
+
 /// The reason an execution fails with when the cluster node that owned it
 /// died and the `execution-adoption` duty ended it (ADR-152 D5.7). Like
 /// [`ORCHESTRATOR_RESTART_FAILURE_REASON`] it starts with the token a caller
@@ -1180,6 +1187,17 @@ impl Execution {
             return None;
         }
         self.fail_with_iteration_in_flight(ORCHESTRATOR_RESTART_FAILURE_REASON.to_string())
+    }
+
+    /// End an execution its draining node could not finish in time
+    /// (ADR-152 D5.9): failed with [`NODE_DRAINED_FAILURE_REASON`], its
+    /// iteration in flight failing too. `None` for an execution already
+    /// ended, which is left as it is, or with no iteration in flight.
+    pub fn fail_node_drained(&mut self) -> Option<u8> {
+        if self.is_completed() {
+            return None;
+        }
+        self.fail_with_iteration_in_flight(NODE_DRAINED_FAILURE_REASON.to_string())
     }
 
     /// End an execution whose owner died, as the `execution-adoption` duty
