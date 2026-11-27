@@ -434,6 +434,21 @@ pub(crate) fn build_relay_cluster(
         ),
         _ => None,
     };
+    // ADR-111: a team owner or member issues enrollment tokens in the team
+    // tenant the core forwards, not silently in their own.
+    let cluster_grpc_auth =
+        cluster_grpc_auth.map(|auth| {
+            auth.with_team_access(
+            Arc::new(aegis_orchestrator_core::infrastructure::repositories::PgTeamRepository::new(
+                pool.clone(),
+            )),
+            Arc::new(
+                aegis_orchestrator_core::infrastructure::repositories::PgMembershipRepository::new(
+                    pool.clone(),
+                ),
+            ),
+        )
+        });
     handler = handler.with_issue_enrollment_token(local_signer, cluster_grpc_auth);
 
     RelayCluster {
