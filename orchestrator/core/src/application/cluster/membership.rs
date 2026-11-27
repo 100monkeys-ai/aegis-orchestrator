@@ -344,6 +344,7 @@ pub(crate) mod tests {
             vrack_address: Some("10.120.0.1".to_string()),
             lease_ttl: Duration::ZERO,
             max_executions: None,
+            display_name: None,
         }
     }
 
