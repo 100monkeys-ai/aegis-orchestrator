@@ -101,6 +101,8 @@ pub struct NodeClusterServiceHandler {
     forward_leases: Option<Arc<dyn crate::domain::cluster_membership::NodeLeaseRepository>>,
     /// The edge dispatch a peer's InvokeEdgeTool runs on (ADR-152 D8).
     edge_dispatch: Option<Arc<crate::application::edge::dispatch_to_edge::DispatchToEdgeService>>,
+    /// The fleet commands a peer's CancelFleetCommand cancels (ADR-152 D4.7).
+    fleet_cancel: Option<Arc<crate::application::edge::fleet::CancelFleetService>>,
 }
 
 /// How far a forward's issue time may be from this node's clock (ADR-152
@@ -145,6 +147,7 @@ impl NodeClusterServiceHandler {
             event_bus: None,
             forward_leases: None,
             edge_dispatch: None,
+            fleet_cancel: None,
         }
     }
 
@@ -189,6 +192,15 @@ impl NodeClusterServiceHandler {
         event_bus: crate::infrastructure::event_bus::EventBus,
     ) -> Self {
         self.event_bus = Some(event_bus);
+        self
+    }
+
+    /// ADR-152 D4.7: take peers' cancels of the fleet commands this member runs.
+    pub fn with_fleet_cancel(
+        mut self,
+        fleet_cancel: Arc<crate::application::edge::fleet::CancelFleetService>,
+    ) -> Self {
+        self.fleet_cancel = Some(fleet_cancel);
         self
     }
 
@@ -653,6 +665,49 @@ impl NodeClusterService for NodeClusterServiceHandler {
         Ok(Response::new(Box::pin(
             tokio_stream::wrappers::ReceiverStream::new(rx),
         )))
+    }
+
+    /// ADR-152 D4.7: a peer's cancel of a fleet command this member runs.
+    async fn cancel_fleet_command(
+        &self,
+        request: Request<crate::infrastructure::aegis_cluster_proto::CancelFleetCommandRequest>,
+    ) -> Result<
+        Response<crate::infrastructure::aegis_cluster_proto::CancelFleetCommandResponse>,
+        Status,
+    > {
+        use crate::application::edge::fleet::FleetCancelAuthority;
+        let (from, inner): (
+            NodeId,
+            crate::infrastructure::aegis_cluster_proto::CancelFleetCommandInner,
+        ) = self
+            .authenticate_node(request.into_inner().envelope)
+            .await?;
+        let Some(fleet_cancel) = self.fleet_cancel.as_ref() else {
+            return Err(Status::failed_precondition(
+                "this node runs no fleet commands",
+            ));
+        };
+        let fleet_id = crate::domain::cluster::FleetCommandId(
+            uuid::Uuid::parse_str(&inner.fleet_command_id)
+                .map_err(|_| Status::invalid_argument("fleet_command_id is not a UUID"))?,
+        );
+        let tenant = if inner.tenant_id.is_empty() {
+            None
+        } else {
+            Some(
+                TenantId::from_string(&inner.tenant_id)
+                    .map_err(|_| Status::invalid_argument("tenant_id is not a tenant"))?,
+            )
+        };
+        let authority = match &tenant {
+            Some(t) => FleetCancelAuthority::Tenant(t),
+            None => FleetCancelAuthority::WritingOperator,
+        };
+        let accepted = fleet_cancel.cancel_forwarded(fleet_id, authority).await;
+        tracing::info!(by = %from, fleet_command_id = %inner.fleet_command_id, accepted, "Forwarded fleet cancel received");
+        Ok(Response::new(
+            crate::infrastructure::aegis_cluster_proto::CancelFleetCommandResponse { accepted },
+        ))
     }
 
     /// ADR-152 D8: a tool call for an edge whose stream this process, or

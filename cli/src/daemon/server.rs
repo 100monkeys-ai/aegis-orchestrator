@@ -3661,11 +3661,13 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             // cluster gRPC server (Controller / Hybrid / RelayCoordinator)
             // must accept ConnectEdge. Pure-worker nodes have no
             // edge_components bundle (no DB pool) and naturally skip this.
-            if let Some((edge_repo, _, conn_registry, edge_dispatch, _, _, _)) =
+            if let Some((edge_repo, _, conn_registry, edge_dispatch, _, _, fleet_cancel)) =
                 edge_components.as_ref()
             {
                 // ADR-152 D8: a peer's InvokeEdgeTool runs on this dispatch.
                 handler = handler.with_edge_dispatch(edge_dispatch.clone());
+                // ADR-152 D4.7: a peer's cancel of a fleet command run here.
+                handler = handler.with_fleet_cancel(fleet_cancel.clone());
                 use aegis_orchestrator_core::application::edge::connect_edge::ConnectEdgeService;
                 use aegis_orchestrator_core::application::edge::issue_enrollment_token::EDGE_ENROLLMENT_SIGNING_KEY;
                 use aegis_orchestrator_core::application::edge::rotate_edge_key::RotateEdgeKeyService;
@@ -3884,9 +3886,29 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 // ADR-152 D8: an edge call this node's dispatch cannot run
                 // goes to the member whose Relay Coordinator holds the
                 // stream, or to this member's own over the pod network.
-                if let (Some((_, _, _, edge_dispatch, _, _, _)), Some(pool)) =
+                if let (Some((_, _, _, edge_dispatch, _, _, fleet_cancel)), Some(pool)) =
                     (edge_components.as_ref(), db_pool.as_ref())
                 {
+                    // ADR-152 D4.7: fleet commands record their member, and a
+                    // cancel of another member's goes to it.
+                    let fleet_owners: Arc<
+                        dyn aegis_orchestrator_core::infrastructure::edge::FleetCommandOwners,
+                    > = Arc::new(
+                        aegis_orchestrator_core::infrastructure::edge::PgFleetCommandOwners::new(
+                            pool.clone(),
+                        ),
+                    );
+                    fleet_cancel
+                        .registry()
+                        .set_ownership(fleet_owners.clone(), joined.membership.process().node_id);
+                    fleet_cancel.set_remote(Arc::new(
+                        aegis_orchestrator_core::infrastructure::cluster::GrpcFleetCancelForwarder::new(
+                            fleet_owners,
+                            joined.membership.process().node_id,
+                            Arc::new(aegis_orchestrator_core::infrastructure::cluster::PgNodeClusterRepository::new(pool.clone())),
+                            transport.clone(),
+                        ),
+                    ));
                     let local_relay = config
                         .spec
                         .cluster

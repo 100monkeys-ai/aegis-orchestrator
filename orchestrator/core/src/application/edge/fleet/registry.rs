@@ -23,9 +23,17 @@ pub struct FleetCommandHandle {
     pub per_node_command_ids: dashmap::DashMap<NodeId, Uuid>,
 }
 
+/// The record of which member runs each command, and this member (ADR-152
+/// D4.7).
+type Ownership = (
+    Arc<dyn crate::infrastructure::edge::FleetCommandOwners>,
+    NodeId,
+);
+
 #[derive(Clone, Default)]
 pub struct FleetRegistry {
     inner: Arc<DashMap<FleetCommandId, Arc<FleetCommandHandle>>>,
+    ownership: Arc<std::sync::OnceLock<Ownership>>,
 }
 
 impl FleetRegistry {
@@ -33,9 +41,32 @@ impl FleetRegistry {
         Self::default()
     }
 
+    /// ADR-152 D4.7: record each command this member runs, so a cancel
+    /// received by another member reaches it.
+    pub fn set_ownership(
+        &self,
+        owners: Arc<dyn crate::infrastructure::edge::FleetCommandOwners>,
+        me: NodeId,
+    ) {
+        let _ = self.ownership.set((owners, me));
+    }
+
     pub fn register(&self, handle: FleetCommandHandle) -> Arc<FleetCommandHandle> {
         let arc = Arc::new(handle);
         self.inner.insert(arc.fleet_command_id, arc.clone());
+        if let Some((owners, me)) = self.ownership.get() {
+            let (owners, me, id, tenant) = (
+                owners.clone(),
+                *me,
+                arc.fleet_command_id,
+                arc.tenant_id.clone(),
+            );
+            tokio::spawn(async move {
+                if let Err(e) = owners.record(id, me, &tenant).await {
+                    tracing::warn!(error = %e, "could not record the fleet command's member");
+                }
+            });
+        }
         arc
     }
 
@@ -45,5 +76,13 @@ impl FleetRegistry {
 
     pub fn remove(&self, id: &FleetCommandId) {
         self.inner.remove(id);
+        if let Some((owners, _)) = self.ownership.get() {
+            let (owners, id) = (owners.clone(), *id);
+            tokio::spawn(async move {
+                if let Err(e) = owners.release(id).await {
+                    tracing::warn!(error = %e, "could not release the fleet command's record");
+                }
+            });
+        }
     }
 }

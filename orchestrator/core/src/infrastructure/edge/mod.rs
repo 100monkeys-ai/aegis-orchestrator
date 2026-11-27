@@ -8,6 +8,7 @@
 
 pub mod connection_registry;
 pub mod enrollment_token_repo;
+pub mod fleet_owners;
 pub mod group_repo;
 pub mod grpc_stream;
 pub mod postgres_repo;
@@ -17,6 +18,7 @@ pub use connection_registry::{
     EdgeCommandTx, EdgeConnectionGuard, EdgeConnectionRegistry, PendingEdgeCalls,
 };
 pub use enrollment_token_repo::PgEnrollmentTokenRepository;
+pub use fleet_owners::{FleetCommandOwners, PgFleetCommandOwners};
 pub use group_repo::PgEdgeGroupRepository;
 pub use postgres_repo::PgEdgeDaemonRepository;
 pub use stream_owners::{EdgeStreamOwners, PgEdgeStreamOwners};

@@ -488,3 +488,72 @@ impl crate::application::edge::dispatch_to_edge::RemoteEdgeInvoker for ClusterEd
         }
     }
 }
+
+/// Forwards a fleet cancel to the member running the command (ADR-152
+/// D4.7), over the members' mutual TLS and SEAL node envelope.
+pub struct GrpcFleetCancelForwarder {
+    owners: Arc<dyn crate::infrastructure::edge::FleetCommandOwners>,
+    me: NodeId,
+    nodes: Arc<dyn crate::domain::cluster::NodeClusterRepository>,
+    transport: Arc<GrpcPeerTransport>,
+}
+
+impl GrpcFleetCancelForwarder {
+    pub fn new(
+        owners: Arc<dyn crate::infrastructure::edge::FleetCommandOwners>,
+        me: NodeId,
+        nodes: Arc<dyn crate::domain::cluster::NodeClusterRepository>,
+        transport: Arc<GrpcPeerTransport>,
+    ) -> Self {
+        Self {
+            owners,
+            me,
+            nodes,
+            transport,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::application::edge::fleet::FleetCancelForwarder for GrpcFleetCancelForwarder {
+    async fn forward(
+        &self,
+        fleet_id: crate::domain::cluster::FleetCommandId,
+        tenant: Option<&crate::domain::shared_kernel::TenantId>,
+    ) -> bool {
+        let owner = match self.owners.owner_of(fleet_id).await {
+            Ok(Some(owner)) if owner != self.me => owner,
+            _ => return false,
+        };
+        let Ok(Some(peer)) = self.nodes.find_peer(&owner).await else {
+            return false;
+        };
+        let inner = crate::infrastructure::aegis_cluster_proto::CancelFleetCommandInner {
+            fleet_command_id: fleet_id.0.to_string(),
+            tenant_id: tenant.map(|t| t.as_str().to_string()).unwrap_or_default(),
+        };
+        let call = async {
+            let envelope = self.transport.envelope(inner.encode_to_vec()).await?;
+            let answer = self
+                .transport
+                .client(&peer.grpc_address)
+                .await?
+                .cancel_fleet_command(
+                    crate::infrastructure::aegis_cluster_proto::CancelFleetCommandRequest {
+                        envelope: Some(envelope),
+                    },
+                )
+                .await?
+                .into_inner();
+            anyhow::Ok(answer.accepted)
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(2), call).await {
+            Ok(Ok(accepted)) => accepted,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, owner = %owner, "fleet cancel forward failed");
+                false
+            }
+            Err(_) => false,
+        }
+    }
+}
