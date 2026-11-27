@@ -651,3 +651,69 @@ mod policy_tests {
         assert!(tmp.path().join("aegis-config.yaml").exists());
     }
 }
+
+#[cfg(test)]
+mod default_context_tests {
+    //! ADR-157: a freshly enrolled edge is deny by default.
+
+    fn contexts(template: &str) -> Vec<(String, Vec<String>)> {
+        let rendered = [
+            "NODE_ID",
+            "CONTROLLER_ENDPOINT",
+            "OS",
+            "ARCH",
+            "LOCAL_TOOLS",
+            "MOUNT_POINTS",
+        ]
+        .iter()
+        .fold(template.to_string(), |t, key| {
+            t.replace(&format!("{{{{{key}}}}}"), "x")
+        });
+        let doc: serde_yaml::Value = serde_yaml::from_str(&rendered).expect("template parses");
+        doc["spec"]["security_contexts"]
+            .as_sequence()
+            .expect("security_contexts")
+            .iter()
+            .map(|c| {
+                (
+                    c["name"].as_str().unwrap().to_string(),
+                    c["capabilities"]
+                        .as_sequence()
+                        .unwrap()
+                        .iter()
+                        .map(|cap| cap["tool_pattern"].as_str().unwrap().to_string())
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_tier_has_a_context_that_allows_only_host_facts() {
+        for (name, template) in [
+            (
+                "minimal",
+                include_str!("../../../templates/edge-config-minimal.yaml"),
+            ),
+            (
+                "examples",
+                include_str!("../../../templates/edge-config-with-examples.yaml"),
+            ),
+        ] {
+            let got = contexts(template);
+            let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(
+                names,
+                ["zaru-free", "zaru-pro", "zaru-business", "zaru-enterprise"],
+                "{name}: every tier a dispatch can name has a context"
+            );
+            for (ctx, patterns) in &got {
+                assert_eq!(
+                    patterns,
+                    &["host.facts"],
+                    "{name}/{ctx} grants only host.facts"
+                );
+            }
+        }
+    }
+}

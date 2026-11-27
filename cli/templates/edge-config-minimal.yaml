@@ -23,12 +23,28 @@ spec:
         arch: "{{ARCH}}"
         local_tools: [shell]
         mount_points: ["/"]
-  # Minimal seed: a single permissive `zaru-free` context so the daemon can
-  # actually serve InvokeTool calls. Tighten or replace before exposing the
-  # daemon to untrusted callers.
+  # Deny by default (ADR-157): a dispatch names the context of its caller's
+  # tier, and each allows only host.facts, which reads and changes nothing.
+  # Grant more deliberately, for example `cmd.run` with a command_allowlist
+  # or `host.apply` for host state, by widening a context here.
   security_contexts:
     - name: zaru-free
-      description: "Permissive minimal default; edit before production use."
+      description: "Read-only default for Free dispatches: host facts only."
       capabilities:
-        - tool_pattern: "*"
+        - tool_pattern: "host.facts"
+      deny_list: []
+    - name: zaru-pro
+      description: "Read-only default for Pro dispatches: host facts only."
+      capabilities:
+        - tool_pattern: "host.facts"
+      deny_list: []
+    - name: zaru-business
+      description: "Read-only default for Business dispatches: host facts only."
+      capabilities:
+        - tool_pattern: "host.facts"
+      deny_list: []
+    - name: zaru-enterprise
+      description: "Read-only default for Enterprise dispatches: host facts only."
+      capabilities:
+        - tool_pattern: "host.facts"
       deny_list: []

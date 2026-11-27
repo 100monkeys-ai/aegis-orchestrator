@@ -57,35 +57,33 @@ spec:
   # `zaru-pro`, `zaru-business`, `zaru-enterprise`. An empty list means every
   # InvokeTool is rejected with `security_context_not_found`.
   #
-  # The seeded contexts below are PERMISSIVE (`tool_pattern: "*"`). This is
-  # the right starting point for a personal edge daemon where the operator IS
-  # the caller — but you SHOULD tighten them before exposing the daemon to
-  # untrusted dispatchers. Replace `"*"` with explicit `tool_pattern` entries
-  # (e.g. `fs.read`, `cmd.run` with `command_allowlist`) once your use case
-  # is known.
+  # The seeded contexts below are DENY BY DEFAULT (ADR-157): each allows
+  # only `host.facts`, which reads and changes nothing. Widen one
+  # deliberately for your use case, for example:
+  #
+  #     - tool_pattern: "cmd.run"
+  #       command_allowlist: ["systemctl", "journalctl"]
+  #     - tool_pattern: "host.apply"
+  #
+  # A host managed by AEGIS itself declares its own `host-admin` context.
   security_contexts:
     - name: zaru-free
-      description: |
-        Permissive default for ZaruTier::Free dispatches. Edit to constrain
-        the toolset before exposing this daemon to untrusted callers.
+      description: "Read-only default for Free dispatches: host facts only."
       capabilities:
-        - tool_pattern: "*"
+        - tool_pattern: "host.facts"
       deny_list: []
     - name: zaru-pro
-      description: |
-        Permissive default for ZaruTier::Pro dispatches.
+      description: "Read-only default for Pro dispatches: host facts only."
       capabilities:
-        - tool_pattern: "*"
+        - tool_pattern: "host.facts"
       deny_list: []
     - name: zaru-business
-      description: |
-        Permissive default for ZaruTier::Business dispatches.
+      description: "Read-only default for Business dispatches: host facts only."
       capabilities:
-        - tool_pattern: "*"
+        - tool_pattern: "host.facts"
       deny_list: []
     - name: zaru-enterprise
-      description: |
-        Permissive default for ZaruTier::Enterprise dispatches.
+      description: "Read-only default for Enterprise dispatches: host facts only."
       capabilities:
-        - tool_pattern: "*"
+        - tool_pattern: "host.facts"
       deny_list: []
