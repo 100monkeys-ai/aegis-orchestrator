@@ -267,6 +267,26 @@ impl NodeClusterService for EdgeOnlyClusterService {
     > {
         Err(tonic::Status::unimplemented("cancel_execution"))
     }
+
+    type StreamClusterEventsStream = Pin<
+        Box<
+            dyn Stream<
+                    Item = Result<
+                        aegis_orchestrator_core::infrastructure::aegis_cluster_proto::ClusterEventEnvelope,
+                        Status,
+                    >,
+                > + Send,
+        >,
+    >;
+
+    async fn stream_cluster_events(
+        &self,
+        _r: Request<
+            aegis_orchestrator_core::infrastructure::aegis_cluster_proto::StreamClusterEventsRequest,
+        >,
+    ) -> Result<Response<Self::StreamClusterEventsStream>, Status> {
+        Err(Status::unimplemented("stream_cluster_events"))
+    }
 }
 
 mod keyed_transit {
