@@ -3205,6 +3205,13 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             Some(workflow_execution_repo.clone()),
         )),
         cluster_repo: cluster_repo.clone(),
+        cluster_overview: db_pool.as_ref().map(|pool| {
+            Arc::new(
+                aegis_orchestrator_core::infrastructure::cluster::overview::PgClusterOverview::new(
+                    pool.clone(),
+                ),
+            )
+        }),
         event_bus: event_bus.clone(),
         inner_loop_service: inner_loop_service.clone(),
         llm_registry,

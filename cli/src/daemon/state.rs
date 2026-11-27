@@ -40,6 +40,9 @@ pub(crate) struct AppState {
         Arc<dyn aegis_orchestrator_core::domain::repository::ExecutionRepository>,
     pub(crate) correlated_activity_stream_service: Arc<CorrelatedActivityStreamService>,
     pub(crate) cluster_repo: Option<Arc<dyn NodeClusterRepository>>,
+    /// The operator's cluster view (ADR-152). `None` without a Postgres pool.
+    pub(crate) cluster_overview:
+        Option<Arc<aegis_orchestrator_core::infrastructure::cluster::overview::PgClusterOverview>>,
     pub(crate) event_bus: Arc<EventBus>,
     pub(crate) inner_loop_service:
         Arc<aegis_orchestrator_core::application::inner_loop_service::InnerLoopService>,

@@ -922,6 +922,12 @@ pub struct MetricsConfig {
     /// Metrics path (e.g., "/metrics")
     #[serde(default = "default_metrics_path")]
     pub path: String,
+
+    /// The cluster Prometheus the operator graphs are read from (ADR-152),
+    /// e.g. `http://10.121.0.1:9090`; `env:VAR` resolves at use. Absent: the
+    /// metrics endpoint answers that no metrics source is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -394,6 +394,7 @@ async fn joined(pool: &PgPool) -> NodeProcess {
             vrack_address: Some("10.120.0.7".to_string()),
             lease_ttl: std::time::Duration::from_secs(15),
             max_executions: None,
+            display_name: None,
         })
         .await
         .unwrap();
@@ -641,6 +642,7 @@ async fn node_with(pool: &PgPool, capacity: Option<u32>, unfinished: usize) -> N
             vrack_address: None,
             lease_ttl: std::time::Duration::from_secs(15),
             max_executions: capacity,
+            display_name: None,
         })
         .await
         .unwrap();
@@ -953,4 +955,23 @@ async fn a_fleet_command_is_found_on_its_member_until_it_ends() {
     owners.release(id).await.unwrap();
     assert_eq!(owners.owner_of(id).await.unwrap(), None);
     db.drop().await;
+}
+
+#[test]
+fn the_cluster_overview_statements_and_migration_065_pass_pg_strict() {
+    use aegis_orchestrator_core::infrastructure::cluster::overview::{
+        DUTIES_SQL, EXECUTIONS_SQL, MEMBERS_SQL,
+    };
+    let migration = MIGRATOR
+        .iter()
+        .find(|m| m.version == 65)
+        .expect("migration 065 ships");
+    for sql in [
+        MEMBERS_SQL,
+        DUTIES_SQL,
+        EXECUTIONS_SQL,
+        migration.sql.as_ref(),
+    ] {
+        assert!(unbounded_writes(sql).is_empty(), "{sql}");
+    }
 }

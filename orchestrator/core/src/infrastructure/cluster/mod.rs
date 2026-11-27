@@ -12,6 +12,7 @@ pub mod grpc_server;
 pub mod membership_repo;
 pub mod node_envelope;
 pub mod node_registry_repo;
+pub mod overview;
 pub mod peer_transport;
 pub mod postgres_repo;
 pub mod round_robin_router;
