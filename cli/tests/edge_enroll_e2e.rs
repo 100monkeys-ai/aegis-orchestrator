@@ -279,6 +279,26 @@ impl NodeClusterService for ScriptedStub {
     > {
         Err(tonic::Status::unimplemented("cancel_execution"))
     }
+
+    type StreamClusterEventsStream = std::pin::Pin<
+        Box<
+            dyn tokio_stream::Stream<
+                    Item = Result<
+                        aegis_orchestrator_core::infrastructure::aegis_cluster_proto::ClusterEventEnvelope,
+                        tonic::Status,
+                    >,
+                > + Send,
+        >,
+    >;
+
+    async fn stream_cluster_events(
+        &self,
+        _r: tonic::Request<
+            aegis_orchestrator_core::infrastructure::aegis_cluster_proto::StreamClusterEventsRequest,
+        >,
+    ) -> Result<tonic::Response<Self::StreamClusterEventsStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("stream_cluster_events"))
+    }
 }
 
 // ---------------------------------------------------------------------------

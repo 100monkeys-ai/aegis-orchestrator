@@ -106,6 +106,11 @@ fn domain_event_type(event: &DomainEvent) -> &'static str {
     }
 }
 
+/// The event's category, as the relay names it (ADR-152 D3).
+pub fn category_of(event: &DomainEvent) -> &'static str {
+    domain_event_type(event)
+}
+
 /// Unified domain event type for the event bus
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
@@ -1108,10 +1113,52 @@ impl DomainEvent {
     }
 }
 
-/// Event bus for publishing and subscribing to domain events
+/// Where an event came from (AEGIS ADR-152 D3): the node and process that
+/// published it, and its place in that process's sequence of relayed
+/// events (one more each, from 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventOrigin {
+    pub node_id: uuid::Uuid,
+    pub incarnation: i64,
+    pub seq: u64,
+}
+
+/// The categories the cluster event relay carries to every peer (ADR-152
+/// D3): the ones a subscriber on another node acts on, such as SSE for
+/// executions, workflows and canvas sessions, and volume deregistration.
+pub fn relayed_category(event: &DomainEvent) -> bool {
+    matches!(
+        event,
+        DomainEvent::Execution(_)
+            | DomainEvent::Workflow(_)
+            | DomainEvent::Canvas(_)
+            | DomainEvent::Volume(_)
+    )
+}
+
+/// One message on the local bus: the event, its origin when it belongs to a
+/// relayed category on a clustered node, and whether it came from a peer.
+#[derive(Clone)]
+struct BusItem {
+    event: DomainEvent,
+    origin: Option<EventOrigin>,
+    relayed: bool,
+}
+
+/// Event bus for publishing and subscribing to domain events.
+///
+/// ADR-152 D3: on a node that has joined a cluster, each event of a relayed
+/// category this process publishes carries an [`EventOrigin`], and events
+/// relayed from peers are republished here with theirs intact. Subscribers
+/// declare a scope: [`EventBus::subscribe`] is origin-only (it never sees a
+/// relayed copy, so a persister or indexer acts once per event); the
+/// per-execution, per-workflow and per-agent receivers and
+/// [`EventBus::subscribe_cluster_wide`] see every copy.
 #[derive(Clone)]
 pub struct EventBus {
-    sender: Arc<broadcast::Sender<DomainEvent>>,
+    sender: Arc<broadcast::Sender<BusItem>>,
+    process: Arc<std::sync::OnceLock<(uuid::Uuid, i64)>>,
+    seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl EventBus {
@@ -1122,6 +1169,8 @@ impl EventBus {
         let (sender, _) = broadcast::channel(capacity);
         Self {
             sender: Arc::new(sender),
+            process: Arc::new(std::sync::OnceLock::new()),
+            seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -1263,12 +1312,44 @@ impl EventBus {
         self.publish(DomainEvent::Goal(event));
     }
 
+    /// Name the process that publishes on this bus (ADR-152 D3), once it
+    /// has joined the cluster. From then on its events of the relayed
+    /// categories carry an origin. A second call changes nothing.
+    pub fn set_origin(&self, node_id: uuid::Uuid, incarnation: i64) {
+        let _ = self.process.set((node_id, incarnation));
+    }
+
+    /// Republish an event a peer relayed (ADR-152 D3), its origin intact.
+    /// Origin-only subscribers never see it.
+    pub fn publish_relayed(&self, event: DomainEvent, origin: EventOrigin) {
+        metrics::counter!("aegis_cluster_events_relayed_in_total", "event_type" => domain_event_type(&event))
+            .increment(1);
+        let _ = self.sender.send(BusItem {
+            event,
+            origin: Some(origin),
+            relayed: true,
+        });
+    }
+
     /// Publish a domain event to all subscribers
     fn publish(&self, event: DomainEvent) {
         let event_type = domain_event_type(&event);
         metrics::counter!("aegis_event_bus_published_total", "event_type" => event_type)
             .increment(1);
-        if self.sender.send(event).is_err() {
+        let origin = match self.process.get() {
+            Some(&(node_id, incarnation)) if relayed_category(&event) => Some(EventOrigin {
+                node_id,
+                incarnation,
+                seq: self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1,
+            }),
+            _ => None,
+        };
+        let item = BusItem {
+            event,
+            origin,
+            relayed: false,
+        };
+        if self.sender.send(item).is_err() {
             metrics::counter!(
                 "aegis_event_bus_delivery_failures_total",
                 "reason" => "no_receivers"
@@ -1281,7 +1362,27 @@ impl EventBus {
     /// Returns a receiver that can be used to listen for events
     pub fn subscribe(&self) -> EventReceiver {
         let receiver = self.sender.subscribe();
-        EventReceiver { receiver }
+        EventReceiver {
+            receiver,
+            cluster_wide: false,
+        }
+    }
+
+    /// Subscribe to every domain event, those relayed from peers included
+    /// (ADR-152 D3: a cluster-wide subscriber).
+    pub fn subscribe_cluster_wide(&self) -> EventReceiver {
+        EventReceiver {
+            receiver: self.sender.subscribe(),
+            cluster_wide: true,
+        }
+    }
+
+    /// The events this process originates in the relayed categories, each
+    /// with its origin (ADR-152 D3): what the relay streams to peers.
+    pub fn subscribe_origin(&self) -> OriginEventReceiver {
+        OriginEventReceiver {
+            receiver: self.sender.subscribe(),
+        }
     }
 
     /// Subscribe and filter for specific execution ID
@@ -1335,52 +1436,36 @@ impl EventBus {
 
 /// Receiver for all domain events
 pub struct EventReceiver {
-    receiver: broadcast::Receiver<DomainEvent>,
+    receiver: broadcast::Receiver<BusItem>,
+    cluster_wide: bool,
+}
+
+/// The relayed-category events this process originates (ADR-152 D3).
+pub struct OriginEventReceiver {
+    receiver: broadcast::Receiver<BusItem>,
+}
+
+impl OriginEventReceiver {
+    /// The next one, with its origin. `Lagged` means events were missed:
+    /// the relay closes its stream and the peer resynchronises.
+    pub async fn recv(&mut self) -> Result<(EventOrigin, DomainEvent), EventBusError> {
+        loop {
+            let item = self.receiver.recv().await.map_err(|e| match e {
+                broadcast::error::RecvError::Closed => EventBusError::Closed,
+                broadcast::error::RecvError::Lagged(n) => EventBusError::Lagged(n),
+            })?;
+            if let (false, Some(origin)) = (item.relayed, item.origin) {
+                return Ok((origin, item.event));
+            }
+        }
+    }
 }
 
 impl EventReceiver {
     /// Receive the next event (blocks until event is available)
     pub async fn recv(&mut self) -> Result<DomainEvent, EventBusError> {
-        self.receiver.recv().await.map_err(|e| match e {
-            broadcast::error::RecvError::Closed => EventBusError::Closed,
-            broadcast::error::RecvError::Lagged(n) => {
-                warn!("Event receiver lagged by {} events", n);
-                metrics::gauge!("aegis_event_bus_subscriber_lag").set(n as f64);
-                EventBusError::Lagged(n)
-            }
-        })
-    }
-
-    /// Try to receive an event without blocking
-    pub fn try_recv(&mut self) -> Result<DomainEvent, EventBusError> {
-        self.receiver.try_recv().map_err(|e| match e {
-            broadcast::error::TryRecvError::Empty => EventBusError::Empty,
-            broadcast::error::TryRecvError::Closed => EventBusError::Closed,
-            broadcast::error::TryRecvError::Lagged(n) => {
-                warn!("Event receiver lagged by {} events", n);
-                metrics::gauge!("aegis_event_bus_subscriber_lag").set(n as f64);
-                EventBusError::Lagged(n)
-            }
-        })
-    }
-}
-
-/// Receiver for execution-specific events (filtered)
-pub struct ExecutionEventReceiver {
-    receiver: broadcast::Receiver<DomainEvent>,
-    execution_id: crate::domain::execution::ExecutionId,
-}
-
-/// Receiver for all domain events correlated to a specific execution.
-pub struct ExecutionDomainEventReceiver {
-    receiver: broadcast::Receiver<DomainEvent>,
-    execution_id: crate::domain::execution::ExecutionId,
-}
-
-impl ExecutionDomainEventReceiver {
-    pub async fn recv(&mut self) -> Result<DomainEvent, EventBusError> {
         loop {
-            let event = self.receiver.recv().await.map_err(|e| match e {
+            let item = self.receiver.recv().await.map_err(|e| match e {
                 broadcast::error::RecvError::Closed => EventBusError::Closed,
                 broadcast::error::RecvError::Lagged(n) => {
                     warn!("Event receiver lagged by {} events", n);
@@ -1388,6 +1473,59 @@ impl ExecutionDomainEventReceiver {
                     EventBusError::Lagged(n)
                 }
             })?;
+            if self.cluster_wide || !item.relayed {
+                return Ok(item.event);
+            }
+        }
+    }
+
+    /// Try to receive an event without blocking
+    pub fn try_recv(&mut self) -> Result<DomainEvent, EventBusError> {
+        loop {
+            let item = self.receiver.try_recv().map_err(|e| match e {
+                broadcast::error::TryRecvError::Empty => EventBusError::Empty,
+                broadcast::error::TryRecvError::Closed => EventBusError::Closed,
+                broadcast::error::TryRecvError::Lagged(n) => {
+                    warn!("Event receiver lagged by {} events", n);
+                    metrics::gauge!("aegis_event_bus_subscriber_lag").set(n as f64);
+                    EventBusError::Lagged(n)
+                }
+            })?;
+            if self.cluster_wide || !item.relayed {
+                return Ok(item.event);
+            }
+        }
+    }
+}
+
+/// Receiver for execution-specific events (filtered)
+pub struct ExecutionEventReceiver {
+    receiver: broadcast::Receiver<BusItem>,
+    execution_id: crate::domain::execution::ExecutionId,
+}
+
+/// Receiver for all domain events correlated to a specific execution.
+pub struct ExecutionDomainEventReceiver {
+    receiver: broadcast::Receiver<BusItem>,
+    execution_id: crate::domain::execution::ExecutionId,
+}
+
+impl ExecutionDomainEventReceiver {
+    pub async fn recv(&mut self) -> Result<DomainEvent, EventBusError> {
+        loop {
+            let event = self
+                .receiver
+                .recv()
+                .await
+                .map_err(|e| match e {
+                    broadcast::error::RecvError::Closed => EventBusError::Closed,
+                    broadcast::error::RecvError::Lagged(n) => {
+                        warn!("Event receiver lagged by {} events", n);
+                        metrics::gauge!("aegis_event_bus_subscriber_lag").set(n as f64);
+                        EventBusError::Lagged(n)
+                    }
+                })?
+                .event;
 
             if event.execution_id() == Some(self.execution_id) {
                 return Ok(event);
@@ -1401,14 +1539,19 @@ impl ExecutionEventReceiver {
     /// Filters out events from other executions
     pub async fn recv(&mut self) -> Result<ExecutionEvent, EventBusError> {
         loop {
-            let event = self.receiver.recv().await.map_err(|e| match e {
-                broadcast::error::RecvError::Closed => EventBusError::Closed,
-                broadcast::error::RecvError::Lagged(n) => {
-                    warn!("Event receiver lagged by {} events", n);
-                    metrics::gauge!("aegis_event_bus_subscriber_lag").set(n as f64);
-                    EventBusError::Lagged(n)
-                }
-            })?;
+            let event = self
+                .receiver
+                .recv()
+                .await
+                .map_err(|e| match e {
+                    broadcast::error::RecvError::Closed => EventBusError::Closed,
+                    broadcast::error::RecvError::Lagged(n) => {
+                        warn!("Event receiver lagged by {} events", n);
+                        metrics::gauge!("aegis_event_bus_subscriber_lag").set(n as f64);
+                        EventBusError::Lagged(n)
+                    }
+                })?
+                .event;
 
             // Filter for execution events matching our ID
             if let DomainEvent::Execution(exec_event) = event {
@@ -1502,7 +1645,7 @@ impl ExecutionEventReceiver {
 
 /// Filtered receiver for workflow-execution–scoped domain events.
 pub struct WorkflowEventReceiver {
-    receiver: broadcast::Receiver<DomainEvent>,
+    receiver: broadcast::Receiver<BusItem>,
     execution_id: crate::domain::execution::ExecutionId,
 }
 
@@ -1512,7 +1655,10 @@ impl WorkflowEventReceiver {
     pub async fn recv(&mut self) -> Result<crate::domain::events::WorkflowEvent, EventBusError> {
         loop {
             match self.receiver.recv().await {
-                Ok(DomainEvent::Workflow(ev)) => {
+                Ok(BusItem {
+                    event: DomainEvent::Workflow(ev),
+                    ..
+                }) => {
                     if self.matches_execution(&ev) {
                         return Ok(ev);
                     }
@@ -1552,7 +1698,7 @@ impl WorkflowEventReceiver {
 
 /// Receiver for agent-specific events (filtered)
 pub struct AgentEventReceiver {
-    receiver: broadcast::Receiver<DomainEvent>,
+    receiver: broadcast::Receiver<BusItem>,
     agent_id: crate::domain::agent::AgentId,
 }
 
@@ -1560,14 +1706,19 @@ impl AgentEventReceiver {
     /// Receive the next event for the specified agent ID
     pub async fn recv(&mut self) -> Result<DomainEvent, EventBusError> {
         loop {
-            let event = self.receiver.recv().await.map_err(|e| match e {
-                broadcast::error::RecvError::Closed => EventBusError::Closed,
-                broadcast::error::RecvError::Lagged(n) => {
-                    warn!("Event receiver lagged by {} events", n);
-                    metrics::gauge!("aegis_event_bus_subscriber_lag").set(n as f64);
-                    EventBusError::Lagged(n)
-                }
-            })?;
+            let event = self
+                .receiver
+                .recv()
+                .await
+                .map_err(|e| match e {
+                    broadcast::error::RecvError::Closed => EventBusError::Closed,
+                    broadcast::error::RecvError::Lagged(n) => {
+                        warn!("Event receiver lagged by {} events", n);
+                        metrics::gauge!("aegis_event_bus_subscriber_lag").set(n as f64);
+                        EventBusError::Lagged(n)
+                    }
+                })?
+                .event;
 
             if self.matches_agent(&event) {
                 return Ok(event);

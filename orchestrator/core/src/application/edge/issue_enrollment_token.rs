@@ -561,6 +561,25 @@ mod tests {
             > {
                 Err(tonic::Status::unimplemented("cancel_execution"))
             }
+            type StreamClusterEventsStream = Pin<
+                Box<
+                    dyn Stream<
+                            Item = Result<
+                                crate::infrastructure::aegis_cluster_proto::ClusterEventEnvelope,
+                                Status,
+                            >,
+                        > + Send,
+                >,
+            >;
+            async fn stream_cluster_events(
+                &self,
+                _r: tonic::Request<
+                    crate::infrastructure::aegis_cluster_proto::StreamClusterEventsRequest,
+                >,
+            ) -> Result<tonic::Response<Self::StreamClusterEventsStream>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("stream_cluster_events"))
+            }
             type ConnectEdgeStream =
                 Pin<Box<dyn Stream<Item = Result<EdgeCommand, Status>> + Send>>;
             async fn connect_edge(

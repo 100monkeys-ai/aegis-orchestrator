@@ -231,6 +231,34 @@ impl GrpcPeerTransport {
     }
 }
 
+impl GrpcPeerTransport {
+    /// Subscribe to the relayed-category events the node at `address`
+    /// originates (ADR-152 D3).
+    pub async fn stream_cluster_events(
+        &self,
+        address: &str,
+        from: NodeProcess,
+    ) -> Result<tonic::Streaming<crate::infrastructure::aegis_cluster_proto::ClusterEventEnvelope>>
+    {
+        let inner = crate::infrastructure::aegis_cluster_proto::StreamClusterEventsInner {
+            node_id: from.node_id.0.to_string(),
+            incarnation: from.incarnation.0,
+        };
+        let envelope = self.envelope(inner.encode_to_vec()).await?;
+        Ok(self
+            .client(address)
+            .await?
+            .stream_cluster_events(
+                crate::infrastructure::aegis_cluster_proto::StreamClusterEventsRequest {
+                    envelope: Some(envelope),
+                },
+            )
+            .await
+            .with_context(|| format!("StreamClusterEvents {address}"))?
+            .into_inner())
+    }
+}
+
 /// Forwards a cancel to the owner at the cluster address it registered
 /// (`cluster_nodes.grpc_address`), over the peer transport's mutual TLS and
 /// SEAL node envelope (ADR-152 D5.4).

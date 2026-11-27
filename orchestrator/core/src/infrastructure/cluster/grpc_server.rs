@@ -94,7 +94,14 @@ pub struct NodeClusterServiceHandler {
     /// The owner's side of a forwarded cancel (ADR-152 D5.4): present on a
     /// node that runs executions.
     canceller: Option<Arc<dyn crate::application::cluster::OwnedExecutionCanceller>>,
+    /// The local bus whose relayed-category events this node streams to its
+    /// peers (ADR-152 D3); present on a joined node.
+    event_bus: Option<crate::infrastructure::event_bus::EventBus>,
 }
+
+/// How many envelopes a peer's stream may hold before it is closed and the
+/// peer resynchronises (ADR-152 D3.6).
+pub const RELAY_OUTBOUND_QUEUE: usize = 4096;
 
 impl NodeClusterServiceHandler {
     #[allow(clippy::too_many_arguments)]
@@ -127,6 +134,7 @@ impl NodeClusterServiceHandler {
             grpc_auth: None,
             membership: None,
             canceller: None,
+            event_bus: None,
         }
     }
 
@@ -162,6 +170,15 @@ impl NodeClusterServiceHandler {
         canceller: Arc<dyn crate::application::cluster::OwnedExecutionCanceller>,
     ) -> Self {
         self.canceller = Some(canceller);
+        self
+    }
+
+    /// ADR-152 D3: stream this node's relayed-category events to its peers.
+    pub fn with_event_relay(
+        mut self,
+        event_bus: crate::infrastructure::event_bus::EventBus,
+    ) -> Self {
+        self.event_bus = Some(event_bus);
         self
     }
 
@@ -535,6 +552,79 @@ impl NodeClusterService for NodeClusterServiceHandler {
             target_node_id: resp.target_node_id.0.to_string(),
             worker_grpc_address: resp.worker_grpc_address,
         }))
+    }
+
+    type StreamClusterEventsStream = Pin<
+        Box<
+            dyn Stream<
+                    Item = Result<
+                        crate::infrastructure::aegis_cluster_proto::ClusterEventEnvelope,
+                        Status,
+                    >,
+                > + Send,
+        >,
+    >;
+
+    /// ADR-152 D3: this node's relayed-category events, as it publishes
+    /// them, to a peer. A full queue or a lagged bus receiver ends the
+    /// stream; the peer resynchronises and subscribes again.
+    async fn stream_cluster_events(
+        &self,
+        request: Request<crate::infrastructure::aegis_cluster_proto::StreamClusterEventsRequest>,
+    ) -> Result<Response<Self::StreamClusterEventsStream>, Status> {
+        let (caller, _inner): (
+            NodeId,
+            crate::infrastructure::aegis_cluster_proto::StreamClusterEventsInner,
+        ) = self
+            .authenticate_node(request.into_inner().envelope)
+            .await?;
+        self.membership()?;
+        let Some(bus) = self.event_bus.as_ref() else {
+            return Err(Status::failed_precondition("this node relays no events"));
+        };
+        let mut events = bus.subscribe_origin();
+        let (tx, rx) = tokio::sync::mpsc::channel(RELAY_OUTBOUND_QUEUE);
+        tracing::info!(peer = %caller, "Peer subscribed to the cluster event relay");
+        tokio::spawn(async move {
+            loop {
+                let (origin, event) = match events.recv().await {
+                    Ok(next) => next,
+                    Err(e) => {
+                        tracing::warn!(peer = %caller, error = %e, "Closing the event relay to a peer");
+                        metrics::counter!("aegis_cluster_relay_streams_closed_total", "reason" => "lagged")
+                            .increment(1);
+                        return;
+                    }
+                };
+                let event_json = match serde_json::to_vec(&event) {
+                    Ok(json) => json,
+                    Err(e) => {
+                        tracing::error!(error = %e, "An event did not serialise for the relay");
+                        continue;
+                    }
+                };
+                let envelope = crate::infrastructure::aegis_cluster_proto::ClusterEventEnvelope {
+                    origin_node_id: origin.node_id.to_string(),
+                    origin_incarnation: origin.incarnation,
+                    origin_seq: origin.seq,
+                    category: crate::infrastructure::event_bus::category_of(&event).to_string(),
+                    event_json,
+                };
+                match tx.try_send(Ok(envelope)) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(peer = %caller, "The peer's relay queue is full; closing its stream");
+                        metrics::counter!("aegis_cluster_relay_streams_closed_total", "reason" => "queue_full")
+                            .increment(1);
+                        return;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
 
     type ForwardExecutionStream =
