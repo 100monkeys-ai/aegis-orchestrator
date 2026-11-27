@@ -379,6 +379,32 @@ async fn connect_once(cfg: &EdgeLifecycleConfig) -> Result<()> {
     Ok(())
 }
 
+/// A tool result carried as structured data (ADR-157 D2: per-resource
+/// outcomes and diffs).
+fn structured(value: serde_json::Value, ok: bool) -> EdgeResult {
+    let summary = value.to_string().into_bytes();
+    EdgeResult {
+        ok,
+        exit_code: if ok { 0 } else { 1 },
+        stdout: summary,
+        stderr: Vec::new(),
+        structured_result: aegis_orchestrator_core::application::edge::json_value_to_prost_struct(
+            value,
+        )
+        .ok(),
+        error_kind: if ok {
+            String::new()
+        } else {
+            "host_state_failed".to_string()
+        },
+        error_message: if ok {
+            String::new()
+        } else {
+            "one or more resources failed".to_string()
+        },
+    }
+}
+
 fn error_result(kind: &str, message: impl Into<String>) -> EdgeResult {
     EdgeResult {
         ok: false,
@@ -550,6 +576,27 @@ async fn handle_invoke_tool(
     }
 
     // 4. Local builtin dispatch.
+    // ADR-157 D3: host state. The security context evaluated above decides
+    // who may reach these; the managed hosts' configuration declares one
+    // (`host-admin`) that allows them.
+    if inv.tool_name == "host.facts" {
+        return structured(crate::daemon::edge_host::facts().await, true);
+    }
+    if inv.tool_name == "host.apply" {
+        let Some(state) = args_json.get("state") else {
+            return error_result(
+                "envelope_invalid",
+                "host.apply: missing required arg 'state'",
+            );
+        };
+        let check = args_json
+            .get("check")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let report = crate::daemon::edge_host::apply(state, check).await;
+        let ok = report.get("failed").and_then(|v| v.as_u64()) == Some(0);
+        return structured(report, ok);
+    }
     if inv.tool_name == "cmd.run" {
         return run_local_cmd(session, tx, node_id_str, stream_id, inv, &args_json).await;
     }
