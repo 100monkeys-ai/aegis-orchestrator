@@ -3698,7 +3698,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         ),
                         member,
                     );
-                    tracing::info!(member = %member, "Edge streams recorded as this member's (ADR-152 D8)");
+                    tracing::info!(member = %member, "Edge streams recorded as this member's");
                 }
                 let connect_edge_service = Arc::new(connect_edge);
                 let rotate_edge_key_service = Arc::new(RotateEdgeKeyService::with_default_ttl(
