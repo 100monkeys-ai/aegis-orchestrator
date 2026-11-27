@@ -313,7 +313,7 @@ pub trait ExecutionService: Send + Sync {
     /// ended the iteration's model call at its time limit.
     ///
     /// The default implementation is a no-op; `StandardExecutionService`
-    /// persists the refinement and `ClusterAwareExecutionService` delegates.
+    /// persists the refinement.
     async fn record_refinement(
         &self,
         _execution_id: ExecutionId,
@@ -329,7 +329,7 @@ pub trait ExecutionService: Send + Sync {
     /// the try.
     ///
     /// The default implementation is a no-op; `StandardExecutionService`
-    /// persists it and `ClusterAwareExecutionService` delegates.
+    /// persists it.
     async fn record_constructed_history(
         &self,
         _execution_id: ExecutionId,
@@ -551,6 +551,9 @@ pub struct StandardExecutionService {
     /// On a cluster node: this node, and how a cancel reaches another owner
     /// (ADR-152 D5.4). Set once the node has joined.
     cluster_cancel: Arc<std::sync::OnceLock<ClusterCancel>>,
+    /// On a cluster node with an advertised capacity: where a new execution
+    /// goes when this node is full or draining (ADR-152 D5.3).
+    cluster_placement: Arc<std::sync::OnceLock<crate::application::cluster::ClusterPlacement>>,
     /// Set when this node begins to drain (ADR-152 D5.9): no new execution
     /// starts here; children of runs in flight still do.
     draining: Arc<std::sync::atomic::AtomicBool>,
@@ -904,6 +907,66 @@ impl StandardExecutionService {
             .map_err(|_| anyhow!("cluster cancel is already set"))
     }
 
+    /// New executions go to a peer with room when this node is full or
+    /// draining (ADR-152 D5.3).
+    pub fn set_cluster_placement(
+        &self,
+        placement: crate::application::cluster::ClusterPlacement,
+    ) -> Result<()> {
+        self.cluster_placement
+            .set(placement)
+            .map_err(|_| anyhow!("cluster placement is already set"))
+    }
+
+    /// ADR-152 D5.3: start a new execution on a peer when this node is full
+    /// or draining. A failed forward starts it here under the id it was sent
+    /// with: a peer that did claim it then fences this node's claim, so it
+    /// never runs twice.
+    async fn place_on_peer(
+        &self,
+        agent_id: AgentId,
+        input: &ExecutionInput,
+        security_context_name: &str,
+        identity: Option<&UserIdentity>,
+    ) -> Placed {
+        let Some(placement) = self.cluster_placement.get() else {
+            return Placed::Here(None);
+        };
+        let draining = self.draining.load(std::sync::atomic::Ordering::SeqCst);
+        let peer = match placement.choose(draining).await {
+            Ok(Some(peer)) => peer,
+            Ok(None) => return Placed::Here(None),
+            Err(e) => {
+                tracing::warn!(error = %e, "Placement could not read the cluster; starting here");
+                return Placed::Here(None);
+            }
+        };
+        let Ok(tenant_id) = Self::resolve_tenant_from_input(input) else {
+            return Placed::Here(None);
+        };
+        let execution_id = ExecutionId::new();
+        let start = crate::application::cluster::ForwardedStart {
+            execution_id,
+            agent_id,
+            input: input.clone(),
+            tenant_id,
+            security_context_name: security_context_name.to_string(),
+            caller: identity.cloned(),
+        };
+        match placement.forwarder.forward(&peer, &start).await {
+            Ok(owner) => {
+                metrics::counter!("aegis_cluster_executions_forwarded_total").increment(1);
+                tracing::info!(execution_id = %execution_id, owner = %owner, draining, "Execution placed on a peer");
+                Placed::OnPeer(execution_id)
+            }
+            Err(e) => {
+                metrics::counter!("aegis_cluster_forward_failures_total").increment(1);
+                tracing::warn!(execution_id = %execution_id, peer = %peer.node_id, error = %e, "Forward failed; starting here");
+                Placed::Here(Some(execution_id))
+            }
+        }
+    }
+
     /// On a cluster node, while a run is live: stop it when a cancel is
     /// recorded on it (ADR-152 D5.4), which is how a cancel whose forward
     /// never arrived still reaches its supervisor. Polls every
@@ -1053,6 +1116,7 @@ impl StandardExecutionService {
             runtime_registry: None,
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
             cluster_cancel: Arc::new(std::sync::OnceLock::new()),
+            cluster_placement: Arc::new(std::sync::OnceLock::new()),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             child_executor: std::sync::OnceLock::new(),
             context_bindings: std::sync::OnceLock::new(),
@@ -1326,6 +1390,14 @@ pub(crate) fn person_sub(identity: Option<&UserIdentity>) -> Option<String> {
 #[derive(Debug, thiserror::Error)]
 #[error("this node is draining and starts no new executions; try again, another node takes it")]
 pub struct NodeDraining;
+
+/// Where placement put a new execution (ADR-152 D5.3).
+enum Placed {
+    /// A peer claimed it.
+    OnPeer(ExecutionId),
+    /// It starts here, under the id a failed forward used, if any.
+    Here(Option<ExecutionId>),
+}
 
 /// What a drain did (ADR-152 D5.9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9618,7 +9690,14 @@ impl ExecutionService for StandardExecutionService {
         security_context_name: String,
         identity: Option<&UserIdentity>,
     ) -> Result<ExecutionId> {
-        self.do_start_execution(None, agent_id, input, security_context_name, identity)
+        let imported = match self
+            .place_on_peer(agent_id, &input, &security_context_name, identity)
+            .await
+        {
+            Placed::OnPeer(id) => return Ok(id),
+            Placed::Here(imported) => imported,
+        };
+        self.do_start_execution(imported, agent_id, input, security_context_name, identity)
             .await
     }
 

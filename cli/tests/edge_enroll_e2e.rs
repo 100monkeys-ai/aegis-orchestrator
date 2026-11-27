@@ -48,7 +48,6 @@ use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::{
     RegisterNodeRequest, RegisterNodeResponse, RotateEdgeKeyRequest, RotateEdgeKeyResponse,
     RouteExecutionRequest, RouteExecutionResponse, SyncConfigRequest, SyncConfigResponse,
 };
-use aegis_orchestrator_core::infrastructure::aegis_runtime_proto::ExecutionEvent;
 
 // ---------------------------------------------------------------------------
 // Scripted NodeClusterService stub
@@ -200,12 +199,15 @@ impl NodeClusterService for ScriptedStub {
     ) -> Result<Response<RouteExecutionResponse>, Status> {
         Err(Status::unimplemented("route_execution"))
     }
-    type ForwardExecutionStream =
-        Pin<Box<dyn Stream<Item = Result<ExecutionEvent, Status>> + Send>>;
     async fn forward_execution(
         &self,
         _r: Request<ForwardExecutionRequest>,
-    ) -> Result<Response<Self::ForwardExecutionStream>, Status> {
+    ) -> Result<
+        Response<
+            aegis_orchestrator_core::infrastructure::aegis_cluster_proto::ForwardExecutionResponse,
+        >,
+        Status,
+    > {
         Err(Status::unimplemented("forward_execution"))
     }
     async fn sync_config(

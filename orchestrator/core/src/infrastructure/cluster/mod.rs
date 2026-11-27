@@ -6,7 +6,6 @@ pub mod adoption_repo;
 pub mod cluster_tls;
 pub mod config_repo;
 pub mod enrolment_token_repo;
-pub mod event_mapper;
 pub mod event_relay;
 pub mod grpc_client;
 pub mod grpc_server;
@@ -29,7 +28,9 @@ pub use node_envelope::{
     ClusterNodeKeys, EdgeDaemonKeys, EnvelopeError, NodeEnvelopeVerifier, NodeKeys,
 };
 pub use node_registry_repo::PgNodeRegistryRepository;
-pub use peer_transport::{GrpcCancelForwarder, GrpcPeerTransport, SelfIssuedToken};
+pub use peer_transport::{
+    GrpcCancelForwarder, GrpcExecutionForwarder, GrpcPeerTransport, SelfIssuedToken,
+};
 pub use postgres_repo::{
     PgNodeChallengeRepository, PgNodeClusterRepository, PgStimulusIdempotencyRepository,
 };
