@@ -1468,7 +1468,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // their corresponding storage has been cleaned up.
     {
         let nfs_deregister_gateway = nfs_gateway.clone();
-        let mut nfs_deregister_sub = event_bus.subscribe();
+        // ADR-152 D7.3: cluster-wide, so a volume deleted or expired through
+        // any member is unexported on every member.
+        let mut nfs_deregister_sub = event_bus.subscribe_cluster_wide();
         tokio::spawn(async move {
             loop {
                 match nfs_deregister_sub.recv().await {
