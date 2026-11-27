@@ -591,6 +591,19 @@ mod tests {
             > {
                 Err(tonic::Status::unimplemented("invoke_edge_tool"))
             }
+            async fn cancel_fleet_command(
+                &self,
+                _r: tonic::Request<
+                    crate::infrastructure::aegis_cluster_proto::CancelFleetCommandRequest,
+                >,
+            ) -> Result<
+                tonic::Response<
+                    crate::infrastructure::aegis_cluster_proto::CancelFleetCommandResponse,
+                >,
+                tonic::Status,
+            > {
+                Err(tonic::Status::unimplemented("cancel_fleet_command"))
+            }
             type ConnectEdgeStream =
                 Pin<Box<dyn Stream<Item = Result<EdgeCommand, Status>> + Send>>;
             async fn connect_edge(

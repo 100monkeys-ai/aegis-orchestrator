@@ -41,9 +41,18 @@ impl<'a> FleetCancelAuthority<'a> {
     }
 }
 
+/// Sends a fleet cancel to the member running the command (ADR-152 D4.7).
+#[async_trait::async_trait]
+pub trait FleetCancelForwarder: Send + Sync {
+    /// `tenant`: the tenant the cancel is authorised for; `None` for a
+    /// writing operator. `true` when the owner accepted it.
+    async fn forward(&self, fleet_id: FleetCommandId, tenant: Option<&TenantId>) -> bool;
+}
+
 pub struct CancelFleetService {
     registry: FleetRegistry,
     conn_registry: EdgeConnectionRegistry,
+    remote: std::sync::OnceLock<std::sync::Arc<dyn FleetCancelForwarder>>,
 }
 
 impl CancelFleetService {
@@ -51,7 +60,29 @@ impl CancelFleetService {
         Self {
             registry,
             conn_registry,
+            remote: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The registry of the fleet commands this member runs.
+    pub fn registry(&self) -> &FleetRegistry {
+        &self.registry
+    }
+
+    /// ADR-152 D4.7: a command this member does not run is cancelled on the
+    /// member that does.
+    pub fn set_remote(&self, remote: std::sync::Arc<dyn FleetCancelForwarder>) {
+        let _ = self.remote.set(remote);
+    }
+
+    /// A cancel a peer forwarded here (CancelFleetCommand): this member's
+    /// commands only, never forwarded again.
+    pub async fn cancel_forwarded(
+        &self,
+        fleet_id: FleetCommandId,
+        authority: FleetCancelAuthority<'_>,
+    ) -> bool {
+        self.cancel_local(fleet_id, authority).await
     }
 
     /// Cancel `fleet_id` on behalf of `authority`.
@@ -60,6 +91,26 @@ impl CancelFleetService {
     /// caller may not cancel it, so a caller outside the owning tenant
     /// cannot tell another tenant's command from one that does not exist.
     pub async fn cancel(
+        &self,
+        fleet_id: FleetCommandId,
+        authority: FleetCancelAuthority<'_>,
+    ) -> bool {
+        if self.registry.get(&fleet_id).is_none() {
+            return match self.remote.get() {
+                Some(remote) => {
+                    let tenant = match authority {
+                        FleetCancelAuthority::Tenant(t) => Some(t),
+                        FleetCancelAuthority::WritingOperator => None,
+                    };
+                    remote.forward(fleet_id, tenant).await
+                }
+                None => false,
+            };
+        }
+        self.cancel_local(fleet_id, authority).await
+    }
+
+    async fn cancel_local(
         &self,
         fleet_id: FleetCommandId,
         authority: FleetCancelAuthority<'_>,
@@ -188,5 +239,52 @@ mod tests {
             "fleet-cancel authority is not confined to the owning tenant:\n{}",
             failures.join("\n")
         );
+    }
+
+    struct Recorded(
+        std::sync::Mutex<Vec<(FleetCommandId, Option<TenantId>)>>,
+        bool,
+    );
+
+    #[async_trait::async_trait]
+    impl FleetCancelForwarder for Recorded {
+        async fn forward(&self, id: FleetCommandId, tenant: Option<&TenantId>) -> bool {
+            self.0.lock().unwrap().push((id, tenant.cloned()));
+            self.1
+        }
+    }
+
+    #[tokio::test]
+    async fn a_command_run_elsewhere_is_forwarded_and_a_forwarded_cancel_never_is() {
+        let owner = tenant("owner");
+        let svc = CancelFleetService::new(FleetRegistry::new(), EdgeConnectionRegistry::new());
+        let remote = std::sync::Arc::new(Recorded(Default::default(), true));
+        svc.set_remote(remote.clone());
+        let id = FleetCommandId(uuid::Uuid::new_v4());
+
+        assert!(svc.cancel(id, FleetCancelAuthority::Tenant(&owner)).await);
+        assert!(svc.cancel(id, FleetCancelAuthority::WritingOperator).await);
+        assert_eq!(
+            *remote.0.lock().unwrap(),
+            vec![(id, Some(owner.clone())), (id, None)],
+            "the tenant travels with the cancel; an operator's carries none"
+        );
+        assert!(
+            !svc.cancel_forwarded(id, FleetCancelAuthority::Tenant(&owner))
+                .await,
+            "a forwarded cancel of a command not run here is not forwarded again"
+        );
+        assert_eq!(remote.0.lock().unwrap().len(), 2);
+
+        // A command run here is cancelled here, not forwarded.
+        let (local, local_id, mut rx) = service_with_command(&owner);
+        local.set_remote(remote.clone());
+        assert!(
+            local
+                .cancel(local_id, FleetCancelAuthority::Tenant(&owner))
+                .await
+        );
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(remote.0.lock().unwrap().len(), 2);
     }
 }

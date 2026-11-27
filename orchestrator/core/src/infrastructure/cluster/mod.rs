@@ -29,8 +29,8 @@ pub use node_envelope::{
 };
 pub use node_registry_repo::PgNodeRegistryRepository;
 pub use peer_transport::{
-    ClusterEdgeInvoker, GrpcCancelForwarder, GrpcExecutionForwarder, GrpcPeerTransport,
-    SelfIssuedToken,
+    ClusterEdgeInvoker, GrpcCancelForwarder, GrpcExecutionForwarder, GrpcFleetCancelForwarder,
+    GrpcPeerTransport, SelfIssuedToken,
 };
 pub use postgres_repo::{
     PgNodeChallengeRepository, PgNodeClusterRepository, PgStimulusIdempotencyRepository,

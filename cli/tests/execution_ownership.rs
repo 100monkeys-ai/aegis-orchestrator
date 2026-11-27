@@ -916,3 +916,40 @@ async fn a_late_close_never_removes_a_newer_streams_record() {
     assert_eq!(owners.owner_of(edge).await.unwrap(), None);
     db.drop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Fleet command owners (ADR-152 D4.7)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_fleet_owner_statements_and_migration_064_pass_pg_strict() {
+    use aegis_orchestrator_core::infrastructure::edge::fleet_owners::{
+        RECORD_FLEET_SQL, RELEASE_FLEET_SQL,
+    };
+    let migration = MIGRATOR
+        .iter()
+        .find(|m| m.version == 64)
+        .expect("migration 064 ships");
+    for sql in [RECORD_FLEET_SQL, RELEASE_FLEET_SQL, migration.sql.as_ref()] {
+        assert!(unbounded_writes(sql).is_empty(), "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn a_fleet_command_is_found_on_its_member_until_it_ends() {
+    use aegis_orchestrator_core::domain::cluster::FleetCommandId;
+    use aegis_orchestrator_core::domain::shared_kernel::TenantId;
+    use aegis_orchestrator_core::infrastructure::edge::{FleetCommandOwners, PgFleetCommandOwners};
+    let Some(db) = Db::new().await else { return };
+    let owners = PgFleetCommandOwners::new(db.pool.clone());
+    let (member, id) = (NodeId::new(), FleetCommandId(uuid::Uuid::new_v4()));
+    let tenant = TenantId::from_realm_slug("fleet-owner").unwrap();
+
+    owners.record(id, member, &tenant).await.unwrap();
+    // A second record of the same command keeps the first.
+    owners.record(id, NodeId::new(), &tenant).await.unwrap();
+    assert_eq!(owners.owner_of(id).await.unwrap(), Some(member));
+    owners.release(id).await.unwrap();
+    assert_eq!(owners.owner_of(id).await.unwrap(), None);
+    db.drop().await;
+}

@@ -314,6 +314,12 @@ impl NodeClusterService for ScriptedStub {
     > {
         Err(tonic::Status::unimplemented("invoke_edge_tool"))
     }
+    async fn cancel_fleet_command(
+        &self,
+        _r: tonic::Request<aegis_orchestrator_core::infrastructure::aegis_cluster_proto::CancelFleetCommandRequest>,
+    ) -> Result<tonic::Response<aegis_orchestrator_core::infrastructure::aegis_cluster_proto::CancelFleetCommandResponse>, tonic::Status>{
+        Err(tonic::Status::unimplemented("cancel_fleet_command"))
+    }
 }
 
 // ---------------------------------------------------------------------------
