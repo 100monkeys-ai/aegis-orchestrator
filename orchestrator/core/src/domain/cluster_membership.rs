@@ -283,6 +283,7 @@ mod tests {
                 "goal-expiry",
                 "cluster-health-sweep",
                 "execution-adoption",
+                "seal-nonce-gc",
             ]
         );
     }
