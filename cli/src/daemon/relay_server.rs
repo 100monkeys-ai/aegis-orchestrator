@@ -359,10 +359,42 @@ pub(crate) fn build_relay_cluster(
     use aegis_orchestrator_core::application::edge::rotate_edge_key::RotateEdgeKeyService;
 
     let conn_registry = EdgeConnectionRegistry::new();
-    let connect_edge_service = Arc::new(ConnectEdgeService::new(
-        edge_repo.clone(),
-        conn_registry.clone(),
-        envelope_verifier,
+    let mut connect_edge =
+        ConnectEdgeService::new(edge_repo.clone(), conn_registry.clone(), envelope_verifier);
+    // A production cluster member's replica records each stream it holds as
+    // that member's (ADR-152 D8), so an execution on any member reaches the
+    // edge through this replica.
+    let member = config
+        .spec
+        .cluster
+        .as_ref()
+        .and_then(|c| {
+            aegis_orchestrator_core::domain::node_config::resolve_env_value_optional(
+                &c.membership.member_node_id,
+            )
+        })
+        .and_then(|id| {
+            aegis_orchestrator_core::domain::shared_kernel::NodeId::from_string(&id).ok()
+        });
+    if let Some(member) = member {
+        connect_edge = connect_edge.with_stream_ownership(
+            Arc::new(
+                aegis_orchestrator_core::infrastructure::edge::PgEdgeStreamOwners::new(
+                    pool.clone(),
+                ),
+            ),
+            member,
+        );
+        tracing::info!(member = %member, "Edge streams recorded as this member's");
+    }
+    let connect_edge_service = Arc::new(connect_edge);
+    // InvokeEdgeTool from this member's core runs on the streams this
+    // replica holds (ADR-152 D8).
+    handler = handler.with_edge_dispatch(Arc::new(
+        aegis_orchestrator_core::application::edge::dispatch_to_edge::DispatchToEdgeService::new(
+            edge_repo.clone(),
+            conn_registry.clone(),
+        ),
     ));
     let rotate_edge_key_service = Arc::new(RotateEdgeKeyService::with_default_ttl(
         edge_repo.clone(),
