@@ -380,7 +380,8 @@ pub fn canvas_event_stream(
     event_bus: Arc<EventBus>,
     session_id: CanvasSessionId,
 ) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
-    let mut receiver = event_bus.subscribe();
+    // ADR-152 D3: the session's events come from whichever node runs it.
+    let mut receiver = event_bus.subscribe_cluster_wide();
     async_stream::stream! {
         loop {
             let next = tokio::time::timeout(Duration::from_secs(120), receiver.recv()).await;

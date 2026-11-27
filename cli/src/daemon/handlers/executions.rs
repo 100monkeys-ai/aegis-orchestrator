@@ -289,6 +289,7 @@ pub(crate) async fn stream_events_handler(
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
     Path(execution_id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
     if let Err(e) = scope_guard.require("execution:stream") {
@@ -299,13 +300,18 @@ pub(crate) async fn stream_events_handler(
     let exec_id = aegis_orchestrator_core::domain::execution::ExecutionId(execution_id);
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
     let activity_service = state.correlated_activity_stream_service.clone();
+    // ADR-152 D3.5: each event's id is its time; a client reconnecting with
+    // Last-Event-ID, to this node or any other, resumes after it.
+    let after = last_event_id(&headers);
 
     let stream = async_stream::stream! {
         if follow {
-            let mut activity_stream = activity_service.stream_execution_activity(&tenant_id, exec_id, verbose).await?;
+            let mut activity_stream = activity_service.stream_execution_activity(&tenant_id, exec_id, verbose, after).await?;
             while let Some(activity) = activity_stream.next().await {
-                let payload = serde_json::to_string(&activity?)?;
-                yield Ok::<_, anyhow::Error>(Event::default().data(payload));
+                let activity = activity?;
+                let id = event_id(&activity);
+                let payload = serde_json::to_string(&activity)?;
+                yield Ok::<_, anyhow::Error>(Event::default().id(id).data(payload));
             }
         } else {
             for activity in activity_service.execution_history(&tenant_id, exec_id, verbose).await? {
@@ -318,6 +324,25 @@ pub(crate) async fn stream_events_handler(
     Sse::new(stream)
         .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response()
+}
+
+/// An activity's SSE id: its time, to the nanosecond (ADR-152 D3.5).
+pub(crate) fn event_id(
+    activity: &aegis_orchestrator_core::domain::events::CorrelatedActivityEvent,
+) -> String {
+    activity
+        .timestamp
+        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+}
+
+/// The time a reconnecting client last received, from `Last-Event-ID`.
+pub(crate) fn last_event_id(
+    headers: &axum::http::HeaderMap,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let raw = headers.get("last-event-id")?.to_str().ok()?;
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
 }
 
 pub(crate) async fn delete_execution_handler(

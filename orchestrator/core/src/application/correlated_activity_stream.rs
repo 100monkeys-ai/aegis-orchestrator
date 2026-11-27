@@ -39,65 +39,47 @@ impl CorrelatedActivityStreamService {
         }
     }
 
+    /// Follow an execution's activity for `tenant_id`: its history (after
+    /// `after`, for a client resuming with `Last-Event-ID`), then every live
+    /// event of it on any node (ADR-152 D3).
+    ///
+    /// When relayed events may have been missed (the bus's resync signal, or
+    /// this stream lagging), the stream re-reads the stored history and sends
+    /// what it has not sent yet: the live path is never the record (D3.5).
+    /// `verbose` adds nothing to the live part: only events that carry this
+    /// execution's id are ever forwarded, never system events of no tenant
+    /// (audit 002 §4.4).
     pub async fn stream_execution_activity(
         &self,
         tenant_id: &TenantId,
         execution_id: ExecutionId,
-        verbose: bool,
+        _verbose: bool,
+        after: Option<DateTime<Utc>>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<CorrelatedActivityEvent>> + Send>>> {
+        // Subscribe before reading the history, so nothing falls between.
+        let live = self.event_bus.subscribe_execution_domain(execution_id);
+        let resync = self.event_bus.subscribe_resync_marked();
         let history = self
-            .execution_history(tenant_id, execution_id, verbose)
+            .execution_history(tenant_id, execution_id, false)
             .await?;
-
-        if verbose {
-            // In verbose mode, subscribe to the global event bus and forward
-            // ONLY events whose execution_id matches the (already tenant-scoped)
-            // exec_id. System-level events with no execution_id are NOT forwarded
-            // here — they belong to no tenant and therefore must not leak across
-            // a tenant-scoped stream (audit 002 §4.4).
-            let receiver = self.event_bus.subscribe();
-            let live = futures::stream::unfold(
-                (receiver, execution_id),
-                |(mut receiver, exec_id)| async move {
-                    loop {
-                        match receiver.recv().await {
-                            Ok(event) => {
-                                let event_exec_id = event.execution_id();
-                                if event_exec_id == Some(exec_id) {
-                                    return Some((
-                                        Ok(normalize_domain_event(&event, None)),
-                                        (receiver, exec_id),
-                                    ));
-                                }
-                                continue;
-                            }
-                            Err(EventBusError::Closed) => return None,
-                            Err(e) => {
-                                return Some((
-                                    Err(anyhow!("Event bus error: {e}")),
-                                    (receiver, exec_id),
-                                ));
-                            }
-                        }
-                    }
-                },
-            );
-
-            let history_stream = futures::stream::iter(history.into_iter().map(Ok));
-            Ok(Box::pin(history_stream.chain(live)))
-        } else {
-            let receiver = self.event_bus.subscribe_execution_domain(execution_id);
-            let live = futures::stream::unfold(receiver, |mut receiver| async move {
-                match receiver.recv().await {
-                    Ok(event) => Some((Ok(normalize_domain_event(&event, None)), receiver)),
-                    Err(EventBusError::Closed) => None,
-                    Err(e) => Some((Err(anyhow!("Event bus error: {e}")), receiver)),
-                }
-            });
-
-            let history_stream = futures::stream::iter(history.into_iter().map(Ok));
-            Ok(Box::pin(history_stream.chain(live)))
-        }
+        let mut state = Follow {
+            live,
+            resync,
+            reader: HistoryReader {
+                executions: Arc::clone(&self.execution_repository),
+                workflows: self.workflow_execution_repository.clone(),
+                tenant_id: tenant_id.clone(),
+                execution_id,
+            },
+            pending: std::collections::VecDeque::new(),
+            sent: SentWindow::default(),
+            after,
+        };
+        state.queue(history);
+        Ok(Box::pin(futures::stream::unfold(
+            state,
+            |mut state| async move { state.next().await.map(|item| (item, state)) },
+        )))
     }
 
     /// Follow an agent's activity for `tenant_id`: its history, then every
@@ -116,7 +98,8 @@ impl CorrelatedActivityStreamService {
         let repository = Arc::clone(&self.execution_repository);
         let cache = Arc::new(RwLock::new(HashMap::<ExecutionId, bool>::new()));
         let tenant = tenant_id.clone();
-        let receiver = self.event_bus.subscribe();
+        // ADR-152 D3: an agent's executions run on any node.
+        let receiver = self.event_bus.subscribe_cluster_wide();
 
         let live = futures::stream::unfold(
             (receiver, repository, cache, tenant),
@@ -171,33 +154,14 @@ impl CorrelatedActivityStreamService {
         execution_id: ExecutionId,
         _verbose: bool,
     ) -> Result<Vec<CorrelatedActivityEvent>> {
-        // Tenant-scoped lookup: callers MUST supply the authenticated tenant.
-        // A miss here returns an empty history (the SSE handler maps that to
-        // a 404-equivalent — no execution data is leaked across tenants).
-        // Audit 002 §4.3.
-        let execution = self
-            .execution_repository
-            .find_by_id_for_tenant(tenant_id, execution_id)
-            .await?
-            .ok_or_else(|| {
-                anyhow!("Execution {execution_id} not found for the requesting tenant")
-            })?;
-
-        let mut history = execution_to_history(&execution);
-
-        if let Some(repo) = &self.workflow_execution_repository {
-            let records = repo.find_events_by_execution(execution_id, 500, 0).await?;
-            for record in records {
-                let event = stored_repository_row(&record.payload, None)
-                    .or_else(|| workflow_record_to_activity(record.payload));
-                if let Some(event) = event {
-                    history.push(event);
-                }
-            }
+        HistoryReader {
+            executions: Arc::clone(&self.execution_repository),
+            workflows: self.workflow_execution_repository.clone(),
+            tenant_id: tenant_id.clone(),
+            execution_id,
         }
-
-        history.sort_by_key(|a| a.timestamp);
-        Ok(history)
+        .read()
+        .await
     }
 
     pub async fn agent_history(
@@ -240,6 +204,149 @@ impl CorrelatedActivityStreamService {
 /// an execution nor an agent, does not. The outcome for an execution is
 /// cached once the execution is found under any tenant; one not stored yet
 /// is looked up again next time.
+/// Reads an execution's stored history: the record and its `execution_events`.
+struct HistoryReader {
+    executions: Arc<dyn ExecutionRepository>,
+    workflows: Option<Arc<dyn WorkflowExecutionRepository>>,
+    tenant_id: TenantId,
+    execution_id: ExecutionId,
+}
+
+impl HistoryReader {
+    async fn read(&self) -> Result<Vec<CorrelatedActivityEvent>> {
+        let (tenant_id, execution_id) = (&self.tenant_id, self.execution_id);
+        // Tenant-scoped lookup: callers MUST supply the authenticated tenant.
+        // A miss here returns an empty history (the SSE handler maps that to
+        // a 404-equivalent — no execution data is leaked across tenants).
+        // Audit 002 §4.3.
+        let execution = self
+            .executions
+            .find_by_id_for_tenant(tenant_id, execution_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow!("Execution {execution_id} not found for the requesting tenant")
+            })?;
+
+        let mut history = execution_to_history(&execution);
+
+        if let Some(repo) = &self.workflows {
+            let records = repo.find_events_by_execution(execution_id, 500, 0).await?;
+            for record in records {
+                let event = stored_repository_row(&record.payload, None)
+                    .or_else(|| workflow_record_to_activity(record.payload));
+                if let Some(event) = event {
+                    history.push(event);
+                }
+            }
+        }
+
+        history.sort_by_key(|a| a.timestamp);
+        Ok(history)
+    }
+}
+
+/// What an execution stream has sent, so a re-read of the history sends only
+/// what is new (ADR-152 D3.5). Bounded: past the bound, nothing older than
+/// the oldest entry remembered is sent again.
+#[derive(Default)]
+struct SentWindow {
+    keys: std::collections::HashSet<(DateTime<Utc>, String, String)>,
+    order: std::collections::VecDeque<(DateTime<Utc>, String, String)>,
+    floor: Option<DateTime<Utc>>,
+}
+
+const SENT_WINDOW: usize = 4096;
+
+impl SentWindow {
+    fn key(a: &CorrelatedActivityEvent) -> (DateTime<Utc>, String, String) {
+        (a.timestamp, a.event_type.clone(), a.message.clone())
+    }
+    /// Record `a` as sent; false if it was already.
+    fn mark(&mut self, a: &CorrelatedActivityEvent) -> bool {
+        if self.floor.is_some_and(|f| a.timestamp < f) {
+            return false;
+        }
+        let key = Self::key(a);
+        if !self.keys.insert(key.clone()) {
+            return false;
+        }
+        self.order.push_back(key);
+        if self.order.len() > SENT_WINDOW {
+            if let Some(old) = self.order.pop_front() {
+                self.keys.remove(&old);
+                self.floor = Some(old.0);
+            }
+        }
+        true
+    }
+}
+
+/// The state of one followed execution stream.
+struct Follow {
+    live: crate::infrastructure::event_bus::ExecutionDomainEventReceiver,
+    resync: tokio::sync::watch::Receiver<u64>,
+    reader: HistoryReader,
+    pending: std::collections::VecDeque<CorrelatedActivityEvent>,
+    sent: SentWindow,
+    after: Option<DateTime<Utc>>,
+}
+
+impl Follow {
+    /// Queue the entries of `history` not sent yet, in time order.
+    fn queue(&mut self, mut history: Vec<CorrelatedActivityEvent>) {
+        history.sort_by_key(|a| a.timestamp);
+        for a in history {
+            if self.after.is_some_and(|after| a.timestamp <= after) {
+                continue;
+            }
+            if self.sent.mark(&a) {
+                self.pending.push_back(a);
+            }
+        }
+    }
+
+    async fn resynchronise(&mut self) -> Result<()> {
+        metrics::counter!("aegis_activity_stream_resyncs_total").increment(1);
+        let history = self.reader.read().await?;
+        self.queue(history);
+        Ok(())
+    }
+
+    async fn next(&mut self) -> Option<Result<CorrelatedActivityEvent>> {
+        loop {
+            if let Some(a) = self.pending.pop_front() {
+                return Some(Ok(a));
+            }
+            tokio::select! {
+                received = self.live.recv() => match received {
+                    Ok(event) => {
+                        let a = normalize_domain_event(&event, None);
+                        if self.sent.mark(&a) {
+                            return Some(Ok(a));
+                        }
+                    }
+                    Err(EventBusError::Closed) => return None,
+                    Err(EventBusError::Lagged(_)) => {
+                        if let Err(e) = self.resynchronise().await {
+                            return Some(Err(e));
+                        }
+                    }
+                    Err(e) => return Some(Err(anyhow!("Event bus error: {e}"))),
+                },
+                changed = self.resync.changed() => {
+                    if changed.is_err() {
+                        // The bus is gone; the live receiver ends the stream.
+                        continue;
+                    }
+                    if let Err(e) = self.resynchronise().await {
+                        return Some(Err(e));
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn event_belongs_to_agent(
     event: &DomainEvent,
     agent_id: AgentId,
@@ -1026,7 +1133,7 @@ mod tests {
         let service = CorrelatedActivityStreamService::new(event_bus.clone(), repository, None);
         let execution_id = execution.id;
         let mut stream = service
-            .stream_execution_activity(&TenantId::system(), execution_id, false)
+            .stream_execution_activity(&TenantId::system(), execution_id, false, None)
             .await
             .unwrap();
 
@@ -1060,6 +1167,94 @@ mod tests {
         }
 
         assert!(saw_live_storage, "expected live storage event in stream");
+    }
+
+    /// ADR-152 D3.5: what reached the record but not the live stream (a
+    /// relayed event lost in a gap) is sent on a resync, once.
+    #[tokio::test]
+    async fn a_resync_sends_what_the_record_holds_and_the_stream_missed_once() {
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let repository = Arc::new(InMemoryExecutionRepository::new());
+        let mut execution = execution_for(AgentId::new());
+        execution.start();
+        repository
+            .save_for_tenant(&TenantId::system(), &execution)
+            .await
+            .unwrap();
+        let service =
+            CorrelatedActivityStreamService::new(event_bus.clone(), repository.clone(), None);
+        let mut stream = service
+            .stream_execution_activity(&TenantId::system(), execution.id, false, None)
+            .await
+            .unwrap();
+        let mut sent = Vec::new();
+        while let Ok(Some(next)) = timeout(Duration::from_millis(200), stream.next()).await {
+            sent.push(next.unwrap().event_type);
+        }
+        assert!(sent.contains(&"execution_started".to_string()), "{sent:?}");
+
+        // It ends on another node, and the relayed event is lost.
+        execution.complete();
+        repository
+            .save_for_tenant(&TenantId::system(), &execution)
+            .await
+            .unwrap();
+        event_bus.request_resync();
+        let mut resent = Vec::new();
+        while let Ok(Some(next)) = timeout(Duration::from_millis(300), stream.next()).await {
+            resent.push(next.unwrap().event_type);
+        }
+        assert!(
+            resent.iter().any(|t| t.contains("completed")),
+            "the record's ending is sent: {resent:?}"
+        );
+        assert!(
+            !resent.contains(&"execution_started".to_string()),
+            "nothing already sent is sent again: {resent:?}"
+        );
+
+        event_bus.request_resync();
+        assert!(
+            timeout(Duration::from_millis(300), stream.next())
+                .await
+                .is_err(),
+            "a second resync finds nothing new"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resumed_stream_starts_after_the_last_event_id() {
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let repository = Arc::new(InMemoryExecutionRepository::new());
+        let mut execution = execution_for(AgentId::new());
+        execution.start();
+        execution.complete();
+        repository
+            .save_for_tenant(&TenantId::system(), &execution)
+            .await
+            .unwrap();
+        let service = CorrelatedActivityStreamService::new(event_bus, repository, None);
+        let all = service
+            .execution_history(&TenantId::system(), execution.id, false)
+            .await
+            .unwrap();
+        let first = all.first().unwrap().timestamp;
+        let mut resumed = service
+            .stream_execution_activity(&TenantId::system(), execution.id, false, Some(first))
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        while let Ok(Some(next)) = timeout(Duration::from_millis(200), resumed.next()).await {
+            got.push(next.unwrap());
+        }
+        assert!(
+            got.iter().all(|a| a.timestamp > first),
+            "nothing at or before the last id"
+        );
+        assert_eq!(
+            got.len(),
+            all.iter().filter(|a| a.timestamp > first).count()
+        );
     }
 
     fn execution_for(agent_id: AgentId) -> Execution {
@@ -1326,7 +1521,7 @@ mod tests {
 
         // Tenant-A asks for tenant-B's execution → must error (handler returns 404).
         let res = service
-            .stream_execution_activity(&tenant_a, exec_id, false)
+            .stream_execution_activity(&tenant_a, exec_id, false, None)
             .await;
         assert!(
             res.is_err(),
@@ -1402,7 +1597,7 @@ mod tests {
 
         // Tenant-A subscribes (verbose=true) to its own execution.
         let mut stream = service
-            .stream_execution_activity(&tenant_a, exec_a_id, true)
+            .stream_execution_activity(&tenant_a, exec_a_id, true, None)
             .await
             .unwrap();
 
