@@ -861,3 +861,58 @@ async fn a_session_attested_on_one_node_is_known_on_another_and_its_token_is_nev
     assert!(matches!(revoked.status, SessionStatus::Revoked { .. }));
     db.drop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Edge stream owners (ADR-152 D8)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_edge_stream_statements_and_migration_063_pass_pg_strict() {
+    use aegis_orchestrator_core::infrastructure::edge::stream_owners::{
+        RECORD_STREAM_SQL, RELEASE_MEMBER_SQL, RELEASE_STREAM_SQL,
+    };
+    let migration = MIGRATOR
+        .iter()
+        .find(|m| m.version == 63)
+        .expect("migration 063 ships");
+    for sql in [
+        RECORD_STREAM_SQL,
+        RELEASE_STREAM_SQL,
+        RELEASE_MEMBER_SQL,
+        migration.sql.as_ref(),
+    ] {
+        assert!(unbounded_writes(sql).is_empty(), "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn a_late_close_never_removes_a_newer_streams_record() {
+    use aegis_orchestrator_core::infrastructure::edge::{EdgeStreamOwners, PgEdgeStreamOwners};
+    let Some(db) = Db::new().await else { return };
+    let owners = PgEdgeStreamOwners::new(db.pool.clone());
+    let (edge, member_a, member_b) = (NodeId::new(), NodeId::new(), NodeId::new());
+    let (first, second) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+
+    owners.record(edge, member_a, first).await.unwrap();
+    assert_eq!(owners.owner_of(edge).await.unwrap(), Some(member_a));
+    // The edge reconnects to another member's replica before the first
+    // stream's close is seen.
+    owners.record(edge, member_b, second).await.unwrap();
+    owners.release(edge, first).await.unwrap();
+    assert_eq!(
+        owners.owner_of(edge).await.unwrap(),
+        Some(member_b),
+        "the first stream's late close leaves the newer record"
+    );
+    owners.release(edge, second).await.unwrap();
+    assert_eq!(owners.owner_of(edge).await.unwrap(), None);
+
+    owners.record(edge, member_a, first).await.unwrap();
+    assert_eq!(
+        owners.release_member(member_a).await.unwrap(),
+        1,
+        "a dead member's streams go"
+    );
+    assert_eq!(owners.owner_of(edge).await.unwrap(), None);
+    db.drop().await;
+}

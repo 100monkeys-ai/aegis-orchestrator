@@ -3661,15 +3661,46 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             // cluster gRPC server (Controller / Hybrid / RelayCoordinator)
             // must accept ConnectEdge. Pure-worker nodes have no
             // edge_components bundle (no DB pool) and naturally skip this.
-            if let Some((edge_repo, _, conn_registry, _, _, _, _)) = edge_components.as_ref() {
+            if let Some((edge_repo, _, conn_registry, edge_dispatch, _, _, _)) =
+                edge_components.as_ref()
+            {
+                // ADR-152 D8: a peer's InvokeEdgeTool runs on this dispatch.
+                handler = handler.with_edge_dispatch(edge_dispatch.clone());
                 use aegis_orchestrator_core::application::edge::connect_edge::ConnectEdgeService;
                 use aegis_orchestrator_core::application::edge::issue_enrollment_token::EDGE_ENROLLMENT_SIGNING_KEY;
                 use aegis_orchestrator_core::application::edge::rotate_edge_key::RotateEdgeKeyService;
-                let connect_edge_service = Arc::new(ConnectEdgeService::new(
+                let mut connect_edge = ConnectEdgeService::new(
                     edge_repo.clone(),
                     conn_registry.clone(),
                     envelope_verifier.clone(),
-                ));
+                );
+                // ADR-152 D8: a Relay Coordinator replica that names its
+                // member records each stream it holds as that member's.
+                let member = config
+                    .spec
+                    .cluster
+                    .as_ref()
+                    .and_then(|c| {
+                        aegis_orchestrator_core::domain::node_config::resolve_env_value_optional(
+                            &c.membership.member_node_id,
+                        )
+                    })
+                    .and_then(|id| {
+                        aegis_orchestrator_core::domain::shared_kernel::NodeId::from_string(&id)
+                            .ok()
+                    });
+                if let (Some(member), Some(pool)) = (member, db_pool.as_ref()) {
+                    connect_edge = connect_edge.with_stream_ownership(
+                        Arc::new(
+                            aegis_orchestrator_core::infrastructure::edge::PgEdgeStreamOwners::new(
+                                pool.clone(),
+                            ),
+                        ),
+                        member,
+                    );
+                    tracing::info!(member = %member, "Edge streams recorded as this member's");
+                }
+                let connect_edge_service = Arc::new(connect_edge);
                 let rotate_edge_key_service = Arc::new(RotateEdgeKeyService::with_default_ttl(
                     edge_repo.clone(),
                     secrets_manager.secret_store(),
@@ -3830,7 +3861,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 let transport = Arc::new(
                     aegis_orchestrator_core::infrastructure::cluster::GrpcPeerTransport::new(
                         joined.signing_key.clone(),
-                        token,
+                        token.clone(),
                     )
                     .with_tls(cluster_tls.clone()),
                 );
@@ -3850,6 +3881,38 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     ),
                 )?;
                 let relay_transport = transport.clone();
+                // ADR-152 D8: an edge call this node's dispatch cannot run
+                // goes to the member whose Relay Coordinator holds the
+                // stream, or to this member's own over the pod network.
+                if let (Some((_, _, _, edge_dispatch, _, _, _)), Some(pool)) =
+                    (edge_components.as_ref(), db_pool.as_ref())
+                {
+                    let local_relay = config
+                        .spec
+                        .cluster
+                        .as_ref()
+                        .and_then(|c| c.relay_coordinator_endpoint.as_ref())
+                        .map(|endpoint| {
+                            (
+                                Arc::new(
+                                    aegis_orchestrator_core::infrastructure::cluster::GrpcPeerTransport::new(
+                                        joined.signing_key.clone(),
+                                        token.clone(),
+                                    ),
+                                ),
+                                endpoint.expose().to_string(),
+                            )
+                        });
+                    edge_dispatch.set_remote(Arc::new(
+                        aegis_orchestrator_core::infrastructure::cluster::ClusterEdgeInvoker::new(
+                            Arc::new(aegis_orchestrator_core::infrastructure::edge::PgEdgeStreamOwners::new(pool.clone())),
+                            joined.membership.process().node_id,
+                            Arc::new(aegis_orchestrator_core::infrastructure::cluster::PgNodeClusterRepository::new(pool.clone())),
+                            transport.clone(),
+                            local_relay,
+                        ),
+                    ));
+                }
                 // ADR-152 D5.3: with an advertised capacity, a full or
                 // draining node sends new executions to the peer with most
                 // headroom.

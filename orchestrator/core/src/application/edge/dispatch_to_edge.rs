@@ -15,9 +15,24 @@ use crate::infrastructure::aegis_cluster_proto::{
 };
 use crate::infrastructure::edge::EdgeConnectionRegistry;
 
+/// Runs a dispatch on a stream another process holds (ADR-152 D8): the
+/// member whose Relay Coordinator holds it, reached over the members'
+/// mutual TLS, or this member's own Relay Coordinator.
+#[async_trait::async_trait]
+pub trait RemoteEdgeInvoker: Send + Sync {
+    /// `from_peer`: the dispatch already crossed members; it may go to this
+    /// member's own Relay Coordinator but never to another member.
+    async fn invoke(
+        &self,
+        req: &DispatchRequest,
+        from_peer: bool,
+    ) -> Result<EdgeResult, EdgeRouterError>;
+}
+
 pub struct DispatchToEdgeService {
     edge_repo: Arc<dyn EdgeDaemonRepository>,
     registry: EdgeConnectionRegistry,
+    remote: std::sync::OnceLock<Arc<dyn RemoteEdgeInvoker>>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,10 +51,34 @@ impl DispatchToEdgeService {
         Self {
             edge_repo,
             registry,
+            remote: std::sync::OnceLock::new(),
         }
     }
 
+    /// ADR-152 D8: an edge whose stream this process does not hold is
+    /// reached through `remote` (set once the cluster's transport exists).
+    pub fn set_remote(&self, remote: Arc<dyn RemoteEdgeInvoker>) {
+        let _ = self.remote.set(remote);
+    }
+
     pub async fn dispatch(&self, req: DispatchRequest) -> Result<EdgeResult, EdgeRouterError> {
+        self.dispatch_from(req, false).await
+    }
+
+    /// A dispatch a peer forwarded here (InvokeEdgeTool): this process's
+    /// streams, or this member's own Relay Coordinator, never another member.
+    pub async fn dispatch_forwarded(
+        &self,
+        req: DispatchRequest,
+    ) -> Result<EdgeResult, EdgeRouterError> {
+        self.dispatch_from(req, true).await
+    }
+
+    async fn dispatch_from(
+        &self,
+        req: DispatchRequest,
+        from_peer: bool,
+    ) -> Result<EdgeResult, EdgeRouterError> {
         // Tenant-ownership check.
         let edge = match self.edge_repo.get(&req.node_id).await {
             Ok(Some(e)) => e,
@@ -56,12 +95,14 @@ impl DispatchToEdgeService {
             });
         }
 
-        let sender = self
-            .registry
-            .get(&req.node_id)
-            .ok_or(EdgeRouterError::EdgeUnavailable {
-                node_id: req.node_id,
-            })?;
+        let Some(sender) = self.registry.get(&req.node_id) else {
+            return match self.remote.get() {
+                Some(remote) => remote.invoke(&req, from_peer).await,
+                None => Err(EdgeRouterError::EdgeUnavailable {
+                    node_id: req.node_id,
+                }),
+            };
+        };
 
         let command_id = Uuid::new_v4();
         let pending = self.registry.pending().clone();

@@ -32,6 +32,12 @@ pub struct ConnectEdgeService {
     edge_repo: Arc<dyn EdgeDaemonRepository>,
     registry: EdgeConnectionRegistry,
     envelope_verifier: Arc<NodeEnvelopeVerifier>,
+    /// On a production cluster member's Relay Coordinator (ADR-152 D8): the
+    /// record of which member holds each stream, and this member.
+    ownership: Option<(
+        Arc<dyn crate::infrastructure::edge::EdgeStreamOwners>,
+        NodeId,
+    )>,
 }
 
 impl ConnectEdgeService {
@@ -44,7 +50,18 @@ impl ConnectEdgeService {
             edge_repo,
             registry,
             envelope_verifier,
+            ownership: None,
         }
+    }
+
+    /// ADR-152 D8: record each stream this process holds as `member`'s.
+    pub fn with_stream_ownership(
+        mut self,
+        owners: Arc<dyn crate::infrastructure::edge::EdgeStreamOwners>,
+        member: NodeId,
+    ) -> Self {
+        self.ownership = Some((owners, member));
+        self
     }
 
     pub fn registry(&self) -> &EdgeConnectionRegistry {
@@ -94,6 +111,13 @@ impl ConnectEdgeService {
 
         let _guard = self.registry.register(node_id, cmd_tx);
         tracing::info!(node_id = %node_id, "edge connected");
+        // ADR-152 D8: the cluster learns which member holds this stream.
+        let stream_id = Uuid::new_v4();
+        if let Some((owners, member)) = &self.ownership {
+            if let Err(e) = owners.record(node_id, *member, stream_id).await {
+                tracing::warn!(error = %e, node_id = %node_id, "could not record the edge stream's member");
+            }
+        }
 
         // Persist any capabilities advertised in Hello (preserve server-side tags).
         if let Some(caps_proto) = hello.capabilities {
@@ -109,6 +133,11 @@ impl ConnectEdgeService {
                     tracing::warn!(error = %e, node_id = %node_id, "edge stream error");
                     break;
                 }
+            }
+        }
+        if let Some((owners, _)) = &self.ownership {
+            if let Err(e) = owners.release(node_id, stream_id).await {
+                tracing::warn!(error = %e, node_id = %node_id, "could not release the edge stream's record");
             }
         }
         // Guard drops here, deregistering and resolving pending oneshots.

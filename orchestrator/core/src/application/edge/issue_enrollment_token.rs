@@ -580,6 +580,17 @@ mod tests {
             {
                 Err(tonic::Status::unimplemented("stream_cluster_events"))
             }
+            async fn invoke_edge_tool(
+                &self,
+                _r: tonic::Request<
+                    crate::infrastructure::aegis_cluster_proto::InvokeEdgeToolRequest,
+                >,
+            ) -> Result<
+                tonic::Response<crate::infrastructure::aegis_cluster_proto::InvokeEdgeToolResponse>,
+                tonic::Status,
+            > {
+                Err(tonic::Status::unimplemented("invoke_edge_tool"))
+            }
             type ConnectEdgeStream =
                 Pin<Box<dyn Stream<Item = Result<EdgeCommand, Status>> + Send>>;
             async fn connect_edge(

@@ -289,6 +289,19 @@ impl NodeClusterService for EdgeOnlyClusterService {
     ) -> Result<Response<Self::StreamClusterEventsStream>, Status> {
         Err(Status::unimplemented("stream_cluster_events"))
     }
+    async fn invoke_edge_tool(
+        &self,
+        _r: tonic::Request<
+            aegis_orchestrator_core::infrastructure::aegis_cluster_proto::InvokeEdgeToolRequest,
+        >,
+    ) -> Result<
+        tonic::Response<
+            aegis_orchestrator_core::infrastructure::aegis_cluster_proto::InvokeEdgeToolResponse,
+        >,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented("invoke_edge_tool"))
+    }
 }
 
 mod keyed_transit {
