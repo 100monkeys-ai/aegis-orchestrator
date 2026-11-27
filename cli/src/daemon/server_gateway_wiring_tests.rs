@@ -432,7 +432,7 @@ async fn unwired(
     let service = ToolInvocationService::new(
         sessions.clone(),
         contexts,
-        daemon_seal_middleware(None, None),
+        daemon_seal_middleware(None, None, None),
         Arc::new(ToolRouter::new(ToolRouter::builtin_dispatchers())),
         fsal,
         NfsVolumeRegistry::new(),

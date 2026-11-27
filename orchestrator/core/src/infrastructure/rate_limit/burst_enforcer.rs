@@ -26,12 +26,40 @@ type Limiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 /// (scope, resource_type) pair maintains an independent token bucket.
 pub struct GovernorBurstEnforcer {
     limiters: DashMap<String, Arc<Limiter>>,
+    /// How many live members share the burst (AEGIS ADR-152 D4.6): each
+    /// grants `ceil(limit / members)` and `ceil(burst / members)`, so the
+    /// cluster together grants what one node did. 1 off a cluster.
+    members: std::sync::atomic::AtomicU32,
+}
+
+/// `ceil(n / members)`, at least 1.
+pub fn share_of(n: u64, members: u32) -> u32 {
+    let members = u64::from(members.max(1));
+    n.div_ceil(members).clamp(1, u64::from(u32::MAX)) as u32
 }
 
 impl GovernorBurstEnforcer {
     pub fn new() -> Self {
         Self {
             limiters: DashMap::new(),
+            members: std::sync::atomic::AtomicU32::new(1),
+        }
+    }
+
+    /// The cluster now has `members` live members (ADR-152 D4.6). On a
+    /// change the buckets are rebuilt at the new share; a bucket starts full.
+    pub fn set_members(&self, members: u32) {
+        let members = members.max(1);
+        if self
+            .members
+            .swap(members, std::sync::atomic::Ordering::SeqCst)
+            != members
+        {
+            self.limiters.clear();
+            tracing::info!(
+                members,
+                "Burst rate limits shared across the cluster's live members"
+            );
         }
     }
 
@@ -58,9 +86,12 @@ impl GovernorBurstEnforcer {
             .limiters
             .entry(key)
             .or_insert_with(|| {
+                let members = self.members.load(std::sync::atomic::Ordering::SeqCst);
                 let burst = per_min.burst.unwrap_or(per_min.limit);
-                let limit = NonZeroU32::new(per_min.limit as u32).unwrap_or(NonZeroU32::MIN);
-                let burst_size = NonZeroU32::new(burst as u32).unwrap_or(NonZeroU32::MIN);
+                let limit =
+                    NonZeroU32::new(share_of(per_min.limit, members)).unwrap_or(NonZeroU32::MIN);
+                let burst_size =
+                    NonZeroU32::new(share_of(burst, members)).unwrap_or(NonZeroU32::MIN);
                 Arc::new(RateLimiter::direct(
                     Quota::per_minute(limit).allow_burst(burst_size),
                 ))
@@ -167,5 +198,33 @@ mod tests {
 
         let remaining = enforcer.remaining_burst(&scope, &policy);
         assert_eq!(remaining, Some(20));
+    }
+
+    #[test]
+    fn the_burst_is_shared_by_the_live_members() {
+        assert_eq!(share_of(10, 1), 10);
+        assert_eq!(share_of(10, 4), 3, "rounded up");
+        assert_eq!(share_of(1, 4), 1, "never below one");
+        assert_eq!(share_of(10, 0), 10, "no members counts as one");
+    }
+
+    #[test]
+    fn a_node_of_four_grants_its_share_of_the_burst() {
+        let enforcer = GovernorBurstEnforcer::new();
+        enforcer.set_members(4);
+        let policy = policy_with_per_minute(8);
+        assert!(
+            enforcer.check_burst(&user_scope(), &policy, 2).is_ok(),
+            "two of eight, a quarter each"
+        );
+        assert!(
+            enforcer.check_burst(&user_scope(), &policy, 1).is_err(),
+            "the third is another node's"
+        );
+        enforcer.set_members(1);
+        assert!(
+            enforcer.check_burst(&user_scope(), &policy, 8).is_ok(),
+            "alone again, the whole burst, the bucket rebuilt full"
+        );
     }
 }

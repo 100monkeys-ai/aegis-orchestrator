@@ -27,7 +27,6 @@
 //! | [`prompt_template_engine`] | Handlebars template expansion for agent prompts | ADR-031 |
 //! | [`context_loader`] | Loads `spec.context` items into agent prompts | — |
 //! | [`temporal_client`] | Temporal.io workflow client (deferred) | ADR-022 |
-//! | [`human_input_service`] | Suspends execution pending human response | ADR-015 |
 
 //! | [`aegis_runtime_proto`] | Generated `aegis.runtime.v1` types shared by server | ADR-042 |
 //! | [`aegis_cortex_proto`] | Generated `aegis.cortex.v1` types for Cortex service | ADR-042 |
@@ -52,7 +51,6 @@ pub mod docker;
 pub mod edge;
 pub mod event_bus;
 pub mod fuse;
-pub mod human_input_service;
 pub mod iam;
 pub mod image_manager;
 pub mod llm;
@@ -78,7 +76,6 @@ pub mod web_tools;
 pub mod workflow_parser;
 
 pub use cortex_client::CortexGrpcClient;
-pub use human_input_service::{HumanInputService, HumanInputStatus, PendingRequestInfo};
 pub use temporal_event_listener::{
     TemporalEventListener, TemporalEventMapper, TemporalEventPayload,
 };

@@ -688,3 +688,65 @@ async fn a_new_execution_goes_to_the_live_peer_with_the_most_headroom() {
     let _ = (full, uncapped);
     db.drop().await;
 }
+
+// ---------------------------------------------------------------------------
+// SEAL replay nonces shared by the cluster (ADR-152 D4.2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_nonce_statements_and_migration_061_pass_pg_strict() {
+    use aegis_orchestrator_core::infrastructure::seal::nonce_store::{
+        DELETE_EXPIRED_NONCES_SQL, RECORD_NONCE_SQL,
+    };
+    let migration = MIGRATOR
+        .iter()
+        .find(|m| m.version == 61)
+        .expect("migration 061 ships");
+    for sql in [
+        RECORD_NONCE_SQL,
+        DELETE_EXPIRED_NONCES_SQL,
+        migration.sql.as_ref(),
+    ] {
+        assert!(unbounded_writes(sql).is_empty(), "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn an_envelope_replayed_to_another_node_is_a_replay() {
+    use aegis_orchestrator_core::infrastructure::seal::nonce_store::{
+        NonceOutcome, NonceStore, PostgresNonceStore,
+    };
+    let Some(db) = Db::new().await else { return };
+    let (node_a, node_b) = (
+        PostgresNonceStore::new(db.pool.clone()),
+        PostgresNonceStore::new(db.pool.clone()),
+    );
+    assert_eq!(node_a.record("sig-1").await.unwrap(), NonceOutcome::Fresh);
+    assert_eq!(
+        node_a.record("sig-1").await.unwrap(),
+        NonceOutcome::Replay,
+        "seen here"
+    );
+    assert_eq!(
+        node_b.record("sig-1").await.unwrap(),
+        NonceOutcome::Replay,
+        "seen on the other node"
+    );
+    assert_eq!(node_b.record("sig-2").await.unwrap(), NonceOutcome::Fresh);
+
+    sqlx::query("UPDATE seal_replay_nonces SET expires_at = now() - interval '1 second' WHERE nonce = 'sig-1'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        PostgresNonceStore::delete_expired(&db.pool).await.unwrap(),
+        1,
+        "only the expired one"
+    );
+    let left: Vec<String> = sqlx::query_scalar("SELECT nonce FROM seal_replay_nonces")
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(left, vec!["sig-2".to_string()]);
+    db.drop().await;
+}

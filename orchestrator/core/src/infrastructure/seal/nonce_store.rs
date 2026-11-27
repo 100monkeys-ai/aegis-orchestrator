@@ -14,10 +14,11 @@
 //! automatically after the configured TTL (30 s by default) and a background
 //! sweep prunes the map so memory stays bounded.
 //!
-//! Expected wire-up: the orchestrator constructs one [`InMemoryNonceStore`]
-//! per process and shares it with [`crate::infrastructure::seal::SealMiddleware`].
+//! A cluster (AEGIS ADR-152 D4.2) shares the record: [`PostgresNonceStore`]
+//! keeps this store as its first check and lets an insert into
+//! `seal_replay_nonces` decide, so an envelope replayed to another node is a
+//! replay too. A node with no database keeps the in-memory store alone.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -39,10 +40,12 @@ pub enum NonceOutcome {
 /// Implementations MUST be safe to share across many concurrent verify calls
 /// and MUST honour the TTL semantics (an entry inserted at time `t` is
 /// considered expired at time `t + ttl`).
+#[async_trait::async_trait]
 pub trait NonceStore: Send + Sync {
     /// Record `nonce`. Returns [`NonceOutcome::Replay`] if `nonce` is already
-    /// present and unexpired; otherwise [`NonceOutcome::Fresh`].
-    fn record(&self, nonce: &str) -> NonceOutcome;
+    /// present and unexpired; otherwise [`NonceOutcome::Fresh`]. An error is
+    /// a store that could not decide, which the caller refuses.
+    async fn record(&self, nonce: &str) -> anyhow::Result<NonceOutcome>;
 }
 
 /// Lock-free, in-memory [`NonceStore`] backed by [`DashMap`].
@@ -85,8 +88,9 @@ impl Default for InMemoryNonceStore {
     }
 }
 
-impl NonceStore for InMemoryNonceStore {
-    fn record(&self, nonce: &str) -> NonceOutcome {
+impl InMemoryNonceStore {
+    /// The decision, synchronously.
+    pub fn record_now(&self, nonce: &str) -> NonceOutcome {
         let now = Instant::now();
         self.sweep(now);
 
@@ -110,9 +114,68 @@ impl NonceStore for InMemoryNonceStore {
     }
 }
 
-impl<T: NonceStore + ?Sized> NonceStore for Arc<T> {
-    fn record(&self, nonce: &str) -> NonceOutcome {
-        (**self).record(nonce)
+#[async_trait::async_trait]
+impl NonceStore for InMemoryNonceStore {
+    async fn record(&self, nonce: &str) -> anyhow::Result<NonceOutcome> {
+        Ok(self.record_now(nonce))
+    }
+}
+
+/// Decides in `seal_replay_nonces`: one row inserted is fresh (ADR-152 D4.2).
+pub const RECORD_NONCE_SQL: &str = r#"
+INSERT INTO seal_replay_nonces (nonce, expires_at)
+VALUES ($1, now() + make_interval(secs => $2))
+ON CONFLICT (nonce) DO NOTHING
+"#;
+
+/// The `seal-nonce-gc` duty's statement.
+pub const DELETE_EXPIRED_NONCES_SQL: &str =
+    "DELETE FROM seal_replay_nonces WHERE expires_at < now()";
+
+/// The cluster's record of SEAL nonces (ADR-152 D4.2): this node's memory
+/// first, then the shared table. A replay this node saw is refused without a
+/// round trip; any other is decided by the insert.
+pub struct PostgresNonceStore {
+    local: InMemoryNonceStore,
+    pool: sqlx::PgPool,
+    ttl: Duration,
+}
+
+impl PostgresNonceStore {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self {
+            local: InMemoryNonceStore::new(),
+            pool,
+            ttl: SEAL_REPLAY_TTL,
+        }
+    }
+
+    /// Delete the expired nonces; how many went.
+    pub async fn delete_expired(pool: &sqlx::PgPool) -> anyhow::Result<u64> {
+        Ok(sqlx::query(DELETE_EXPIRED_NONCES_SQL)
+            .execute(pool)
+            .await?
+            .rows_affected())
+    }
+}
+
+#[async_trait::async_trait]
+impl NonceStore for PostgresNonceStore {
+    async fn record(&self, nonce: &str) -> anyhow::Result<NonceOutcome> {
+        if self.local.record_now(nonce) == NonceOutcome::Replay {
+            return Ok(NonceOutcome::Replay);
+        }
+        let inserted = sqlx::query(RECORD_NONCE_SQL)
+            .bind(nonce)
+            .bind(self.ttl.as_secs_f64())
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(if inserted == 1 {
+            NonceOutcome::Fresh
+        } else {
+            NonceOutcome::Replay
+        })
     }
 }
 
@@ -124,28 +187,28 @@ mod tests {
     #[test]
     fn first_seen_is_fresh() {
         let store = InMemoryNonceStore::new();
-        assert_eq!(store.record("sig-a"), NonceOutcome::Fresh);
+        assert_eq!(store.record_now("sig-a"), NonceOutcome::Fresh);
     }
 
     #[test]
     fn second_seen_within_window_is_replay() {
         let store = InMemoryNonceStore::new();
-        assert_eq!(store.record("sig-a"), NonceOutcome::Fresh);
-        assert_eq!(store.record("sig-a"), NonceOutcome::Replay);
+        assert_eq!(store.record_now("sig-a"), NonceOutcome::Fresh);
+        assert_eq!(store.record_now("sig-a"), NonceOutcome::Replay);
     }
 
     #[test]
     fn distinct_nonces_do_not_collide() {
         let store = InMemoryNonceStore::new();
-        assert_eq!(store.record("sig-a"), NonceOutcome::Fresh);
-        assert_eq!(store.record("sig-b"), NonceOutcome::Fresh);
+        assert_eq!(store.record_now("sig-a"), NonceOutcome::Fresh);
+        assert_eq!(store.record_now("sig-b"), NonceOutcome::Fresh);
     }
 
     #[test]
     fn nonce_is_accepted_again_after_ttl_elapses() {
         let store = InMemoryNonceStore::with_ttl(Duration::from_millis(50));
-        assert_eq!(store.record("sig-a"), NonceOutcome::Fresh);
+        assert_eq!(store.record_now("sig-a"), NonceOutcome::Fresh);
         sleep(Duration::from_millis(75));
-        assert_eq!(store.record("sig-a"), NonceOutcome::Fresh);
+        assert_eq!(store.record_now("sig-a"), NonceOutcome::Fresh);
     }
 }

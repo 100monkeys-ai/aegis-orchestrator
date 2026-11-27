@@ -490,15 +490,23 @@ pub(crate) fn daemon_seal_middleware(
     rate_limit_resolver: Option<
         Arc<dyn aegis_orchestrator_core::domain::rate_limit::RateLimitPolicyResolver>,
     >,
+    db_pool: Option<&sqlx::PgPool>,
 ) -> Arc<aegis_orchestrator_core::infrastructure::seal::middleware::SealMiddleware> {
+    use aegis_orchestrator_core::infrastructure::seal::nonce_store::{
+        InMemoryNonceStore, NonceStore, PostgresNonceStore,
+    };
+    // ADR-152 D4.2: with a database, the cluster's shared record decides; a
+    // node without one remembers what it saw itself.
+    let nonces: Arc<dyn NonceStore> = match db_pool {
+        Some(pool) => Arc::new(PostgresNonceStore::new(pool.clone())),
+        None => Arc::new(InMemoryNonceStore::new()),
+    };
     Arc::new(
         aegis_orchestrator_core::infrastructure::seal::middleware::SealMiddleware::with_rate_limiting(
             rate_limit_enforcer,
             rate_limit_resolver,
         )
-        .with_replay_protection(Arc::new(
-            aegis_orchestrator_core::infrastructure::seal::nonce_store::InMemoryNonceStore::new(),
-        )),
+        .with_replay_protection(nonces),
     )
 }
 
@@ -1460,7 +1468,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // their corresponding storage has been cleaned up.
     {
         let nfs_deregister_gateway = nfs_gateway.clone();
-        let mut nfs_deregister_sub = event_bus.subscribe();
+        // ADR-152 D7.3: cluster-wide, so a volume deleted or expired through
+        // any member is unexported on every member.
+        let mut nfs_deregister_sub = event_bus.subscribe_cluster_wide();
         tokio::spawn(async move {
             loop {
                 match nfs_deregister_sub.recv().await {
@@ -1574,6 +1584,22 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         Option<Arc<dyn RateLimitPolicyResolver>>,
     ) = if let Some(ref pool) = db_pool {
         let burst = Arc::new(GovernorBurstEnforcer::new());
+        // ADR-152 D4.6: a clustered node grants its share of each burst,
+        // recomputed from the live leases every 15 s.
+        if let Some(joined) = joined_cluster.as_ref() {
+            let (burst, leases) = (burst.clone(), joined.leases.clone());
+            tokio::spawn(async move {
+                loop {
+                    match aegis_orchestrator_core::domain::cluster_membership::NodeLeaseRepository::leases(leases.as_ref()).await {
+                        Ok(all) => burst.set_members(all.iter().filter(|l| l.live).count() as u32),
+                        Err(e) => {
+                            tracing::debug!(error = %e, "burst share: the leases could not be read")
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                }
+            });
+        }
         let postgres = Arc::new(PostgresWindowEnforcer::new(pool.clone()));
         let enforcer: Arc<dyn RateLimitEnforcer> = Arc::new(
             CompositeRateLimitEnforcer::new(burst, postgres).with_event_bus(event_bus.clone()),
@@ -1615,8 +1641,30 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // Initialize SEAL / Tool Routing Services (now hoisted for ExecutionService dependency)
     info!("Initializing SEAL & Tool Routing services...");
 
-    let seal_middleware =
-        daemon_seal_middleware(rate_limit_enforcer.clone(), rate_limit_resolver.clone());
+    let seal_middleware = daemon_seal_middleware(
+        rate_limit_enforcer.clone(),
+        rate_limit_resolver.clone(),
+        db_pool.as_ref(),
+    );
+    // The seal-nonce-gc cluster duty (ADR-152 D4.2): the expired nonces
+    // leave the shared record every minute. Idempotent, so no fence.
+    if let Some(ref pool) = db_pool {
+        let gc_pool = pool.clone();
+        duty_runner.register(
+            aegis_orchestrator_core::domain::cluster_membership::ClusterDutyName::SEAL_NONCE_GC,
+            aegis_orchestrator_core::application::cluster::DutySchedule::every(
+                std::time::Duration::from_secs(60),
+            ),
+            move |_fence| {
+                let pool = gc_pool.clone();
+                async move {
+                    if let Err(e) = aegis_orchestrator_core::infrastructure::seal::nonce_store::PostgresNonceStore::delete_expired(&pool).await {
+                        tracing::warn!(error = %e, "SEAL nonce cleanup failed");
+                    }
+                }
+            },
+        );
+    }
     // Derive builtin dispatchers from the canonical tool router registry.
     // User-configured dispatchers from aegis-config.yaml take precedence.
     let mut builtin_dispatchers = config.spec.builtin_dispatchers.clone().unwrap_or_default();
@@ -1856,10 +1904,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         agent_service.clone(),
         judge_context.clone(),
     ));
-
-    // Create human input service
-    let human_input_service =
-        Arc::new(aegis_orchestrator_core::infrastructure::HumanInputService::new());
 
     // Legacy WorkflowEngine removed as part of Temporal migration
 
@@ -3152,7 +3196,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         event_bus: event_bus.clone(),
         inner_loop_service: inner_loop_service.clone(),
         llm_registry,
-        human_input_service: human_input_service.clone(),
         temporal_event_listener,
         register_workflow_use_case: register_workflow_use_case.clone(),
         start_workflow_execution_use_case,
@@ -4948,7 +4991,7 @@ max_output_tokens: 16384
         let tools = aegis_orchestrator_core::application::tool_invocation_service::ToolInvocationService::new(
             Arc::new(aegis_orchestrator_core::infrastructure::seal::session_repository::InMemorySealSessionRepository::new()),
             Arc::new(aegis_orchestrator_core::infrastructure::security_context::InMemorySecurityContextRepository::new()),
-            super::daemon_seal_middleware(None, None),
+            super::daemon_seal_middleware(None, None, None),
             Arc::new(aegis_orchestrator_core::infrastructure::tool_router::ToolRouter::new(
                 aegis_orchestrator_core::infrastructure::tool_router::ToolRouter::builtin_dispatchers(),
             )),
