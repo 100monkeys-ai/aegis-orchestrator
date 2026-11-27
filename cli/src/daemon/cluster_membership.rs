@@ -124,6 +124,7 @@ pub(crate) async fn join_cluster(
             grpc_address,
             vrack_address,
             lease_ttl: timing.ttl,
+            max_executions: cluster.membership.max_executions,
         },
         timing,
     )

@@ -22,7 +22,7 @@ pub use config_repo::PgConfigLayerRepository;
 pub use enrolment_token_repo::PgClusterEnrolmentTokenRepository;
 pub use grpc_client::NodeClusterClient;
 pub use grpc_server::NodeClusterServiceHandler;
-pub use membership_repo::{PgClusterDutyRepository, PgNodeLeaseRepository};
+pub use membership_repo::{PgClusterDutyRepository, PgNodeLeaseRepository, PgPlacementRepository};
 pub use node_envelope::{
     ClusterNodeKeys, EdgeDaemonKeys, EnvelopeError, NodeEnvelopeVerifier, NodeKeys,
 };

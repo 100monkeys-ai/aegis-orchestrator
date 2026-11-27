@@ -343,6 +343,7 @@ pub(crate) mod tests {
             grpc_address: "10.120.0.1:50056".to_string(),
             vrack_address: Some("10.120.0.1".to_string()),
             lease_ttl: Duration::ZERO,
+            max_executions: None,
         }
     }
 

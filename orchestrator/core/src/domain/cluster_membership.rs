@@ -79,6 +79,30 @@ pub struct NodeJoin {
     pub vrack_address: Option<String>,
     /// The lease the join grants, before the first renewal.
     pub lease_ttl: Duration,
+    /// How many executions this node runs before new ones go to a peer
+    /// (ADR-152 D5.3); `None`: it never forwards and is never chosen.
+    pub max_executions: Option<u32>,
+}
+
+/// A peer a new execution may go to (ADR-152 D5.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementCandidate {
+    pub node_id: crate::domain::cluster::NodeId,
+    pub grpc_address: String,
+    /// Its advertised capacity less the unfinished executions it owns.
+    pub headroom: i64,
+}
+
+/// Where a new execution runs (ADR-152 D5.3).
+#[async_trait::async_trait]
+pub trait PlacementRepository: Send + Sync {
+    /// How many unfinished executions `node` owns.
+    async fn load_of(&self, node: crate::domain::cluster::NodeId) -> anyhow::Result<i64>;
+    /// Live, active peers other than `me` with headroom, most first.
+    async fn candidates(
+        &self,
+        me: crate::domain::cluster::NodeId,
+    ) -> anyhow::Result<Vec<PlacementCandidate>>;
 }
 
 /// A node's lease as the database sees it now.
