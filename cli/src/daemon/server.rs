@@ -3372,6 +3372,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         ),
         _ => None,
     };
+    // ADR-111: a consumer's forwarded team tenant is honoured for members.
+    let grpc_auth =
+        grpc_auth.map(
+            |auth| match (team_repo_opt.clone(), membership_repo_opt.clone()) {
+                (Some(teams), Some(memberships)) => auth.with_team_access(teams, memberships),
+                _ => auth,
+            },
+        );
 
     // The main gRPC server is ready while its database answers, when it has
     // one; without one it serves from in-memory repositories.
@@ -3654,6 +3662,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     ),
                     _ => None,
                 };
+                let cluster_grpc_auth = cluster_grpc_auth.map(|auth| {
+                    match (team_repo_opt.clone(), membership_repo_opt.clone()) {
+                        (Some(teams), Some(memberships)) => {
+                            auth.with_team_access(teams, memberships)
+                        }
+                        _ => auth,
+                    }
+                });
                 handler = handler.with_issue_enrollment_token(local_signer, cluster_grpc_auth);
             }
 

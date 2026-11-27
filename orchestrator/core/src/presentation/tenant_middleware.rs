@@ -373,7 +373,7 @@ pub async fn tenant_context_middleware(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::domain::iam::{AegisRole, ZaruTier};
     use crate::domain::repository::RepositoryError;
@@ -495,12 +495,12 @@ mod tests {
 
     /// In-memory [`TeamRepository`] for middleware tests.
     #[derive(Default)]
-    struct InMemoryTeamRepo {
+    pub(crate) struct InMemoryTeamRepo {
         by_slug: Mutex<HashMap<String, Team>>,
     }
 
     impl InMemoryTeamRepo {
-        fn insert(&self, team: Team) {
+        pub(crate) fn insert(&self, team: Team) {
             self.by_slug
                 .lock()
                 .unwrap()
@@ -556,12 +556,12 @@ mod tests {
 
     /// In-memory [`MembershipRepository`] for middleware tests.
     #[derive(Default)]
-    struct InMemoryMembershipRepo {
+    pub(crate) struct InMemoryMembershipRepo {
         memberships: Mutex<Vec<Membership>>,
     }
 
     impl InMemoryMembershipRepo {
-        fn insert(&self, m: Membership) {
+        pub(crate) fn insert(&self, m: Membership) {
             self.memberships.lock().unwrap().push(m);
         }
     }
@@ -693,7 +693,7 @@ mod tests {
 
     // ----- Middleware integration tests -----
 
-    fn consumer_identity(sub: &str) -> UserIdentity {
+    pub(crate) fn consumer_identity(sub: &str) -> UserIdentity {
         UserIdentity {
             sub: sub.to_string(),
             realm_slug: "zaru-consumer".to_string(),
