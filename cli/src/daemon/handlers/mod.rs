@@ -11,7 +11,6 @@ use axum::{http::StatusCode, Json};
 pub(crate) mod admin;
 pub(crate) mod agents;
 pub(crate) mod api_keys;
-pub(crate) mod approvals;
 pub(crate) mod billing;
 pub(crate) mod canvas;
 pub(crate) mod cluster;

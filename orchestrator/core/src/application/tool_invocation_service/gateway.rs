@@ -1417,7 +1417,9 @@ impl ToolInvocationService {
                 crate::domain::seal_session::SessionStatus::Expired,
             ))?;
         verify_listing_envelope(&mut session, envelope)?;
-        self.seal_middleware.check_replay(&session, envelope)?;
+        self.seal_middleware
+            .check_replay(&session, envelope)
+            .await?;
         let choices = match meta {
             Some(meta) => super::context_args::parse_contexts(meta)?,
             None => None,

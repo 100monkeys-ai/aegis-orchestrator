@@ -27,7 +27,6 @@ use crate::daemon::handlers::api_keys::{
     create_api_key_handler, list_api_keys_handler, revoke_api_key_handler, update_api_key_handler,
     validate_api_key_handler,
 };
-use crate::daemon::handlers::approvals::{approvals_router, ApprovalsState};
 use crate::daemon::handlers::billing::{
     change_tier_handler, create_checkout_handler, create_portal_handler, get_subscription_handler,
     list_invoices_handler, list_prices_handler, preview_tier_change_handler, update_seats_handler,
@@ -401,13 +400,6 @@ pub(crate) fn create_router(
             .rate_limit_override_repo
             .clone()
             .map(|repo| repo as Arc<dyn RateLimitOverrideStore>),
-    }));
-
-    // Human-approval requests (ADR-097 §approvals, ADR-073 §3e), mounted over
-    // their own narrow state so their gate is driven through the real
-    // middleware stack by the handler tests.
-    let router = router.merge(approvals_router(ApprovalsState {
-        human_input_service: app_state.human_input_service.clone(),
     }));
 
     // Tool approvals (AEGIS ADR-126 D4): a user answers a gated tool call

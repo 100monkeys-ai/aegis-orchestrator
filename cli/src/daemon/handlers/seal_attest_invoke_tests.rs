@@ -2079,7 +2079,7 @@ async fn a_refused_context_is_403_context_not_allowed_naming_no_context() {
 async fn the_daemons_middleware_refuses_a_replayed_envelope_and_admits_a_fresh_one() {
     let mut mcp = attest_through(
         zaru_pro(),
-        crate::daemon::server::daemon_seal_middleware(None, None),
+        crate::daemon::server::daemon_seal_middleware(None, None, None),
         |service, _| service,
     )
     .await;

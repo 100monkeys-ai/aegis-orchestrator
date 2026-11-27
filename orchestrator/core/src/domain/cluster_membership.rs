@@ -162,10 +162,10 @@ impl ClusterDutyName {
     pub const GOAL_EXPIRY: Self = Self("goal-expiry");
     pub const CLUSTER_HEALTH_SWEEP: Self = Self("cluster-health-sweep");
     pub const EXECUTION_ADOPTION: Self = Self("execution-adoption");
+    pub const SEAL_NONCE_GC: Self = Self("seal-nonce-gc");
 
-    /// Every cluster duty this binary knows (ADR-152 D2.4). `seal-nonce-gc`
-    /// (D4.2) joins with the phase that builds what it sweeps.
-    pub const ALL: [Self; 9] = [
+    /// Every cluster duty this binary knows (ADR-152 D2.4).
+    pub const ALL: [Self; 10] = [
         Self::VOLUME_TTL_CLEANUP,
         Self::RATE_LIMIT_COUNTER_CLEANUP,
         Self::DISCOVERY_BACKFILL,
@@ -175,6 +175,7 @@ impl ClusterDutyName {
         Self::GOAL_EXPIRY,
         Self::CLUSTER_HEALTH_SWEEP,
         Self::EXECUTION_ADOPTION,
+        Self::SEAL_NONCE_GC,
     ];
 
     /// A name for a duty the catalogue above does not hold (tests).
