@@ -34,6 +34,7 @@ pub(crate) mod container_helpers;
 mod credential_log_tests;
 #[cfg(test)]
 mod edge_fleet_cancel_tests;
+pub mod edge_host;
 pub mod edge_lifecycle;
 pub mod handlers;
 #[cfg(unix)]
