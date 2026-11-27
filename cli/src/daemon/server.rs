@@ -3886,9 +3886,36 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 // ADR-152 D8: an edge call this node's dispatch cannot run
                 // goes to the member whose Relay Coordinator holds the
                 // stream, or to this member's own over the pod network.
-                if let (Some((_, _, _, edge_dispatch, _, _, fleet_cancel)), Some(pool)) =
-                    (edge_components.as_ref(), db_pool.as_ref())
+                if let (
+                    Some((_, _, conn_registry, edge_dispatch, _, _, fleet_cancel)),
+                    Some(pool),
+                ) = (edge_components.as_ref(), db_pool.as_ref())
                 {
+                    // ADR-152 D8: edges whose streams a member's Relay
+                    // Coordinator holds count as connected here, so the
+                    // host view and fleet resolution see them.
+                    {
+                        let owners =
+                            aegis_orchestrator_core::infrastructure::edge::PgEdgeStreamOwners::new(
+                                pool.clone(),
+                            );
+                        let conn_registry = conn_registry.clone();
+                        tokio::spawn(async move {
+                            use aegis_orchestrator_core::infrastructure::edge::EdgeStreamOwners;
+                            let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+                            loop {
+                                tick.tick().await;
+                                match owners.connected_edges().await {
+                                    Ok(ids) => {
+                                        conn_registry.set_cluster_streams(ids.into_iter().collect())
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(error = %e, "could not read the cluster's edge streams")
+                                    }
+                                }
+                            }
+                        });
+                    }
                     // ADR-152 D4.7: fleet commands record their member, and a
                     // cancel of another member's goes to it.
                     let fleet_owners: Arc<

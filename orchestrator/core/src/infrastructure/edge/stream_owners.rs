@@ -19,6 +19,9 @@ pub trait EdgeStreamOwners: Send + Sync {
     /// The member holding the edge's stream, if any.
     async fn owner_of(&self, edge: NodeId) -> Result<Option<NodeId>>;
     /// A dead member's rows go (its streams died with it).
+    /// Every edge with a recorded stream (ADR-152 D8).
+    async fn connected_edges(&self) -> Result<Vec<NodeId>>;
+
     async fn release_member(&self, member: NodeId) -> Result<u64>;
 }
 
@@ -30,6 +33,7 @@ SET member_node_id = EXCLUDED.member_node_id, stream_id = EXCLUDED.stream_id, co
 "#;
 pub const RELEASE_STREAM_SQL: &str =
     "DELETE FROM edge_stream_owners WHERE edge_node_id = $1 AND stream_id = $2";
+pub const CONNECTED_EDGES_SQL: &str = "SELECT edge_node_id FROM edge_stream_owners";
 pub const RELEASE_MEMBER_SQL: &str = "DELETE FROM edge_stream_owners WHERE member_node_id = $1";
 const OWNER_OF_SQL: &str = "SELECT member_node_id FROM edge_stream_owners WHERE edge_node_id = $1";
 
@@ -70,6 +74,13 @@ impl EdgeStreamOwners for PgEdgeStreamOwners {
             .fetch_optional(&self.pool)
             .await?;
         Ok(member.map(NodeId))
+    }
+
+    async fn connected_edges(&self) -> Result<Vec<NodeId>> {
+        let ids: Vec<uuid::Uuid> = sqlx::query_scalar(CONNECTED_EDGES_SQL)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(ids.into_iter().map(NodeId).collect())
     }
 
     async fn release_member(&self, member: NodeId) -> Result<u64> {

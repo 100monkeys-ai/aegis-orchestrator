@@ -24,6 +24,11 @@ pub type EdgeCommandTx = mpsc::Sender<EdgeCommand>;
 pub struct EdgeConnectionRegistry {
     inner: Arc<DashMap<NodeId, EdgeCommandTx>>,
     pending: PendingEdgeCalls,
+    /// Edges whose stream another process of the cluster holds (ADR-152 D8):
+    /// a member's Relay Coordinator, as `edge_stream_owners` records it.
+    /// Mirrored by [`Self::set_cluster_streams`]; they count as connected,
+    /// and calls to them go through the dispatcher's cluster fallback.
+    cluster: Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
 }
 
 impl EdgeConnectionRegistry {
@@ -50,6 +55,19 @@ impl EdgeConnectionRegistry {
     /// view of liveness without depending on heartbeat-staleness derivation.
     pub fn is_connected(&self, node_id: &NodeId) -> bool {
         self.inner.contains_key(node_id)
+            || self
+                .cluster
+                .read()
+                .map(|c| c.contains(node_id))
+                .unwrap_or(false)
+    }
+
+    /// ADR-152 D8: replace the set of edges whose streams other processes
+    /// of the cluster hold.
+    pub fn set_cluster_streams(&self, edges: std::collections::HashSet<NodeId>) {
+        if let Ok(mut c) = self.cluster.write() {
+            *c = edges;
+        }
     }
 
     pub fn pending(&self) -> &PendingEdgeCalls {
@@ -57,7 +75,12 @@ impl EdgeConnectionRegistry {
     }
 
     pub fn connected_node_ids(&self) -> Vec<NodeId> {
-        self.inner.iter().map(|r| *r.key()).collect()
+        let mut ids: std::collections::HashSet<NodeId> =
+            self.inner.iter().map(|r| *r.key()).collect();
+        if let Ok(c) = self.cluster.read() {
+            ids.extend(c.iter().copied());
+        }
+        ids.into_iter().collect()
     }
 
     /// Forcibly evict a node's live `ConnectEdge` stream by removing its
@@ -76,6 +99,9 @@ impl EdgeConnectionRegistry {
     /// when the node had no live stream.
     pub fn evict(&self, node_id: &NodeId) -> bool {
         let removed = self.inner.remove(node_id).is_some();
+        if let Ok(mut c) = self.cluster.write() {
+            c.remove(node_id);
+        }
         self.pending.disconnect_node(node_id);
         removed
     }
@@ -160,5 +186,26 @@ impl PendingEdgeCalls {
                 let _ = entry.sender.send(Err(EdgeRouterError::EdgeDisconnected));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cluster_stream_tests {
+    use super::*;
+
+    #[test]
+    fn an_edge_held_elsewhere_in_the_cluster_counts_until_evicted() {
+        let registry = EdgeConnectionRegistry::new();
+        let edge = NodeId::new();
+        assert!(!registry.is_connected(&edge));
+        registry.set_cluster_streams([edge].into_iter().collect());
+        assert!(registry.is_connected(&edge));
+        assert_eq!(registry.connected_node_ids(), vec![edge]);
+        assert!(
+            registry.get(&edge).is_none(),
+            "no local sender: calls go through the cluster"
+        );
+        registry.evict(&edge);
+        assert!(!registry.is_connected(&edge));
     }
 }

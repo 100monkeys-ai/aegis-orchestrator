@@ -869,7 +869,7 @@ async fn a_session_attested_on_one_node_is_known_on_another_and_its_token_is_nev
 #[test]
 fn the_edge_stream_statements_and_migration_063_pass_pg_strict() {
     use aegis_orchestrator_core::infrastructure::edge::stream_owners::{
-        RECORD_STREAM_SQL, RELEASE_MEMBER_SQL, RELEASE_STREAM_SQL,
+        CONNECTED_EDGES_SQL, RECORD_STREAM_SQL, RELEASE_MEMBER_SQL, RELEASE_STREAM_SQL,
     };
     let migration = MIGRATOR
         .iter()
@@ -879,6 +879,7 @@ fn the_edge_stream_statements_and_migration_063_pass_pg_strict() {
         RECORD_STREAM_SQL,
         RELEASE_STREAM_SQL,
         RELEASE_MEMBER_SQL,
+        CONNECTED_EDGES_SQL,
         migration.sql.as_ref(),
     ] {
         assert!(unbounded_writes(sql).is_empty(), "{sql}");
