@@ -750,3 +750,114 @@ async fn an_envelope_replayed_to_another_node_is_a_replay() {
     assert_eq!(left, vec!["sig-2".to_string()]);
     db.drop().await;
 }
+
+// ---------------------------------------------------------------------------
+// SEAL sessions shared by the cluster (ADR-152 D4.1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_session_statements_and_migration_062_pass_pg_strict() {
+    use aegis_orchestrator_core::infrastructure::seal::session_repository::{
+        DELETE_STALE_SESSIONS_SQL, SAVE_SESSION_SQL,
+    };
+    let migration = MIGRATOR
+        .iter()
+        .find(|m| m.version == 62)
+        .expect("migration 062 ships");
+    for sql in [
+        SAVE_SESSION_SQL,
+        DELETE_STALE_SESSIONS_SQL,
+        migration.sql.as_ref(),
+    ] {
+        assert!(unbounded_writes(sql).is_empty(), "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn a_session_attested_on_one_node_is_known_on_another_and_its_token_is_never_stored() {
+    use aegis_orchestrator_core::domain::seal_session::{SealSession, SessionStatus};
+    use aegis_orchestrator_core::domain::seal_session_repository::SealSessionRepository;
+    use aegis_orchestrator_core::domain::secrets::SensitiveString;
+    use aegis_orchestrator_core::domain::security_context::{
+        SecurityContext, SecurityContextMetadata,
+    };
+    use aegis_orchestrator_core::domain::shared_kernel::{AgentId, ExecutionId};
+    use aegis_orchestrator_core::infrastructure::seal::session_repository::PostgresSealSessionRepository;
+    let Some(db) = Db::new().await else { return };
+    let context = SecurityContext {
+        name: "zaru-pro".to_string(),
+        description: "test".to_string(),
+        capabilities: vec![],
+        deny_list: vec![],
+        metadata: SecurityContextMetadata {
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            version: 1,
+        },
+    };
+    let token = "header.payload.signature-of-a-seal-token";
+    let session = SealSession::new(
+        AgentId::new(),
+        ExecutionId::new(),
+        vec![7; 32],
+        token.to_string(),
+        context,
+        TenantId::for_consumer_user("seal-shared").unwrap(),
+    );
+    let (node_a, node_b) = (
+        PostgresSealSessionRepository::new(db.pool.clone()),
+        PostgresSealSessionRepository::new(db.pool.clone()),
+    );
+    node_a.save(session.clone()).await.unwrap();
+
+    let found = node_b
+        .find_active_by_security_token(&SensitiveString::new(token))
+        .await
+        .unwrap()
+        .expect("the other node finds the session by its token");
+    assert_eq!(found.id, session.id);
+    assert_eq!(found.agent_public_key, session.agent_public_key);
+    assert_eq!(found.tenant_id, session.tenant_id);
+    assert_eq!(found.security_token_raw, SensitiveString::new(token));
+    assert!(node_b
+        .find_active_by_security_token(&SensitiveString::new("another-token"))
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        node_b
+            .find_active_by_agent(&session.agent_id)
+            .await
+            .unwrap()
+            .map(|s| s.id),
+        Some(session.id)
+    );
+
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM seal_sessions WHERE body::text LIKE '%' || $1 || '%' OR encode(token_hash, 'escape') LIKE '%' || $1 || '%'",
+    )
+    .bind(token)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored, 0,
+        "the bearer token is stored nowhere, only its hash"
+    );
+
+    node_b
+        .revoke_for_agent(&session.agent_id, "execution ended".to_string())
+        .await
+        .unwrap();
+    assert!(
+        node_a
+            .find_active_by_security_token(&SensitiveString::new(token))
+            .await
+            .unwrap()
+            .is_none(),
+        "revoked on one node, gone on the other"
+    );
+    let revoked = node_a.find_by_id(&session.id).await.unwrap().unwrap();
+    assert!(matches!(revoked.status, SessionStatus::Revoked { .. }));
+    db.drop().await;
+}
