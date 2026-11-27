@@ -1524,6 +1524,13 @@ pub struct ClusterMembershipConfig {
     /// forwards a new execution and is never chosen for one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_executions: Option<u32>,
+    /// On a Relay Coordinator replica: the cluster member it serves, the
+    /// UUID that member's orchestrator joins as (`env:VAR` is read from the
+    /// environment). Each edge stream the replica holds is recorded as that
+    /// member's (ADR-152 D8), so an execution on any member reaches the edge
+    /// through it. Absent: no stream is recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_node_id: Option<String>,
 }
 
 fn default_drain_timeout_secs() -> u64 {
@@ -1553,6 +1560,7 @@ impl Default for ClusterMembershipConfig {
             probe_failures_to_suspect: default_probe_failures_to_suspect(),
             drain_timeout_secs: default_drain_timeout_secs(),
             max_executions: None,
+            member_node_id: None,
         }
     }
 }

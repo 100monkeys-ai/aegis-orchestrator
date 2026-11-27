@@ -351,3 +351,140 @@ impl crate::application::cluster::CancelForwarder for GrpcCancelForwarder {
         .context("the owner did not answer the cancel within 2 s")?
     }
 }
+
+/// Runs an edge dispatch on the stream's holder (ADR-152 D8): this member's
+/// own Relay Coordinator over the pod network, or the member whose Relay
+/// Coordinator holds it, over the members' mutual TLS.
+pub struct ClusterEdgeInvoker {
+    owners: Arc<dyn crate::infrastructure::edge::EdgeStreamOwners>,
+    me: NodeId,
+    nodes: Arc<dyn crate::domain::cluster::NodeClusterRepository>,
+    peers: Arc<GrpcPeerTransport>,
+    /// This member's Relay Coordinator: a transport without TLS (the pod
+    /// network) and its endpoint.
+    local_relay: Option<(Arc<GrpcPeerTransport>, String)>,
+}
+
+impl ClusterEdgeInvoker {
+    pub fn new(
+        owners: Arc<dyn crate::infrastructure::edge::EdgeStreamOwners>,
+        me: NodeId,
+        nodes: Arc<dyn crate::domain::cluster::NodeClusterRepository>,
+        peers: Arc<GrpcPeerTransport>,
+        local_relay: Option<(Arc<GrpcPeerTransport>, String)>,
+    ) -> Self {
+        Self {
+            owners,
+            me,
+            nodes,
+            peers,
+            local_relay,
+        }
+    }
+}
+
+impl GrpcPeerTransport {
+    /// InvokeEdgeTool at `address` (ADR-152 D8).
+    pub async fn invoke_edge_tool(
+        &self,
+        address: &str,
+        req: &crate::application::edge::dispatch_to_edge::DispatchRequest,
+    ) -> std::result::Result<crate::infrastructure::aegis_cluster_proto::EdgeResult, tonic::Status>
+    {
+        let inner = crate::infrastructure::aegis_cluster_proto::InvokeEdgeToolInner {
+            edge_node_id: req.node_id.0.to_string(),
+            tenant_id: req.tenant_id.as_str().to_string(),
+            tool_name: req.tool_name.clone(),
+            args: Some(req.args.clone()),
+            security_context_name: req.security_context_name.clone(),
+            user_seal_envelope: Some(req.user_seal_envelope.clone()),
+            deadline: Some(prost_types::Duration {
+                seconds: req.deadline.as_secs() as i64,
+                nanos: 0,
+            }),
+        };
+        let envelope = self
+            .envelope(inner.encode_to_vec())
+            .await
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        let answer = self
+            .client(address)
+            .await
+            .map_err(|e| tonic::Status::unavailable(e.to_string()))?
+            .invoke_edge_tool(
+                crate::infrastructure::aegis_cluster_proto::InvokeEdgeToolRequest {
+                    envelope: Some(envelope),
+                },
+            )
+            .await?
+            .into_inner();
+        answer
+            .result
+            .ok_or_else(|| tonic::Status::internal("InvokeEdgeTool answered no result"))
+    }
+}
+
+fn edge_error(
+    edge: NodeId,
+    deadline: std::time::Duration,
+    status: tonic::Status,
+) -> crate::domain::edge::EdgeRouterError {
+    use crate::domain::edge::EdgeRouterError;
+    match status.code() {
+        tonic::Code::FailedPrecondition | tonic::Code::NotFound => {
+            EdgeRouterError::EdgeUnavailable { node_id: edge }
+        }
+        tonic::Code::DeadlineExceeded => EdgeRouterError::Timeout(deadline),
+        tonic::Code::PermissionDenied => EdgeRouterError::CrossTenantAccessDenied {
+            node_id: edge,
+            tenant: String::new(),
+        },
+        _ => EdgeRouterError::EdgeDisconnected,
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::application::edge::dispatch_to_edge::RemoteEdgeInvoker for ClusterEdgeInvoker {
+    async fn invoke(
+        &self,
+        req: &crate::application::edge::dispatch_to_edge::DispatchRequest,
+        from_peer: bool,
+    ) -> std::result::Result<
+        crate::infrastructure::aegis_cluster_proto::EdgeResult,
+        crate::domain::edge::EdgeRouterError,
+    > {
+        use crate::domain::edge::EdgeRouterError;
+        let unavailable = || EdgeRouterError::EdgeUnavailable {
+            node_id: req.node_id,
+        };
+        let owner = self.owners.owner_of(req.node_id).await.map_err(|e| {
+            tracing::warn!(error = %e, "edge stream owners unreadable");
+            unavailable()
+        })?;
+        let deadline = req.deadline + std::time::Duration::from_secs(5);
+        let call = |transport: Arc<GrpcPeerTransport>, address: String| async move {
+            tokio::time::timeout(deadline, transport.invoke_edge_tool(&address, req))
+                .await
+                .map_err(|_| EdgeRouterError::Timeout(req.deadline))?
+                .map_err(|s| edge_error(req.node_id, req.deadline, s))
+        };
+        match owner {
+            None => Err(unavailable()),
+            Some(member) if member == self.me => match &self.local_relay {
+                Some((transport, endpoint)) => call(transport.clone(), endpoint.clone()).await,
+                None => Err(unavailable()),
+            },
+            Some(_) if from_peer => Err(unavailable()),
+            Some(member) => {
+                let peer = self
+                    .nodes
+                    .find_peer(&member)
+                    .await
+                    .ok()
+                    .flatten()
+                    .ok_or_else(unavailable)?;
+                call(self.peers.clone(), peer.grpc_address).await
+            }
+        }
+    }
+}

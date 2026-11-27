@@ -99,6 +99,8 @@ pub struct NodeClusterServiceHandler {
     /// The leases a forwarding node must be live in (ADR-152 D5.5); present
     /// on a joined node that runs executions.
     forward_leases: Option<Arc<dyn crate::domain::cluster_membership::NodeLeaseRepository>>,
+    /// The edge dispatch a peer's InvokeEdgeTool runs on (ADR-152 D8).
+    edge_dispatch: Option<Arc<crate::application::edge::dispatch_to_edge::DispatchToEdgeService>>,
 }
 
 /// How far a forward's issue time may be from this node's clock (ADR-152
@@ -142,6 +144,7 @@ impl NodeClusterServiceHandler {
             canceller: None,
             event_bus: None,
             forward_leases: None,
+            edge_dispatch: None,
         }
     }
 
@@ -186,6 +189,15 @@ impl NodeClusterServiceHandler {
         event_bus: crate::infrastructure::event_bus::EventBus,
     ) -> Self {
         self.event_bus = Some(event_bus);
+        self
+    }
+
+    /// ADR-152 D8: run InvokeEdgeTool on this process's edge dispatch.
+    pub fn with_edge_dispatch(
+        mut self,
+        dispatch: Arc<crate::application::edge::dispatch_to_edge::DispatchToEdgeService>,
+    ) -> Self {
+        self.edge_dispatch = Some(dispatch);
         self
     }
 
@@ -641,6 +653,62 @@ impl NodeClusterService for NodeClusterServiceHandler {
         Ok(Response::new(Box::pin(
             tokio_stream::wrappers::ReceiverStream::new(rx),
         )))
+    }
+
+    /// ADR-152 D8: a tool call for an edge whose stream this process, or
+    /// this member's Relay Coordinator, holds. Never forwarded to another
+    /// member from here.
+    async fn invoke_edge_tool(
+        &self,
+        request: Request<crate::infrastructure::aegis_cluster_proto::InvokeEdgeToolRequest>,
+    ) -> Result<Response<crate::infrastructure::aegis_cluster_proto::InvokeEdgeToolResponse>, Status>
+    {
+        use crate::domain::edge::EdgeRouterError;
+        let (from, inner): (
+            NodeId,
+            crate::infrastructure::aegis_cluster_proto::InvokeEdgeToolInner,
+        ) = self
+            .authenticate_node(request.into_inner().envelope)
+            .await?;
+        let Some(dispatch) = self.edge_dispatch.as_ref() else {
+            return Err(Status::failed_precondition(
+                "this node dispatches to no edge",
+            ));
+        };
+        let req = crate::application::edge::dispatch_to_edge::DispatchRequest {
+            node_id: NodeId::from_string(&inner.edge_node_id)
+                .map_err(|_| Status::invalid_argument("edge_node_id is not a node"))?,
+            tenant_id: TenantId::from_string(&inner.tenant_id)
+                .map_err(|_| Status::invalid_argument("tenant_id is not a tenant"))?,
+            tool_name: inner.tool_name,
+            args: inner.args.unwrap_or_default(),
+            security_context_name: inner.security_context_name,
+            user_seal_envelope: inner
+                .user_seal_envelope
+                .ok_or_else(|| Status::invalid_argument("no user SEAL envelope"))?,
+            deadline: inner
+                .deadline
+                .map(|d| std::time::Duration::from_secs(d.seconds.max(0) as u64))
+                .unwrap_or(std::time::Duration::from_secs(30)),
+        };
+        tracing::info!(by = %from, edge = %req.node_id, "Edge call forwarded here");
+        match dispatch.dispatch_forwarded(req).await {
+            Ok(result) => Ok(Response::new(
+                crate::infrastructure::aegis_cluster_proto::InvokeEdgeToolResponse {
+                    result: Some(result),
+                },
+            )),
+            Err(EdgeRouterError::EdgeUnavailable { node_id }) => Err(Status::failed_precondition(
+                format!("edge {node_id} unavailable"),
+            )),
+            Err(EdgeRouterError::CrossTenantAccessDenied { .. }) => {
+                Err(Status::permission_denied("edge not owned by the tenant"))
+            }
+            Err(EdgeRouterError::Timeout(d)) => Err(Status::deadline_exceeded(format!(
+                "edge deadline {d:?} exceeded"
+            ))),
+            Err(e) => Err(Status::unavailable(e.to_string())),
+        }
     }
 
     /// ADR-152 D5.3, D5.5: a peer at capacity, or draining, starts an
