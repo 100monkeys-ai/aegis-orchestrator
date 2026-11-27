@@ -222,7 +222,27 @@ pub async fn run(args: DaemonArgs) -> Result<()> {
             }
         }
     } else {
-        tokio::select! {
+        // ADR-157 D1: the daemon keeps its own node security token fresh. The
+        // token lasts an hour; a refresh every 20 minutes keeps two in hand,
+        // and a failed one is retried each minute. The reconnect loop reads
+        // the token from disk, so a refresh takes effect on the next connect.
+        let renew_dir = state_dir.clone();
+        let renewal = tokio::spawn(async move {
+            loop {
+                let wait = match super::token::refresh_in(&renew_dir).await {
+                    Ok(exp) => {
+                        info!(expires_at = %exp, "edge daemon: node security token renewed");
+                        TOKEN_RENEW_EVERY
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "edge daemon: node security token renewal failed; retrying");
+                        TOKEN_RENEW_RETRY
+                    }
+                };
+                tokio::time::sleep(wait).await;
+            }
+        });
+        let res = tokio::select! {
             res = run_edge_daemon(lifecycle_cfg) => {
                 // run_edge_daemon's outer loop is unconditional — it only
                 // returns if it fails before entering the loop. Surface the
@@ -233,9 +253,16 @@ pub async fn run(args: DaemonArgs) -> Result<()> {
                 info!("edge daemon: received shutdown signal — exiting");
                 Ok(())
             }
-        }
+        };
+        renewal.abort();
+        res
     }
 }
+
+/// How often a long-running daemon renews its node security token, and how
+/// soon it retries a failed renewal (ADR-157 D1).
+const TOKEN_RENEW_EVERY: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+const TOKEN_RENEW_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Lower bound (inclusive) for `spec.cluster.heartbeat_interval_secs`.
 const MIN_HEARTBEAT_INTERVAL_SECS: u64 = 1;
