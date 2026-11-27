@@ -1582,6 +1582,22 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         Option<Arc<dyn RateLimitPolicyResolver>>,
     ) = if let Some(ref pool) = db_pool {
         let burst = Arc::new(GovernorBurstEnforcer::new());
+        // ADR-152 D4.6: a clustered node grants its share of each burst,
+        // recomputed from the live leases every 15 s.
+        if let Some(joined) = joined_cluster.as_ref() {
+            let (burst, leases) = (burst.clone(), joined.leases.clone());
+            tokio::spawn(async move {
+                loop {
+                    match aegis_orchestrator_core::domain::cluster_membership::NodeLeaseRepository::leases(leases.as_ref()).await {
+                        Ok(all) => burst.set_members(all.iter().filter(|l| l.live).count() as u32),
+                        Err(e) => {
+                            tracing::debug!(error = %e, "burst share: the leases could not be read")
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                }
+            });
+        }
         let postgres = Arc::new(PostgresWindowEnforcer::new(pool.clone()));
         let enforcer: Arc<dyn RateLimitEnforcer> = Arc::new(
             CompositeRateLimitEnforcer::new(burst, postgres).with_event_bus(event_bus.clone()),
