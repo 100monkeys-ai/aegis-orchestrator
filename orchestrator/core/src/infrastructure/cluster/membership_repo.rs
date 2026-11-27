@@ -27,10 +27,12 @@ use crate::domain::cluster_membership::{
 pub const JOIN_SQL: &str = r#"
 INSERT INTO cluster_nodes (
     node_id, role, public_key, grpc_address, status, vrack_address,
-    incarnation, lease_expires_at, last_renewed_at, last_heartbeat_at
+    incarnation, lease_expires_at, last_renewed_at, last_heartbeat_at,
+    max_executions
 ) VALUES (
     $1, $2, $3, $4, 'active', $5,
-    1, now() + make_interval(secs => $6), now(), now()
+    1, now() + make_interval(secs => $6), now(), now(),
+    $7
 )
 ON CONFLICT (node_id) DO UPDATE SET
     role              = EXCLUDED.role,
@@ -41,7 +43,8 @@ ON CONFLICT (node_id) DO UPDATE SET
     incarnation       = cluster_nodes.incarnation + 1,
     lease_expires_at  = EXCLUDED.lease_expires_at,
     last_renewed_at   = EXCLUDED.last_renewed_at,
-    last_heartbeat_at = EXCLUDED.last_heartbeat_at
+    last_heartbeat_at = EXCLUDED.last_heartbeat_at,
+    max_executions    = EXCLUDED.max_executions
 RETURNING incarnation
 "#;
 
@@ -146,6 +149,7 @@ impl NodeLeaseRepository for PgNodeLeaseRepository {
             .bind(&join.grpc_address)
             .bind(&join.vrack_address)
             .bind(seconds(join.lease_ttl))
+            .bind(join.max_executions.map(|n| n as i32))
             .fetch_one(&self.pool)
             .await?;
         Ok(NodeIncarnation(incarnation))
@@ -236,5 +240,69 @@ impl ClusterDutyRepository for PgClusterDutyRepository {
             .execute(&self.pool)
             .await?;
         Ok(done.rows_affected() == 1)
+    }
+}
+
+/// How many unfinished executions a node owns (ADR-152 D5.3).
+pub const LOAD_OF_SQL: &str = r#"
+SELECT count(*) FROM executions
+WHERE owner_node_id = $1 AND status IN ('pending', 'running')
+"#;
+
+/// The live, active peers with headroom, most first (ADR-152 D5.3): a lease
+/// valid by the database clock, an advertised capacity, and fewer
+/// unfinished owned executions than that capacity.
+pub const PLACEMENT_CANDIDATES_SQL: &str = r#"
+SELECT n.node_id, n.grpc_address,
+       n.max_executions - count(e.id) AS headroom
+FROM cluster_nodes n
+LEFT JOIN executions e
+  ON e.owner_node_id = n.node_id AND e.status IN ('pending', 'running')
+WHERE n.node_id <> $1
+  AND n.status = 'active'
+  AND n.lease_expires_at > now()
+  AND n.max_executions IS NOT NULL
+GROUP BY n.node_id, n.grpc_address, n.max_executions
+HAVING n.max_executions - count(e.id) > 0
+ORDER BY headroom DESC, n.node_id
+"#;
+
+pub struct PgPlacementRepository {
+    pool: PgPool,
+}
+
+impl PgPlacementRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::domain::cluster_membership::PlacementRepository for PgPlacementRepository {
+    async fn load_of(&self, node: crate::domain::cluster::NodeId) -> anyhow::Result<i64> {
+        Ok(sqlx::query_scalar(LOAD_OF_SQL)
+            .bind(node.0)
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    async fn candidates(
+        &self,
+        me: crate::domain::cluster::NodeId,
+    ) -> anyhow::Result<Vec<crate::domain::cluster_membership::PlacementCandidate>> {
+        let rows: Vec<(uuid::Uuid, String, i64)> = sqlx::query_as(PLACEMENT_CANDIDATES_SQL)
+            .bind(me.0)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, grpc_address, headroom)| {
+                crate::domain::cluster_membership::PlacementCandidate {
+                    node_id: crate::domain::cluster::NodeId(id),
+                    grpc_address,
+                    headroom,
+                }
+            })
+            .collect())
     }
 }

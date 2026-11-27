@@ -1519,6 +1519,11 @@ pub struct ClusterMembershipConfig {
     /// the process's stop grace period, or the stop kills the drain.
     #[serde(default = "default_drain_timeout_secs")]
     pub drain_timeout_secs: u64,
+    /// How many executions this node runs before new ones go to the peer
+    /// with the most headroom (ADR-152 D5.3). Absent: this node never
+    /// forwards a new execution and is never chosen for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_executions: Option<u32>,
 }
 
 fn default_drain_timeout_secs() -> u64 {
@@ -1547,6 +1552,7 @@ impl Default for ClusterMembershipConfig {
             probe_interval_ms: default_probe_interval_ms(),
             probe_failures_to_suspect: default_probe_failures_to_suspect(),
             drain_timeout_secs: default_drain_timeout_secs(),
+            max_executions: None,
         }
     }
 }

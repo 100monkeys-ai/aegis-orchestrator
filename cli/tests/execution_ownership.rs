@@ -393,6 +393,7 @@ async fn joined(pool: &PgPool) -> NodeProcess {
             grpc_address: "10.120.0.7:50056".to_string(),
             vrack_address: Some("10.120.0.7".to_string()),
             lease_ttl: std::time::Duration::from_secs(15),
+            max_executions: None,
         })
         .await
         .unwrap();
@@ -602,5 +603,88 @@ async fn a_cancel_is_recorded_on_an_unfinished_run_once_and_answers_its_owner() 
         None,
         "an ended run records no cancel"
     );
+    db.drop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Placement (D5.3)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_placement_statements_and_migration_060_pass_pg_strict() {
+    use aegis_orchestrator_core::infrastructure::cluster::membership_repo::{
+        LOAD_OF_SQL, PLACEMENT_CANDIDATES_SQL,
+    };
+    let migration = MIGRATOR
+        .iter()
+        .find(|m| m.version == 60)
+        .expect("migration 060 ships");
+    for sql in [
+        LOAD_OF_SQL,
+        PLACEMENT_CANDIDATES_SQL,
+        migration.sql.as_ref(),
+    ] {
+        assert!(unbounded_writes(sql).is_empty(), "{sql}");
+    }
+}
+
+/// A node joined with `capacity`, owning `unfinished` unfinished executions.
+async fn node_with(pool: &PgPool, capacity: Option<u32>, unfinished: usize) -> NodeProcess {
+    let leases = PgNodeLeaseRepository::new(pool.clone());
+    let node_id = NodeId::new();
+    let incarnation = leases
+        .join(&NodeJoin {
+            node_id,
+            role: "hybrid".to_string(),
+            public_key: vec![9; 32],
+            grpc_address: format!("10.121.0.{}:50056", (node_id.0.as_u128() % 200) + 20),
+            vrack_address: None,
+            lease_ttl: std::time::Duration::from_secs(15),
+            max_executions: capacity,
+        })
+        .await
+        .unwrap();
+    let me = NodeProcess {
+        node_id,
+        incarnation,
+    };
+    let (repo, _) = owned(pool, me);
+    let tenant = TenantId::for_consumer_user("placement").unwrap();
+    for _ in 0..unfinished {
+        let run = running(pool, &tenant).await;
+        repo.save_for_tenant(&tenant, &run).await.unwrap();
+    }
+    me
+}
+
+#[tokio::test]
+async fn a_new_execution_goes_to_the_live_peer_with_the_most_headroom() {
+    use aegis_orchestrator_core::domain::cluster_membership::PlacementRepository;
+    use aegis_orchestrator_core::infrastructure::cluster::PgPlacementRepository;
+    let Some(db) = Db::new().await else { return };
+    let me = node_with(&db.pool, Some(2), 2).await;
+    let roomy = node_with(&db.pool, Some(5), 1).await;
+    let tight = node_with(&db.pool, Some(3), 2).await;
+    let full = node_with(&db.pool, Some(2), 2).await;
+    let uncapped = node_with(&db.pool, None, 0).await;
+    let dead = node_with(&db.pool, Some(10), 0).await;
+    sqlx::query("UPDATE cluster_nodes SET lease_expires_at = now() - interval '1 second' WHERE node_id = $1")
+        .bind(dead.node_id.0)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let placement = PgPlacementRepository::new(db.pool.clone());
+    assert_eq!(placement.load_of(me.node_id).await.unwrap(), 2);
+    let candidates = placement.candidates(me.node_id).await.unwrap();
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|c| (c.node_id, c.headroom))
+            .collect::<Vec<_>>(),
+        vec![(roomy.node_id, 4), (tight.node_id, 1)],
+        "most headroom first; this node, a full, an uncapped and a dead peer are never chosen"
+    );
+    let _ = (full, uncapped);
     db.drop().await;
 }
