@@ -125,6 +125,7 @@ pub(crate) async fn join_cluster(
             vrack_address,
             lease_ttl: timing.ttl,
             max_executions: cluster.membership.max_executions,
+            display_name: Some(config.metadata.name.clone()).filter(|n| !n.is_empty()),
         },
         timing,
     )

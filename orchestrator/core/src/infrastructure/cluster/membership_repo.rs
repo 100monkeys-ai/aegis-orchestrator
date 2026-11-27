@@ -28,11 +28,11 @@ pub const JOIN_SQL: &str = r#"
 INSERT INTO cluster_nodes (
     node_id, role, public_key, grpc_address, status, vrack_address,
     incarnation, lease_expires_at, last_renewed_at, last_heartbeat_at,
-    max_executions
+    max_executions, display_name
 ) VALUES (
     $1, $2, $3, $4, 'active', $5,
     1, now() + make_interval(secs => $6), now(), now(),
-    $7
+    $7, $8
 )
 ON CONFLICT (node_id) DO UPDATE SET
     role              = EXCLUDED.role,
@@ -44,7 +44,8 @@ ON CONFLICT (node_id) DO UPDATE SET
     lease_expires_at  = EXCLUDED.lease_expires_at,
     last_renewed_at   = EXCLUDED.last_renewed_at,
     last_heartbeat_at = EXCLUDED.last_heartbeat_at,
-    max_executions    = EXCLUDED.max_executions
+    max_executions    = EXCLUDED.max_executions,
+    display_name      = EXCLUDED.display_name
 RETURNING incarnation
 "#;
 
@@ -150,6 +151,7 @@ impl NodeLeaseRepository for PgNodeLeaseRepository {
             .bind(&join.vrack_address)
             .bind(seconds(join.lease_ttl))
             .bind(join.max_executions.map(|n| n as i32))
+            .bind(&join.display_name)
             .fetch_one(&self.pool)
             .await?;
         Ok(NodeIncarnation(incarnation))

@@ -39,7 +39,10 @@ use crate::daemon::handlers::canvas::{
     terminate_session_handler as canvas_terminate_session_handler,
     update_session_handler as canvas_update_session_handler,
 };
-use crate::daemon::handlers::cluster::{cluster_nodes_handler, cluster_status_handler};
+use crate::daemon::handlers::cluster::{
+    cluster_metrics_handler, cluster_nodes_handler, cluster_overview_handler,
+    cluster_status_handler,
+};
 use crate::daemon::handlers::colony::{
     accept_invitation, cancel_invitation, create_invitation, create_team, delete_team,
     get_saml_config, get_subscription, list_invitations, list_members, list_teams, remove_member,
@@ -221,6 +224,8 @@ pub(crate) fn create_router(
         .route("/v1/seal/context-tools", post(context_tools_seal_handler))
         .route("/v1/cluster/status", get(cluster_status_handler))
         .route("/v1/cluster/nodes", get(cluster_nodes_handler))
+        .route("/v1/cluster/overview", get(cluster_overview_handler))
+        .route("/v1/cluster/metrics", get(cluster_metrics_handler))
         .route("/v1/swarms", get(list_swarms_handler))
         .route("/v1/swarms/{swarm_id}", get(get_swarm_handler))
         .route(

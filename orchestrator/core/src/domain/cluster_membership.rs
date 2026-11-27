@@ -82,6 +82,8 @@ pub struct NodeJoin {
     /// How many executions this node runs before new ones go to a peer
     /// (ADR-152 D5.3); `None`: it never forwards and is never chosen.
     pub max_executions: Option<u32>,
+    /// The member's human-readable name, from `metadata.name`.
+    pub display_name: Option<String>,
 }
 
 /// A peer a new execution may go to (ADR-152 D5.3).
