@@ -1661,6 +1661,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     if let Err(e) = aegis_orchestrator_core::infrastructure::seal::nonce_store::PostgresNonceStore::delete_expired(&pool).await {
                         tracing::warn!(error = %e, "SEAL nonce cleanup failed");
                     }
+                    // ADR-152 D4.1: sessions a day past their end go too.
+                    if let Err(e) = aegis_orchestrator_core::infrastructure::seal::session_repository::PostgresSealSessionRepository::delete_stale(&pool).await {
+                        tracing::warn!(error = %e, "SEAL session cleanup failed");
+                    }
                 }
             },
         );
@@ -1945,11 +1949,19 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     // Note: security_context_repo was initialized earlier (before agent_service) — see above.
 
+    // ADR-152 D4.1: with a database, every member shares the sessions (a
+    // client the load balancer sends to another member keeps its session);
+    // a node without one keeps them itself.
     let seal_session_repo: Arc<
         dyn aegis_orchestrator_core::domain::seal_session_repository::SealSessionRepository,
-    > = Arc::new(
-        aegis_orchestrator_core::infrastructure::seal::session_repository::InMemorySealSessionRepository::new(),
-    );
+    > = match db_pool.as_ref() {
+        Some(pool) => Arc::new(
+            aegis_orchestrator_core::infrastructure::seal::session_repository::PostgresSealSessionRepository::new(pool.clone()),
+        ),
+        None => Arc::new(
+            aegis_orchestrator_core::infrastructure::seal::session_repository::InMemorySealSessionRepository::new(),
+        ),
+    };
 
     // Application Services — token_issuer was created earlier (ADR-088 §A8) and shared with ExecutionService.
     let mut attestation_service_builder =
