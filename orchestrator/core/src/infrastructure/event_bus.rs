@@ -1159,6 +1159,9 @@ pub struct EventBus {
     sender: Arc<broadcast::Sender<BusItem>>,
     process: Arc<std::sync::OnceLock<(uuid::Uuid, i64)>>,
     seq: Arc<std::sync::atomic::AtomicU64>,
+    /// Raised when relayed events may have been missed (ADR-152 D3.5, D3.7):
+    /// cluster-wide subscribers re-read the durable trail.
+    resync: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
 impl EventBus {
@@ -1171,6 +1174,7 @@ impl EventBus {
             sender: Arc::new(sender),
             process: Arc::new(std::sync::OnceLock::new()),
             seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            resync: Arc::new(tokio::sync::watch::channel(0).0),
         }
     }
 
@@ -1317,6 +1321,21 @@ impl EventBus {
     /// categories carry an origin. A second call changes nothing.
     pub fn set_origin(&self, node_id: uuid::Uuid, incarnation: i64) {
         let _ = self.process.set((node_id, incarnation));
+    }
+
+    /// Tell cluster-wide subscribers that relayed events may have been
+    /// missed: a gap in an origin's sequence, a stream that ended, or a peer
+    /// the relay cannot reach (ADR-152 D3.5, D3.7).
+    pub fn request_resync(&self) {
+        self.resync.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Changes whenever [`EventBus::request_resync`] is called after this
+    /// call (the current value counts as seen).
+    pub fn subscribe_resync_marked(&self) -> tokio::sync::watch::Receiver<u64> {
+        let mut receiver = self.resync.subscribe();
+        receiver.mark_unchanged();
+        receiver
     }
 
     /// Republish an event a peer relayed (ADR-152 D3), its origin intact.

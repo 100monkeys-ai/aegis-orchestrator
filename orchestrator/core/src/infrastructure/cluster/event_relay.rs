@@ -20,6 +20,10 @@ use crate::infrastructure::aegis_cluster_proto::ClusterEventEnvelope;
 use crate::infrastructure::cluster::GrpcPeerTransport;
 use crate::infrastructure::event_bus::{DomainEvent, EventBus, EventOrigin};
 
+/// How often cluster-wide subscribers re-read the durable trail while a
+/// peer's relay is down (ADR-152 D3.7, `relay_fallback_poll_ms`).
+pub const RELAY_FALLBACK_POLL: Duration = Duration::from_millis(1000);
+
 /// What one envelope's sequence says about the stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SequenceCheck {
@@ -142,8 +146,19 @@ impl ClusterEventRelay {
         })
     }
 
-    /// One peer's stream, until it ends; the supervisor opens it again.
+    /// One peer's stream, then the partition fallback (ADR-152 D3.7): while
+    /// it is down, cluster-wide subscribers re-read the durable trail every
+    /// [`RELAY_FALLBACK_POLL`] until the supervisor opens it again.
     async fn follow(&self, peer: NodeId, address: String) {
+        self.stream_from(peer, address).await;
+        let polls = (self.refresh.as_millis() / RELAY_FALLBACK_POLL.as_millis()).max(1);
+        for _ in 0..polls {
+            self.bus.request_resync();
+            tokio::time::sleep(RELAY_FALLBACK_POLL).await;
+        }
+    }
+
+    async fn stream_from(&self, peer: NodeId, address: String) {
         let mut sequences = OriginSequences::default();
         let mut stream = match self
             .transport
@@ -180,6 +195,7 @@ impl ClusterEventRelay {
                     metrics::counter!("aegis_cluster_relay_gaps_total", "reason" => "sequence")
                         .increment(1);
                     tracing::warn!(peer = %peer, missed, "Events relayed from the peer were missed");
+                    self.bus.request_resync();
                 }
                 SequenceCheck::InOrder => {}
             }
