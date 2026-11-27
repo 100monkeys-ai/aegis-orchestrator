@@ -128,7 +128,7 @@ impl GrpcPeerTransport {
         self
     }
 
-    async fn envelope(&self, payload: Vec<u8>) -> Result<SealNodeEnvelope> {
+    pub(crate) async fn envelope(&self, payload: Vec<u8>) -> Result<SealNodeEnvelope> {
         Ok(crate::infrastructure::cluster::node_envelope::seal(
             &self.signing_key,
             self.token.token().await?,
@@ -136,7 +136,7 @@ impl GrpcPeerTransport {
         ))
     }
 
-    async fn client(&self, address: &str) -> Result<NodeClusterServiceClient<Channel>> {
+    pub(crate) async fn client(&self, address: &str) -> Result<NodeClusterServiceClient<Channel>> {
         let mut channels = self.channels.lock().await;
         if let Some(client) = channels.get(address) {
             return Ok(client.clone());
@@ -256,6 +256,59 @@ impl GrpcPeerTransport {
             .await
             .with_context(|| format!("StreamClusterEvents {address}"))?
             .into_inner())
+    }
+}
+
+/// Sends a new execution to a peer with room (ADR-152 D5.3), vouching for
+/// the caller inside the SEAL node envelope (D5.5).
+pub struct GrpcExecutionForwarder {
+    transport: Arc<GrpcPeerTransport>,
+    me: NodeId,
+}
+
+impl GrpcExecutionForwarder {
+    pub fn new(transport: Arc<GrpcPeerTransport>, me: NodeId) -> Self {
+        Self { transport, me }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::application::cluster::ExecutionForwarder for GrpcExecutionForwarder {
+    async fn forward(
+        &self,
+        peer: &crate::domain::cluster_membership::PlacementCandidate,
+        start: &crate::application::cluster::ForwardedStart,
+    ) -> Result<NodeId> {
+        let inner = crate::infrastructure::aegis_cluster_proto::ForwardExecutionInner {
+            execution_id: start.execution_id.to_string(),
+            agent_id: start.agent_id.to_string(),
+            input: serde_json::to_string(&start.input)?,
+            tenant_id: start.tenant_id.as_str().to_string(),
+            originating_node_id: self.me.0.to_string(),
+            security_context_name: start.security_context_name.clone(),
+            caller_identity_json: match &start.caller {
+                Some(caller) => serde_json::to_string(caller)?,
+                None => String::new(),
+            },
+            vouched_at_unix: chrono::Utc::now().timestamp(),
+        };
+        let envelope = self.transport.envelope(inner.encode_to_vec()).await?;
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            self.transport
+                .client(&peer.grpc_address)
+                .await?
+                .forward_execution(
+                    crate::infrastructure::aegis_cluster_proto::ForwardExecutionRequest {
+                        envelope: Some(envelope),
+                    },
+                )
+                .await
+                .with_context(|| format!("ForwardExecution {}", peer.grpc_address))
+        })
+        .await
+        .context("the peer did not claim the execution within 5 s")??
+        .into_inner();
+        NodeId::from_string(&answer.owner_node_id).context("the forward's answer names no owner")
     }
 }
 

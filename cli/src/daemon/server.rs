@@ -3531,7 +3531,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     // this node owns.
                     .with_execution_canceller(execution_service.clone())
                     // ADR-152 D3: peers follow this node's events.
-                    .with_event_relay((*event_bus).clone());
+                    .with_event_relay((*event_bus).clone())
+                    // ADR-152 D5.5: a peer at capacity starts executions here,
+                    // vouching for the caller; it must hold a live lease.
+                    .with_forward_acceptance(joined.leases.clone());
             }
 
             // ADR-117: the relay-coordinator (and Hybrid / Controller-without-relay
@@ -3792,6 +3795,28 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     ),
                 )?;
                 let relay_transport = transport.clone();
+                // ADR-152 D5.3: with an advertised capacity, a full or
+                // draining node sends new executions to the peer with most
+                // headroom.
+                if let Some(capacity) = m.max_executions {
+                    execution_service.set_cluster_placement(
+                        aegis_orchestrator_core::application::cluster::ClusterPlacement {
+                            me: joined.membership.process().node_id,
+                            capacity,
+                            placement: Arc::new(
+                                aegis_orchestrator_core::infrastructure::cluster::PgPlacementRepository::new(
+                                    joined.pool.clone(),
+                                ),
+                            ),
+                            forwarder: Arc::new(
+                                aegis_orchestrator_core::infrastructure::cluster::GrpcExecutionForwarder::new(
+                                    transport.clone(),
+                                    joined.membership.process().node_id,
+                                ),
+                            ),
+                        },
+                    )?;
+                }
                 let prober = Arc::new(
                     aegis_orchestrator_core::application::cluster::PeerProber::new(
                         joined.membership.clone(),

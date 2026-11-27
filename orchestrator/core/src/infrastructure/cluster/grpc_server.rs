@@ -28,7 +28,6 @@ use crate::infrastructure::aegis_cluster_proto::{
     RegisterNodeResponse, RouteExecutionInner, RouteExecutionRequest, RouteExecutionResponse,
     SealNodeEnvelope as ProtoEnvelope, SyncConfigInner, SyncConfigRequest, SyncConfigResponse,
 };
-use crate::infrastructure::aegis_runtime_proto::ExecutionEvent;
 use prost::Message;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -97,7 +96,14 @@ pub struct NodeClusterServiceHandler {
     /// The local bus whose relayed-category events this node streams to its
     /// peers (ADR-152 D3); present on a joined node.
     event_bus: Option<crate::infrastructure::event_bus::EventBus>,
+    /// The leases a forwarding node must be live in (ADR-152 D5.5); present
+    /// on a joined node that runs executions.
+    forward_leases: Option<Arc<dyn crate::domain::cluster_membership::NodeLeaseRepository>>,
 }
+
+/// How far a forward's issue time may be from this node's clock (ADR-152
+/// D5.5).
+pub const FORWARD_MAX_AGE_SECS: i64 = 60;
 
 /// How many envelopes a peer's stream may hold before it is closed and the
 /// peer resynchronises (ADR-152 D3.6).
@@ -135,6 +141,7 @@ impl NodeClusterServiceHandler {
             membership: None,
             canceller: None,
             event_bus: None,
+            forward_leases: None,
         }
     }
 
@@ -179,6 +186,15 @@ impl NodeClusterServiceHandler {
         event_bus: crate::infrastructure::event_bus::EventBus,
     ) -> Self {
         self.event_bus = Some(event_bus);
+        self
+    }
+
+    /// ADR-152 D5.5: take forwarded executions from peers live in `leases`.
+    pub fn with_forward_acceptance(
+        mut self,
+        leases: Arc<dyn crate::domain::cluster_membership::NodeLeaseRepository>,
+    ) -> Self {
+        self.forward_leases = Some(leases);
         self
     }
 
@@ -627,47 +643,91 @@ impl NodeClusterService for NodeClusterServiceHandler {
         )))
     }
 
-    type ForwardExecutionStream =
-        Pin<Box<dyn Stream<Item = Result<ExecutionEvent, Status>> + Send>>;
-
+    /// ADR-152 D5.3, D5.5: a peer at capacity, or draining, starts an
+    /// execution here. The forwarding node vouches for the caller: its
+    /// envelope is verified, it must hold a live lease, and the forward must
+    /// be no older than [`FORWARD_MAX_AGE_SECS`]. Answers once this node has
+    /// claimed the execution.
     async fn forward_execution(
         &self,
         request: Request<ForwardExecutionRequest>,
-    ) -> Result<Response<Self::ForwardExecutionStream>, Status> {
-        let (_node_id, inner): (NodeId, ForwardExecutionInner) = self
+    ) -> Result<
+        Response<crate::infrastructure::aegis_cluster_proto::ForwardExecutionResponse>,
+        Status,
+    > {
+        let (from, inner): (NodeId, ForwardExecutionInner) = self
             .authenticate_node(request.into_inner().envelope)
             .await?;
-
+        let me = self.membership()?.process().node_id;
+        let Some(leases) = self.forward_leases.as_ref() else {
+            return Err(Status::failed_precondition(
+                "this node takes no forwarded executions",
+            ));
+        };
+        let live = leases
+            .leases()
+            .await
+            .map_err(|e| Status::unavailable(format!("reading the cluster's leases: {e}")))?
+            .into_iter()
+            .any(|l| l.node_id == from && l.live);
+        if !live {
+            return Err(Status::permission_denied(
+                "the forwarding node holds no live lease in this cluster",
+            ));
+        }
+        let age = (chrono::Utc::now().timestamp() - inner.vouched_at_unix).abs();
+        if age > FORWARD_MAX_AGE_SECS {
+            return Err(Status::permission_denied(format!(
+                "the forward was issued {age} s from this node's clock (limit {FORWARD_MAX_AGE_SECS} s)"
+            )));
+        }
+        let caller: Option<crate::domain::iam::UserIdentity> =
+            if inner.caller_identity_json.is_empty() {
+                None
+            } else {
+                Some(
+                    serde_json::from_str(&inner.caller_identity_json).map_err(|_| {
+                        Status::invalid_argument("caller_identity_json is not an identity")
+                    })?,
+                )
+            };
+        let execution_id = ExecutionId::from_string(&inner.execution_id)
+            .map_err(|_| Status::invalid_argument("Invalid execution_id"))?;
         let app_req = AppForwardExecutionRequest {
-            execution_id: ExecutionId::from_string(&inner.execution_id)
-                .map_err(|_| Status::invalid_argument("Invalid execution_id"))?,
+            execution_id,
             agent_id: AgentId::from_string(&inner.agent_id)
                 .map_err(|_| Status::invalid_argument("Invalid agent_id"))?,
             input: inner.input,
             tenant_id: TenantId::from_string(&inner.tenant_id)
                 .map_err(|_| Status::invalid_argument("Invalid tenant_id"))?,
-            originating_node_id: inner.originating_node_id,
-            user_security_token: inner.user_security_token,
-            // ADR-083: propagate security context from the proto message.
             security_context_name: inner.security_context_name,
+            caller,
         };
-
         let forward_uc = self.forward_execution_use_case.as_ref().ok_or_else(|| {
             Status::failed_precondition(
                 "ForwardExecution disabled on this node (relay-coordinator role does not host agent execution)",
             )
         })?;
-        let stream = forward_uc
-            .execute(app_req)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        let output_stream = tokio_stream::StreamExt::filter_map(stream, |res| match res {
-            Err(e) => Some(Err(Status::internal(e.to_string()))),
-            Ok(domain_ev) => super::event_mapper::domain_to_proto(domain_ev).map(Ok),
-        });
-
-        Ok(Response::new(Box::pin(output_stream)))
+        let outcome = forward_uc.execute(app_req).await.map_err(|e| {
+            if e.downcast_ref::<crate::application::execution::NodeDraining>()
+                .is_some()
+            {
+                Status::unavailable("this node is draining")
+            } else {
+                Status::internal(e.to_string())
+            }
+        })?;
+        tracing::info!(
+            vouched_by = %from,
+            execution_id = %execution_id,
+            ?outcome,
+            "Forwarded execution accepted"
+        );
+        Ok(Response::new(
+            crate::infrastructure::aegis_cluster_proto::ForwardExecutionResponse {
+                owner_node_id: me.0.to_string(),
+            },
+        ))
     }
 
     async fn sync_config(

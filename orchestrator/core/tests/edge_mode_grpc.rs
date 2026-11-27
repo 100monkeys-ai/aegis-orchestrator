@@ -54,7 +54,6 @@ use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::{
     RegisterNodeResponse, RotateEdgeKeyRequest, RotateEdgeKeyResponse, RouteExecutionRequest,
     RouteExecutionResponse, SealEnvelope, SealNodeEnvelope, SyncConfigRequest, SyncConfigResponse,
 };
-use aegis_orchestrator_core::infrastructure::aegis_runtime_proto::ExecutionEvent;
 use aegis_orchestrator_core::infrastructure::cluster::node_envelope::{seal, NodeEnvelopeVerifier};
 use aegis_orchestrator_core::infrastructure::edge::EdgeConnectionRegistry;
 
@@ -178,12 +177,15 @@ impl NodeClusterService for EdgeOnlyClusterService {
         Err(Status::unimplemented("route_execution"))
     }
 
-    type ForwardExecutionStream =
-        Pin<Box<dyn Stream<Item = Result<ExecutionEvent, Status>> + Send>>;
     async fn forward_execution(
         &self,
         _r: Request<ForwardExecutionRequest>,
-    ) -> Result<Response<Self::ForwardExecutionStream>, Status> {
+    ) -> Result<
+        Response<
+            aegis_orchestrator_core::infrastructure::aegis_cluster_proto::ForwardExecutionResponse,
+        >,
+        Status,
+    > {
         Err(Status::unimplemented("forward_execution"))
     }
 

@@ -434,7 +434,6 @@ mod tests {
             RotateEdgeKeyResponse, RouteExecutionRequest, RouteExecutionResponse,
             SyncConfigRequest, SyncConfigResponse,
         };
-        use crate::infrastructure::aegis_runtime_proto::ExecutionEvent;
         use std::pin::Pin;
         use std::sync::Mutex;
         use tokio_stream::Stream;
@@ -507,12 +506,13 @@ mod tests {
             ) -> Result<Response<RouteExecutionResponse>, Status> {
                 Err(Status::unimplemented(""))
             }
-            type ForwardExecutionStream =
-                Pin<Box<dyn Stream<Item = Result<ExecutionEvent, Status>> + Send>>;
             async fn forward_execution(
                 &self,
                 _: Request<ForwardExecutionRequest>,
-            ) -> Result<Response<Self::ForwardExecutionStream>, Status> {
+            ) -> Result<
+                Response<crate::infrastructure::aegis_cluster_proto::ForwardExecutionResponse>,
+                Status,
+            > {
                 Err(Status::unimplemented(""))
             }
             async fn sync_config(
