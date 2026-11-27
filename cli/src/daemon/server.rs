@@ -3529,7 +3529,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     .with_membership(joined.membership.clone())
                     // ADR-152 D5.4: a peer forwards here the cancel of a run
                     // this node owns.
-                    .with_execution_canceller(execution_service.clone());
+                    .with_execution_canceller(execution_service.clone())
+                    // ADR-152 D3: peers follow this node's events.
+                    .with_event_relay((*event_bus).clone());
             }
 
             // ADR-117: the relay-coordinator (and Hybrid / Controller-without-relay
@@ -3789,16 +3791,33 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         ),
                     ),
                 )?;
+                let relay_transport = transport.clone();
                 let prober = Arc::new(
                     aegis_orchestrator_core::application::cluster::PeerProber::new(
                         joined.membership.clone(),
                         joined.leases.clone(),
-                        transport,
+                        transport.clone(),
                         std::time::Duration::from_millis(m.probe_interval_ms.max(100)),
                         m.probe_failures_to_suspect,
                     ),
                 );
                 prober.clone().spawn();
+
+                // ADR-152 D3: this process's relayed-category events carry
+                // its origin, and every live peer's are republished here.
+                event_bus.set_origin(
+                    joined.membership.process().node_id.0,
+                    joined.membership.process().incarnation.0,
+                );
+                Arc::new(
+                    aegis_orchestrator_core::infrastructure::cluster::ClusterEventRelay::new(
+                        joined.membership.process(),
+                        joined.leases.clone(),
+                        relay_transport,
+                        (*event_bus).clone(),
+                    ),
+                )
+                .spawn();
 
                 // ADR-152 D5.7: the holder of execution-adoption ends what a
                 // dead peer left (lease expired and probes failed).
