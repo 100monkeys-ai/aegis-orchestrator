@@ -383,6 +383,35 @@ pub(crate) async fn webhook_handler(
         Err(e) => return e.into_response(),
     };
 
+    // AEGIS ADR-157 D4: a delivery is accepted once. GitHub names each one in
+    // X-GitHub-Delivery; a source that names none is not checked.
+    if let Some(delivery) = headers
+        .get("x-github-delivery")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+    {
+        use aegis_orchestrator_core::infrastructure::seal::nonce_store::NonceOutcome;
+        let key = format!("webhook:{}:{}:{delivery}", source, guard.tenant_id.as_str());
+        match state.webhook_deliveries.record(&key).await {
+            Ok(NonceOutcome::Fresh) => {}
+            Ok(NonceOutcome::Replay) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({ "error": "replayed_delivery", "message": "this delivery was already accepted" })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not record a webhook delivery; refusing it");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "delivery_store_unavailable" })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     // Convert verified body bytes to String (treat as UTF-8 if possible, else base64)
     let content = String::from_utf8(guard.body.to_vec())
         .unwrap_or_else(|_| base64::engine::general_purpose::STANDARD.encode(&guard.body));

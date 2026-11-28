@@ -143,10 +143,16 @@ pub struct PostgresNonceStore {
 
 impl PostgresNonceStore {
     pub fn new(pool: sqlx::PgPool) -> Self {
+        Self::with_ttl(pool, SEAL_REPLAY_TTL)
+    }
+
+    /// A store whose entries live `ttl`: a webhook delivery's id is
+    /// remembered far longer than a SEAL nonce (AEGIS ADR-157 D4).
+    pub fn with_ttl(pool: sqlx::PgPool, ttl: Duration) -> Self {
         Self {
-            local: InMemoryNonceStore::new(),
+            local: InMemoryNonceStore::with_ttl(ttl),
             pool,
-            ttl: SEAL_REPLAY_TTL,
+            ttl,
         }
     }
 

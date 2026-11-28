@@ -238,10 +238,18 @@ impl WebhookHmacGuard {
             .unwrap_or("unknown")
             .to_string();
 
-        // ── Extract X-Aegis-Signature header ──────────────────────────────────
+        // ── Extract the signature header ──────────────────────────────────────
+        // GitHub signs with the same HMAC-SHA256 `sha256=<hex>` scheme in its
+        // own header, X-Hub-Signature-256 (AEGIS ADR-157 D4); every other
+        // source uses X-Aegis-Signature.
+        let header_name = if source == "github" {
+            "X-Hub-Signature-256"
+        } else {
+            "X-Aegis-Signature"
+        };
         let sig_header = req
             .headers()
-            .get("X-Aegis-Signature")
+            .get(header_name)
             .ok_or(WebhookAuthError::MissingSignature)?
             .to_str()
             .map_err(|_| WebhookAuthError::MalformedSignature)?
@@ -562,6 +570,45 @@ mod tests {
             matches!(result, Err(WebhookAuthError::BodyReadError(_))),
             "expected BodyReadError once the cap is exceeded, got {:?}",
             result.err()
+        );
+    }
+
+    /// AEGIS ADR-157 D4: GitHub signs in its own header, X-Hub-Signature-256,
+    /// with the same scheme; a GitHub delivery signed only in
+    /// X-Aegis-Signature is refused.
+    #[tokio::test]
+    async fn a_github_delivery_is_verified_from_x_hub_signature_256() {
+        use axum::body::Body;
+        use axum::http::Request;
+
+        std::env::set_var("AEGIS_WEBHOOK_SECRET_U_GH_GITHUB", "gh-secret");
+        let provider = EnvWebhookSecretProvider;
+        let body = b"{\"ref\":\"refs/heads/main\"}";
+        let sig = compute_webhook_signature(body, b"gh-secret");
+
+        let github = Request::builder()
+            .uri("/v1/webhooks/github")
+            .header("X-Hub-Signature-256", sig.clone())
+            .body(Body::from(body.as_slice()))
+            .unwrap();
+        let accepted = WebhookHmacGuard::from_request(github, &provider, &[ten("u-gh")]).await;
+
+        let wrong_header = Request::builder()
+            .uri("/v1/webhooks/github")
+            .header("X-Aegis-Signature", sig)
+            .body(Body::from(body.as_slice()))
+            .unwrap();
+        let refused = WebhookHmacGuard::from_request(wrong_header, &provider, &[ten("u-gh")]).await;
+        std::env::remove_var("AEGIS_WEBHOOK_SECRET_U_GH_GITHUB");
+
+        assert!(
+            accepted.is_ok(),
+            "GitHub's own header verifies: {:?}",
+            accepted.err()
+        );
+        assert!(
+            matches!(refused, Err(WebhookAuthError::MissingSignature)),
+            "a GitHub delivery without X-Hub-Signature-256 is refused"
         );
     }
 }
