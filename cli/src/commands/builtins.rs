@@ -189,6 +189,10 @@ pub const BUILTIN_WORKFLOWS: &[(&str, &str)] = &[
         "infra-apply",
         include_str!("../../templates/workflows/infra-apply.yaml"),
     ),
+    (
+        "provider-apply",
+        include_str!("../../templates/workflows/provider-apply.yaml"),
+    ),
 ];
 
 /// All builtin templates that should be synced to disk.
@@ -2783,6 +2787,39 @@ mod tests {
             "AEGIS ADR-149: carbon-forge does not cut the landed run:\n{}",
             complaints.join("\n")
         );
+    }
+
+    /// AEGIS ADR-157 D11: `provider-apply` is a built-in: PLAN, the gated
+    /// APPLY and VERIFY, each a provider state action.
+    #[test]
+    fn provider_apply_is_a_builtin_planning_applying_and_verifying_a_provider_state() {
+        use aegis_orchestrator_core::domain::workflow::{ActionName, StateKind};
+        let Some((_, yaml)) = BUILTIN_WORKFLOWS
+            .iter()
+            .find(|(n, _)| *n == "provider-apply")
+        else {
+            panic!("AEGIS ADR-157 D11: provider-apply is not registered");
+        };
+        let parsed =
+            aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(
+                yaml,
+            )
+            .unwrap_or_else(|e| panic!("provider-apply does not parse: {e}"));
+        let action_of = |state: &str| {
+            let (_, spec) = parsed
+                .spec
+                .states
+                .iter()
+                .find(|(n, _)| n.as_str() == state)
+                .unwrap();
+            match &spec.kind {
+                StateKind::Action { action, .. } => *action,
+                other => panic!("{state} is not an Action: {other:?}"),
+            }
+        };
+        assert_eq!(action_of("PLAN"), ActionName::ProviderStatePlan);
+        assert_eq!(action_of("APPLY"), ActionName::ProviderStateApply);
+        assert_eq!(action_of("VERIFY"), ActionName::ProviderStatePlan);
     }
 
     /// AEGIS ADR-157 D4: `infra-apply` is a built-in: PLAN, the gated APPLY

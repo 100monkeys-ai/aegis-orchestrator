@@ -87,6 +87,9 @@ pub struct EdgeApiState {
     pub connection_registry: EdgeConnectionRegistry,
     /// Host state (ADR-157 D2); `None` without a database.
     pub host_states: Option<Arc<crate::application::host_state_service::HostStateService>>,
+    /// ADR-157 D11: provider states; None without the database.
+    pub provider_states:
+        Option<Arc<crate::application::provider_state_service::ProviderStateService>>,
 }
 
 /// Mount the `/v1/edge` router.
@@ -121,6 +124,20 @@ pub fn router(state: EdgeApiState) -> Router {
         )
         .route("/v1/host-states/{name}/plan", post(plan_host_state))
         .route("/v1/host-states/{name}/apply", post(apply_host_state))
+        .route(
+            "/v1/provider-states",
+            get(list_provider_states).post(create_provider_state),
+        )
+        .route(
+            "/v1/provider-states/validate",
+            post(validate_provider_state),
+        )
+        .route(
+            "/v1/provider-states/{name}",
+            get(get_provider_state)
+                .put(update_provider_state)
+                .delete(archive_provider_state),
+        )
         .route(
             "/v1/host-state-secrets/{*path}",
             get(get_host_state_secret).put(put_host_state_secret),
@@ -918,6 +935,7 @@ mod tests {
             dispatch_service,
             connection_registry: conn_registry,
             host_states: None,
+            provider_states: None,
         }
     }
 
@@ -1277,6 +1295,7 @@ mod tests {
             dispatch_service,
             connection_registry: conn_registry,
             host_states: None,
+            provider_states: None,
         }
     }
 
@@ -1747,6 +1766,135 @@ fn host_state_view(s: &crate::domain::host_state::HostState) -> HostStateView {
         created_by: s.created_by.clone(),
         created_at: s.created_at.to_rfc3339(),
     }
+}
+
+// ── Provider states (ADR-157 D11) ─────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct ProviderStateView {
+    name: String,
+    version: i32,
+    status: &'static str,
+    description: Option<String>,
+    provider: String,
+    resources: usize,
+    manifest_yaml: String,
+    created_by: String,
+    created_at: String,
+}
+
+fn provider_state_view(s: &crate::domain::provider_state::ProviderState) -> ProviderStateView {
+    ProviderStateView {
+        name: s.name.clone(),
+        version: s.version,
+        status: s.status.as_str(),
+        description: s.manifest.metadata.description.clone(),
+        provider: s.manifest.spec.provider.clone(),
+        resources: s.manifest.spec.resources.len(),
+        manifest_yaml: s.manifest_yaml.clone(),
+        created_by: s.created_by.clone(),
+        created_at: s.created_at.to_rfc3339(),
+    }
+}
+
+fn provider_states(
+    s: &EdgeApiState,
+) -> Result<&crate::application::provider_state_service::ProviderStateService, ApiError> {
+    s.provider_states
+        .as_deref()
+        .ok_or_else(|| ApiError::internal("provider state needs the orchestrator's database"))
+}
+
+fn provider_state_error(
+    e: crate::application::provider_state_service::ProviderStateError,
+) -> ApiError {
+    use crate::application::provider_state_service::ProviderStateError as E;
+    match e {
+        E::Invalid(_) => ApiError::bad_request(e.to_string()),
+        E::NotFound(_) => ApiError::not_found(e.to_string()),
+        E::Repository(_) => ApiError::internal(e.to_string()),
+    }
+}
+
+async fn list_provider_states(
+    State(s): State<EdgeApiState>,
+    Extension(tenant): Extension<TenantId>,
+) -> Result<Json<Vec<ProviderStateView>>, ApiError> {
+    let list = provider_states(&s)?
+        .list(&tenant)
+        .await
+        .map_err(provider_state_error)?;
+    Ok(Json(list.iter().map(provider_state_view).collect()))
+}
+
+async fn create_provider_state(
+    State(s): State<EdgeApiState>,
+    Extension(tenant): Extension<TenantId>,
+    identity: Option<Extension<UserIdentity>>,
+    Json(body): Json<HostStateBody>,
+) -> Result<Json<ProviderStateView>, ApiError> {
+    let saved = provider_states(&s)?
+        .register(&tenant, &body.manifest_yaml, &actor(&identity))
+        .await
+        .map_err(provider_state_error)?;
+    Ok(Json(provider_state_view(&saved)))
+}
+
+async fn update_provider_state(
+    State(s): State<EdgeApiState>,
+    Extension(tenant): Extension<TenantId>,
+    identity: Option<Extension<UserIdentity>>,
+    Path(name): Path<String>,
+    Json(body): Json<HostStateBody>,
+) -> Result<Json<ProviderStateView>, ApiError> {
+    let manifest = crate::domain::provider_state::ProviderStateManifest::parse(&body.manifest_yaml)
+        .map_err(|p| ApiError::bad_request(p.join("; ")))?;
+    if manifest.metadata.name != name {
+        return Err(ApiError::bad_request(format!(
+            "the manifest names {:?}, not {name:?}",
+            manifest.metadata.name
+        )));
+    }
+    let svc = provider_states(&s)?;
+    svc.get(&tenant, &name)
+        .await
+        .map_err(provider_state_error)?;
+    let saved = svc
+        .register(&tenant, &body.manifest_yaml, &actor(&identity))
+        .await
+        .map_err(provider_state_error)?;
+    Ok(Json(provider_state_view(&saved)))
+}
+
+async fn validate_provider_state(Json(body): Json<HostStateBody>) -> Json<serde_json::Value> {
+    let problems = crate::application::provider_state_service::ProviderStateService::validate(
+        &body.manifest_yaml,
+    );
+    Json(serde_json::json!({ "valid": problems.is_empty(), "problems": problems }))
+}
+
+async fn get_provider_state(
+    State(s): State<EdgeApiState>,
+    Extension(tenant): Extension<TenantId>,
+    Path(name): Path<String>,
+) -> Result<Json<ProviderStateView>, ApiError> {
+    let st = provider_states(&s)?
+        .get(&tenant, &name)
+        .await
+        .map_err(provider_state_error)?;
+    Ok(Json(provider_state_view(&st)))
+}
+
+async fn archive_provider_state(
+    State(s): State<EdgeApiState>,
+    Extension(tenant): Extension<TenantId>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    provider_states(&s)?
+        .archive(&tenant, &name)
+        .await
+        .map_err(provider_state_error)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn host_states(

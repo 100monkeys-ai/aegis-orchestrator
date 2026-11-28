@@ -51,6 +51,14 @@ impl ToolInvocationService {
         self
     }
 
+    pub fn with_provider_state_service(
+        mut self,
+        service: Arc<crate::application::provider_state_service::ProviderStateService>,
+    ) -> Self {
+        self.provider_state_service = Some(service);
+        self
+    }
+
     /// Run one `aegis.host_state.*` tool in the call's tenant. A plan or an
     /// apply is attested as the caller's, through this MCP call (D12).
     pub(super) async fn invoke_aegis_host_state_tool(
@@ -229,6 +237,11 @@ impl ToolInvocationService {
         }
         if action == "tool_call" {
             return self.tool_call(tenant, run, &args).await;
+        }
+        if action == "provider_state_plan" || action == "provider_state_apply" {
+            return self
+                .provider_state_run(tenant, run, &args, action == "provider_state_plan")
+                .await;
         }
         if self.host_state_service.is_none() {
             return HostActionAnswer::refused(NO_HOST_STATES);
@@ -437,6 +450,140 @@ async fn http_check(args: &serde_json::Map<String, Value>) -> HostActionAnswer {
     }
 }
 
+/// One provider object's report, from `cloudflare.execute`'s answer: the
+/// generated code returns `{status, diff}`, which the gateway hands back as
+/// the value itself or as MCP text content holding it.
+fn provider_report(answer: &Value) -> (String, String) {
+    let parsed = if answer.get("status").is_some() {
+        Some(answer.clone())
+    } else {
+        answer
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|c| c.iter().find_map(|x| x.get("text").and_then(Value::as_str)))
+            .and_then(|t| serde_json::from_str::<Value>(t).ok())
+    };
+    match parsed {
+        Some(v) => (
+            v.get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("failed")
+                .to_string(),
+            v.get("diff")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        None => ("failed".into(), format!("the provider answered {answer}")),
+    }
+}
+
+impl ToolInvocationService {
+    /// Plan or apply a registered provider state (AEGIS ADR-157 D11): one
+    /// `cloudflare.execute` per resource, with code the state generates, as
+    /// the run's person and with the binding the run's `contexts` chose for
+    /// `cloudflare`. A plan only reads. An apply waits at the approval gate
+    /// once, for the whole state, then writes each resource's difference
+    /// and stops at the first that fails.
+    async fn provider_state_run(
+        &self,
+        tenant: &TenantId,
+        run: uuid::Uuid,
+        args: &serde_json::Map<String, Value>,
+        check: bool,
+    ) -> HostActionAnswer {
+        let Some(service) = self.provider_state_service.as_ref() else {
+            return HostActionAnswer::refused("provider states need the orchestrator's database");
+        };
+        let Some(name) = args.get("name").and_then(Value::as_str) else {
+            return HostActionAnswer::refused("`name` is required");
+        };
+        let state = match service.get(tenant, name).await {
+            Ok(state) => state,
+            Err(e) => return HostActionAnswer::refused(e.to_string()),
+        };
+        let Some(executions) = self.workflow_execution_repo.as_ref() else {
+            return HostActionAnswer::refused("the workflow execution store is not configured");
+        };
+        let execution = match executions
+            .find_by_id_for_tenant(tenant, crate::domain::execution::ExecutionId(run))
+            .await
+        {
+            Ok(Some(execution)) => execution,
+            Ok(None) => return HostActionAnswer::refused(format!("no workflow run {run}")),
+            Err(e) => return HostActionAnswer::refused(e.to_string()),
+        };
+        let person = execution.initiating_user_sub.clone().unwrap_or_default();
+        let acting = Self::run_acting(
+            Some(person.as_str()),
+            Some(execution.workflow_id.as_uuid()),
+            self.remote_tool_former_names.execution_contexts(
+                crate::domain::execution::ExecutionContexts::from_value(
+                    execution
+                        .input
+                        .get(crate::domain::execution::CONTEXTS_INPUT_KEY),
+                ),
+            ),
+        );
+        let server = state.manifest.spec.provider.clone();
+        let calls = state.manifest.execute_calls(check);
+        let version = state.version;
+        let go = || async {
+            let mut results = Vec::new();
+            let (mut changed, mut failed) = (0usize, 0usize);
+            for (id, call_args) in calls {
+                let (status, diff) = match self
+                    .invoke_remote_tool_with_binding_for_run(
+                        run, tenant, &acting, &server, "execute", call_args,
+                    )
+                    .await
+                {
+                    Ok(answer) => provider_report(&answer),
+                    Err(e) => ("failed".to_string(), e.to_string()),
+                };
+                match status.as_str() {
+                    "changed" => changed += 1,
+                    "ok" => {}
+                    _ => failed += 1,
+                }
+                results.push(json!({ "id": id, "status": status, "diff": diff }));
+                if failed > 0 && !check {
+                    break;
+                }
+            }
+            Ok(json!({
+                "name": name, "version": version, "check": check,
+                "changed": changed, "failed": failed, "results": results,
+            }))
+        };
+        let outcome = if check {
+            go().await.map(super::storage::GatedLanding::Landed)
+        } else {
+            self.land_at_gate(
+                tenant,
+                crate::domain::execution::ExecutionId(run),
+                &person,
+                "aegis.provider_state.apply",
+                json!({ "name": name, "version": version }),
+                go,
+            )
+            .await
+            .map_err(|e| SealSessionError::InternalError(e.to_string()))
+        };
+        match outcome {
+            Ok(super::storage::GatedLanding::Landed(result)) => HostActionAnswer {
+                ok: result.get("failed").and_then(Value::as_u64) == Some(0),
+                sentence: None,
+                result,
+            },
+            Ok(super::storage::GatedLanding::NotApproved(sentence)) => HostActionAnswer::refused(
+                sentence.replace("nothing was landed", "nothing was changed"),
+            ),
+            Err(e) => HostActionAnswer::refused(e.to_string()),
+        }
+    }
+}
+
 impl ToolInvocationService {
     /// A workflow's `tool_call` (AEGIS ADR-157 D11): `tool` on its remote
     /// server, with `args`, as the run's person and with the binding the
@@ -541,6 +688,26 @@ mod host_action_tests {
     use super::*;
     use crate::domain::workflow::ActionName;
 
+    /// ADR-157 D11: a provider's answer is read as the value itself or as
+    /// MCP text content holding it; anything else is a failure.
+    #[test]
+    fn a_providers_answer_is_read_either_way() {
+        let direct = serde_json::json!({ "status": "changed", "diff": "created 1.2.3.4" });
+        assert_eq!(
+            super::provider_report(&direct),
+            ("changed".into(), "created 1.2.3.4".into())
+        );
+        let text = serde_json::json!({ "content": [{ "type": "text", "text": "{\"status\":\"ok\",\"diff\":\"in place\"}" }] });
+        assert_eq!(
+            super::provider_report(&text),
+            ("ok".into(), "in place".into())
+        );
+        assert_eq!(
+            super::provider_report(&serde_json::json!({ "x": 1 })).0,
+            "failed"
+        );
+    }
+
     /// ADR-157 D11: tool_call reaches remote servers only; AEGIS's own tools
     /// keep their own actions and rules.
     #[test]
@@ -574,6 +741,8 @@ mod host_action_tests {
             ("edge_fleet_invoke", true),
             ("http_check", false),
             ("tool_call", true),
+            ("provider_state_plan", false),
+            ("provider_state_apply", true),
         ] {
             let action = ActionName::from_literal(name).expect(name);
             assert_eq!(action.as_str(), name);

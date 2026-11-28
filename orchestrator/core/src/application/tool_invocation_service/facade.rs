@@ -242,6 +242,7 @@ impl ToolInvocationService {
             goal_service: None,
             schedule_service: None,
             host_state_service: None,
+            provider_state_service: None,
             image_generation: None,
         }
     }
