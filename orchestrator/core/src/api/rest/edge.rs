@@ -1875,7 +1875,12 @@ async fn run_host_state(
     let token =
         bearer(headers).ok_or_else(|| ApiError::unauthorized("a bearer token is required"))?;
     let run = host_states(s)?
-        .run(tenant, name, check, &token)
+        .run(
+            tenant,
+            name,
+            check,
+            &crate::application::host_state_service::HostStatePrincipal::Bearer(token),
+        )
         .await
         .map_err(host_state_error)?;
     Ok(Json(run))
