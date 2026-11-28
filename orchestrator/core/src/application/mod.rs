@@ -50,6 +50,7 @@ pub mod edge;
 pub mod effective_tier_service;
 pub mod execution;
 pub mod goal_service;
+pub mod host_state_service;
 pub mod lifecycle;
 pub mod operator_escalation_service;
 pub mod profile_service;
