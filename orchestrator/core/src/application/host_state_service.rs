@@ -17,7 +17,7 @@ use serde_json::Value;
 use crate::application::edge::fleet::dispatcher::FleetInvocation;
 use crate::application::edge::fleet::{EdgeFleetResolver, FleetDispatcher, FleetEvent};
 use crate::domain::cluster::FleetCommandId;
-use crate::domain::edge_fleet::FleetDispatchPolicy;
+use crate::domain::edge_fleet::{FleetDispatchPolicy, FleetMode};
 use crate::domain::host_state::{HostState, HostStateManifest, HostStateRepository};
 use crate::domain::repository::RepositoryError;
 use crate::domain::shared_kernel::TenantId;
@@ -48,6 +48,15 @@ pub enum HostStatePrincipal {
         via: &'static str,
         reference: String,
     },
+}
+
+/// The outcome of one fleet run: each edge's result, and the edges the
+/// target named that were not reached.
+#[derive(Debug, Clone)]
+pub struct FleetRun {
+    pub fleet_command_id: FleetCommandId,
+    pub hosts: Vec<HostRun>,
+    pub skipped: Vec<(String, String)>,
 }
 
 /// One edge's outcome of a plan or an apply.
@@ -151,29 +160,60 @@ impl HostStateService {
     ) -> Result<HostStateRun, HostStateError> {
         let state = self.get(tenant, name).await?;
         let spec = &state.manifest.spec;
+        let fleet = self
+            .invoke_fleet(
+                tenant,
+                &spec.target,
+                "host.apply",
+                serde_json::json!({ "state": spec.apply_state(), "check": check }),
+                spec.security_context(),
+                FleetMode::Sequential,
+                principal,
+            )
+            .await?;
+        Ok(summarise(
+            &state,
+            check,
+            fleet.fleet_command_id,
+            fleet.hosts,
+            fleet.skipped,
+        ))
+    }
+
+    /// Run `tool` with `args` on the edges `target` names, under `context`,
+    /// one at a time (stopping at the first failure) or in parallel, for
+    /// `principal`. Each edge's structured result comes back as its report.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn invoke_fleet(
+        &self,
+        tenant: &TenantId,
+        target: &crate::domain::edge::EdgeTarget,
+        tool: &str,
+        args: Value,
+        context: &str,
+        mode: FleetMode,
+        principal: &HostStatePrincipal,
+    ) -> Result<FleetRun, HostStateError> {
         let resolved = self
             .resolver
-            .resolve(tenant, &spec.target)
+            .resolve(tenant, target)
             .await
             .map_err(|e| HostStateError::NoTargets(e.to_string()))?;
         if resolved.is_empty() {
-            return Err(HostStateError::NoTargets(name.to_string()));
+            return Err(HostStateError::NoTargets(format!("{target:?}")));
         }
-        let args = crate::application::edge::json_value_to_prost_struct(serde_json::json!({
-            "state": spec.apply_state(),
-            "check": check,
-        }))
-        .map_err(|e| HostStateError::Invalid(vec![e.to_string()]))?;
-        let context = spec.security_context().to_string();
+        let args = crate::application::edge::json_value_to_prost_struct(args)
+            .map_err(|e| HostStateError::Invalid(vec![e.to_string()]))?;
         let inv = FleetInvocation {
             fleet_command_id: FleetCommandId::new(),
             tenant_id: tenant.clone(),
-            tool_name: "host.apply".to_string(),
+            tool_name: tool.to_string(),
             args,
-            security_context_name: context.clone(),
-            user_seal_envelope: principal_envelope(principal, tenant, context),
+            security_context_name: context.to_string(),
+            user_seal_envelope: principal_envelope(principal, tenant, context.to_string()),
             resolved,
             policy: FleetDispatchPolicy {
+                mode,
                 per_target_deadline: APPLY_DEADLINE,
                 ..FleetDispatchPolicy::default()
             },
@@ -214,7 +254,11 @@ impl HostStateService {
                 _ => {}
             }
         }
-        Ok(summarise(&state, check, fleet_command_id, hosts, skipped))
+        Ok(FleetRun {
+            fleet_command_id,
+            hosts,
+            skipped,
+        })
     }
 }
 
