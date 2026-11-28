@@ -3617,7 +3617,13 @@ mod tests {
         // Init a repo with a commit on `main` so libgit2 has a ref to
         // push. This mirrors the A2 `ready_binding` fixture pattern —
         // a real working tree that the service's push path can open.
-        let repo = git2::Repository::init(workdir).expect("git init");
+        // Initialise straight onto `main`, so the push refspec is the same
+        // whatever the host git's `init.defaultBranch` is.
+        let repo = git2::Repository::init_opts(
+            workdir,
+            git2::RepositoryInitOptions::new().initial_head("main"),
+        )
+        .expect("git init");
         {
             let sig = git2::Signature::now("Tester", "test@aegis.test").unwrap();
             let mut index = repo.index().unwrap();
@@ -3628,12 +3634,6 @@ mod tests {
             let tree = repo.find_tree(tree_id).unwrap();
             repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
                 .unwrap();
-            // Normalise the branch name to `main` so the push refspec
-            // is deterministic regardless of the host git's
-            // `init.defaultBranch` setting.
-            let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
-            repo.branch("main", &head_commit, true).unwrap();
-            repo.set_head("refs/heads/main").unwrap();
         }
 
         // SSH remote pointing at a deliberately-unreachable address.
@@ -3698,7 +3698,13 @@ mod tests {
     fn committed_message(message: &str) -> String {
         let tmp = tempfile::tempdir().expect("tempdir");
         let workdir = tmp.path();
-        let repo = git2::Repository::init(workdir).expect("git init");
+        // Initialise straight onto `main`, so the push refspec is the same
+        // whatever the host git's `init.defaultBranch` is.
+        let repo = git2::Repository::init_opts(
+            workdir,
+            git2::RepositoryInitOptions::new().initial_head("main"),
+        )
+        .expect("git init");
         {
             let sig = git2::Signature::now("Tester", "test@aegis.test").unwrap();
             let mut index = repo.index().unwrap();
