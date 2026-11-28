@@ -207,13 +207,86 @@ impl ToolInvocationService {
         if action == "http_check" {
             return http_check(&args).await;
         }
-        let Some(service) = self.host_state_service.as_ref() else {
+        if self.host_state_service.is_none() {
             return HostActionAnswer::refused(NO_HOST_STATES);
+        }
+        // The run's person: who the run acts for, attested to the edges (D12)
+        // and the one whose approval a changing action waits for.
+        let person = match self.workflow_execution_repo.as_ref() {
+            Some(executions) => match executions
+                .find_by_id_for_tenant(tenant, crate::domain::execution::ExecutionId(run))
+                .await
+            {
+                Ok(Some(execution)) => execution.initiating_user_sub.clone().unwrap_or_default(),
+                Ok(None) => return HostActionAnswer::refused(format!("no workflow run {run}")),
+                Err(e) => return HostActionAnswer::refused(e.to_string()),
+            },
+            None => {
+                return HostActionAnswer::refused("the workflow execution store is not configured")
+            }
         };
         let principal = HostStatePrincipal::Attested {
-            principal: format!("workflow_run:{run}"),
+            principal: if person.is_empty() {
+                format!("workflow_run:{run}")
+            } else {
+                person.clone()
+            },
             via: "workflow_run",
             reference: run.to_string(),
+        };
+        // A changing action waits at the approval gate as the tool it is,
+        // so a person's "always allow" for it lets their deploys run alone.
+        let gate_tool: Option<&'static str> = match action {
+            "host_state_apply" => Some("aegis.host_state.apply"),
+            "edge_fleet_invoke" => Some("aegis.edge.fleet.invoke"),
+            _ => None,
+        };
+        let Some(tool) = gate_tool else {
+            return self
+                .host_action_now(tenant, action, &args, &principal)
+                .await;
+        };
+        let gated = self
+            .land_at_gate(
+                tenant,
+                crate::domain::execution::ExecutionId(run),
+                &person,
+                tool,
+                Value::Object(args.clone()),
+                || async {
+                    let a = self
+                        .host_action_now(tenant, action, &args, &principal)
+                        .await;
+                    Ok(json!({ "result": a.result, "ok": a.ok, "sentence": a.sentence }))
+                },
+            )
+            .await;
+        match gated {
+            Ok(super::storage::GatedLanding::Landed(v)) => HostActionAnswer {
+                ok: v.get("ok").and_then(Value::as_bool).unwrap_or(false),
+                sentence: v
+                    .get("sentence")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                result: v.get("result").cloned().unwrap_or(Value::Null),
+            },
+            Ok(super::storage::GatedLanding::NotApproved(sentence)) => HostActionAnswer::refused(
+                sentence.replace("nothing was landed", "nothing was changed"),
+            ),
+            Err(e) => HostActionAnswer::refused(e.to_string()),
+        }
+    }
+
+    /// Run a host action at once: the gate, when it applies, has passed.
+    async fn host_action_now(
+        &self,
+        tenant: &crate::domain::shared_kernel::TenantId,
+        action: &str,
+        args: &serde_json::Map<String, Value>,
+        principal: &HostStatePrincipal,
+    ) -> HostActionAnswer {
+        let Some(service) = self.host_state_service.as_ref() else {
+            return HostActionAnswer::refused(NO_HOST_STATES);
         };
         match action {
             "host_state_plan" | "host_state_apply" => {
@@ -221,7 +294,7 @@ impl ToolInvocationService {
                     return HostActionAnswer::refused("`name` is required");
                 };
                 match service
-                    .run(tenant, name, action == "host_state_plan", &principal)
+                    .run(tenant, name, action == "host_state_plan", principal)
                     .await
                 {
                     Ok(r) => HostActionAnswer {
@@ -234,7 +307,7 @@ impl ToolInvocationService {
             }
             "edge_fleet_invoke" => {
                 let target: crate::domain::edge::EdgeTarget =
-                    match arg_json(&args, "target").map(serde_json::from_value) {
+                    match arg_json(args, "target").map(serde_json::from_value) {
                         Some(Ok(t)) => t,
                         _ => return HostActionAnswer::refused(
                             "`target` must be an edge target: a node, a group, a selector or All",
@@ -243,7 +316,7 @@ impl ToolInvocationService {
                 let Some(tool) = args.get("tool").and_then(Value::as_str) else {
                     return HostActionAnswer::refused("`tool` is required");
                 };
-                let tool_args = arg_json(&args, "args").unwrap_or_else(|| json!({}));
+                let tool_args = arg_json(args, "args").unwrap_or_else(|| json!({}));
                 let context = args
                     .get("security_context")
                     .and_then(Value::as_str)
@@ -253,7 +326,7 @@ impl ToolInvocationService {
                     _ => crate::domain::edge_fleet::FleetMode::Sequential,
                 };
                 match service
-                    .invoke_fleet(tenant, &target, tool, tool_args, context, mode, &principal)
+                    .invoke_fleet(tenant, &target, tool, tool_args, context, mode, principal)
                     .await
                 {
                     Ok(f) => HostActionAnswer {
