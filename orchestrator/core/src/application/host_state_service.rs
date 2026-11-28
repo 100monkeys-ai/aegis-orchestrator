@@ -18,10 +18,16 @@ use crate::application::edge::fleet::dispatcher::FleetInvocation;
 use crate::application::edge::fleet::{EdgeFleetResolver, FleetDispatcher, FleetEvent};
 use crate::domain::cluster::FleetCommandId;
 use crate::domain::edge_fleet::{FleetDispatchPolicy, FleetMode};
-use crate::domain::host_state::{HostState, HostStateManifest, HostStateRepository};
+use std::collections::BTreeMap;
+
+use crate::domain::host_state::{
+    redact_secrets, HostState, HostStateManifest, HostStateRepository,
+};
 use crate::domain::repository::RepositoryError;
+use crate::domain::secrets::{AccessContext, SecretPath};
 use crate::domain::shared_kernel::TenantId;
 use crate::infrastructure::aegis_cluster_proto::SealEnvelope;
+use crate::infrastructure::secrets_manager::SecretsManager;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostStateError {
@@ -33,6 +39,10 @@ pub enum HostStateError {
     NoTargets(String),
     #[error("{0}")]
     Repository(#[from] RepositoryError),
+    /// A secret the state names could not be read. The sentence names the
+    /// secret and its path, never a value.
+    #[error("{0}")]
+    Unavailable(String),
 }
 
 /// Who a plan or an apply runs for, as the edge reads it (ADR-157 D12).
@@ -88,6 +98,22 @@ pub struct HostStateService {
     repo: Arc<dyn HostStateRepository>,
     resolver: Arc<EdgeFleetResolver>,
     dispatcher: Arc<FleetDispatcher>,
+    /// Where a state's `secrets` are read, in the tenant's own store. None
+    /// when the daemon runs with no secret store: a state that names a
+    /// secret is then refused, never applied with the placeholder.
+    secrets: Option<Arc<SecretsManager>>,
+}
+
+/// The tenant's own store for host state secrets: `host-states/<path>` in
+/// the tenant's OpenBao namespace, under `users/<tenant>/` for a person's
+/// tenant, whose namespace is shared by its realm (ADR-056).
+pub fn host_state_secret_path(tenant: &TenantId, path: &str) -> SecretPath {
+    let inner = if tenant.as_str().starts_with("u-") {
+        format!("users/{}/host-states/{path}", tenant.as_str())
+    } else {
+        format!("host-states/{path}")
+    };
+    SecretPath::for_tenant(tenant.clone(), "kv", inner)
 }
 
 /// How long one edge may take to apply a state (packages, image pulls).
@@ -98,11 +124,13 @@ impl HostStateService {
         repo: Arc<dyn HostStateRepository>,
         resolver: Arc<EdgeFleetResolver>,
         dispatcher: Arc<FleetDispatcher>,
+        secrets: Option<Arc<SecretsManager>>,
     ) -> Self {
         Self {
             repo,
             resolver,
             dispatcher,
+            secrets,
         }
     }
 
@@ -160,24 +188,165 @@ impl HostStateService {
     ) -> Result<HostStateRun, HostStateError> {
         let state = self.get(tenant, name).await?;
         let spec = &state.manifest.spec;
+        let secrets = self.read_secrets(tenant, spec).await?;
         let fleet = self
             .invoke_fleet(
                 tenant,
                 &spec.target,
                 "host.apply",
-                serde_json::json!({ "state": spec.apply_state(), "check": check }),
+                serde_json::json!({ "state": spec.apply_state(&secrets), "check": check }),
                 spec.security_context(),
                 FleetMode::Sequential,
                 principal,
             )
             .await?;
+        let hosts = fleet
+            .hosts
+            .into_iter()
+            .map(|h| HostRun {
+                report: h.report.map(|r| redact_secrets(&r, &secrets)),
+                error: h.error.map(|e| {
+                    redact_secrets(&Value::String(e), &secrets)
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string()
+                }),
+                ..h
+            })
+            .collect();
         Ok(summarise(
             &state,
             check,
             fleet.fleet_command_id,
-            fleet.hosts,
+            hosts,
             fleet.skipped,
         ))
+    }
+
+    /// Store `fields` at `path` (`path#field` references read them) in the
+    /// tenant's own host state store, replacing what was there. Values are
+    /// write-only: [`Self::secret_fields`] answers names alone.
+    pub async fn put_secret(
+        &self,
+        tenant: &TenantId,
+        path: &str,
+        fields: BTreeMap<String, String>,
+    ) -> Result<(), HostStateError> {
+        let store = self.secret_store_for(path)?;
+        if fields.is_empty() {
+            return Err(HostStateError::Invalid(vec![
+                "a secret needs at least one field".into(),
+            ]));
+        }
+        for name in fields.keys() {
+            if crate::domain::host_state::SecretRef::parse(&format!("{path}#{name}")).is_none() {
+                return Err(HostStateError::Invalid(vec![format!(
+                    "field {name:?} must be letters, digits, '-' or '_'"
+                )]));
+            }
+        }
+        let at = host_state_secret_path(tenant, path);
+        store
+            .write_secret(
+                &at.effective_mount(),
+                &at.path,
+                fields
+                    .into_iter()
+                    .map(|(k, v)| (k, crate::domain::secrets::SensitiveString::new(v)))
+                    .collect(),
+                &AccessContext::system("aegis-host-state-service"),
+            )
+            .await
+            .map_err(|_| {
+                HostStateError::Unavailable(format!("host-states/{path} could not be written"))
+            })
+    }
+
+    /// The field names stored at `path`, never their values.
+    pub async fn secret_fields(
+        &self,
+        tenant: &TenantId,
+        path: &str,
+    ) -> Result<Vec<String>, HostStateError> {
+        let store = self.secret_store_for(path)?;
+        let at = host_state_secret_path(tenant, path);
+        match store
+            .read_secret(
+                &at.effective_mount(),
+                &at.path,
+                &AccessContext::system("aegis-host-state-service"),
+            )
+            .await
+        {
+            Ok(fields) => Ok(fields.into_keys().collect()),
+            Err(crate::domain::secrets::SecretsError::SecretNotFound { .. }) => Err(
+                HostStateError::NotFound(format!("secret host-states/{path}")),
+            ),
+            Err(_) => Err(HostStateError::Unavailable(format!(
+                "host-states/{path} could not be read"
+            ))),
+        }
+    }
+
+    fn secret_store_for(&self, path: &str) -> Result<&Arc<SecretsManager>, HostStateError> {
+        if crate::domain::host_state::SecretRef::parse(&format!("{path}#f")).is_none() {
+            return Err(HostStateError::Invalid(vec![format!(
+                "{path:?} must be segments of letters, digits, '-', '_' or '.', with no '..'"
+            )]));
+        }
+        self.secrets.as_ref().ok_or_else(|| {
+            HostStateError::Unavailable("this orchestrator has no secret store".into())
+        })
+    }
+
+    /// The values of the secrets `spec` names, read for this run from the
+    /// tenant's own store. Held only for the run: they go to the edges in
+    /// the sealed command and are scrubbed from every report.
+    async fn read_secrets(
+        &self,
+        tenant: &TenantId,
+        spec: &crate::domain::host_state::HostStateSpec,
+    ) -> Result<BTreeMap<String, String>, HostStateError> {
+        let refs = spec.secret_refs();
+        let mut values = BTreeMap::new();
+        if refs.is_empty() {
+            return Ok(values);
+        }
+        let Some(store) = &self.secrets else {
+            return Err(HostStateError::Unavailable(
+                "this state names secrets, and this orchestrator has no secret store".into(),
+            ));
+        };
+        for (name, reference) in refs {
+            let path = host_state_secret_path(tenant, &reference.path);
+            let fields = store
+                .read_secret(
+                    &path.effective_mount(),
+                    &path.path,
+                    &AccessContext::system("aegis-host-state-service"),
+                )
+                .await
+                .map_err(|e| {
+                    HostStateError::Unavailable(format!(
+                        "secret {name} (host-states/{}#{}) could not be read: {}",
+                        reference.path,
+                        reference.field,
+                        match e {
+                            crate::domain::secrets::SecretsError::SecretNotFound { .. } =>
+                                "it does not exist".to_string(),
+                            _ => "the secret store refused or failed".to_string(),
+                        }
+                    ))
+                })?;
+            let Some(value) = fields.get(&reference.field) else {
+                return Err(HostStateError::Unavailable(format!(
+                    "secret {name}: host-states/{} has no field {}",
+                    reference.path, reference.field
+                )));
+            };
+            values.insert(name, value.expose().to_string());
+        }
+        Ok(values)
     }
 
     /// Run `tool` with `args` on the edges `target` names, under `context`,

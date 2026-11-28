@@ -2433,6 +2433,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 ),
                 resolver.clone(),
                 fleet_dispatcher.clone(),
+                Some(secrets_manager.clone()),
             ),
         )),
         _ => None,
@@ -3278,6 +3279,19 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         credential_service,
         secrets_manager: secrets_manager.clone(),
         webhook_secret_provider: Arc::new(EnvWebhookSecretProvider),
+        webhook_deliveries: match db_pool.as_ref() {
+            Some(pool) => Arc::new(
+                aegis_orchestrator_core::infrastructure::seal::nonce_store::PostgresNonceStore::with_ttl(
+                    pool.clone(),
+                    std::time::Duration::from_secs(30 * 24 * 3600),
+                ),
+            ),
+            None => Arc::new(
+                aegis_orchestrator_core::infrastructure::seal::nonce_store::InMemoryNonceStore::with_ttl(
+                    std::time::Duration::from_secs(30 * 24 * 3600),
+                ),
+            ),
+        },
         stimulus_service: None,
         user_volume_service,
         file_operations_service,

@@ -328,6 +328,12 @@ async fn service(r: &Value, check: bool, restart: bool) -> Report {
     if restart && active && want_running != Some(false) {
         diffs.push("restarted: a watched resource changed".into());
         if !check {
+            // A watched resource may be the unit file itself, or a drop-in:
+            // systemd reads it again only after a reload.
+            let (okay, _, err) = run(&["systemctl".into(), "daemon-reload".into()]).await;
+            if !okay {
+                return failed(err);
+            }
             let (okay, _, err) = run(&["systemctl".into(), "restart".into(), name.into()]).await;
             if !okay {
                 return failed(err);

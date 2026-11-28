@@ -22,6 +22,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 use crate::domain::edge::EdgeTarget;
 use crate::domain::repository::RepositoryError;
@@ -78,6 +79,112 @@ pub struct HostStateSpec {
     pub continue_on_failure: bool,
     /// The ordered resources; each a JSON object with an `id` and a `kind`.
     pub resources: Vec<Value>,
+    /// Plain values a resource names as `((vars.NAME))`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub vars: BTreeMap<String, String>,
+    /// Secrets a resource names as `((secret.NAME))`, each `path#field` in
+    /// the tenant's `host-states/` store in OpenBao. The orchestrator reads
+    /// them when it plans or applies, and the state holds only their names.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets: BTreeMap<String, String>,
+}
+
+/// One secret a state names: its OpenBao path under `host-states/` and its
+/// field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretRef {
+    pub path: String,
+    pub field: String,
+}
+
+impl SecretRef {
+    /// `path#field`, the path relative to the tenant's `host-states/`:
+    /// segments of letters, digits, `-`, `_` and `.`, no `..`, no leading
+    /// `/`.
+    pub fn parse(reference: &str) -> Option<Self> {
+        let (path, field) = reference.split_once('#')?;
+        let segment_ok = |s: &str| {
+            !s.is_empty()
+                && s != "."
+                && s != ".."
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        };
+        let field_ok = !field.is_empty()
+            && field
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+        (path.split('/').all(segment_ok) && field_ok).then(|| Self {
+            path: path.to_string(),
+            field: field.to_string(),
+        })
+    }
+}
+
+/// `((secret.NAME))` and `((vars.NAME))`, spaces allowed inside the parens.
+fn placeholders(s: &str) -> Vec<(std::ops::Range<usize>, &str, &str)> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(open) = s[from..].find("((").map(|i| i + from) {
+        let Some(close) = s[open + 2..].find("))").map(|i| i + open + 2) else {
+            break;
+        };
+        let inner = s[open + 2..close].trim();
+        if let Some((scope, name)) = inner.split_once('.') {
+            if matches!(scope, "secret" | "vars") && ident_ok(name) {
+                out.push((open..close + 2, scope, name));
+            }
+        }
+        from = close + 2;
+    }
+    out
+}
+
+fn ident_ok(name: &str) -> bool {
+    name.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn each_string(v: &Value, f: &mut dyn FnMut(&str)) {
+    match v {
+        Value::String(s) => f(s),
+        Value::Array(a) => a.iter().for_each(|x| each_string(x, f)),
+        Value::Object(o) => o.values().for_each(|x| each_string(x, f)),
+        _ => {}
+    }
+}
+
+fn map_strings(v: &Value, f: &dyn Fn(&str) -> String) -> Value {
+    match v {
+        Value::String(s) => Value::String(f(s)),
+        Value::Array(a) => Value::Array(a.iter().map(|x| map_strings(x, f)).collect()),
+        Value::Object(o) => Value::Object(
+            o.iter()
+                .map(|(k, x)| (k.clone(), map_strings(x, f)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Replace every occurrence of a secret's value in `v` with
+/// `[secret NAME]`, so a report that echoes content (a file's diff, an
+/// error) never carries it.
+pub fn redact_secrets(v: &Value, secrets: &BTreeMap<String, String>) -> Value {
+    let mut by_length: Vec<(&String, &String)> = secrets
+        .iter()
+        .filter(|(_, value)| !value.is_empty())
+        .collect();
+    by_length.sort_by_key(|(_, value)| std::cmp::Reverse(value.len()));
+    map_strings(v, &|s| {
+        let mut s = s.to_string();
+        for (name, value) in &by_length {
+            s = s.replace(value.as_str(), &format!("[secret {name}]"));
+        }
+        s
+    })
 }
 
 impl HostStateSpec {
@@ -87,12 +194,37 @@ impl HostStateSpec {
             .unwrap_or(DEFAULT_HOST_CONTEXT)
     }
 
-    /// The `state` argument of `host.apply`.
-    pub fn apply_state(&self) -> Value {
+    /// The `state` argument of `host.apply`, with every `((vars.NAME))` and
+    /// `((secret.NAME))` replaced from `vars` and `secrets` (the values read
+    /// for this run). Validation refuses a placeholder that names neither.
+    pub fn apply_state(&self, secrets: &BTreeMap<String, String>) -> Value {
+        let render = |s: &str| {
+            let mut out = String::with_capacity(s.len());
+            let mut last = 0;
+            for (range, scope, name) in placeholders(s) {
+                out.push_str(&s[last..range.start]);
+                let value = match scope {
+                    "secret" => secrets.get(name),
+                    _ => self.vars.get(name),
+                };
+                out.push_str(value.map(String::as_str).unwrap_or(&s[range.clone()]));
+                last = range.end;
+            }
+            out.push_str(&s[last..]);
+            out
+        };
         serde_json::json!({
-            "resources": self.resources,
+            "resources": map_strings(&Value::Array(self.resources.clone()), &render),
             "continue_on_failure": self.continue_on_failure,
         })
+    }
+
+    /// The secrets the state declares, parsed.
+    pub fn secret_refs(&self) -> Vec<(String, SecretRef)> {
+        self.secrets
+            .iter()
+            .filter_map(|(name, r)| SecretRef::parse(r).map(|r| (name.clone(), r)))
+            .collect()
     }
 }
 
@@ -141,6 +273,38 @@ impl HostStateManifest {
         }
         if self.spec.resources.is_empty() {
             p.push("spec.resources must name at least one resource".into());
+        }
+        for name in self.spec.vars.keys() {
+            if !ident_ok(name) {
+                p.push(format!("spec.vars: {name:?} must be letters, digits and '_', not starting with a digit"));
+            }
+        }
+        for (name, reference) in &self.spec.secrets {
+            if !ident_ok(name) {
+                p.push(format!("spec.secrets: {name:?} must be letters, digits and '_', not starting with a digit"));
+            }
+            if SecretRef::parse(reference).is_none() {
+                p.push(format!(
+                    "spec.secrets.{name}: {reference:?} must be path#field, the path under host-states/ (segments of letters, digits, '-', '_', '.'; no '..')"
+                ));
+            }
+        }
+        for resource in &self.spec.resources {
+            each_string(resource, &mut |s| {
+                for (_, scope, name) in placeholders(s) {
+                    let declared = match scope {
+                        "secret" => self.spec.secrets.contains_key(name),
+                        _ => self.spec.vars.contains_key(name),
+                    };
+                    let key = if scope == "secret" { "secrets" } else { "vars" };
+                    let problem = format!(
+                        "(({scope}.{name})) is used but spec.{key} does not declare {name}"
+                    );
+                    if !declared && !p.contains(&problem) {
+                        p.push(problem);
+                    }
+                }
+            });
         }
         let mut seen = std::collections::HashSet::new();
         for (i, r) in self.spec.resources.iter().enumerate() {
@@ -290,7 +454,10 @@ spec:
         let m = HostStateManifest::parse(OK).expect("valid");
         assert_eq!(m.spec.security_context(), "host-admin");
         assert_eq!(
-            m.spec.apply_state()["resources"].as_array().unwrap().len(),
+            m.spec.apply_state(&BTreeMap::new())["resources"]
+                .as_array()
+                .unwrap()
+                .len(),
             3
         );
     }
@@ -320,6 +487,78 @@ spec:
             "watches \"later\"",
         ] {
             assert!(all.contains(needle), "missing {needle:?} in:\n{all}");
+        }
+    }
+
+    const WITH_SECRETS: &str = r#"
+apiVersion: 100monkeys.ai/v1
+kind: HostState
+metadata:
+  name: api
+spec:
+  target: All
+  vars:
+    port: "8080"
+  secrets:
+    db: "api/db#password"
+  resources:
+    - id: env
+      kind: file
+      path: /etc/api.env
+      content: "PORT=((vars.port))\nDB_PASSWORD=(( secret.db ))\n"
+"#;
+
+    /// ADR-157 D2: a state names a secret by path; apply_state fills it in
+    /// for the run, and the stored state carries only the name.
+    #[test]
+    fn a_secret_is_rendered_for_the_run_and_never_stored() {
+        let m = HostStateManifest::parse(WITH_SECRETS).expect("valid");
+        assert!(!serde_json::to_string(&m).unwrap().contains("s3cr3t"));
+        let mut values = BTreeMap::new();
+        values.insert("db".to_string(), "s3cr3t".to_string());
+        let state = m.spec.apply_state(&values);
+        assert_eq!(
+            state["resources"][0]["content"],
+            "PORT=8080\nDB_PASSWORD=s3cr3t\n"
+        );
+        assert_eq!(
+            m.spec.secret_refs()[0].1,
+            SecretRef {
+                path: "api/db".into(),
+                field: "password".into()
+            }
+        );
+    }
+
+    /// A report that echoes a secret's value carries its name instead.
+    #[test]
+    fn a_report_never_carries_a_secret_value() {
+        let mut values = BTreeMap::new();
+        values.insert("db".to_string(), "s3cr3t".to_string());
+        let report = serde_json::json!({"results": [{"diff": "+DB_PASSWORD=s3cr3t", "error": "bad s3cr3t"}]});
+        let clean = redact_secrets(&report, &values).to_string();
+        assert!(!clean.contains("s3cr3t"), "{clean}");
+        assert!(clean.contains("[secret db]"));
+    }
+
+    /// An undeclared placeholder and a path that climbs out of
+    /// host-states/ are refused.
+    #[test]
+    fn undeclared_placeholders_and_escaping_paths_are_refused() {
+        let bad = WITH_SECRETS
+            .replace("api/db#password", "../c/x#password")
+            .replace("((vars.port))", "((vars.nope))");
+        let problems = HostStateManifest::parse(&bad).unwrap_err();
+        assert!(
+            problems.iter().any(|p| p.contains("spec.secrets.db")),
+            "{problems:?}"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("((vars.nope))")),
+            "{problems:?}"
+        );
+        for refused in ["/abs#f", "a/../b#f", "a#", "#f", "a b#f", "a#f.g"] {
+            assert!(SecretRef::parse(refused).is_none(), "{refused}");
         }
     }
 }
