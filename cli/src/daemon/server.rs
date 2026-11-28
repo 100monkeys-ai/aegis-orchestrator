@@ -2669,6 +2669,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         tool_invocation_service_builder =
             tool_invocation_service_builder.with_host_state_service(hs);
     }
+    if let Some(ps) = provider_state_service.clone() {
+        tool_invocation_service_builder =
+            tool_invocation_service_builder.with_provider_state_service(ps);
+    }
 
     // Initialize git repo service (ADR-081 Waves A2 / A3). Requires a
     // Postgres pool for the binding repository; left as `None` when the

@@ -1,0 +1,117 @@
+# Copyright (c) 2026 100monkeys.ai
+# SPDX-License-Identifier: AGPL-3.0
+#
+# Provider Apply: converge a ProviderState's objects at its provider
+# (AEGIS ADR-157 D11).
+#
+#   PLAN (provider_state_plan) ─► APPLY (provider_state_apply, your approval) ─► VERIFY (provider_state_plan) ─► COMPLETE
+#     │ refused                    │ refused, not approved or an object failed    │ refused
+#     ▼                            ▼                                              ▼
+#   PLAN_REFUSED                APPLY_FAILED                                   VERIFY_FAILED
+#
+# Each step is one provider call per object, as you, with the binding this
+# run's `contexts` chose for the provider (for Cloudflare, the token in
+# your Vault). PLAN reads and compares each object. APPLY writes only the
+# differences, stopping at the first object that fails. VERIFY plans again:
+# a converged state reports no change.
+
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+
+metadata:
+  name: "provider-apply"
+  version: "1.0.0"
+  description: |-
+    Applies one of your ProviderStates at its provider: a plan first, then
+    the apply after your approval, then a second plan that shows whether
+    every object converged. The run records each object's change.
+  labels:
+    builtin: "true"
+    category: "deployment"
+  input_schema:
+    type: object
+    properties:
+      name:
+        type: string
+        description: "The ProviderState to apply, by name."
+    required:
+      - name
+
+spec:
+  initial_state: PLAN
+
+  states:
+
+    PLAN:
+      kind: Action
+      action: provider_state_plan
+      args:
+        name: "{{input.name}}"
+      transitions:
+        - condition: on_success
+          target: APPLY
+        - condition: on_failure
+          target: PLAN_REFUSED
+
+    APPLY:
+      kind: Action
+      action: provider_state_apply
+      args:
+        name: "{{input.name}}"
+      transitions:
+        - condition: on_success
+          target: VERIFY
+        - condition: on_failure
+          target: APPLY_FAILED
+
+    VERIFY:
+      kind: Action
+      action: provider_state_plan
+      args:
+        name: "{{input.name}}"
+      transitions:
+        - condition: on_success
+          target: COMPLETE
+        - condition: on_failure
+          target: VERIFY_FAILED
+
+    COMPLETE:
+      kind: Action
+      action: update_blackboard
+      args:
+        outcome: "complete"
+        name: "{{input.name}}"
+        planned_changes: "{{PLAN.output.result.changed}}"
+        applied_changes: "{{APPLY.output.result.changed}}"
+        remaining_changes: "{{VERIFY.output.result.changed}}"
+        sentence: ""
+      transitions: []
+
+    PLAN_REFUSED:
+      kind: Action
+      action: update_blackboard
+      args:
+        outcome: "plan_refused"
+        name: "{{input.name}}"
+        sentence: "{{{PLAN.output.sentence}}}"
+      transitions: []
+
+    APPLY_FAILED:
+      kind: Action
+      action: update_blackboard
+      args:
+        outcome: "apply_failed"
+        name: "{{input.name}}"
+        planned_changes: "{{PLAN.output.result.changed}}"
+        sentence: "{{{APPLY.output.sentence}}}"
+      transitions: []
+
+    VERIFY_FAILED:
+      kind: Action
+      action: update_blackboard
+      args:
+        outcome: "verify_failed"
+        name: "{{input.name}}"
+        applied_changes: "{{APPLY.output.result.changed}}"
+        sentence: "{{{VERIFY.output.sentence}}}"
+      transitions: []

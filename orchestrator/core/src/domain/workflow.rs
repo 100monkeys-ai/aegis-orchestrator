@@ -1264,6 +1264,13 @@ pub enum ActionName {
     /// (AEGIS ADR-157 D11). A tool the configuration gates waits at the
     /// approval gate as that person.
     ToolCall,
+    /// Plans a registered `ProviderState` (`name`) at its provider: reads
+    /// and compares each object, changing nothing (AEGIS ADR-157 D11).
+    ProviderStatePlan,
+    /// Applies a registered `ProviderState` (`name`): writes only each
+    /// object's difference, stopping at the first that fails; waits at the
+    /// approval gate as the run's person (AEGIS ADR-157 D11).
+    ProviderStateApply,
 }
 
 /// Where `image_generate` writes its files when a state names no `path`.
@@ -1307,7 +1314,7 @@ pub enum ActionNeed {
 
 impl ActionName {
     /// Every action, in the order the refusal lists them.
-    pub const ALL: [ActionName; 18] = [
+    pub const ALL: [ActionName; 20] = [
         ActionName::UpdateBlackboard,
         ActionName::RepositoryDiff,
         ActionName::RepositoryCommit,
@@ -1326,6 +1333,8 @@ impl ActionName {
         ActionName::EdgeFleetInvoke,
         ActionName::HttpCheck,
         ActionName::ToolCall,
+        ActionName::ProviderStatePlan,
+        ActionName::ProviderStateApply,
     ];
 
     /// The literal a manifest writes.
@@ -1349,6 +1358,8 @@ impl ActionName {
             ActionName::EdgeFleetInvoke => "edge_fleet_invoke",
             ActionName::HttpCheck => "http_check",
             ActionName::ToolCall => "tool_call",
+            ActionName::ProviderStatePlan => "provider_state_plan",
+            ActionName::ProviderStateApply => "provider_state_apply",
         }
     }
 
@@ -1416,6 +1427,9 @@ impl ActionName {
                 required: &["tool"],
                 optional: &["args"],
             },
+            ActionName::ProviderStatePlan | ActionName::ProviderStateApply => {
+                ActionArguments::Required(&["name"])
+            }
         }
     }
 
@@ -1439,7 +1453,9 @@ impl ActionName {
             | ActionName::HostStateApply
             | ActionName::EdgeFleetInvoke
             | ActionName::HttpCheck
-            | ActionName::ToolCall => ActionNeed::Nothing,
+            | ActionName::ToolCall
+            | ActionName::ProviderStatePlan
+            | ActionName::ProviderStateApply => ActionNeed::Nothing,
         }
     }
 
@@ -1454,6 +1470,7 @@ impl ActionName {
                 | ActionName::HostStateApply
                 | ActionName::EdgeFleetInvoke
                 | ActionName::ToolCall
+                | ActionName::ProviderStateApply
         )
     }
 

@@ -230,6 +230,9 @@ pub struct ToolInvocationService {
     /// AEGIS ADR-157 D2: host state, for the `aegis.host_state.*` tools.
     /// `None` answers every host state tool as unavailable.
     host_state_service: Option<Arc<crate::application::host_state_service::HostStateService>>,
+    /// ADR-157 D11: the provider states a workflow plans and applies.
+    provider_state_service:
+        Option<Arc<crate::application::provider_state_service::ProviderStateService>>,
     /// AEGIS ADR-143 I2: the node's image generation models, for
     /// `aegis.image.generate`. `None` answers it as a node with none.
     image_generation: Option<Arc<dyn crate::domain::vision::ImageGenerationModels>>,
