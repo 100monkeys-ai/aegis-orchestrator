@@ -539,10 +539,23 @@ async fn pod(r: &Value, check: bool) -> Report {
     {
         return failed(format!("pod name {name:?} is not a name"));
     }
+    let network = s(r, "network");
+    if let Some(n) = network {
+        if n.is_empty()
+            || !n
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
+            return failed(format!("pod network {n:?} is not a network name"));
+        }
+    }
     let Some(uid) = uid_of(as_user).await else {
         return failed(format!("no user {as_user}"));
     };
-    let fingerprint = hex::encode(Sha256::digest(spec.as_bytes()));
+    // The network is part of what the pod is: a change replaces it.
+    let fingerprint = hex::encode(Sha256::digest(
+        format!("{}\0{}", network.unwrap_or(""), spec).as_bytes(),
+    ));
     let dir = Path::new(HOST_STATE_DIR).join("pods");
     let marker = dir.join(format!("{name}.sha256"));
     let running = run(&[
@@ -585,8 +598,15 @@ async fn pod(r: &Value, check: bool) -> Report {
         "kube".into(),
         "play".into(),
         "--replace".into(),
-        spec_path.display().to_string(),
-    ])
+    ]
+    .into_iter()
+    .chain(
+        network
+            .into_iter()
+            .flat_map(|n| ["--network".to_string(), n.to_string()]),
+    )
+    .chain([spec_path.display().to_string()])
+    .collect::<Vec<String>>())
     .await;
     if !okay {
         return failed(err.lines().last().unwrap_or("kube play failed").to_string());
