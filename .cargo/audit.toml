@@ -44,6 +44,14 @@
 # row ripens and a replacement decision is recorded, or the crate is adopted by
 # a new maintainer and publishes above 1.3.3.
 #
+# RUSTSEC-2026-0459 — libsqlite3-sys 0.30.1: bundled SQLite before 3.54.0.
+# Reason: transitive via sqlx-sqlite, which sits in Cargo.lock only as an
+# optional dependency of sqlx. No crate here enables sqlx's `sqlite` feature
+# (PostgreSQL only), so it is never compiled: `cargo tree -i libsqlite3-sys
+# --target all -e all` prints nothing. Re-justify when that command shows a
+# path, the `sqlite` feature is enabled on sqlx anywhere in the workspace, or
+# sqlx moves to libsqlite3-sys >= 0.39.
+#
 # NOT AN IGNORE ENTRY, AND IT CANNOT BE ONE: spin 0.9.8.
 # `spin` 0.9.8 was yanked from crates.io. cargo-audit reports a yanked crate as
 # a warning with a NULL advisory, so it has no RUSTSEC id and there is nothing
@@ -60,5 +68,6 @@ ignore = [
     "RUSTSEC-2023-0071",
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0459",
     "RUSTSEC-2025-0141",
 ]
