@@ -54,6 +54,7 @@ pub mod host_state_service;
 pub mod lifecycle;
 pub mod operator_escalation_service;
 pub mod profile_service;
+pub mod provider_state_service;
 pub mod schedule_service;
 pub mod schema_registry;
 pub mod scope_requester;

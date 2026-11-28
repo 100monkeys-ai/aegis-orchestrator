@@ -2421,6 +2421,20 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // One service for the `/v1/host-states` routes and the
     // `aegis.host_state.*` tools, running through this process's fleet
     // dispatcher.
+    // ADR-157 D11: provider states, stored beside host states.
+    let provider_state_service: Option<
+        Arc<aegis_orchestrator_core::application::provider_state_service::ProviderStateService>,
+    > = db_pool.as_ref().map(|pool| {
+        Arc::new(
+            aegis_orchestrator_core::application::provider_state_service::ProviderStateService::new(
+                Arc::new(
+                    aegis_orchestrator_core::infrastructure::repositories::postgres_provider_state::PgProviderStateRepository::new(
+                        pool.clone(),
+                    ),
+                ),
+            ),
+        )
+    });
     let host_state_service: Option<
         Arc<aegis_orchestrator_core::application::host_state_service::HostStateService>,
     > = match (db_pool.as_ref(), edge_components.as_ref()) {
@@ -3221,6 +3235,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     connection_registry: conn_registry.clone(),
                     // ADR-157 D2: the one host state service.
                     host_states: host_state_service.clone(),
+                    provider_states: provider_state_service.clone(),
                 }
             },
         );

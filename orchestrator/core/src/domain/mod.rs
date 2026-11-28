@@ -77,6 +77,7 @@ pub mod output_handler;
 pub mod path_sanitizer;
 pub mod policy;
 pub mod profile;
+pub mod provider_state;
 pub mod rate_limit;
 pub mod repository;
 pub mod run_tree;

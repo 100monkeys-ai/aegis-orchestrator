@@ -160,6 +160,7 @@ fn edge_state(fleet_registry: FleetRegistry) -> EdgeApiState {
         dispatch_service,
         connection_registry: conn_registry,
         host_states: None,
+        provider_states: None,
     }
 }
 
