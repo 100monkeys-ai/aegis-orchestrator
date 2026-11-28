@@ -310,14 +310,15 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                     let ctx = AccessContext::system("orchestrator");
                     // A tenant's run reads only its own namespace (ADR-056);
                     // the platform's own runs read the global one.
-                    let mount = registry_secret_mount(config.tenant_id.as_ref(), engine, secret_path)
-                        .map_err(|error| ContainerStepError::ImagePullFailed {
-                            image: config.image.clone(),
-                            error,
-                        })?;
+                    let (mount, scoped_path) =
+                        registry_secret_location(config.tenant_id.as_ref(), engine, secret_path)
+                            .map_err(|error| ContainerStepError::ImagePullFailed {
+                                image: config.image.clone(),
+                                error,
+                            })?;
                     let fields = self
                         .secrets_manager
-                        .read_secret(&mount, secret_path, &ctx)
+                        .read_secret(&mount, &scoped_path, &ctx)
                         .await
                         .map_err(|e| ContainerStepError::ImagePullFailed {
                             image: config.image.clone(),
@@ -1268,27 +1269,30 @@ fn step_container_identity(
 /// is read from: the run's own tenant namespace (ADR-056), or the global one
 /// for the platform's own steps. A person's tenant shares its realm's
 /// namespace, so its path must be under its own `users/<tenant>/`.
-fn registry_secret_mount(
+fn registry_secret_location(
     tenant: Option<&crate::domain::shared_kernel::TenantId>,
     engine: &str,
     path: &str,
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
     match tenant {
         Some(t) if !t.is_system() => {
+            if path.split('/').any(|seg| seg == ".." || seg == ".") {
+                return Err("registry_credentials must not name '.' or '..'".to_string());
+            }
             if t.as_str().starts_with("u-") {
                 let own = format!("users/{}/", t.as_str());
-                if !path.starts_with(&own) || path.split('/').any(|seg| seg == "..") {
+                if !path.starts_with(&own) {
                     return Err(format!(
                         "registry_credentials for a person's run must name a path under {own}"
                     ));
                 }
             }
-            Ok(
-                crate::domain::secrets::SecretPath::for_tenant(t.clone(), engine, path)
-                    .effective_mount(),
-            )
+            // The tenant's own location: a team's path gains its
+            // `teams/<tenant>/` prefix here, in the realm's mount.
+            let at = crate::domain::secrets::SecretPath::for_tenant(t.clone(), engine, path);
+            Ok((at.effective_mount(), at.path))
         }
-        _ => Ok(engine.to_string()),
+        _ => Ok((engine.to_string(), path.to_string())),
     }
 }
 
@@ -1363,22 +1367,32 @@ mod tests {
     fn a_tenants_registry_secret_is_read_in_its_own_namespace() {
         use crate::domain::shared_kernel::TenantId;
         let team = TenantId::from_realm_slug("t-acme").unwrap();
+        // A team reads under its own prefix in the realm mount, never the
+        // bare path another team could also name.
         assert_eq!(
-            super::registry_secret_mount(Some(&team), "kv", "cicd/ghcr").unwrap(),
-            "tenant-t-acme/kv"
+            super::registry_secret_location(Some(&team), "kv", "cicd/ghcr").unwrap(),
+            (
+                "tenant-zaru-consumer/kv".to_string(),
+                "teams/t-acme/cicd/ghcr".to_string()
+            )
         );
+        assert!(super::registry_secret_location(Some(&team), "kv", "../t-other/cicd").is_err());
         assert_eq!(
-            super::registry_secret_mount(None, "kv", "cicd/ghcr").unwrap(),
-            "kv"
+            super::registry_secret_location(None, "kv", "cicd/ghcr").unwrap(),
+            ("kv".to_string(), "cicd/ghcr".to_string())
         );
         let person = TenantId::from_realm_slug("u-abc").unwrap();
-        assert!(super::registry_secret_mount(Some(&person), "kv", "users/u-other/x").is_err());
+        assert!(super::registry_secret_location(Some(&person), "kv", "users/u-other/x").is_err());
         assert!(
-            super::registry_secret_mount(Some(&person), "kv", "users/u-abc/../u-other/x").is_err()
+            super::registry_secret_location(Some(&person), "kv", "users/u-abc/../u-other/x")
+                .is_err()
         );
         assert_eq!(
-            super::registry_secret_mount(Some(&person), "kv", "users/u-abc/ghcr").unwrap(),
-            "tenant-zaru-consumer/kv"
+            super::registry_secret_location(Some(&person), "kv", "users/u-abc/ghcr").unwrap(),
+            (
+                "tenant-zaru-consumer/kv".to_string(),
+                "users/u-abc/ghcr".to_string()
+            )
         );
     }
 

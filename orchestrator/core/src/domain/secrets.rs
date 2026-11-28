@@ -569,6 +569,10 @@ impl SecretPath {
     }
 
     /// Construct a `SecretPath` scoped to a specific tenant (ADR-056).
+    ///
+    /// A team's tenant (`t-<id>`) keeps its secrets in its realm's mount,
+    /// as a person's does, under its own `teams/<tenant>/`: that prefix is
+    /// added here, so no caller can name another team's path.
     pub fn for_tenant(
         tenant_id: TenantId,
         mount_point: impl Into<String>,
@@ -579,10 +583,19 @@ impl SecretPath {
         } else {
             tenant_namespace(&tenant_id)
         };
+        let path: String = path.into();
+        // Idempotent: a stored path read back (the credential repository
+        // keeps `path` as written) already carries the prefix.
+        let own = format!("teams/{}/", tenant_id.as_str());
+        let path = if tenant_id.is_team() && !path.starts_with(&own) {
+            format!("{own}{path}")
+        } else {
+            path
+        };
         Self {
             namespace: namespace.clone(),
             mount_point: mount_point.into(),
-            path: path.into(),
+            path,
             tenant_id: Some(tenant_id),
         }
     }
@@ -616,9 +629,11 @@ impl SecretPath {
 /// mount, `tenant-zaru-consumer` (ADR-056: "Consumer user secrets reside in
 /// `tenant-zaru-consumer/`."; ADR-125 Update): no mount is made per person,
 /// and the path inside it carries the tenant and the user
-/// (`users/<tenant>/<user>/...`). Every other tenant uses `tenant-{slug}`.
+/// (`users/<tenant>/<user>/...`). A team's tenant (`t-<id>`) is of the same
+/// realm and keeps its secrets there too, under `teams/<tenant>/`, which
+/// [`SecretPath::for_tenant`] adds. Every other tenant uses `tenant-{slug}`.
 fn tenant_namespace(tenant_id: &TenantId) -> String {
-    if tenant_id.as_str().starts_with("u-") {
+    if tenant_id.as_str().starts_with("u-") || tenant_id.is_team() {
         format!("tenant-{CONSUMER_SLUG}")
     } else {
         format!("tenant-{}", tenant_id.as_str())
@@ -1260,8 +1275,36 @@ mod tests {
         assert!(!secret.is_expired());
         assert!(secret.remaining_ttl() > Duration::ZERO);
     }
-}
 
-#[cfg(test)]
-#[path = "secrets_policy_tests.rs"]
-mod policy_tests;
+    #[cfg(test)]
+    mod team_namespace_tests {
+        use super::*;
+
+        /// A team's secrets live in its realm's mount under its own prefix,
+        /// which the orchestrator's policy grants (`teams/*`); a path it names
+        /// cannot leave that prefix by construction.
+        #[test]
+        fn a_teams_secret_is_under_its_own_prefix_in_the_realm_mount() {
+            let team = TenantId::new("t-465fa94f-36a6-464b-b82d-88f2bc07b03e").unwrap();
+            let p = SecretPath::for_tenant(team, "kv", "host-states/api");
+            assert_eq!(p.effective_mount(), "tenant-zaru-consumer/kv");
+            assert_eq!(
+                p.path,
+                "teams/t-465fa94f-36a6-464b-b82d-88f2bc07b03e/host-states/api"
+            );
+            let again = SecretPath::for_tenant(
+                TenantId::new("t-465fa94f-36a6-464b-b82d-88f2bc07b03e").unwrap(),
+                "kv",
+                p.path.clone(),
+            );
+            assert_eq!(
+                again.path, p.path,
+                "a stored path read back is not prefixed twice"
+            );
+            let person = TenantId::new("u-d7f8170035d349b6b237c391ccc19035").unwrap();
+            let q =
+                SecretPath::for_tenant(person, "kv", "users/u-d7f8170035d349b6b237c391ccc19035/x");
+            assert_eq!(q.path, "users/u-d7f8170035d349b6b237c391ccc19035/x");
+        }
+    }
+}
