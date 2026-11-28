@@ -98,6 +98,10 @@ pub(crate) struct AppState {
     pub(crate) secrets_manager: Arc<SecretsManager>,
     /// HMAC secret provider for webhook requests (ADR-021).
     pub(crate) webhook_secret_provider: Arc<dyn WebhookSecretProvider>,
+    /// AEGIS ADR-157 D4: the webhook deliveries already accepted, so a
+    /// replayed delivery starts no run. Remembered for 30 days.
+    pub(crate) webhook_deliveries:
+        Arc<dyn aegis_orchestrator_core::infrastructure::seal::nonce_store::NonceStore>,
     /// BC-8: Stimulus routing and webhook ingestion service (ADR-021). Optional until wired.
     pub(crate) stimulus_service: Option<Arc<dyn StimulusService>>,
     pub(crate) user_volume_service: Arc<UserVolumeService>,
