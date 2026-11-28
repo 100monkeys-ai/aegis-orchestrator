@@ -58,6 +58,7 @@ pub mod postgres_credential;
 pub mod postgres_execution;
 pub mod postgres_git_repo;
 pub mod postgres_goal;
+pub mod postgres_host_state;
 pub mod postgres_operator_escalation;
 pub mod postgres_profile;
 pub mod postgres_realm;

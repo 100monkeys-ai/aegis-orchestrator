@@ -3191,6 +3191,20 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     fleet_cancel: fleet_cancel.clone(),
                     dispatch_service: dispatch_service.clone(),
                     connection_registry: conn_registry.clone(),
+                    // ADR-157 D2: host state, run through this fleet dispatcher.
+                    host_states: db_pool.as_ref().map(|pool| {
+                        Arc::new(
+                            aegis_orchestrator_core::application::host_state_service::HostStateService::new(
+                                Arc::new(
+                                    aegis_orchestrator_core::infrastructure::repositories::postgres_host_state::PgHostStateRepository::new(
+                                        pool.clone(),
+                                    ),
+                                ),
+                                resolver.clone(),
+                                fleet_dispatcher.clone(),
+                            ),
+                        )
+                    }),
                 }
             },
         );

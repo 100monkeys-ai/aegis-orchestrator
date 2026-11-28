@@ -85,6 +85,8 @@ pub struct EdgeApiState {
     /// `EdgeHostView` — instant and drift-free, independent of the
     /// `last_heartbeat_at` staleness window.
     pub connection_registry: EdgeConnectionRegistry,
+    /// Host state (ADR-157 D2); `None` without a database.
+    pub host_states: Option<Arc<crate::application::host_state_service::HostStateService>>,
 }
 
 /// Mount the `/v1/edge` router.
@@ -106,6 +108,19 @@ pub fn router(state: EdgeApiState) -> Router {
         .route("/v1/edge/fleet/{id}/cancel", post(fleet_cancel))
         .route("/v1/edge/fleet/runs", get(list_runs))
         .route("/v1/edge/fleet/runs/{id}", get(get_run))
+        .route(
+            "/v1/host-states",
+            get(list_host_states).post(create_host_state),
+        )
+        .route("/v1/host-states/validate", post(validate_host_state))
+        .route(
+            "/v1/host-states/{name}",
+            get(get_host_state)
+                .put(update_host_state)
+                .delete(archive_host_state),
+        )
+        .route("/v1/host-states/{name}/plan", post(plan_host_state))
+        .route("/v1/host-states/{name}/apply", post(apply_host_state))
         .with_state(state)
 }
 
@@ -612,6 +627,7 @@ struct FleetInvokeRequest {
 async fn fleet_invoke(
     State(s): State<EdgeApiState>,
     Extension(tenant): Extension<TenantId>,
+    headers: HeaderMap,
     Json(req): Json<FleetInvokeRequest>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let resolved = s
@@ -627,11 +643,18 @@ async fn fleet_invoke(
         tenant_id: tenant.clone(),
         tool_name: req.tool_name,
         args: args_struct,
-        security_context_name: req.security_context_name,
+        security_context_name: req.security_context_name.clone(),
+        // The edge checks that the inner envelope names the same context
+        // as the command and carries the caller's token: the caller's own
+        // bearer unless the request names one.
         user_seal_envelope: crate::infrastructure::aegis_cluster_proto::SealEnvelope {
-            user_security_token: req.user_security_token,
+            user_security_token: if req.user_security_token.is_empty() {
+                bearer(&headers).unwrap_or_default()
+            } else {
+                req.user_security_token
+            },
             tenant_id: tenant.as_str().to_string(),
-            security_context_name: String::new(),
+            security_context_name: req.security_context_name,
             payload: None,
             signature: vec![],
         },
@@ -890,6 +913,7 @@ mod tests {
             fleet_cancel,
             dispatch_service,
             connection_registry: conn_registry,
+            host_states: None,
         }
     }
 
@@ -1248,6 +1272,7 @@ mod tests {
             fleet_cancel,
             dispatch_service,
             connection_registry: conn_registry,
+            host_states: None,
         }
     }
 
@@ -1676,4 +1701,182 @@ mod tests {
             "absent ConnectEdge stream MUST surface as connected:false"
         );
     }
+}
+
+// ── Host state (ADR-157 D2) ────────────────────────────────────────────
+
+fn bearer(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_string)
+}
+
+#[derive(Debug, Deserialize)]
+struct HostStateBody {
+    manifest_yaml: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HostStateView {
+    name: String,
+    version: i32,
+    status: &'static str,
+    description: Option<String>,
+    target: EdgeTarget,
+    resources: usize,
+    manifest_yaml: String,
+    created_by: String,
+    created_at: String,
+}
+
+fn host_state_view(s: &crate::domain::host_state::HostState) -> HostStateView {
+    HostStateView {
+        name: s.name.clone(),
+        version: s.version,
+        status: s.status.as_str(),
+        description: s.manifest.metadata.description.clone(),
+        target: s.manifest.spec.target.clone(),
+        resources: s.manifest.spec.resources.len(),
+        manifest_yaml: s.manifest_yaml.clone(),
+        created_by: s.created_by.clone(),
+        created_at: s.created_at.to_rfc3339(),
+    }
+}
+
+fn host_states(
+    s: &EdgeApiState,
+) -> Result<&crate::application::host_state_service::HostStateService, ApiError> {
+    s.host_states
+        .as_deref()
+        .ok_or_else(|| ApiError::internal("host state needs the orchestrator's database"))
+}
+
+fn host_state_error(e: crate::application::host_state_service::HostStateError) -> ApiError {
+    use crate::application::host_state_service::HostStateError as E;
+    match e {
+        E::Invalid(_) | E::NoTargets(_) => ApiError::bad_request(e.to_string()),
+        E::NotFound(_) => ApiError::not_found(e.to_string()),
+        E::Repository(_) => ApiError::internal(e.to_string()),
+    }
+}
+
+fn actor(identity: &Option<Extension<UserIdentity>>) -> String {
+    identity
+        .as_ref()
+        .map(|i| i.0.sub.clone())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+async fn list_host_states(
+    State(s): State<EdgeApiState>,
+    Extension(tenant): Extension<TenantId>,
+) -> Result<Json<Vec<HostStateView>>, ApiError> {
+    let list = host_states(&s)?
+        .list(&tenant)
+        .await
+        .map_err(host_state_error)?;
+    Ok(Json(list.iter().map(host_state_view).collect()))
+}
+
+async fn create_host_state(
+    State(s): State<EdgeApiState>,
+    Extension(tenant): Extension<TenantId>,
+    identity: Option<Extension<UserIdentity>>,
+    Json(body): Json<HostStateBody>,
+) -> Result<Json<HostStateView>, ApiError> {
+    let saved = host_states(&s)?
+        .register(&tenant, &body.manifest_yaml, &actor(&identity))
+        .await
+        .map_err(host_state_error)?;
+    Ok(Json(host_state_view(&saved)))
+}
+
+async fn update_host_state(
+    State(s): State<EdgeApiState>,
+    Extension(tenant): Extension<TenantId>,
+    identity: Option<Extension<UserIdentity>>,
+    Path(name): Path<String>,
+    Json(body): Json<HostStateBody>,
+) -> Result<Json<HostStateView>, ApiError> {
+    let manifest = crate::domain::host_state::HostStateManifest::parse(&body.manifest_yaml)
+        .map_err(|p| ApiError::bad_request(p.join("; ")))?;
+    if manifest.metadata.name != name {
+        return Err(ApiError::bad_request(format!(
+            "the manifest names {:?}, not {name:?}",
+            manifest.metadata.name
+        )));
+    }
+    let svc = host_states(&s)?;
+    svc.get(&tenant, &name).await.map_err(host_state_error)?;
+    let saved = svc
+        .register(&tenant, &body.manifest_yaml, &actor(&identity))
+        .await
+        .map_err(host_state_error)?;
+    Ok(Json(host_state_view(&saved)))
+}
+
+async fn validate_host_state(Json(body): Json<HostStateBody>) -> Json<serde_json::Value> {
+    let problems =
+        crate::application::host_state_service::HostStateService::validate(&body.manifest_yaml);
+    Json(serde_json::json!({ "valid": problems.is_empty(), "problems": problems }))
+}
+
+async fn get_host_state(
+    State(s): State<EdgeApiState>,
+    Extension(tenant): Extension<TenantId>,
+    Path(name): Path<String>,
+) -> Result<Json<HostStateView>, ApiError> {
+    let st = host_states(&s)?
+        .get(&tenant, &name)
+        .await
+        .map_err(host_state_error)?;
+    Ok(Json(host_state_view(&st)))
+}
+
+async fn archive_host_state(
+    State(s): State<EdgeApiState>,
+    Extension(tenant): Extension<TenantId>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    host_states(&s)?
+        .archive(&tenant, &name)
+        .await
+        .map_err(host_state_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn plan_host_state(
+    State(s): State<EdgeApiState>,
+    Extension(tenant): Extension<TenantId>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<crate::application::host_state_service::HostStateRun>, ApiError> {
+    run_host_state(&s, &tenant, &headers, &name, true).await
+}
+
+async fn apply_host_state(
+    State(s): State<EdgeApiState>,
+    Extension(tenant): Extension<TenantId>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<crate::application::host_state_service::HostStateRun>, ApiError> {
+    run_host_state(&s, &tenant, &headers, &name, false).await
+}
+
+async fn run_host_state(
+    s: &EdgeApiState,
+    tenant: &TenantId,
+    headers: &HeaderMap,
+    name: &str,
+    check: bool,
+) -> Result<Json<crate::application::host_state_service::HostStateRun>, ApiError> {
+    let token =
+        bearer(headers).ok_or_else(|| ApiError::unauthorized("a bearer token is required"))?;
+    let run = host_states(s)?
+        .run(tenant, name, check, &token)
+        .await
+        .map_err(host_state_error)?;
+    Ok(Json(run))
 }
