@@ -10,7 +10,7 @@
 //!   name: chrony
 //!   description: Time sync on every member
 //! spec:
-//!   target: { Selector: { tags: [member] } }
+//!   target: { Selector: { tags: [ { Has: member } ] } }
 //!   resources:
 //!     - { id: pkg, kind: package, name: chrony }
 //!     - { id: svc, kind: service, name: chrony, enabled: true, running: true }
@@ -236,13 +236,21 @@ impl HostStateManifest {
     /// Parse and validate a manifest. Every problem is reported, not just
     /// the first, so an author or an agent fixes them in one pass.
     pub fn parse(yaml: &str) -> Result<Self, Vec<String>> {
-        let manifest: Self = serde_yaml::from_str(yaml).map_err(|e| vec![e.to_string()])?;
+        let manifest = Self::from_yaml(yaml).map_err(|e| vec![e])?;
         let problems = manifest.problems();
         if problems.is_empty() {
             Ok(manifest)
         } else {
             Err(problems)
         }
+    }
+
+    /// Read a manifest without validating it. Through JSON values: a
+    /// target is written as a map, `{ Selector: { tags: [ { Has: vm } ] } }`,
+    /// which serde_yaml reads only as a YAML tag (`!Selector`).
+    pub fn from_yaml(yaml: &str) -> Result<Self, String> {
+        let value: Value = serde_yaml::from_str(yaml).map_err(|e| e.to_string())?;
+        serde_json::from_value(value).map_err(|e| e.to_string())
     }
 
     pub fn problems(&self) -> Vec<String> {
@@ -560,5 +568,19 @@ spec:
         for refused in ["/abs#f", "a/../b#f", "a#", "#f", "a b#f", "a#f.g"] {
             assert!(SecretRef::parse(refused).is_none(), "{refused}");
         }
+    }
+
+    /// A selector in a manifest names only what it matches on.
+    #[test]
+    fn a_selector_names_only_its_tags() {
+        let yaml = WITH_SECRETS.replace(
+            "target: All",
+            "target: { Selector: { tags: [ { Has: vm } ] } }",
+        );
+        let m = HostStateManifest::parse(&yaml).expect("a short selector parses");
+        assert!(matches!(
+            m.spec.target,
+            crate::domain::edge::EdgeTarget::Selector(_)
+        ));
     }
 }

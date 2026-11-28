@@ -75,7 +75,9 @@ impl EdgeCapabilities {
 // EdgeSelector / LabelMatch / TagMatch
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Every field is optional in a manifest: an omitted one matches all.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EdgeSelector {
     pub os: Option<String>,
     pub arch: Option<String>,
