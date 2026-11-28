@@ -39,7 +39,7 @@ fn db(e: sqlx::Error) -> RepositoryError {
 fn row_to_state(r: &sqlx::postgres::PgRow) -> Result<HostState, RepositoryError> {
     let yaml: String = r.get("manifest_yaml");
     let manifest: HostStateManifest =
-        serde_yaml::from_str(&yaml).map_err(|e| RepositoryError::Serialization(e.to_string()))?;
+        HostStateManifest::from_yaml(&yaml).map_err(RepositoryError::Serialization)?;
     let tenant: String = r.get("tenant_id");
     Ok(HostState {
         id: r.get("id"),

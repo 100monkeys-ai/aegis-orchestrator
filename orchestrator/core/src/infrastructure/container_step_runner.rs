@@ -231,6 +231,16 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
             ContainerStepError,
         > = match &config.registry_credentials {
             None => Ok(None),
+            Some(s) if s.starts_with("env:") && !runs_as_platform(&config) => {
+                // The orchestrator's environment is the platform's, not a
+                // tenant's: a tenant's step that named a variable would
+                // send its value to the registry the step names.
+                let _ = s;
+                Err(ContainerStepError::ImagePullFailed {
+                    image: config.image.clone(),
+                    error: "registry_credentials env:NAME reads the orchestrator's own environment, which only the platform's own runs may; store the credential as a secret of your tenant and name it secret:kv/<path>".to_string(),
+                })
+            }
             Some(s) if s.starts_with("env:") => {
                 let var_name = s.strip_prefix("env:").unwrap();
 
@@ -298,9 +308,16 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                         })?;
 
                     let ctx = AccessContext::system("orchestrator");
+                    // A tenant's run reads only its own namespace (ADR-056);
+                    // the platform's own runs read the global one.
+                    let mount = registry_secret_mount(config.tenant_id.as_ref(), engine, secret_path)
+                        .map_err(|error| ContainerStepError::ImagePullFailed {
+                            image: config.image.clone(),
+                            error,
+                        })?;
                     let fields = self
                         .secrets_manager
-                        .read_secret(engine, secret_path, &ctx)
+                        .read_secret(&mount, secret_path, &ctx)
                         .await
                         .map_err(|e| ContainerStepError::ImagePullFailed {
                             image: config.image.clone(),
@@ -1247,6 +1264,40 @@ fn step_container_identity(
     )
 }
 
+/// The secret-store mount a step's `secret:engine/path` registry credential
+/// is read from: the run's own tenant namespace (ADR-056), or the global one
+/// for the platform's own steps. A person's tenant shares its realm's
+/// namespace, so its path must be under its own `users/<tenant>/`.
+fn registry_secret_mount(
+    tenant: Option<&crate::domain::shared_kernel::TenantId>,
+    engine: &str,
+    path: &str,
+) -> Result<String, String> {
+    match tenant {
+        Some(t) if !t.is_system() => {
+            if t.as_str().starts_with("u-") {
+                let own = format!("users/{}/", t.as_str());
+                if !path.starts_with(&own) || path.split('/').any(|seg| seg == "..") {
+                    return Err(format!(
+                        "registry_credentials for a person's run must name a path under {own}"
+                    ));
+                }
+            }
+            Ok(
+                crate::domain::secrets::SecretPath::for_tenant(t.clone(), engine, path)
+                    .effective_mount(),
+            )
+        }
+        _ => Ok(engine.to_string()),
+    }
+}
+
+/// Whether the step is the platform's own (no tenant, or the system tenant),
+/// the only steps that may name the orchestrator's environment.
+fn runs_as_platform(config: &ContainerStepConfig) -> bool {
+    config.tenant_id.as_ref().is_none_or(|t| t.is_system())
+}
+
 /// The error text for a step's `registry_credentials` value that is neither
 /// `env:VAR_NAME` nor `secret:engine/path`.
 ///
@@ -1309,6 +1360,29 @@ mod tests {
     /// rejects it is published as the step's failure reason and returned to
     /// the caller, so it must not repeat the value.
     #[test]
+    fn a_tenants_registry_secret_is_read_in_its_own_namespace() {
+        use crate::domain::shared_kernel::TenantId;
+        let team = TenantId::from_realm_slug("t-acme").unwrap();
+        assert_eq!(
+            super::registry_secret_mount(Some(&team), "kv", "cicd/ghcr").unwrap(),
+            "tenant-t-acme/kv"
+        );
+        assert_eq!(
+            super::registry_secret_mount(None, "kv", "cicd/ghcr").unwrap(),
+            "kv"
+        );
+        let person = TenantId::from_realm_slug("u-abc").unwrap();
+        assert!(super::registry_secret_mount(Some(&person), "kv", "users/u-other/x").is_err());
+        assert!(
+            super::registry_secret_mount(Some(&person), "kv", "users/u-abc/../u-other/x").is_err()
+        );
+        assert_eq!(
+            super::registry_secret_mount(Some(&person), "kv", "users/u-abc/ghcr").unwrap(),
+            "tenant-zaru-consumer/kv"
+        );
+    }
+
+    #[test]
     fn unrecognised_registry_credentials_error_does_not_echo_the_value() {
         let marker = "Mk7-registry-password-marker";
         let mut leaked = Vec::new();
@@ -1369,6 +1443,7 @@ mod tests {
             volumes: vec![],
             resources: None,
             registry_credentials: None,
+            tenant_id: None,
             execution_id: ExecutionId::new(),
             state_name: StateName::new("EXECUTE_CODE").unwrap(),
             read_only_root_filesystem: true,
@@ -1569,6 +1644,7 @@ mod tests {
             volumes: vec![],
             resources: None,
             registry_credentials: None,
+            tenant_id: None,
             execution_id,
             state_name: StateName::new("STDIN").unwrap(),
             read_only_root_filesystem: true,

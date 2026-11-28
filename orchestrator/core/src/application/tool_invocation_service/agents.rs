@@ -952,6 +952,7 @@ impl ToolInvocationService {
                 timeout: Some(std::time::Duration::from_secs(PROGRAM_CHECK_TIMEOUT_SECS)),
             }),
             registry_credentials: None,
+            tenant_id: None,
             execution_id: crate::domain::execution::ExecutionId::new(),
             state_name,
             read_only_root_filesystem: false,

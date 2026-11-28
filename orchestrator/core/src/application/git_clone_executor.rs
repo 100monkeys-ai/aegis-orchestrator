@@ -578,6 +578,7 @@ impl EphemeralCliEngine {
             }],
             resources: None,
             registry_credentials: None,
+            tenant_id: None,
             execution_id,
             state_name: StateName::new(state).expect("static state name is valid"),
             // A read-only root file system comes with a memory-backed `/tmp`,

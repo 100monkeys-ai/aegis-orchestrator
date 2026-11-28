@@ -10,7 +10,7 @@
 //!   name: chrony
 //!   description: Time sync on every member
 //! spec:
-//!   target: { Selector: { tags: [member] } }
+//!   target: { Selector: { tags: [ { Has: member } ] } }
 //!   resources:
 //!     - { id: pkg, kind: package, name: chrony }
 //!     - { id: svc, kind: service, name: chrony, enabled: true, running: true }
@@ -169,6 +169,36 @@ fn map_strings(v: &Value, f: &dyn Fn(&str) -> String) -> Value {
     }
 }
 
+/// `manifest_yaml` with `vars` set in its `spec.vars`, or None when each
+/// already has that value. The rest of the manifest is kept as written.
+pub fn with_vars(
+    manifest_yaml: &str,
+    vars: &BTreeMap<String, String>,
+) -> Result<Option<String>, String> {
+    let mut doc: Value = serde_yaml::from_str(manifest_yaml).map_err(|e| e.to_string())?;
+    let spec = doc
+        .get_mut("spec")
+        .and_then(Value::as_object_mut)
+        .ok_or("the state has no spec")?;
+    let current = spec
+        .entry("vars")
+        .or_insert_with(|| Value::Object(Default::default()))
+        .as_object_mut()
+        .ok_or("spec.vars is not a map")?;
+    if vars
+        .iter()
+        .all(|(k, v)| current.get(k).and_then(Value::as_str) == Some(v.as_str()))
+    {
+        return Ok(None);
+    }
+    for (k, v) in vars {
+        current.insert(k.clone(), Value::String(v.clone()));
+    }
+    serde_yaml::to_string(&doc)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
 /// Replace every occurrence of a secret's value in `v` with
 /// `[secret NAME]`, so a report that echoes content (a file's diff, an
 /// error) never carries it.
@@ -236,13 +266,21 @@ impl HostStateManifest {
     /// Parse and validate a manifest. Every problem is reported, not just
     /// the first, so an author or an agent fixes them in one pass.
     pub fn parse(yaml: &str) -> Result<Self, Vec<String>> {
-        let manifest: Self = serde_yaml::from_str(yaml).map_err(|e| vec![e.to_string()])?;
+        let manifest = Self::from_yaml(yaml).map_err(|e| vec![e])?;
         let problems = manifest.problems();
         if problems.is_empty() {
             Ok(manifest)
         } else {
             Err(problems)
         }
+    }
+
+    /// Read a manifest without validating it. Through JSON values: a
+    /// target is written as a map, `{ Selector: { tags: [ { Has: vm } ] } }`,
+    /// which serde_yaml reads only as a YAML tag (`!Selector`).
+    pub fn from_yaml(yaml: &str) -> Result<Self, String> {
+        let value: Value = serde_yaml::from_str(yaml).map_err(|e| e.to_string())?;
+        serde_json::from_value(value).map_err(|e| e.to_string())
     }
 
     pub fn problems(&self) -> Vec<String> {
@@ -560,5 +598,32 @@ spec:
         for refused in ["/abs#f", "a/../b#f", "a#", "#f", "a b#f", "a#f.g"] {
             assert!(SecretRef::parse(refused).is_none(), "{refused}");
         }
+    }
+
+    /// A selector in a manifest names only what it matches on.
+    #[test]
+    fn a_selector_names_only_its_tags() {
+        let yaml = WITH_SECRETS.replace(
+            "target: All",
+            "target: { Selector: { tags: [ { Has: vm } ] } }",
+        );
+        let m = HostStateManifest::parse(&yaml).expect("a short selector parses");
+        assert!(matches!(
+            m.spec.target,
+            crate::domain::edge::EdgeTarget::Selector(_)
+        ));
+    }
+
+    /// A deploy sets a var as the state's next version; the same value again
+    /// stores nothing.
+    #[test]
+    fn vars_are_set_as_a_new_manifest_and_unchanged_ones_store_nothing() {
+        let mut tag = BTreeMap::new();
+        tag.insert("port".to_string(), "9090".to_string());
+        let next = with_vars(WITH_SECRETS, &tag).unwrap().expect("a change");
+        let m = HostStateManifest::parse(&next).expect("still valid");
+        assert_eq!(m.spec.vars["port"], "9090");
+        assert_eq!(m.spec.secrets["db"], "api/db#password");
+        assert!(with_vars(&next, &tag).unwrap().is_none());
     }
 }

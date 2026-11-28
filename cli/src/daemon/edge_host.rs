@@ -539,10 +539,23 @@ async fn pod(r: &Value, check: bool) -> Report {
     {
         return failed(format!("pod name {name:?} is not a name"));
     }
+    let network = s(r, "network");
+    if let Some(n) = network {
+        if n.is_empty()
+            || !n
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
+            return failed(format!("pod network {n:?} is not a network name"));
+        }
+    }
     let Some(uid) = uid_of(as_user).await else {
         return failed(format!("no user {as_user}"));
     };
-    let fingerprint = hex::encode(Sha256::digest(spec.as_bytes()));
+    // The network is part of what the pod is: a change replaces it.
+    let fingerprint = hex::encode(Sha256::digest(
+        format!("{}\0{}", network.unwrap_or(""), spec).as_bytes(),
+    ));
     let dir = Path::new(HOST_STATE_DIR).join("pods");
     let marker = dir.join(format!("{name}.sha256"));
     let running = run(&[
@@ -585,8 +598,15 @@ async fn pod(r: &Value, check: bool) -> Report {
         "kube".into(),
         "play".into(),
         "--replace".into(),
-        spec_path.display().to_string(),
-    ])
+    ]
+    .into_iter()
+    .chain(
+        network
+            .into_iter()
+            .flat_map(|n| ["--network".to_string(), n.to_string()]),
+    )
+    .chain([spec_path.display().to_string()])
+    .collect::<Vec<String>>())
     .await;
     if !okay {
         return failed(err.lines().last().unwrap_or("kube play failed").to_string());
@@ -601,11 +621,28 @@ async fn pod(r: &Value, check: bool) -> Report {
 /// order; a `service` with `watch: [ids]` restarts when any of them changed.
 /// The first failure stops the run unless `continue_on_failure` is set.
 pub async fn apply(state: &Value, check: bool) -> Value {
-    let resources = state
+    let mut resources = state
         .get("resources")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // A state may name this host's facts, ((facts.interfaces.wg0|127.0.0.1)):
+    // rendered here, where the facts are, before anything is applied. A
+    // fact the host lacks, with no default, refuses the whole state.
+    if resources.iter().any(names_a_fact) {
+        let known = facts().await;
+        match render_facts(&Value::Array(resources), &known) {
+            Ok(Value::Array(rendered)) => resources = rendered,
+            Ok(_) => unreachable!("an array renders to an array"),
+            Err(missing) => {
+                return json!({
+                    "changed": 0,
+                    "failed": 1,
+                    "results": [{ "id": "facts", "status": "failed", "diff": missing }],
+                })
+            }
+        }
+    }
     let keep_going = state
         .get("continue_on_failure")
         .and_then(Value::as_bool)
@@ -666,6 +703,104 @@ pub async fn apply(state: &Value, check: bool) -> Value {
 
 /// What the host is: the facts a state's templates and a workflow's
 /// targeting read.
+fn names_a_fact(v: &Value) -> bool {
+    match v {
+        Value::String(s) => s.contains("((facts."),
+        Value::Array(a) => a.iter().any(names_a_fact),
+        Value::Object(o) => o.values().any(names_a_fact),
+        _ => false,
+    }
+}
+
+/// Replace every `((facts.PATH))` or `((facts.PATH|DEFAULT))` with the fact
+/// at PATH (dot-separated keys into `facts`), or DEFAULT where the host has
+/// none. Err names every fact the host lacks with no default.
+fn render_facts(v: &Value, facts: &Value) -> Result<Value, String> {
+    fn lookup(facts: &Value, path: &str) -> Option<String> {
+        let mut at = facts;
+        for key in path.split('.') {
+            at = match at {
+                Value::Object(o) => o.get(key)?,
+                Value::Array(a) => a.get(key.parse::<usize>().ok()?)?,
+                _ => return None,
+            };
+        }
+        match at {
+            Value::String(s) if !s.is_empty() => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            Value::Bool(b) => Some(b.to_string()),
+            _ => None,
+        }
+    }
+    fn walk(v: &Value, facts: &Value, missing: &mut Vec<String>) -> Value {
+        match v {
+            Value::String(s) => {
+                let mut out = String::with_capacity(s.len());
+                let mut rest = s.as_str();
+                while let Some(open) = rest.find("((facts.") {
+                    let Some(close) = rest[open..].find("))").map(|i| i + open) else {
+                        break;
+                    };
+                    out.push_str(&rest[..open]);
+                    let inner = rest[open + 8..close].trim();
+                    let (path, default) = match inner.split_once('|') {
+                        Some((p, d)) => (p.trim(), Some(d.trim())),
+                        None => (inner, None),
+                    };
+                    match lookup(facts, path).or_else(|| default.map(str::to_string)) {
+                        Some(value) => out.push_str(&value),
+                        None => {
+                            missing.push(format!("facts.{path}"));
+                            out.push_str(&rest[open..close + 2]);
+                        }
+                    }
+                    rest = &rest[close + 2..];
+                }
+                out.push_str(rest);
+                Value::String(out)
+            }
+            Value::Array(a) => Value::Array(a.iter().map(|x| walk(x, facts, missing)).collect()),
+            Value::Object(o) => Value::Object(
+                o.iter()
+                    .map(|(k, x)| (k.clone(), walk(x, facts, missing)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+    let mut missing = Vec::new();
+    let rendered = walk(v, facts, &mut missing);
+    if missing.is_empty() {
+        Ok(rendered)
+    } else {
+        missing.dedup();
+        Err(format!(
+            "this host has no {} and the state gives no default; nothing was applied",
+            missing.join(", ")
+        ))
+    }
+}
+
+/// Each interface's first IPv4 address, from `ip -4 -o addr show`.
+fn interfaces_from(ip_output: &str) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    for line in ip_output.lines() {
+        let mut words = line.split_whitespace();
+        let (Some(_), Some(name)) = (words.next(), words.next()) else {
+            continue;
+        };
+        let addr = words
+            .skip_while(|w| *w != "inet")
+            .nth(1)
+            .and_then(|cidr| cidr.split('/').next());
+        if let Some(addr) = addr {
+            out.entry(name.trim_end_matches(':').to_string())
+                .or_insert_with(|| Value::String(addr.to_string()));
+        }
+    }
+    out
+}
+
 pub async fn facts() -> Value {
     let os = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
     let field = |k: &str| {
@@ -679,6 +814,14 @@ pub async fn facts() -> Value {
     });
     let (_, kernel, _) = run(&["uname".into(), "-r".into()]).await;
     let (_, addrs, _) = run(&["hostname".into(), "-I".into()]).await;
+    let (_, ip_out, _) = run(&[
+        "ip".into(),
+        "-4".into(),
+        "-o".into(),
+        "addr".into(),
+        "show".into(),
+    ])
+    .await;
     json!({
         "hostname": std::fs::read_to_string("/etc/hostname").unwrap_or_default().trim(),
         "os_id": field("ID"),
@@ -688,6 +831,7 @@ pub async fn facts() -> Value {
         "cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
         "mem_total": mem_kb,
         "addresses": addrs.split_whitespace().collect::<Vec<_>>(),
+        "interfaces": interfaces_from(&ip_out),
         "systemd": Path::new("/run/systemd/system").exists(),
         "podman": run(&["podman".into(), "--version".into()]).await.0,
         "ufw": Path::new("/usr/sbin/ufw").exists(),
@@ -697,6 +841,32 @@ pub async fn facts() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interfaces_are_read_from_ip_addr() {
+        let out = "1: lo    inet 127.0.0.1/8 scope host lo\n2: ens3    inet 135.148.170.197/32 metric 100 scope global dynamic ens3\n5: wg0    inet 10.121.0.2/24 scope global wg0\n";
+        let i = interfaces_from(out);
+        assert_eq!(i["wg0"], "10.121.0.2");
+        assert_eq!(i["ens3"], "135.148.170.197");
+    }
+
+    #[test]
+    fn facts_render_with_defaults_and_refuse_when_missing() {
+        let facts = json!({ "hostname": "aegis-node-1", "interfaces": { "wg0": "10.121.0.2" } });
+        let state =
+            json!([{ "content": "ip=((facts.interfaces.wg0|127.0.0.1)) on ((facts.hostname))" }]);
+        assert_eq!(
+            render_facts(&state, &facts).unwrap()[0]["content"],
+            "ip=10.121.0.2 on aegis-node-1"
+        );
+        let standalone = json!({ "hostname": "nuclear-vm-1", "interfaces": {} });
+        assert_eq!(
+            render_facts(&state, &standalone).unwrap()[0]["content"],
+            "ip=127.0.0.1 on nuclear-vm-1"
+        );
+        let err = render_facts(&json!(["((facts.interfaces.wg9))"]), &facts).unwrap_err();
+        assert!(err.contains("facts.interfaces.wg9"), "{err}");
+    }
 
     #[tokio::test]
     async fn check_mode_reports_and_changes_nothing_then_apply_converges() {
