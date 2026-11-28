@@ -445,6 +445,44 @@ async fn send_result(
         .map_err(|e| anyhow::anyhow!("send_result: {e}"))
 }
 
+/// The principal an orchestrator attestation names (ADR-157 D12): its
+/// payload's `attestation`, with a non-empty `via` and `principal`.
+fn attested_principal(envelope: &ProtoSealEnvelope) -> Option<String> {
+    use prost_types::value::Kind;
+    let att = envelope.payload.as_ref()?.fields.get("attestation")?;
+    let Some(Kind::StructValue(att)) = &att.kind else {
+        return None;
+    };
+    let text = |k: &str| match att.fields.get(k).and_then(|v| v.kind.as_ref()) {
+        Some(Kind::StringValue(s)) if !s.trim().is_empty() => Some(s.clone()),
+        _ => None,
+    };
+    text("via")?;
+    text("principal")
+}
+
+fn check_context_and_tenant(
+    envelope: &ProtoSealEnvelope,
+    outer_scn: &str,
+) -> Result<(), Box<EdgeResult>> {
+    if envelope.tenant_id.trim().is_empty() {
+        return Err(Box::new(error_result(
+            "envelope_invalid",
+            "inner SealEnvelope missing tenant_id",
+        )));
+    }
+    if envelope.security_context_name != outer_scn {
+        return Err(Box::new(error_result(
+            "envelope_invalid",
+            format!(
+                "inner SealEnvelope security_context_name '{}' does not match outer '{}'",
+                envelope.security_context_name, outer_scn
+            ),
+        )));
+    }
+    Ok(())
+}
+
 /// Verify the inner proto `SealEnvelope` carried in an InvokeToolCommand.
 ///
 /// What we verify locally on the edge:
@@ -460,7 +498,13 @@ fn verify_inner_envelope(
     envelope: &ProtoSealEnvelope,
     outer_scn: &str,
 ) -> Result<(), Box<EdgeResult>> {
+    // ADR-157 D12: a run an MCP call or a workflow started carries no user
+    // token. The orchestrator attests its principal in the payload, under
+    // the controller-signed outer envelope this daemon has already verified.
     if envelope.user_security_token.trim().is_empty() {
+        if attested_principal(envelope).is_some() {
+            return check_context_and_tenant(envelope, outer_scn);
+        }
         return Err(Box::new(error_result(
             "envelope_invalid",
             "inner SealEnvelope missing user_security_token",
@@ -1424,6 +1468,55 @@ mod tests {
             chain.contains("connection refused"),
             "flat-chain format MUST include the underlying cause so operators \
              can see the gRPC status: {chain}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod attestation_tests {
+    //! ADR-157 D12: an inner envelope with no user token is accepted only
+    //! when the orchestrator attests its principal.
+    use super::*;
+
+    fn envelope(
+        token: &str,
+        attestation: Option<serde_json::Value>,
+        scn: &str,
+    ) -> ProtoSealEnvelope {
+        ProtoSealEnvelope {
+            user_security_token: token.to_string(),
+            tenant_id: "t-1".into(),
+            security_context_name: scn.into(),
+            payload: attestation.map(|a| {
+                aegis_orchestrator_core::application::edge::json_value_to_prost_struct(
+                    serde_json::json!({ "attestation": a }),
+                )
+                .unwrap()
+            }),
+            signature: vec![],
+        }
+    }
+
+    #[test]
+    fn an_attested_principal_stands_in_for_a_user_token() {
+        let att = serde_json::json!({ "via": "seal_session", "principal": "user-1", "reference": "exec-1" });
+        assert!(verify_inner_envelope(
+            &envelope("", Some(att.clone()), "host-admin"),
+            "host-admin"
+        )
+        .is_ok());
+        assert!(
+            verify_inner_envelope(&envelope("", Some(att), "host-admin"), "zaru-free").is_err(),
+            "the attested envelope's context must still match the command's"
+        );
+    }
+
+    #[test]
+    fn no_token_and_no_attestation_is_refused() {
+        assert!(verify_inner_envelope(&envelope("", None, "host-admin"), "host-admin").is_err());
+        let hollow = serde_json::json!({ "via": "seal_session", "principal": "" });
+        assert!(
+            verify_inner_envelope(&envelope("", Some(hollow), "host-admin"), "host-admin").is_err()
         );
     }
 }

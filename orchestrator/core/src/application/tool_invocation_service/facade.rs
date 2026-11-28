@@ -241,6 +241,7 @@ impl ToolInvocationService {
             execution_repository: None,
             goal_service: None,
             schedule_service: None,
+            host_state_service: None,
             image_generation: None,
         }
     }
@@ -3146,6 +3147,19 @@ impl ToolInvocationService {
             // AEGIS ADR-140 D6: a start that chooses nothing itself starts
             // its run on the profile the call carries.
             super::context_args::give_profile(args, run_profile);
+        }
+        // AEGIS ADR-157 D2: the tenant's host state.
+        if super::host_states::HOST_STATE_TOOLS.contains(&tool_name) {
+            return Some(
+                self.invoke_aegis_host_state_tool(
+                    tool_name,
+                    args,
+                    execution_id,
+                    caller_identity,
+                    tenant_scope,
+                )
+                .await,
+            );
         }
         // AEGIS ADR-139 N11: the person's schedules.
         if super::schedules::SCHEDULE_TOOLS.contains(&tool_name) {

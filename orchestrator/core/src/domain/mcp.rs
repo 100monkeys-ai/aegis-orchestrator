@@ -412,6 +412,12 @@ impl ToolInputContract {
             | "aegis.task.remove" => &["execution_id"],
             "aegis.goal.cancel" => &["goal_id"],
             "aegis.schedule.create" => &["name", "target_kind", "target"],
+            "aegis.host_state.create" | "aegis.host_state.validate" => &["manifest_yaml"],
+            "aegis.host_state.update" => &["name", "manifest_yaml"],
+            "aegis.host_state.get"
+            | "aegis.host_state.plan"
+            | "aegis.host_state.apply"
+            | "aegis.host_state.archive" => &["name"],
             "aegis.schedule.get"
             | "aegis.schedule.update"
             | "aegis.schedule.pause"

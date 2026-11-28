@@ -2417,6 +2417,27 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         None
     };
 
+    // ─── Host state (AEGIS ADR-157 D2) ──────────────────────────────────────
+    // One service for the `/v1/host-states` routes and the
+    // `aegis.host_state.*` tools, running through this process's fleet
+    // dispatcher.
+    let host_state_service: Option<
+        Arc<aegis_orchestrator_core::application::host_state_service::HostStateService>,
+    > = match (db_pool.as_ref(), edge_components.as_ref()) {
+        (Some(pool), Some((_, _, _, _, resolver, fleet_dispatcher, _))) => Some(Arc::new(
+            aegis_orchestrator_core::application::host_state_service::HostStateService::new(
+                Arc::new(
+                    aegis_orchestrator_core::infrastructure::repositories::postgres_host_state::PgHostStateRepository::new(
+                        pool.clone(),
+                    ),
+                ),
+                resolver.clone(),
+                fleet_dispatcher.clone(),
+            ),
+        )),
+        _ => None,
+    };
+
     // ─── Tool approval gate (AEGIS ADR-126) ─────────────────────────────────
     // Requests and "always allow" policies live in PostgreSQL (migration
     // 036), so a pending request outlives the agent and this process; a node
@@ -2627,6 +2648,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // `/v1/schedules` routes use.
     tool_invocation_service_builder =
         tool_invocation_service_builder.with_schedule_service(schedule_service.clone());
+    // AEGIS ADR-157 D2: the host state tools use the service the
+    // `/v1/host-states` routes use.
+    if let Some(hs) = host_state_service.clone() {
+        tool_invocation_service_builder =
+            tool_invocation_service_builder.with_host_state_service(hs);
+    }
 
     // Initialize git repo service (ADR-081 Waves A2 / A3). Requires a
     // Postgres pool for the binding repository; left as `None` when the
@@ -3191,20 +3218,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     fleet_cancel: fleet_cancel.clone(),
                     dispatch_service: dispatch_service.clone(),
                     connection_registry: conn_registry.clone(),
-                    // ADR-157 D2: host state, run through this fleet dispatcher.
-                    host_states: db_pool.as_ref().map(|pool| {
-                        Arc::new(
-                            aegis_orchestrator_core::application::host_state_service::HostStateService::new(
-                                Arc::new(
-                                    aegis_orchestrator_core::infrastructure::repositories::postgres_host_state::PgHostStateRepository::new(
-                                        pool.clone(),
-                                    ),
-                                ),
-                                resolver.clone(),
-                                fleet_dispatcher.clone(),
-                            ),
-                        )
-                    }),
+                    // ADR-157 D2: the one host state service.
+                    host_states: host_state_service.clone(),
                 }
             },
         );

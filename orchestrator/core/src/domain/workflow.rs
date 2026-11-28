@@ -1243,6 +1243,21 @@ pub enum ActionName {
     /// conclude, up to `timeout_seconds`, answering `no_run` when none
     /// appeared within `no_run_grace_seconds` (AEGIS ADR-149 C2).
     ArchiveDeployWait,
+    /// Plans the HostState named by the argument `name` over its target:
+    /// each edge reports what it would change, and changes nothing (AEGIS
+    /// ADR-157 D4).
+    HostStatePlan,
+    /// Applies the HostState named by the argument `name`: each target edge,
+    /// one at a time, converges to it; gated (AEGIS ADR-157 D4).
+    HostStateApply,
+    /// Runs the tool `tool` with `args` on the edges `target` names under
+    /// `security_context`, sequentially or in parallel (`mode`); gated
+    /// (AEGIS ADR-157 D4).
+    EdgeFleetInvoke,
+    /// Waits for `url` to answer `expect_status` (default 200), trying
+    /// `attempts` times `interval_secs` apart: a rollout's health gate
+    /// (AEGIS ADR-157 D4); touches nothing.
+    HttpCheck,
 }
 
 /// Where `image_generate` writes its files when a state names no `path`.
@@ -1286,7 +1301,7 @@ pub enum ActionNeed {
 
 impl ActionName {
     /// Every action, in the order the refusal lists them.
-    pub const ALL: [ActionName; 13] = [
+    pub const ALL: [ActionName; 17] = [
         ActionName::UpdateBlackboard,
         ActionName::RepositoryDiff,
         ActionName::RepositoryCommit,
@@ -1300,6 +1315,10 @@ impl ActionName {
         ActionName::ArchiveRender,
         ActionName::ArchivePush,
         ActionName::ArchiveDeployWait,
+        ActionName::HostStatePlan,
+        ActionName::HostStateApply,
+        ActionName::EdgeFleetInvoke,
+        ActionName::HttpCheck,
     ];
 
     /// The literal a manifest writes.
@@ -1318,6 +1337,10 @@ impl ActionName {
             ActionName::ArchiveRender => "archive_render",
             ActionName::ArchivePush => "archive_push",
             ActionName::ArchiveDeployWait => "archive_deploy_wait",
+            ActionName::HostStatePlan => "host_state_plan",
+            ActionName::HostStateApply => "host_state_apply",
+            ActionName::EdgeFleetInvoke => "edge_fleet_invoke",
+            ActionName::HttpCheck => "http_check",
         }
     }
 
@@ -1366,6 +1389,17 @@ impl ActionName {
                 required: &["cut"],
                 optional: &["timeout_seconds", "no_run_grace_seconds"],
             },
+            ActionName::HostStatePlan | ActionName::HostStateApply => {
+                ActionArguments::Required(&["name"])
+            }
+            ActionName::EdgeFleetInvoke => ActionArguments::Declared {
+                required: &["target", "tool"],
+                optional: &["args", "security_context", "mode"],
+            },
+            ActionName::HttpCheck => ActionArguments::Declared {
+                required: &["url"],
+                optional: &["expect_status", "attempts", "interval_secs"],
+            },
         }
     }
 
@@ -1385,6 +1419,10 @@ impl ActionName {
             | ActionName::ArchiveRender
             | ActionName::ArchivePush
             | ActionName::ArchiveDeployWait => ActionNeed::RunTreeRef,
+            ActionName::HostStatePlan
+            | ActionName::HostStateApply
+            | ActionName::EdgeFleetInvoke
+            | ActionName::HttpCheck => ActionNeed::Nothing,
         }
     }
 
@@ -1393,7 +1431,11 @@ impl ActionName {
     pub fn touches_the_world(&self) -> bool {
         matches!(
             self,
-            ActionName::RepositoryLand | ActionName::TreeLand | ActionName::ArchivePush
+            ActionName::RepositoryLand
+                | ActionName::TreeLand
+                | ActionName::ArchivePush
+                | ActionName::HostStateApply
+                | ActionName::EdgeFleetInvoke
         )
     }
 

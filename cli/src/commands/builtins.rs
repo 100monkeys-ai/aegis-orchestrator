@@ -185,6 +185,10 @@ pub const BUILTIN_WORKFLOWS: &[(&str, &str)] = &[
         "transcribe-audio",
         include_str!("../../templates/workflows/transcribe-audio.yaml"),
     ),
+    (
+        "infra-apply",
+        include_str!("../../templates/workflows/infra-apply.yaml"),
+    ),
 ];
 
 /// All builtin templates that should be synced to disk.
@@ -1007,8 +1011,8 @@ mod tests {
     /// built-in agent that may make two tries fits two whole tries under its
     /// execution bound, each its clock and its judges', with the wait the
     /// supervisor makes after a failed try and the time a try takes to start
-    /// (`resources.timeout >= 2 x (iteration_timeout + judges' timeout_seconds)
-    /// + failed_execution_backoff(1) + TRY_START_ALLOWANCE`, the supervisor's
+    /// (`resources.timeout >= 2 x (iteration_timeout + judges' timeout_seconds) +
+    /// failed_execution_backoff(1) + TRY_START_ALLOWANCE`, the supervisor's
     /// `two_tries_bound`), outside the exemptions the domain names beside it
     /// (`TWO_TRIES_EXEMPT`, moved there by AEGIS ADR-141's Update of
     /// 2026-10-21, clause 12, and read from there). Run `e7f2c2aa`'s
@@ -2779,6 +2783,44 @@ mod tests {
             "AEGIS ADR-149: carbon-forge does not cut the landed run:\n{}",
             complaints.join("\n")
         );
+    }
+
+    /// AEGIS ADR-157 D4: `infra-apply` is a built-in: PLAN, the gated APPLY
+    /// and VERIFY, each a host action, with a terminal state recording each
+    /// outcome.
+    #[test]
+    fn infra_apply_is_a_builtin_planning_applying_and_verifying_a_host_state() {
+        use aegis_orchestrator_core::domain::workflow::{ActionName, StateKind};
+        let Some((_, yaml)) = BUILTIN_WORKFLOWS.iter().find(|(n, _)| *n == "infra-apply") else {
+            panic!("AEGIS ADR-157 D4: infra-apply is not registered");
+        };
+        let parsed =
+            aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(
+                yaml,
+            )
+            .unwrap_or_else(|e| panic!("AEGIS ADR-157 D4: infra-apply does not parse: {e}"));
+        let action_of = |state: &str| {
+            let (_, spec) = parsed
+                .spec
+                .states
+                .iter()
+                .find(|(name, _)| name.as_str() == state)
+                .unwrap_or_else(|| panic!("infra-apply has no state {state}"));
+            match &spec.kind {
+                StateKind::Action { action, .. } => *action,
+                other => panic!("{state} is not an Action: {other:?}"),
+            }
+        };
+        assert_eq!(action_of("PLAN"), ActionName::HostStatePlan);
+        assert_eq!(action_of("APPLY"), ActionName::HostStateApply);
+        assert_eq!(action_of("VERIFY"), ActionName::HostStatePlan);
+        for terminal in ["COMPLETE", "PLAN_REFUSED", "APPLY_FAILED", "VERIFY_FAILED"] {
+            assert_eq!(
+                action_of(terminal),
+                ActionName::UpdateBlackboard,
+                "{terminal}"
+            );
+        }
     }
 
     /// AEGIS ADR-149 C2, C3, C4: `carbon-deploy` is a built-in registered
