@@ -994,11 +994,21 @@ async fn enroll_seeds_security_contexts_that_match_consumer_tier_names() {
             "template must seed '{required}' (matches ZaruTier::to_security_context_name); found {names:?}"
         );
     }
-    let zaru_free = contexts.iter().find(|c| c.name == "zaru-free").unwrap();
-    assert!(
-        zaru_free.capabilities.iter().any(|c| c.tool_pattern == "*"),
-        "zaru-free seed must include a permissive '*' tool_pattern as the starting point"
-    );
+    // Deny by default: every seeded context allows only host.facts, and
+    // nothing is granted by a wildcard.
+    for c in contexts {
+        let patterns: Vec<&str> = c
+            .capabilities
+            .iter()
+            .map(|k| k.tool_pattern.as_str())
+            .collect();
+        assert_eq!(
+            patterns,
+            ["host.facts"],
+            "context '{}' must allow only host.facts by default",
+            c.name
+        );
+    }
 }
 
 /// BUG 3 regression: bootstrap must populate `spec.cluster.edge.capabilities`
