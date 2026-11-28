@@ -35,6 +35,21 @@ pub enum HostStateError {
     Repository(#[from] RepositoryError),
 }
 
+/// Who a plan or an apply runs for, as the edge reads it (ADR-157 D12).
+#[derive(Debug, Clone)]
+pub enum HostStatePrincipal {
+    /// A REST caller: their own bearer token travels in the inner envelope.
+    Bearer(crate::domain::secrets::SensitiveString),
+    /// A caller attested by the orchestrator: an MCP call (its SEAL
+    /// session) or a workflow run (its run's authority). `via` names which,
+    /// `reference` the session or run.
+    Attested {
+        principal: String,
+        via: &'static str,
+        reference: String,
+    },
+}
+
 /// One edge's outcome of a plan or an apply.
 #[derive(Debug, Clone, Serialize)]
 pub struct HostRun {
@@ -125,14 +140,14 @@ impl HostStateService {
 
     /// Plan (`check`) or apply the active version of `name` over its target,
     /// one edge at a time, stopping at the first edge that fails.
-    /// `principal_token` is the caller's own token, carried in the inner
-    /// SEAL envelope the edge checks.
+    /// `principal` is who the run is for, carried in the inner SEAL envelope
+    /// the edge checks (D12).
     pub async fn run(
         &self,
         tenant: &TenantId,
         name: &str,
         check: bool,
-        principal_token: &str,
+        principal: &HostStatePrincipal,
     ) -> Result<HostStateRun, HostStateError> {
         let state = self.get(tenant, name).await?;
         let spec = &state.manifest.spec;
@@ -156,13 +171,7 @@ impl HostStateService {
             tool_name: "host.apply".to_string(),
             args,
             security_context_name: context.clone(),
-            user_seal_envelope: SealEnvelope {
-                user_security_token: principal_token.to_string(),
-                tenant_id: tenant.as_str().to_string(),
-                security_context_name: context,
-                payload: None,
-                signature: vec![],
-            },
+            user_seal_envelope: principal_envelope(principal, tenant, context),
             resolved,
             policy: FleetDispatchPolicy {
                 per_target_deadline: APPLY_DEADLINE,
@@ -209,6 +218,36 @@ impl HostStateService {
     }
 }
 
+/// The inner envelope for `principal`: a bearer's token, or the
+/// orchestrator's attestation of the principal in its payload (D12).
+pub fn principal_envelope(
+    principal: &HostStatePrincipal,
+    tenant: &TenantId,
+    context: String,
+) -> SealEnvelope {
+    let (token, payload) = match principal {
+        HostStatePrincipal::Bearer(token) => (token.expose().to_string(), None),
+        HostStatePrincipal::Attested {
+            principal,
+            via,
+            reference,
+        } => (
+            String::new(),
+            crate::application::edge::json_value_to_prost_struct(serde_json::json!({
+                "attestation": { "via": via, "principal": principal, "reference": reference },
+            }))
+            .ok(),
+        ),
+    };
+    SealEnvelope {
+        user_security_token: token,
+        tenant_id: tenant.as_str().to_string(),
+        security_context_name: context,
+        payload,
+        signature: vec![],
+    }
+}
+
 fn summarise(
     state: &HostState,
     check: bool,
@@ -237,5 +276,40 @@ fn summarise(
         skipped,
         changed_hosts,
         failed_hosts,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bearer_travels_as_the_token_and_an_attestation_in_the_payload() {
+        let tenant = TenantId::from_string("t-465fa94f-36a6-464b-b82d-88f2bc07b03e").unwrap();
+        let bearer = principal_envelope(
+            &HostStatePrincipal::Bearer(crate::domain::secrets::SensitiveString::new(
+                "a.b.c".to_string(),
+            )),
+            &tenant,
+            "host-admin".into(),
+        );
+        assert_eq!(bearer.user_security_token, "a.b.c");
+        assert!(bearer.payload.is_none());
+        assert_eq!(bearer.security_context_name, "host-admin");
+
+        let attested = principal_envelope(
+            &HostStatePrincipal::Attested {
+                principal: "user-1".into(),
+                via: "seal_session",
+                reference: "exec-1".into(),
+            },
+            &tenant,
+            "host-admin".into(),
+        );
+        assert!(attested.user_security_token.is_empty());
+        let json =
+            crate::application::edge::prost_struct_to_json(attested.payload.as_ref().unwrap());
+        assert_eq!(json["attestation"]["principal"], "user-1");
+        assert_eq!(json["attestation"]["via"], "seal_session");
     }
 }

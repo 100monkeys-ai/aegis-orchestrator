@@ -17,6 +17,7 @@ mod gateway;
 #[cfg(test)]
 mod goal_tests;
 mod goals;
+mod host_states;
 #[cfg(test)]
 mod mail_tools_tests;
 #[cfg(test)]
@@ -226,6 +227,9 @@ pub struct ToolInvocationService {
     /// AEGIS ADR-139 N11: the person's schedules, for the `aegis.schedule.*`
     /// tools. `None` answers every schedule tool as unavailable.
     schedule_service: Option<Arc<crate::application::schedule_service::ScheduleService>>,
+    /// AEGIS ADR-157 D2: host state, for the `aegis.host_state.*` tools.
+    /// `None` answers every host state tool as unavailable.
+    host_state_service: Option<Arc<crate::application::host_state_service::HostStateService>>,
     /// AEGIS ADR-143 I2: the node's image generation models, for
     /// `aegis.image.generate`. `None` answers it as a node with none.
     image_generation: Option<Arc<dyn crate::domain::vision::ImageGenerationModels>>,

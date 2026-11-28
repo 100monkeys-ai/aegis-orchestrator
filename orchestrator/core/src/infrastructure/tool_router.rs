@@ -228,6 +228,14 @@ const BUILTIN_TOOL_DEFINITIONS: &[BuiltinToolDefinition] = &[
     BuiltinToolDefinition::new("aegis.schedule.resume", "Resumes a paused schedule by schedule_id."),
     BuiltinToolDefinition::new("aegis.schedule.run_now", "Starts one run of a schedule now by schedule_id, whether it is active or paused, as its timed runs start; refused while its last run is still running."),
     BuiltinToolDefinition::new("aegis.schedule.delete", "Deletes a schedule by schedule_id. The runs it started are kept."),
+    BuiltinToolDefinition::new("aegis.host_state.create", "Registers a HostState manifest (manifest_yaml): the declared state of a set of edge hosts, an ordered list of resources (files, directories, packages, services, users, groups, sysctls, firewall rules, guarded commands, Podman pods) and the edge target it applies to. Validated first; every problem is reported."),
+    BuiltinToolDefinition::new("aegis.host_state.update", "Registers a new version of a HostState by name, from manifest_yaml; the previous version is archived."),
+    BuiltinToolDefinition::new("aegis.host_state.get", "Returns a HostState by name: its active version, target and manifest.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.host_state.list", "Lists the tenant's active HostStates.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.host_state.validate", "Checks a HostState manifest (manifest_yaml) and reports every problem, registering nothing.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.host_state.plan", "Plans a HostState by name: each target edge reports, per resource, what it would change, and changes nothing.").skip_judge(),
+    BuiltinToolDefinition::new("aegis.host_state.apply", "Applies a HostState by name: each target edge, one at a time, converges to it and reports per resource ok, changed or failed. Stops at the first edge that fails."),
+    BuiltinToolDefinition::new("aegis.host_state.archive", "Archives a HostState by name; its history is kept."),
     BuiltinToolDefinition::new("aegis.schedule.runs", "Lists a schedule's runs by schedule_id, newest first: each time it fired, its outcome and the execution it started.").skip_judge(),
     BuiltinToolDefinition::new("aegis.execute.intent", "Starts the intent-to-execution pipeline: discovers or generates an agent, writes code, executes in a container, and returns the formatted result."),
     BuiltinToolDefinition::new("aegis.execute.status", "Returns the current status of an intent-to-execution pipeline run.").skip_judge(),
@@ -450,6 +458,30 @@ impl ToolRouter {
             "aegis.schedule.create" => Self::schema_aegis_schedule_write(true),
             "aegis.schedule.update" => Self::schema_aegis_schedule_write(false),
             "aegis.schedule.list" => json!({ "type": "object", "properties": {} }),
+            "aegis.host_state.list" => json!({ "type": "object", "properties": {} }),
+            "aegis.host_state.create" | "aegis.host_state.validate" => json!({
+                "type": "object",
+                "properties": {
+                    "manifest_yaml": { "type": "string", "description": "A HostState manifest: apiVersion 100monkeys.ai/v1, kind HostState, metadata.name, spec.target, spec.resources." }
+                },
+                "required": ["manifest_yaml"]
+            }),
+            "aegis.host_state.update" => json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "The HostState's name; the manifest must name it too." },
+                    "manifest_yaml": { "type": "string", "description": "The new version's manifest." }
+                },
+                "required": ["name", "manifest_yaml"]
+            }),
+            "aegis.host_state.get"
+            | "aegis.host_state.plan"
+            | "aegis.host_state.apply"
+            | "aegis.host_state.archive" => json!({
+                "type": "object",
+                "properties": { "name": { "type": "string", "description": "The HostState's name." } },
+                "required": ["name"]
+            }),
             "aegis.schedule.get"
             | "aegis.schedule.pause"
             | "aegis.schedule.resume"
@@ -3251,6 +3283,11 @@ mod tests {
         "aegis.schedule.list",
         "aegis.schedule.get",
         "aegis.schedule.runs",
+        // ADR-157 D2: host state's reads (plan changes nothing).
+        "aegis.host_state.get",
+        "aegis.host_state.list",
+        "aegis.host_state.validate",
+        "aegis.host_state.plan",
     ];
 
     /// Pre-consolidation `EDGE_EXECUTOR_TOOLS` membership (frozen).
