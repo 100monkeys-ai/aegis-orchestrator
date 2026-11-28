@@ -92,6 +92,22 @@ pub(crate) fn zaru_tier_of(identity: &UserIdentity) -> ZaruTier {
     aegis_orchestrator_core::application::git_repo_service::zaru_tier_of(Some(identity))
 }
 
+/// The tenant a workflow request acts in: the active team workspace when the
+/// request named one (`X-Tenant-Id`), which the tenant middleware admits only
+/// for a team the caller is an active member of (ADR-111), otherwise the
+/// caller's own tenant, exactly as [`tenant_id_from_identity`] gives it.
+/// Without it, a person working in a team's workspace in Zaru registered and
+/// ran every workflow in their own tenant.
+pub(crate) fn tenant_for_request(
+    identity: Option<&UserIdentity>,
+    workspace: Option<&TenantId>,
+) -> TenantId {
+    match workspace {
+        Some(team) if team.is_team() => team.clone(),
+        _ => tenant_id_from_identity(identity),
+    }
+}
+
 pub(crate) fn tenant_id_from_identity(identity: Option<&UserIdentity>) -> TenantId {
     match identity {
         Some(UserIdentity {
@@ -356,6 +372,24 @@ mod tests {
         assert_eq!(
             zaru_tier_of(&operator_identity(AegisRole::Operator)),
             ZaruTier::Enterprise
+        );
+    }
+
+    /// A workflow request acts in the active team workspace the tenant
+    /// middleware admitted, and otherwise in the caller's own tenant, as
+    /// before: a non-team value (the caller's own, or none) changes nothing.
+    #[test]
+    fn a_workflow_request_acts_in_the_admitted_team_workspace() {
+        let person =
+            crate::daemon::handlers::test_support::consumer("8d6e5f2a-0000-4000-8000-000000000001");
+        let own = tenant_id_from_identity(Some(&person));
+        let team = TenantId::new("t-465fa94f-36a6-464b-b82d-88f2bc07b03e").unwrap();
+        assert_eq!(tenant_for_request(Some(&person), Some(&team)), team);
+        assert_eq!(tenant_for_request(Some(&person), None), own);
+        assert_eq!(tenant_for_request(Some(&person), Some(&own)), own);
+        assert_eq!(
+            tenant_for_request(Some(&person), Some(&TenantId::system())),
+            own
         );
     }
 }
