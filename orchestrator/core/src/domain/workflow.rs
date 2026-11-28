@@ -1258,6 +1258,12 @@ pub enum ActionName {
     /// `attempts` times `interval_secs` apart: a rollout's health gate
     /// (AEGIS ADR-157 D4); touches nothing.
     HttpCheck,
+    /// Calls `tool`, a remote server's `<server>.<tool>` (Cloudflare, GitHub,
+    /// Carbon Forge…), with `args` (a JSON object), as the run's person and
+    /// with the credential the run's own `contexts` chose for that server
+    /// (AEGIS ADR-157 D11). A tool the configuration gates waits at the
+    /// approval gate as that person.
+    ToolCall,
 }
 
 /// Where `image_generate` writes its files when a state names no `path`.
@@ -1301,7 +1307,7 @@ pub enum ActionNeed {
 
 impl ActionName {
     /// Every action, in the order the refusal lists them.
-    pub const ALL: [ActionName; 17] = [
+    pub const ALL: [ActionName; 18] = [
         ActionName::UpdateBlackboard,
         ActionName::RepositoryDiff,
         ActionName::RepositoryCommit,
@@ -1319,6 +1325,7 @@ impl ActionName {
         ActionName::HostStateApply,
         ActionName::EdgeFleetInvoke,
         ActionName::HttpCheck,
+        ActionName::ToolCall,
     ];
 
     /// The literal a manifest writes.
@@ -1341,6 +1348,7 @@ impl ActionName {
             ActionName::HostStateApply => "host_state_apply",
             ActionName::EdgeFleetInvoke => "edge_fleet_invoke",
             ActionName::HttpCheck => "http_check",
+            ActionName::ToolCall => "tool_call",
         }
     }
 
@@ -1400,6 +1408,10 @@ impl ActionName {
                 required: &["url"],
                 optional: &["expect_status", "attempts", "interval_secs"],
             },
+            ActionName::ToolCall => ActionArguments::Declared {
+                required: &["tool"],
+                optional: &["args"],
+            },
         }
     }
 
@@ -1422,7 +1434,8 @@ impl ActionName {
             ActionName::HostStatePlan
             | ActionName::HostStateApply
             | ActionName::EdgeFleetInvoke
-            | ActionName::HttpCheck => ActionNeed::Nothing,
+            | ActionName::HttpCheck
+            | ActionName::ToolCall => ActionNeed::Nothing,
         }
     }
 
@@ -1436,6 +1449,7 @@ impl ActionName {
                 | ActionName::ArchivePush
                 | ActionName::HostStateApply
                 | ActionName::EdgeFleetInvoke
+                | ActionName::ToolCall
         )
     }
 
