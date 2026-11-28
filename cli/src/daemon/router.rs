@@ -234,6 +234,20 @@ pub(crate) fn create_router(
         )
         .route("/v1/stimuli/{stimulus_id}", get(get_stimulus_handler))
         .route(
+            "/v1/webhook-sources",
+            get(crate::daemon::handlers::webhook_sources::list_webhook_sources_handler)
+                .post(crate::daemon::handlers::webhook_sources::register_webhook_source_handler),
+        )
+        .route(
+            "/v1/webhook-sources/{name}",
+            get(crate::daemon::handlers::webhook_sources::get_webhook_source_handler)
+                .delete(crate::daemon::handlers::webhook_sources::delete_webhook_source_handler),
+        )
+        .route(
+            "/v1/webhook-sources/{name}/rotate-secret",
+            post(crate::daemon::handlers::webhook_sources::rotate_webhook_source_secret_handler),
+        )
+        .route(
             "/v1/security/incidents",
             get(list_security_incidents_handler),
         )

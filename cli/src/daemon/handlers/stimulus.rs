@@ -359,6 +359,15 @@ pub(crate) async fn webhook_handler(
     // caller-supplied headers. Enumerate every tenant that has
     // registered this source name and let the guard try each
     // `(tenant, source)` secret with constant-time compare.
+    // AEGIS ADR-157 D4: a source a tenant registered (/v1/webhook-sources)
+    // is verified with its stored secret and starts its own workflow.
+    if let Some(sources) = state.webhook_sources.clone() {
+        let tenants = sources.tenants_for(&source).await;
+        if !tenants.is_empty() {
+            return registered_delivery(&state, sources, &source, &tenants, &headers, req).await;
+        }
+    }
+
     let stimulus_service = match &state.stimulus_service {
         Some(svc) => svc.clone(),
         None => {
@@ -383,33 +392,8 @@ pub(crate) async fn webhook_handler(
         Err(e) => return e.into_response(),
     };
 
-    // AEGIS ADR-157 D4: a delivery is accepted once. GitHub names each one in
-    // X-GitHub-Delivery; a source that names none is not checked.
-    if let Some(delivery) = headers
-        .get("x-github-delivery")
-        .and_then(|v| v.to_str().ok())
-        .filter(|v| !v.is_empty())
-    {
-        use aegis_orchestrator_core::infrastructure::seal::nonce_store::NonceOutcome;
-        let key = format!("webhook:{}:{}:{delivery}", source, guard.tenant_id.as_str());
-        match state.webhook_deliveries.record(&key).await {
-            Ok(NonceOutcome::Fresh) => {}
-            Ok(NonceOutcome::Replay) => {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(json!({ "error": "replayed_delivery", "message": "this delivery was already accepted" })),
-                )
-                    .into_response();
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "could not record a webhook delivery; refusing it");
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({ "error": "delivery_store_unavailable" })),
-                )
-                    .into_response();
-            }
-        }
+    if let Some(refused) = accept_once(&state, &source, &guard.tenant_id, &headers).await {
+        return refused;
     }
 
     // Convert verified body bytes to String (treat as UTF-8 if possible, else base64)
@@ -452,6 +436,137 @@ pub(crate) async fn webhook_handler(
 // ──────────────────────────────────────────────────────────────────────────────
 // Regression tests — Findings 4.12 / 4.32 (security-audits/002 §4.12, §4.32)
 // ──────────────────────────────────────────────────────────────────────────────
+/// AEGIS ADR-157 D4: a delivery is accepted once. GitHub names each one in
+/// X-GitHub-Delivery; a source that names none is not checked. `Some` is the
+/// refusal to answer.
+async fn accept_once(
+    state: &AppState,
+    source: &str,
+    tenant: &aegis_orchestrator_core::domain::shared_kernel::TenantId,
+    headers: &HeaderMap,
+) -> Option<axum::response::Response> {
+    let delivery = headers
+        .get("x-github-delivery")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())?;
+    use aegis_orchestrator_core::infrastructure::seal::nonce_store::NonceOutcome;
+    let key = format!("webhook:{source}:{}:{delivery}", tenant.as_str());
+    match state.webhook_deliveries.record(&key).await {
+        Ok(NonceOutcome::Fresh) => None,
+        Ok(NonceOutcome::Replay) => Some(
+            (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "replayed_delivery", "message": "this delivery was already accepted" })),
+            )
+                .into_response(),
+        ),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not record a webhook delivery; refusing it");
+            Some(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "delivery_store_unavailable" })),
+                )
+                    .into_response(),
+            )
+        }
+    }
+}
+
+/// A delivery to a registered source (AEGIS ADR-157 D4): verified against the
+/// stored secret of each tenant that registered the name, accepted once,
+/// then the source's event filter and input map decide what it starts. The
+/// run acts as the source's owner in the source's tenant, as a schedule's
+/// does, so a gated step waits for that person's approval.
+async fn registered_delivery(
+    state: &AppState,
+    sources: Arc<
+        aegis_orchestrator_core::application::webhook_source_service::WebhookSourceService,
+    >,
+    source: &str,
+    tenants: &[aegis_orchestrator_core::domain::shared_kernel::TenantId],
+    headers: &HeaderMap,
+    req: Request,
+) -> axum::response::Response {
+    use aegis_orchestrator_core::application::start_workflow_execution::StartWorkflowExecutionUseCase as _;
+    use aegis_orchestrator_core::domain::webhook_source::Delivery;
+    let guard = match WebhookHmacGuard::from_request(req, sources.as_ref(), tenants).await {
+        Ok(g) => g,
+        Err(e) => return e.into_response(),
+    };
+    if let Some(refused) = accept_once(state, source, &guard.tenant_id, headers).await {
+        return refused;
+    }
+    let registered = match sources.get(&guard.tenant_id, source).await {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "unknown_source", "message": e.to_string() })),
+            )
+                .into_response()
+        }
+    };
+    let names: std::collections::BTreeMap<String, String> = headers
+        .iter()
+        .filter_map(|(k, v)| {
+            Some((
+                k.as_str().to_ascii_lowercase(),
+                v.to_str().ok()?.to_string(),
+            ))
+        })
+        .collect();
+    let payload: serde_json::Value =
+        serde_json::from_slice(&guard.body).unwrap_or(serde_json::Value::Null);
+    match registered.spec.delivery(&names, &payload) {
+        Delivery::Ignored(why) => {
+            info!(source = %source, tenant = %guard.tenant_id, reason = %why, "webhook delivery ignored by its source");
+            (StatusCode::OK, Json(json!({ "ignored": why }))).into_response()
+        }
+        Delivery::Start { workflow, input } => {
+            let owner = match registered.owner.to_identity(&guard.tenant_id) {
+                Ok(o) => o,
+                Err(e) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({ "error": "source_owner", "message": e })),
+                    )
+                        .into_response()
+                }
+            };
+            let request = aegis_orchestrator_core::application::start_workflow_execution::StartWorkflowExecutionRequest {
+                workflow_id: workflow.clone(),
+                input,
+                blackboard: None,
+                version: None,
+                tenant_id: Some(guard.tenant_id.clone()),
+                security_context_name: None,
+                intent: None,
+            };
+            match state
+                .start_workflow_execution_use_case
+                .start_execution_for_tenant(&guard.tenant_id, request, Some(&owner))
+                .await
+            {
+                Ok(started) => {
+                    info!(source = %source, tenant = %guard.tenant_id, workflow = %workflow,
+                        execution = %started.execution_id, "webhook delivery started its workflow");
+                    (
+                        StatusCode::ACCEPTED,
+                        Json(json!({ "workflow": workflow, "workflow_execution_id": started.execution_id })),
+                    )
+                        .into_response()
+                }
+                Err(e) => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({ "error": "workflow_not_started", "message": e.to_string() })),
+                )
+                    .into_response(),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod stripe_signature_tests {
     use super::*;

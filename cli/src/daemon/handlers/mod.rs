@@ -37,6 +37,7 @@ pub(crate) mod test_support;
 pub(crate) mod tool_approvals;
 pub(crate) mod vault_client_secrets;
 pub(crate) mod volumes;
+pub(crate) mod webhook_sources;
 pub(crate) mod workflow_executions;
 pub(crate) mod workflow_gates;
 pub(crate) mod workflows;

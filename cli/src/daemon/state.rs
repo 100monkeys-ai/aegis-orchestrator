@@ -98,6 +98,11 @@ pub(crate) struct AppState {
     pub(crate) secrets_manager: Arc<SecretsManager>,
     /// HMAC secret provider for webhook requests (ADR-021).
     pub(crate) webhook_secret_provider: Arc<dyn WebhookSecretProvider>,
+    /// AEGIS ADR-157 D4: the tenants' registered webhook sources; None
+    /// without the database.
+    pub(crate) webhook_sources: Option<
+        Arc<aegis_orchestrator_core::application::webhook_source_service::WebhookSourceService>,
+    >,
     /// AEGIS ADR-157 D4: the webhook deliveries already accepted, so a
     /// replayed delivery starts no run. Remembered for 30 days.
     pub(crate) webhook_deliveries:

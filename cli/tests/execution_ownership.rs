@@ -1013,3 +1013,17 @@ fn the_provider_state_statements_and_migration_067_pass_pg_strict() {
         assert!(unbounded_writes(sql).is_empty(), "{sql}");
     }
 }
+
+#[test]
+fn the_webhook_source_statements_and_migration_068_pass_pg_strict() {
+    use aegis_orchestrator_core::infrastructure::repositories::postgres_webhook_source::{
+        DELETE_SQL, UPSERT_SQL,
+    };
+    let migration = MIGRATOR
+        .iter()
+        .find(|m| m.version == 68)
+        .expect("migration 068 ships");
+    for sql in [UPSERT_SQL, DELETE_SQL, migration.sql.as_ref()] {
+        assert!(unbounded_writes(sql).is_empty(), "{sql}");
+    }
+}

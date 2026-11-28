@@ -103,5 +103,6 @@ pub mod validation;
 pub mod vault_audit;
 pub mod vision;
 pub mod volume;
+pub mod webhook_source;
 pub mod workflow;
 pub mod workflow_registry;
