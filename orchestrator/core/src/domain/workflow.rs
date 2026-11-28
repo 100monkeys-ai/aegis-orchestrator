@@ -1389,9 +1389,13 @@ impl ActionName {
                 required: &["cut"],
                 optional: &["timeout_seconds", "no_run_grace_seconds"],
             },
-            ActionName::HostStatePlan | ActionName::HostStateApply => {
-                ActionArguments::Required(&["name"])
-            }
+            ActionName::HostStatePlan => ActionArguments::Required(&["name"]),
+            // `vars`, a JSON object of strings, is set on the state as its next
+            // version before the apply: a deploy of a new image tag.
+            ActionName::HostStateApply => ActionArguments::Declared {
+                required: &["name"],
+                optional: &["vars"],
+            },
             ActionName::EdgeFleetInvoke => ActionArguments::Declared {
                 required: &["target", "tool"],
                 optional: &["args", "security_context", "mode"],

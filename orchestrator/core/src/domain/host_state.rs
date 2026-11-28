@@ -169,6 +169,36 @@ fn map_strings(v: &Value, f: &dyn Fn(&str) -> String) -> Value {
     }
 }
 
+/// `manifest_yaml` with `vars` set in its `spec.vars`, or None when each
+/// already has that value. The rest of the manifest is kept as written.
+pub fn with_vars(
+    manifest_yaml: &str,
+    vars: &BTreeMap<String, String>,
+) -> Result<Option<String>, String> {
+    let mut doc: Value = serde_yaml::from_str(manifest_yaml).map_err(|e| e.to_string())?;
+    let spec = doc
+        .get_mut("spec")
+        .and_then(Value::as_object_mut)
+        .ok_or("the state has no spec")?;
+    let current = spec
+        .entry("vars")
+        .or_insert_with(|| Value::Object(Default::default()))
+        .as_object_mut()
+        .ok_or("spec.vars is not a map")?;
+    if vars
+        .iter()
+        .all(|(k, v)| current.get(k).and_then(Value::as_str) == Some(v.as_str()))
+    {
+        return Ok(None);
+    }
+    for (k, v) in vars {
+        current.insert(k.clone(), Value::String(v.clone()));
+    }
+    serde_yaml::to_string(&doc)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
 /// Replace every occurrence of a secret's value in `v` with
 /// `[secret NAME]`, so a report that echoes content (a file's diff, an
 /// error) never carries it.
@@ -582,5 +612,18 @@ spec:
             m.spec.target,
             crate::domain::edge::EdgeTarget::Selector(_)
         ));
+    }
+
+    /// A deploy sets a var as the state's next version; the same value again
+    /// stores nothing.
+    #[test]
+    fn vars_are_set_as_a_new_manifest_and_unchanged_ones_store_nothing() {
+        let mut tag = BTreeMap::new();
+        tag.insert("port".to_string(), "9090".to_string());
+        let next = with_vars(WITH_SECRETS, &tag).unwrap().expect("a change");
+        let m = HostStateManifest::parse(&next).expect("still valid");
+        assert_eq!(m.spec.vars["port"], "9090");
+        assert_eq!(m.spec.secrets["db"], "api/db#password");
+        assert!(with_vars(&next, &tag).unwrap().is_none());
     }
 }
