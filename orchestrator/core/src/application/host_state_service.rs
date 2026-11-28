@@ -156,6 +156,26 @@ impl HostStateService {
             .await?)
     }
 
+    /// Set `vars` on the active version of `name`, as its next version, by
+    /// `actor`; nothing is stored when they are already its values. A deploy
+    /// of a new image tag is this, then an apply: the registered state stays
+    /// the desired one, and each deploy is a version.
+    pub async fn set_vars(
+        &self,
+        tenant: &TenantId,
+        name: &str,
+        vars: BTreeMap<String, String>,
+        actor: &str,
+    ) -> Result<HostState, HostStateError> {
+        let current = self.get(tenant, name).await?;
+        let Some(yaml) = crate::domain::host_state::with_vars(&current.manifest_yaml, &vars)
+            .map_err(|e| HostStateError::Invalid(vec![e]))?
+        else {
+            return Ok(current);
+        };
+        self.register(tenant, &yaml, actor).await
+    }
+
     pub async fn get(&self, tenant: &TenantId, name: &str) -> Result<HostState, HostStateError> {
         self.repo
             .get_active(tenant, name)

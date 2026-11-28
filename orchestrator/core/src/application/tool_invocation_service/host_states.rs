@@ -293,6 +293,26 @@ impl ToolInvocationService {
                 let Some(name) = args.get("name").and_then(Value::as_str) else {
                     return HostActionAnswer::refused("`name` is required");
                 };
+                if action == "host_state_apply" {
+                    if let Some(vars) = arg_json(args, "vars") {
+                        let Some(vars) = vars.as_object().and_then(|o| {
+                            o.iter()
+                                .map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                                .collect::<Option<std::collections::BTreeMap<_, _>>>()
+                        }) else {
+                            return HostActionAnswer::refused(
+                                "`vars` must be a JSON object of strings",
+                            );
+                        };
+                        let actor = match principal {
+                            HostStatePrincipal::Attested { principal, .. } => principal.clone(),
+                            HostStatePrincipal::Bearer(_) => "rest".to_string(),
+                        };
+                        if let Err(e) = service.set_vars(tenant, name, vars, &actor).await {
+                            return HostActionAnswer::refused(e.to_string());
+                        }
+                    }
+                }
                 match service
                     .run(tenant, name, action == "host_state_plan", principal)
                     .await
