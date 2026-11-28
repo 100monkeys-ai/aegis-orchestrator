@@ -39,7 +39,7 @@ pub enum HostStateError {
 #[derive(Debug, Clone)]
 pub enum HostStatePrincipal {
     /// A REST caller: their own bearer token travels in the inner envelope.
-    Bearer(String),
+    Bearer(crate::domain::secrets::SensitiveString),
     /// A caller attested by the orchestrator: an MCP call (its SEAL
     /// session) or a workflow run (its run's authority). `via` names which,
     /// `reference` the session or run.
@@ -226,7 +226,7 @@ pub fn principal_envelope(
     context: String,
 ) -> SealEnvelope {
     let (token, payload) = match principal {
-        HostStatePrincipal::Bearer(token) => (token.clone(), None),
+        HostStatePrincipal::Bearer(token) => (token.expose().to_string(), None),
         HostStatePrincipal::Attested {
             principal,
             via,
@@ -287,7 +287,9 @@ mod tests {
     fn a_bearer_travels_as_the_token_and_an_attestation_in_the_payload() {
         let tenant = TenantId::from_string("t-465fa94f-36a6-464b-b82d-88f2bc07b03e").unwrap();
         let bearer = principal_envelope(
-            &HostStatePrincipal::Bearer("a.b.c".into()),
+            &HostStatePrincipal::Bearer(crate::domain::secrets::SensitiveString::new(
+                "a.b.c".to_string(),
+            )),
             &tenant,
             "host-admin".into(),
         );

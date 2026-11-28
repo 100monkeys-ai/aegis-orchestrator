@@ -1879,7 +1879,9 @@ async fn run_host_state(
             tenant,
             name,
             check,
-            &crate::application::host_state_service::HostStatePrincipal::Bearer(token),
+            &crate::application::host_state_service::HostStatePrincipal::Bearer(
+                crate::domain::secrets::SensitiveString::new(token),
+            ),
         )
         .await
         .map_err(host_state_error)?;
