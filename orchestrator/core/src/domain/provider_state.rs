@@ -36,7 +36,7 @@ use serde_json::{json, Value};
 pub const PROVIDERS: &[&str] = &["cloudflare"];
 
 /// The resource kinds of each provider.
-pub const CLOUDFLARE_KINDS: &[&str] = &["dns_record"];
+pub const CLOUDFLARE_KINDS: &[&str] = &["dns_record", "lb_monitor", "lb_pool", "load_balancer"];
 
 /// DNS record types a `dns_record` may declare.
 const DNS_TYPES: &[&str] = &["A", "AAAA", "CNAME", "TXT", "MX", "NS", "SRV", "CAA"];
@@ -152,8 +152,12 @@ impl ProviderStateManifest {
                 ));
                 continue;
             }
-            if let Err(problem) = DnsRecord::from_resource(r) {
-                p.push(format!("{at} (dns_record): {problem}"));
+            let checked = match kind {
+                "dns_record" => DnsRecord::from_resource(r).map(|_| ()),
+                _ => ApiObject::from_resource(r, &self.spec).map(|_| ()),
+            };
+            if let Err(problem) = checked {
+                p.push(format!("{at} ({kind}): {problem}"));
             }
         }
         p
@@ -167,14 +171,232 @@ impl ProviderStateManifest {
             .iter()
             .filter_map(|r| {
                 let id = str_field(r, "id")?.to_string();
-                let record = DnsRecord::from_resource(r).ok()?;
-                let mut args = json!({ "code": record.code(check) });
+                let code = match str_field(r, "kind")? {
+                    "dns_record" => DnsRecord::from_resource(r).ok()?.code(check),
+                    _ => ApiObject::from_resource(r, &self.spec).ok()?.code(check),
+                };
+                let mut args = json!({ "code": code });
                 if let Some(account) = &self.spec.account_id {
                     args["account_id"] = Value::String(account.clone());
                 }
                 Some((id, args))
             })
             .collect()
+    }
+}
+
+/// A Cloudflare Load Balancing object a state declares (`lb_monitor`,
+/// `lb_pool`, `load_balancer`), found at its collection by its name field.
+/// A reference to another resource of the state (a pool's `monitor`, a load
+/// balancer's pools) names that resource's `id`; the generated code finds
+/// the referenced object by its name and uses its Cloudflare id. Only the
+/// declared fields are compared; a change writes the whole declared object.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApiObject {
+    /// `account` or `zone`.
+    scope: &'static str,
+    account: String,
+    zone: Option<String>,
+    collection: &'static str,
+    name_field: &'static str,
+    name: String,
+    /// The declared object; references are `{"$ref": {collection,
+    /// name_field, name}}`.
+    body: Value,
+    present: bool,
+}
+
+fn reference(spec: &ProviderStateSpec, id: &str, want_kind: &str) -> Result<Value, String> {
+    let target = spec
+        .resources
+        .iter()
+        .find(|r| str_field(r, "id") == Some(id))
+        .ok_or_else(|| format!("refers to {id:?}, which is no resource of this state"))?;
+    if str_field(target, "kind") != Some(want_kind) {
+        return Err(format!("refers to {id:?}, which is not a {want_kind}"));
+    }
+    let (collection, field) = match want_kind {
+        "lb_monitor" => ("load_balancers/monitors", "description"),
+        _ => ("load_balancers/pools", "name"),
+    };
+    let name = str_field(target, field)
+        .ok_or_else(|| format!("refers to {id:?}, which has no {field}"))?;
+    Ok(json!({ "$ref": { "collection": collection, "name_field": field, "name": name } }))
+}
+
+impl ApiObject {
+    pub fn from_resource(r: &Value, spec: &ProviderStateSpec) -> Result<Self, String> {
+        let kind = str_field(r, "kind").unwrap_or("");
+        let Some(account) = spec.account_id.clone() else {
+            return Err(
+                "needs spec.account_id: Load Balancing monitors and pools belong to an account"
+                    .into(),
+            );
+        };
+        let present = str_field(r, "state") != Some("absent");
+        let mut body = r.clone();
+        if let Some(o) = body.as_object_mut() {
+            for k in ["id", "kind", "state", "zone"] {
+                o.remove(k);
+            }
+        }
+        let (scope, collection, name_field) = match kind {
+            "lb_monitor" => ("account", "load_balancers/monitors", "description"),
+            "lb_pool" => ("account", "load_balancers/pools", "name"),
+            "load_balancer" => ("zone", "load_balancers", "name"),
+            other => return Err(format!("kind {other:?} is not a Load Balancing object")),
+        };
+        let name = str_field(r, name_field)
+            .ok_or_else(|| format!("needs {name_field}, its name at Cloudflare"))?
+            .to_string();
+        let mut zone = None;
+        match kind {
+            "lb_monitor" => {
+                if present && str_field(r, "type").is_none() {
+                    return Err("needs type (https, http, tcp…)".into());
+                }
+            }
+            "lb_pool" => {
+                if present {
+                    let origins = r.get("origins").and_then(Value::as_array);
+                    if origins.is_none_or(|o| o.is_empty()) {
+                        return Err("needs origins".into());
+                    }
+                    if let Some(monitor) = str_field(r, "monitor") {
+                        body["monitor"] = reference(spec, monitor, "lb_monitor")?;
+                    }
+                }
+            }
+            _ => {
+                let z = str_field(r, "zone").ok_or("needs zone, the zone's name")?;
+                if !hostname_ok(z) || !(name == z || name.ends_with(&format!(".{z}"))) {
+                    return Err(format!("name {name:?} is not in the zone {z:?}"));
+                }
+                zone = Some(z.to_string());
+                if present {
+                    let pools = r
+                        .get("default_pools")
+                        .and_then(Value::as_array)
+                        .filter(|p| !p.is_empty())
+                        .ok_or("needs default_pools, the ids of this state's pools")?;
+                    let mut refs = Vec::new();
+                    for p in pools {
+                        let id = p.as_str().ok_or("default_pools names pools by id")?;
+                        refs.push(reference(spec, id, "lb_pool")?);
+                    }
+                    body["default_pools"] = Value::Array(refs);
+                    let fallback = str_field(r, "fallback_pool")
+                        .ok_or("needs fallback_pool, the id of one of this state's pools")?;
+                    body["fallback_pool"] = reference(spec, fallback, "lb_pool")?;
+                    if let Some(weights) = r
+                        .pointer("/random_steering/pool_weights")
+                        .and_then(Value::as_object)
+                    {
+                        let mut pairs = Vec::new();
+                        for (id, weight) in weights {
+                            pairs.push(json!([reference(spec, id, "lb_pool")?, weight]));
+                        }
+                        body["random_steering"]["pool_weights"] = json!({ "$pairs": pairs });
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            scope,
+            account,
+            zone,
+            collection,
+            name_field,
+            name,
+            body,
+            present,
+        })
+    }
+
+    /// The code `cloudflare.execute` runs for this object, answering
+    /// `{status, diff}`. Everything declared is one JSON literal.
+    pub fn code(&self, check: bool) -> String {
+        let want = json!({
+            "scope": self.scope,
+            "account": self.account,
+            "zone": self.zone,
+            "collection": self.collection,
+            "name_field": self.name_field,
+            "name": self.name,
+            "body": self.body,
+            "present": self.present,
+            "check": check,
+        });
+        format!(
+            r#"async () => {{
+  const want = {want};
+  let base;
+  if (want.scope === "zone") {{
+    const zones = await cloudflare.request({{ method: "GET", path: "/zones?name=" + encodeURIComponent(want.zone) }});
+    const zone = (zones.result || [])[0];
+    if (!zone) return {{ status: "failed", diff: "no zone " + want.zone }};
+    base = "/zones/" + zone.id + "/" + want.collection;
+  }} else {{
+    base = "/accounts/" + want.account + "/" + want.collection;
+  }}
+  const named = async (path, field, name) => {{
+    const all = await cloudflare.request({{ method: "GET", path }});
+    return (all.result || []).filter((o) => o[field] === name);
+  }};
+  const found = await named(base, want.name_field, want.name);
+  if (found.length > 1) return {{ status: "failed", diff: found.length + " objects named " + want.name + "; declare one" }};
+  const have = found[0];
+  if (!want.present) {{
+    if (!have) return {{ status: "ok", diff: "absent" }};
+    if (want.check) return {{ status: "changed", diff: "would delete " + want.name }};
+    await cloudflare.request({{ method: "DELETE", path: base + "/" + have.id }});
+    return {{ status: "changed", diff: "deleted " + want.name }};
+  }}
+  const missing = [];
+  const resolve = async (v) => {{
+    if (Array.isArray(v)) return Promise.all(v.map(resolve));
+    if (v && typeof v === "object") {{
+      if (v.$ref) {{
+        const r = v.$ref;
+        const hits = await named("/accounts/" + want.account + "/" + r.collection, r.name_field, r.name);
+        if (hits.length === 1) return hits[0].id;
+        missing.push(r.name);
+        return "<" + r.name + ">";
+      }}
+      if (v.$pairs) {{
+        const out = {{}};
+        for (const [ref, w] of v.$pairs) out[await resolve(ref)] = w;
+        return out;
+      }}
+      const out = {{}};
+      for (const [k, x] of Object.entries(v)) out[k] = await resolve(x);
+      return out;
+    }}
+    return v;
+  }};
+  const body = await resolve(want.body);
+  if (missing.length && !want.check) return {{ status: "failed", diff: "no " + missing.join(", ") + " yet: apply the objects it refers to first" }};
+  const project = (h, w) => {{
+    if (Array.isArray(w)) return (Array.isArray(h) ? h : []).map((x, i) => project(x, w[i] === undefined ? w[0] : w[i]));
+    if (w && typeof w === "object") {{
+      const out = {{}};
+      for (const k of Object.keys(w)) out[k] = project(h ? h[k] : undefined, w[k]);
+      return out;
+    }}
+    return h === undefined ? null : h;
+  }};
+  if (!have) {{
+    if (want.check) return {{ status: "changed", diff: "would create " + want.name }};
+    await cloudflare.request({{ method: "POST", path: base, body }});
+    return {{ status: "changed", diff: "created " + want.name }};
+  }}
+  const diffs = Object.keys(body).filter((k) => JSON.stringify(project(have[k], body[k])) !== JSON.stringify(body[k]));
+  if (diffs.length === 0) return {{ status: "ok", diff: "in place" }};
+  if (want.check) return {{ status: "changed", diff: "would set " + diffs.join(", ") }};
+  await cloudflare.request({{ method: "PUT", path: base + "/" + have.id, body }});
+  return {{ status: "changed", diff: "set " + diffs.join(", ") }};
+}}"#
+        )
     }
 }
 
@@ -407,7 +629,7 @@ spec:
     - { id: a, kind: dns_record, zone: example.com, type: SPF, name: example.com, content: x }
     - { id: c, kind: dns_record, zone: example.com, type: A, name: example.com }
     - { id: d, kind: dns_record, zone: example.com, type: A, name: d.example.com, content: 1.2.3.4, ttl: 5 }
-    - { id: e, kind: load_balancer }
+    - { id: e, kind: waf_rule }
 "#;
         let p = ProviderStateManifest::parse(bad).unwrap_err();
         for needle in [
@@ -419,9 +641,63 @@ spec:
             "type \"SPF\"",
             "needs content",
             "ttl must be",
-            "kind \"load_balancer\"",
+            "kind \"waf_rule\"",
         ] {
             assert!(p.iter().any(|x| x.contains(needle)), "{needle}: {p:?}");
         }
+    }
+
+    const LB: &str = r#"
+apiVersion: 100monkeys.ai/v1
+kind: ProviderState
+metadata: { name: edge-lb }
+spec:
+  provider: cloudflare
+  account_id: 7f696bea9939feff1d6d2d902be9bc3c
+  resources:
+    - { id: ready, kind: lb_monitor, description: "edge readiness", type: https, path: /health/ready, expected_codes: "200" }
+    - id: vm
+      kind: lb_pool
+      name: aegis-vm
+      monitor: ready
+      origins: [ { name: nuclear-vm-1, address: 34.67.243.141, enabled: true } ]
+    - id: api
+      kind: load_balancer
+      zone: myzaru.com
+      name: api.myzaru.com
+      default_pools: [vm]
+      fallback_pool: vm
+      proxied: true
+      random_steering: { default_weight: 1, pool_weights: { vm: 1 } }
+"#;
+
+    /// ADR-157 D11: the Load Balancing objects of edge-lb.sh, as resources
+    /// that refer to each other by id; a reference becomes a lookup by name.
+    #[test]
+    fn load_balancing_objects_refer_to_each_other_by_name() {
+        let m = ProviderStateManifest::parse(LB).expect("valid");
+        let calls = m.execute_calls(true);
+        assert_eq!(calls.len(), 3);
+        let pool = calls[1].1["code"].as_str().unwrap();
+        assert!(pool.contains(r#""monitor":{"$ref":{"collection":"load_balancers/monitors","name":"edge readiness","name_field":"description"}}"#), "{pool}");
+        let lb = calls[2].1["code"].as_str().unwrap();
+        assert!(lb.contains(r#""fallback_pool":{"$ref""#), "{lb}");
+        assert!(lb.contains(r#""$pairs""#), "{lb}");
+        assert!(!lb.contains("accountId"));
+    }
+
+    #[test]
+    fn a_reference_must_name_a_resource_of_the_right_kind() {
+        let bad = LB
+            .replace("monitor: ready", "monitor: vm")
+            .replace("fallback_pool: vm", "fallback_pool: nope");
+        let p = ProviderStateManifest::parse(&bad).unwrap_err();
+        assert!(p.iter().any(|x| x.contains("not a lb_monitor")), "{p:?}");
+        assert!(p.iter().any(|x| x.contains("\"nope\"")), "{p:?}");
+        let no_account = LB.replace("  account_id: 7f696bea9939feff1d6d2d902be9bc3c\n", "");
+        assert!(ProviderStateManifest::parse(&no_account)
+            .unwrap_err()
+            .iter()
+            .any(|x| x.contains("account_id")));
     }
 }
