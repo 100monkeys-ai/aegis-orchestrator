@@ -1126,6 +1126,42 @@ impl AegisRuntime for AegisRuntimeService {
         )
     }
 
+    /// A workflow's host and fleet actions (AEGIS ADR-157 D4):
+    /// host_state_plan, host_state_apply, edge_fleet_invoke and http_check,
+    /// run through the tool invocation service in the run's tenant and
+    /// attested as the run. A refusal is answered in `sentence`.
+    async fn run_host_action(
+        &self,
+        request: Request<crate::infrastructure::aegis_runtime_proto::RunHostActionRequest>,
+    ) -> Result<Response<crate::infrastructure::aegis_runtime_proto::RunHostActionResponse>, Status>
+    {
+        let auth = self
+            .authorize(&request, "/aegis.v1.AegisRuntime/RunHostAction")
+            .await?;
+        let tenant_id = Self::step_tenant(auth, &request, "");
+        let req = request.into_inner();
+        let run = uuid::Uuid::parse_str(&req.workflow_execution_id).map_err(|e| {
+            Status::invalid_argument(format!(
+                "invalid workflow_execution_id '{}': {e}",
+                req.workflow_execution_id
+            ))
+        })?;
+        let service = self
+            .tool_invocation_service
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("host actions are not configured on this node"))?;
+        let answer = service
+            .run_host_action(&tenant_id, run, &req.action, &req.args_json)
+            .await;
+        Ok(Response::new(
+            crate::infrastructure::aegis_runtime_proto::RunHostActionResponse {
+                result_json: answer.result.to_string(),
+                ok: answer.ok,
+                sentence: answer.sentence,
+            },
+        ))
+    }
+
     /// The workflow interpreter's own image generation step (AEGIS ADR-143
     /// I5a): images from a prompt with the node's image generation model,
     /// written into the workflow execution's volume through the tool
