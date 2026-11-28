@@ -1,0 +1,122 @@
+# Copyright (c) 2026 100monkeys.ai
+# SPDX-License-Identifier: AGPL-3.0
+#
+# Infra Apply: converge a HostState's edges to it (AEGIS ADR-157 D4).
+#
+#   PLAN (host_state_plan) ─► APPLY (host_state_apply, your approval) ─► VERIFY (host_state_plan) ─► COMPLETE
+#     │ refused                 │ refused, not approved or a host failed   │ refused
+#     ▼                         ▼                                          ▼
+#   PLAN_REFUSED             APPLY_FAILED                               VERIFY_FAILED
+#
+# PLAN shows what each target edge would change. APPLY converges them one at
+# a time, stopping at the first edge that fails; it waits for your approval,
+# or runs at once on your standing "always allow" for aegis.host_state.apply.
+# VERIFY plans again: a converged fleet reports no change, and COMPLETE
+# records how many hosts each step changed, so a VERIFY that still finds
+# changes is visible in the run's record.
+#
+# A rollout of several states is a workflow of your own whose states apply
+# each state in turn, with an http_check between them as a health gate;
+# compose this one per stage (workflow-to-workflow composition).
+
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+
+metadata:
+  name: "infra-apply"
+  version: "1.0.0"
+  description: |-
+    Applies one of your HostStates to its edges: a plan first, then the
+    apply after your approval, one host at a time, then a second plan that
+    shows whether every host converged. The run records each host's
+    changes.
+  labels:
+    builtin: "true"
+    category: "deployment"
+  input_schema:
+    type: object
+    properties:
+      name:
+        type: string
+        description: "The HostState to apply, by name."
+    required:
+      - name
+
+spec:
+  initial_state: PLAN
+
+  states:
+
+    PLAN:
+      kind: Action
+      action: host_state_plan
+      args:
+        name: "{{input.name}}"
+      transitions:
+        - condition: on_success
+          target: APPLY
+        - condition: on_failure
+          target: PLAN_REFUSED
+
+    APPLY:
+      kind: Action
+      action: host_state_apply
+      args:
+        name: "{{input.name}}"
+      transitions:
+        - condition: on_success
+          target: VERIFY
+        - condition: on_failure
+          target: APPLY_FAILED
+
+    VERIFY:
+      kind: Action
+      action: host_state_plan
+      args:
+        name: "{{input.name}}"
+      transitions:
+        - condition: on_success
+          target: COMPLETE
+        - condition: on_failure
+          target: VERIFY_FAILED
+
+    COMPLETE:
+      kind: Action
+      action: update_blackboard
+      args:
+        outcome: "complete"
+        name: "{{input.name}}"
+        planned_changes: "{{PLAN.output.result.changed_hosts}}"
+        applied_changes: "{{APPLY.output.result.changed_hosts}}"
+        remaining_changes: "{{VERIFY.output.result.changed_hosts}}"
+        sentence: ""
+      transitions: []
+
+    PLAN_REFUSED:
+      kind: Action
+      action: update_blackboard
+      args:
+        outcome: "plan_refused"
+        name: "{{input.name}}"
+        sentence: "{{{PLAN.output.sentence}}}"
+      transitions: []
+
+    APPLY_FAILED:
+      kind: Action
+      action: update_blackboard
+      args:
+        outcome: "apply_failed"
+        name: "{{input.name}}"
+        planned_changes: "{{PLAN.output.result.changed_hosts}}"
+        sentence: "{{{APPLY.output.sentence}}}"
+      transitions: []
+
+    VERIFY_FAILED:
+      kind: Action
+      action: update_blackboard
+      args:
+        outcome: "verify_failed"
+        name: "{{input.name}}"
+        applied_changes: "{{APPLY.output.result.changed_hosts}}"
+        sentence: "{{{VERIFY.output.sentence}}}"
+      transitions: []

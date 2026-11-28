@@ -185,6 +185,10 @@ pub const BUILTIN_WORKFLOWS: &[(&str, &str)] = &[
         "transcribe-audio",
         include_str!("../../templates/workflows/transcribe-audio.yaml"),
     ),
+    (
+        "infra-apply",
+        include_str!("../../templates/workflows/infra-apply.yaml"),
+    ),
 ];
 
 /// All builtin templates that should be synced to disk.
@@ -2779,6 +2783,44 @@ mod tests {
             "AEGIS ADR-149: carbon-forge does not cut the landed run:\n{}",
             complaints.join("\n")
         );
+    }
+
+    /// AEGIS ADR-157 D4: `infra-apply` is a built-in: PLAN, the gated APPLY
+    /// and VERIFY, each a host action, with a terminal state recording each
+    /// outcome.
+    #[test]
+    fn infra_apply_is_a_builtin_planning_applying_and_verifying_a_host_state() {
+        use aegis_orchestrator_core::domain::workflow::{ActionName, StateKind};
+        let Some((_, yaml)) = BUILTIN_WORKFLOWS.iter().find(|(n, _)| *n == "infra-apply") else {
+            panic!("AEGIS ADR-157 D4: infra-apply is not registered");
+        };
+        let parsed =
+            aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(
+                yaml,
+            )
+            .unwrap_or_else(|e| panic!("AEGIS ADR-157 D4: infra-apply does not parse: {e}"));
+        let action_of = |state: &str| {
+            let (_, spec) = parsed
+                .spec
+                .states
+                .iter()
+                .find(|(name, _)| name.as_str() == state)
+                .unwrap_or_else(|| panic!("infra-apply has no state {state}"));
+            match &spec.kind {
+                StateKind::Action { action, .. } => *action,
+                other => panic!("{state} is not an Action: {other:?}"),
+            }
+        };
+        assert_eq!(action_of("PLAN"), ActionName::HostStatePlan);
+        assert_eq!(action_of("APPLY"), ActionName::HostStateApply);
+        assert_eq!(action_of("VERIFY"), ActionName::HostStatePlan);
+        for terminal in ["COMPLETE", "PLAN_REFUSED", "APPLY_FAILED", "VERIFY_FAILED"] {
+            assert_eq!(
+                action_of(terminal),
+                ActionName::UpdateBlackboard,
+                "{terminal}"
+            );
+        }
     }
 
     /// AEGIS ADR-149 C2, C3, C4: `carbon-deploy` is a built-in registered
