@@ -696,7 +696,7 @@ fn names_a_fact(v: &Value) -> bool {
 /// at PATH (dot-separated keys into `facts`), or DEFAULT where the host has
 /// none. Err names every fact the host lacks with no default.
 fn render_facts(v: &Value, facts: &Value) -> Result<Value, String> {
-    fn lookup<'a>(facts: &'a Value, path: &str) -> Option<String> {
+    fn lookup(facts: &Value, path: &str) -> Option<String> {
         let mut at = facts;
         for key in path.split('.') {
             at = match at {
