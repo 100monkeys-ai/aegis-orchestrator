@@ -74,7 +74,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::daemon::handlers::tenant_id_from_identity;
+use crate::daemon::handlers::tenant_for_request;
 
 type Refusal = (StatusCode, Json<Value>);
 
@@ -432,6 +432,7 @@ pub(crate) async fn list_workflow_gates_handler(
     State(state): State<WorkflowGatesState>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
+    workspace: Option<Extension<TenantId>>,
     Query(query): Query<GatesQuery>,
 ) -> Result<Json<Value>, Refusal> {
     scope_guard.require("workflow:read")?;
@@ -463,7 +464,7 @@ pub(crate) async fn list_workflow_gates_handler(
         ));
     }
 
-    let tenant_id = tenant_id_from_identity(Some(identity));
+    let tenant_id = tenant_for_request(Some(identity), workspace.as_ref().map(|w| &w.0));
     let mut names = WorkflowNames {
         workflows: state.workflows.as_ref(),
         tenant_id: &tenant_id,

@@ -30,7 +30,7 @@ use aegis_orchestrator_core::infrastructure::temporal_proto::temporal::api::work
 use aegis_orchestrator_core::infrastructure::TemporalEventPayload;
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
-use crate::daemon::handlers::{is_operator, tenant_id_from_identity};
+use crate::daemon::handlers::{is_operator, tenant_for_request};
 use crate::daemon::ports::{
     cancel_workflow_run, CancelOutcome, TemporalGrpcRunControl, TemporalRunControl,
 };
@@ -519,11 +519,12 @@ pub(crate) async fn list_workflow_executions_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
+    workspace: Option<Extension<TenantId>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("workflow:list")?;
     let identity_ref = identity.as_ref().map(|identity| &identity.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
+    let tenant_id = tenant_for_request(identity_ref, workspace.as_ref().map(|w| &w.0));
     let limit = params
         .get("limit")
         .and_then(|v| v.parse::<usize>().ok())
@@ -597,10 +598,14 @@ pub(crate) async fn get_workflow_execution_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
+    workspace: Option<Extension<TenantId>>,
     Path(execution_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("workflow:read")?;
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let tenant_id = tenant_for_request(
+        identity.as_ref().map(|identity| &identity.0),
+        workspace.as_ref().map(|w| &w.0),
+    );
     let execution = match state
         .workflow_execution_repo
         .find_by_id_for_tenant(&tenant_id, ExecutionId(execution_id))
@@ -690,6 +695,7 @@ pub(crate) async fn signal_workflow_execution_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
+    workspace: Option<Extension<TenantId>>,
     Path(execution_id): Path<String>,
     Json(request): Json<WorkflowSignalRequest>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
@@ -699,7 +705,10 @@ pub(crate) async fn signal_workflow_execution_handler(
     // and a known execution UUID) was previously possible. Return 404 on
     // mismatch — never 403 — to avoid leaking the existence of another
     // tenant's execution.
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let tenant_id = tenant_for_request(
+        identity.as_ref().map(|identity| &identity.0),
+        workspace.as_ref().map(|w| &w.0),
+    );
     let exec_uuid = match Uuid::parse_str(&execution_id) {
         Ok(uuid) => uuid,
         Err(_) => {
@@ -970,11 +979,15 @@ pub(crate) async fn get_workflow_logs_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
+    workspace: Option<Extension<TenantId>>,
     Path(execution_id): Path<Uuid>,
     Query(params): Query<WorkflowLogQuery>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("workflow:read")?;
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let tenant_id = tenant_for_request(
+        identity.as_ref().map(|identity| &identity.0),
+        workspace.as_ref().map(|w| &w.0),
+    );
     let execution_id = ExecutionId(execution_id);
     let execution = match state
         .workflow_execution_repo
@@ -1340,6 +1353,7 @@ pub(crate) async fn stream_workflow_logs_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
+    workspace: Option<Extension<TenantId>>,
     Path(execution_id): Path<Uuid>,
 ) -> axum::response::Response {
     if let Err(e) = scope_guard.require("workflow:logs") {
@@ -1358,7 +1372,10 @@ pub(crate) async fn stream_workflow_logs_handler(
             .into_response()
     };
 
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let tenant_id = tenant_for_request(
+        identity.as_ref().map(|identity| &identity.0),
+        workspace.as_ref().map(|w| &w.0),
+    );
     let execution_id = ExecutionId(execution_id);
     let execution = match state
         .workflow_execution_repo
@@ -1452,6 +1469,7 @@ pub(crate) async fn cancel_workflow_execution_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
+    workspace: Option<Extension<TenantId>>,
     Path(execution_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("workflow:cancel")?;
@@ -1459,7 +1477,10 @@ pub(crate) async fn cancel_workflow_execution_handler(
     // Cross-tenant denial of service (any caller with workflow:cancel could
     // cancel any tenant's running workflow given the UUID) was previously
     // possible. Return 404 on mismatch — never 403.
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let tenant_id = tenant_for_request(
+        identity.as_ref().map(|identity| &identity.0),
+        workspace.as_ref().map(|w| &w.0),
+    );
     match state
         .workflow_execution_repo
         .find_by_id_for_tenant(&tenant_id, ExecutionId(execution_id))
@@ -1532,6 +1553,7 @@ pub(crate) async fn remove_workflow_execution_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
+    workspace: Option<Extension<TenantId>>,
     Path(execution_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("workflow:cancel")?;
@@ -1539,7 +1561,10 @@ pub(crate) async fn remove_workflow_execution_handler(
     // destructive DELETE. Previously the DELETE statement carried no tenant
     // predicate so any caller with workflow:cancel scope plus a UUID could
     // wipe another tenant's workflow execution row. Return 404 on mismatch.
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let tenant_id = tenant_for_request(
+        identity.as_ref().map(|identity| &identity.0),
+        workspace.as_ref().map(|w| &w.0),
+    );
     match state
         .workflow_execution_repo
         .find_by_id_for_tenant(&tenant_id, ExecutionId(execution_id))

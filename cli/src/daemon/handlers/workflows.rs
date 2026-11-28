@@ -21,7 +21,7 @@ use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser;
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
-use crate::daemon::handlers::{is_operator, tenant_id_from_identity};
+use crate::daemon::handlers::{is_operator, tenant_for_request};
 use crate::daemon::state::AppState;
 
 #[derive(serde::Deserialize, Default)]
@@ -37,6 +37,7 @@ pub(crate) async fn register_temporal_workflow_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
+    workspace: Option<Extension<TenantId>>,
     axum::extract::Query(query): axum::extract::Query<RegisterWorkflowQuery>,
     body: String,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
@@ -49,7 +50,10 @@ pub(crate) async fn register_temporal_workflow_handler(
     let (tenant_id, scope) = match query.scope.as_deref() {
         Some("global") => (TenantId::system(), WorkflowScope::Global),
         _ => (
-            tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0)),
+            tenant_for_request(
+                identity.as_ref().map(|identity| &identity.0),
+                workspace.as_ref().map(|w| &w.0),
+            ),
             WorkflowScope::Tenant,
         ),
     };
@@ -75,6 +79,7 @@ pub(crate) async fn execute_temporal_workflow_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
+    workspace: Option<Extension<TenantId>>,
     Json(mut request): Json<StartWorkflowExecutionRequest>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("workflow:run")?;
@@ -84,8 +89,11 @@ pub(crate) async fn execute_temporal_workflow_handler(
     // tenant-A previously executed under tenant-B's quota and security
     // context — a cross-tenant privilege escalation. Overwrite
     // unconditionally with the JWT-derived tenant.
-    let tenant_id =
-        resolve_execute_tenant(identity.as_ref().map(|identity| &identity.0), &mut request);
+    let tenant_id = resolve_execute_tenant(
+        identity.as_ref().map(|identity| &identity.0),
+        workspace.as_ref().map(|w| &w.0),
+        &mut request,
+    );
     match state
         .start_workflow_execution_use_case
         .start_execution_for_tenant(&tenant_id, request, identity.as_ref().map(|ext| &ext.0))
@@ -133,9 +141,10 @@ pub(crate) async fn execute_temporal_workflow_handler(
 /// execute under tenant-B's quota and security context.
 fn resolve_execute_tenant(
     identity: Option<&UserIdentity>,
+    workspace: Option<&TenantId>,
     request: &mut StartWorkflowExecutionRequest,
 ) -> TenantId {
-    let tenant_id = tenant_id_from_identity(identity);
+    let tenant_id = tenant_for_request(identity, workspace);
     request.tenant_id = Some(tenant_id.clone());
     tenant_id
 }
@@ -159,6 +168,7 @@ pub(crate) async fn run_workflow_legacy_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
+    workspace: Option<Extension<TenantId>>,
     Path(name): Path<String>,
     Query(query): Query<RunWorkflowQuery>,
     Json(request): Json<RunWorkflowLegacyRequest>,
@@ -169,8 +179,9 @@ pub(crate) async fn run_workflow_legacy_handler(
         input: request.input,
         blackboard: request.blackboard,
         version: query.version,
-        tenant_id: Some(tenant_id_from_identity(
+        tenant_id: Some(tenant_for_request(
             identity.as_ref().map(|identity| &identity.0),
+            workspace.as_ref().map(|w| &w.0),
         )),
         security_context_name: identity
             .as_ref()
@@ -179,7 +190,8 @@ pub(crate) async fn run_workflow_legacy_handler(
     };
     // Re-use execute handler but bypass the scope check (already checked above)
     let bypass_guard = ScopeGuard(vec!["workflow:run".to_string()]);
-    execute_temporal_workflow_handler(State(state), bypass_guard, identity, Json(req)).await
+    execute_temporal_workflow_handler(State(state), bypass_guard, identity, workspace, Json(req))
+        .await
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -196,11 +208,12 @@ pub(crate) async fn list_workflows_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
+    workspace: Option<Extension<TenantId>>,
     axum::extract::Query(query): axum::extract::Query<ListWorkflowsQuery>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("workflow:list")?;
     let identity_ref = identity.as_ref().map(|identity| &identity.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
+    let tenant_id = tenant_for_request(identity_ref, workspace.as_ref().map(|w| &w.0));
 
     use aegis_orchestrator_core::domain::repository::{
         StatusFilter, WorkflowListing, STATUS_FILTER_REFUSAL,
@@ -297,11 +310,12 @@ pub(crate) async fn get_workflow_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
+    workspace: Option<Extension<TenantId>>,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("workflow:read")?;
     let identity_ref = identity.as_ref().map(|identity| &identity.0);
-    let tenant_id = tenant_id_from_identity(identity_ref);
+    let tenant_id = tenant_for_request(identity_ref, workspace.as_ref().map(|w| &w.0));
 
     // Operator cross-tenant fetch (ADR-097): scan `list_all` and find the
     // first workflow whose name matches. A `find_by_name_unscoped` repo
@@ -366,10 +380,14 @@ pub(crate) async fn delete_workflow_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
+    workspace: Option<Extension<TenantId>>,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("workflow:delete")?;
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let tenant_id = tenant_for_request(
+        identity.as_ref().map(|identity| &identity.0),
+        workspace.as_ref().map(|w| &w.0),
+    );
     match state
         .workflow_repo
         .find_by_name_for_tenant(&tenant_id, &name)
@@ -410,10 +428,14 @@ pub(crate) async fn list_workflow_versions_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
+    workspace: Option<Extension<TenantId>>,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("workflow:list")?;
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let tenant_id = tenant_for_request(
+        identity.as_ref().map(|identity| &identity.0),
+        workspace.as_ref().map(|w| &w.0),
+    );
     // The tenant's rows of the name and, for a tenant other than the
     // system's, the built-in's global rows, any status (AEGIS ADR-148).
     let rows = async {
@@ -482,6 +504,7 @@ pub(crate) async fn set_workflow_status_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
+    workspace: Option<Extension<TenantId>>,
     Path(id_or_name): Path<String>,
     Json(body): Json<SetStatusBody>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
@@ -495,7 +518,10 @@ pub(crate) async fn set_workflow_status_handler(
             Json(serde_json::json!({"error": "status must be one of: active, archived"})),
         ));
     };
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let tenant_id = tenant_for_request(
+        identity.as_ref().map(|identity| &identity.0),
+        workspace.as_ref().map(|w| &w.0),
+    );
     match state
         .workflow_repo
         .change_status(&tenant_id, &id_or_name, body.version.as_deref(), status)
@@ -536,6 +562,7 @@ pub(crate) async fn update_workflow_scope_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
+    workspace: Option<Extension<TenantId>>,
     Path(id_or_name): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
@@ -543,7 +570,10 @@ pub(crate) async fn update_workflow_scope_handler(
     use aegis_orchestrator_core::application::workflow_scope::ScopeChangeRequester;
     use aegis_orchestrator_core::domain::workflow::WorkflowScope;
 
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let tenant_id = tenant_for_request(
+        identity.as_ref().map(|identity| &identity.0),
+        workspace.as_ref().map(|w| &w.0),
+    );
     let user_id = identity
         .as_ref()
         .map(|ext| ext.0.sub.clone())
@@ -732,7 +762,7 @@ mod tests {
         // Sanity: the body claims tenant-B.
         assert_eq!(request.tenant_id.as_ref().unwrap(), &attacker_target);
 
-        let resolved = resolve_execute_tenant(Some(&identity), &mut request);
+        let resolved = resolve_execute_tenant(Some(&identity), None, &mut request);
 
         // Resolved dispatch tenant is tenant-A (from JWT), not tenant-B (from body).
         assert_eq!(resolved.as_str(), "acme");
@@ -752,7 +782,7 @@ mod tests {
         let bob_tenant = TenantId::for_consumer_user("user-bob").unwrap();
         let mut request = empty_request_with_body_tenant(bob_tenant.clone());
 
-        let resolved = resolve_execute_tenant(Some(&identity), &mut request);
+        let resolved = resolve_execute_tenant(Some(&identity), None, &mut request);
 
         assert_eq!(resolved, alice_tenant);
         assert_eq!(request.tenant_id.as_ref().unwrap(), &alice_tenant);
@@ -775,7 +805,7 @@ mod tests {
             intent: None,
         };
 
-        let resolved = resolve_execute_tenant(Some(&identity), &mut request);
+        let resolved = resolve_execute_tenant(Some(&identity), None, &mut request);
 
         assert_eq!(resolved.as_str(), "acme");
         assert_eq!(request.tenant_id.as_ref().unwrap().as_str(), "acme");
