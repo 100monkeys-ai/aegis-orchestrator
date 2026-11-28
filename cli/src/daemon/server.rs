@@ -3298,6 +3298,18 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         credential_service,
         secrets_manager: secrets_manager.clone(),
         webhook_secret_provider: Arc::new(EnvWebhookSecretProvider),
+        webhook_sources: db_pool.as_ref().map(|pool| {
+            Arc::new(
+                aegis_orchestrator_core::application::webhook_source_service::WebhookSourceService::new(
+                    Arc::new(
+                        aegis_orchestrator_core::infrastructure::repositories::postgres_webhook_source::PgWebhookSourceRepository::new(
+                            pool.clone(),
+                        ),
+                    ),
+                    secrets_manager.clone(),
+                ),
+            )
+        }),
         webhook_deliveries: match db_pool.as_ref() {
             Some(pool) => Arc::new(
                 aegis_orchestrator_core::infrastructure::seal::nonce_store::PostgresNonceStore::with_ttl(

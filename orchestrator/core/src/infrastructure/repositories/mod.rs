@@ -71,6 +71,7 @@ pub mod postgres_tenant;
 pub mod postgres_tool_approval;
 pub mod postgres_vault_audit;
 pub mod postgres_volume;
+pub mod postgres_webhook_source;
 pub use postgres_api_key::PostgresApiKeyRepository;
 pub use postgres_canvas::PostgresCanvasSessionRepository;
 pub use postgres_credential::PostgresCredentialBindingRepository;
