@@ -1011,8 +1011,8 @@ mod tests {
     /// built-in agent that may make two tries fits two whole tries under its
     /// execution bound, each its clock and its judges', with the wait the
     /// supervisor makes after a failed try and the time a try takes to start
-    /// (`resources.timeout >= 2 x (iteration_timeout + judges' timeout_seconds)
-    /// + failed_execution_backoff(1) + TRY_START_ALLOWANCE`, the supervisor's
+    /// (`resources.timeout >= 2 x (iteration_timeout + judges' timeout_seconds) +
+    /// failed_execution_backoff(1) + TRY_START_ALLOWANCE`, the supervisor's
     /// `two_tries_bound`), outside the exemptions the domain names beside it
     /// (`TWO_TRIES_EXEMPT`, moved there by AEGIS ADR-141's Update of
     /// 2026-10-21, clause 12, and read from there). Run `e7f2c2aa`'s
