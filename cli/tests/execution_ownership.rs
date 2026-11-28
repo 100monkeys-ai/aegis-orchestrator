@@ -994,3 +994,22 @@ fn the_host_state_statements_and_migration_066_pass_pg_strict() {
         assert!(unbounded_writes(sql).is_empty(), "{sql}");
     }
 }
+
+#[test]
+fn the_provider_state_statements_and_migration_067_pass_pg_strict() {
+    use aegis_orchestrator_core::infrastructure::repositories::postgres_provider_state::{
+        ARCHIVE_ACTIVE_SQL, INSERT_SQL, NEXT_VERSION_SQL,
+    };
+    let migration = MIGRATOR
+        .iter()
+        .find(|m| m.version == 67)
+        .expect("migration 067 ships");
+    for sql in [
+        ARCHIVE_ACTIVE_SQL,
+        NEXT_VERSION_SQL,
+        INSERT_SQL,
+        migration.sql.as_ref(),
+    ] {
+        assert!(unbounded_writes(sql).is_empty(), "{sql}");
+    }
+}
