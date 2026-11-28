@@ -638,7 +638,7 @@ pub async fn apply(state: &Value, check: bool) -> Value {
                 return json!({
                     "changed": 0,
                     "failed": 1,
-                    "results": [{ "id": "facts", "status": "failed", "diff": missing }],
+                    "resources": [{ "id": "facts", "status": "failed", "diff": missing }],
                 })
             }
         }

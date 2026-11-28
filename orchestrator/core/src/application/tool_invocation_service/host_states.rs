@@ -553,7 +553,7 @@ impl ToolInvocationService {
             }
             Ok(json!({
                 "name": name, "version": version, "check": check,
-                "changed": changed, "failed": failed, "results": results,
+                "changed": changed, "failed": failed, "resources": results,
             }))
         };
         let outcome = if check {
