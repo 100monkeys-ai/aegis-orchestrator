@@ -29,7 +29,8 @@ pub struct WebhookSourceSpec {
     #[serde(default = "default_event_header")]
     pub event_header: String,
     /// Conditions on the payload, each a JSON pointer and the string it must
-    /// equal. Every condition must hold.
+    /// equal, or, ending in `*`, begin with (`sha-*`). Every condition must
+    /// hold.
     #[serde(default)]
     pub when: BTreeMap<String, String>,
     /// The workflow's input: each key from a JSON pointer into the payload.
@@ -133,7 +134,12 @@ impl WebhookSourceSpec {
         }
         for (pointer, want) in &self.when {
             let have = payload.pointer(pointer).map(text_of);
-            if have.as_deref() != Some(want.as_str()) {
+            let holds = match (have.as_deref(), want.strip_suffix('*')) {
+                (Some(h), Some(prefix)) => h.starts_with(prefix),
+                (Some(h), None) => h == want,
+                (None, _) => false,
+            };
+            if !holds {
                 return Delivery::Ignored(format!(
                     "{pointer} is {}, not {want:?}",
                     have.map(|h| format!("{h:?}"))
@@ -236,6 +242,29 @@ mod tests {
                 input: json!({ "image_tag": "sha-0180a38" }),
             }
         );
+    }
+
+    /// A `*`-ending condition is a prefix: a sha tag starts the deploy, and
+    /// the same build's `latest` does not.
+    #[test]
+    fn a_prefix_condition_takes_the_sha_tag_and_not_latest() {
+        let mut s = worker_publish();
+        s.when.insert(
+            "/registry_package/package_version/container_metadata/tag/name".into(),
+            "sha-*".into(),
+        );
+        let tagged = |tag: &str| {
+            json!({ "action": "published", "registry_package": { "package_version": {
+            "container_metadata": { "tag": { "name": tag } } } } })
+        };
+        assert!(matches!(
+            s.delivery(&headers("registry_package"), &tagged("sha-0180a38")),
+            Delivery::Start { .. }
+        ));
+        assert!(matches!(
+            s.delivery(&headers("registry_package"), &tagged("latest")),
+            Delivery::Ignored(_)
+        ));
     }
 
     /// GitHub's ping, an update, or a payload without the tag starts
