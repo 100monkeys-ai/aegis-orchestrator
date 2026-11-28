@@ -584,8 +584,11 @@ impl SecretPath {
             tenant_namespace(&tenant_id)
         };
         let path: String = path.into();
-        let path = if tenant_id.is_team() {
-            format!("teams/{}/{path}", tenant_id.as_str())
+        // Idempotent: a stored path read back (the credential repository
+        // keeps `path` as written) already carries the prefix.
+        let own = format!("teams/{}/", tenant_id.as_str());
+        let path = if tenant_id.is_team() && !path.starts_with(&own) {
+            format!("{own}{path}")
         } else {
             path
         };
@@ -1288,6 +1291,15 @@ mod tests {
             assert_eq!(
                 p.path,
                 "teams/t-465fa94f-36a6-464b-b82d-88f2bc07b03e/host-states/api"
+            );
+            let again = SecretPath::for_tenant(
+                TenantId::new("t-465fa94f-36a6-464b-b82d-88f2bc07b03e").unwrap(),
+                "kv",
+                p.path.clone(),
+            );
+            assert_eq!(
+                again.path, p.path,
+                "a stored path read back is not prefixed twice"
             );
             let person = TenantId::new("u-d7f8170035d349b6b237c391ccc19035").unwrap();
             let q =
