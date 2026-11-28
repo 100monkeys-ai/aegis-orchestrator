@@ -121,6 +121,10 @@ pub fn router(state: EdgeApiState) -> Router {
         )
         .route("/v1/host-states/{name}/plan", post(plan_host_state))
         .route("/v1/host-states/{name}/apply", post(apply_host_state))
+        .route(
+            "/v1/host-state-secrets/{*path}",
+            get(get_host_state_secret).put(put_host_state_secret),
+        )
         .with_state(state)
 }
 
@@ -1756,7 +1760,7 @@ fn host_states(
 fn host_state_error(e: crate::application::host_state_service::HostStateError) -> ApiError {
     use crate::application::host_state_service::HostStateError as E;
     match e {
-        E::Invalid(_) | E::NoTargets(_) => ApiError::bad_request(e.to_string()),
+        E::Invalid(_) | E::NoTargets(_) | E::Unavailable(_) => ApiError::bad_request(e.to_string()),
         E::NotFound(_) => ApiError::not_found(e.to_string()),
         E::Repository(_) => ApiError::internal(e.to_string()),
     }
@@ -1815,6 +1819,39 @@ async fn update_host_state(
         .await
         .map_err(host_state_error)?;
     Ok(Json(host_state_view(&saved)))
+}
+
+#[derive(Debug, Deserialize)]
+struct HostStateSecretBody {
+    fields: std::collections::BTreeMap<String, String>,
+}
+
+/// ADR-157 D2: store a secret a host state names as `path#field`. The
+/// values are write-only.
+async fn put_host_state_secret(
+    State(s): State<EdgeApiState>,
+    Extension(tenant): Extension<TenantId>,
+    Path(path): Path<String>,
+    Json(body): Json<HostStateSecretBody>,
+) -> Result<StatusCode, ApiError> {
+    host_states(&s)?
+        .put_secret(&tenant, &path, body.fields)
+        .await
+        .map_err(host_state_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The field names of a host state secret, never their values.
+async fn get_host_state_secret(
+    State(s): State<EdgeApiState>,
+    Extension(tenant): Extension<TenantId>,
+    Path(path): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let fields = host_states(&s)?
+        .secret_fields(&tenant, &path)
+        .await
+        .map_err(host_state_error)?;
+    Ok(Json(serde_json::json!({ "path": path, "fields": fields })))
 }
 
 async fn validate_host_state(Json(body): Json<HostStateBody>) -> Json<serde_json::Value> {

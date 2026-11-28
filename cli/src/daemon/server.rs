@@ -2433,6 +2433,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 ),
                 resolver.clone(),
                 fleet_dispatcher.clone(),
+                Some(secrets_manager.clone()),
             ),
         )),
         _ => None,
