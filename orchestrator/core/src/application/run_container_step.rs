@@ -809,6 +809,7 @@ impl RunContainerStepUseCase {
                 volumes: input.volumes.clone(),
                 resources: input.resources.clone(),
                 registry_credentials: input.registry_credentials.clone(),
+                tenant_id: Some(input.tenant_id.clone()),
                 execution_id: input.execution_id,
                 state_name: input.state_name.clone(),
                 read_only_root_filesystem: input.read_only_root_filesystem,

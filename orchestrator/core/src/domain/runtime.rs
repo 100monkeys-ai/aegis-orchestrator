@@ -598,6 +598,13 @@ pub struct ContainerStepConfig {
     /// Secret-backend path (`secret:path/to/secret`) for private registry credentials
     pub registry_credentials: Option<String>,
 
+    /// The tenant whose run the step belongs to. A `secret:` reference in
+    /// `registry_credentials` is read in this tenant's own namespace, and an
+    /// `env:` reference (the orchestrator's own environment) is refused
+    /// unless it is the system tenant. `None` is a step the platform itself
+    /// runs (a clone, an agent's container).
+    pub tenant_id: Option<crate::domain::shared_kernel::TenantId>,
+
     /// Correlation — links this step to the parent workflow execution
     pub execution_id: ExecutionId,
 
