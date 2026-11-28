@@ -49,6 +49,39 @@ pub fn json_value_to_prost_struct(
     }
 }
 
+/// Convert a `prost_types::Struct` back into a JSON object: an edge tool's
+/// structured result, for fleet events and run records.
+pub fn prost_struct_to_json(s: &prost_types::Struct) -> serde_json::Value {
+    serde_json::Value::Object(
+        s.fields
+            .iter()
+            .map(|(k, v)| (k.clone(), prost_value_to_json(v)))
+            .collect(),
+    )
+}
+
+fn prost_value_to_json(v: &prost_types::Value) -> serde_json::Value {
+    use prost_types::value::Kind;
+    match &v.kind {
+        None | Some(Kind::NullValue(_)) => serde_json::Value::Null,
+        Some(Kind::BoolValue(b)) => serde_json::Value::Bool(*b),
+        Some(Kind::NumberValue(n)) => {
+            if n.fract() == 0.0 && n.abs() < 9.007_199_254_740_992e15 {
+                serde_json::Value::from(*n as i64)
+            } else {
+                serde_json::Number::from_f64(*n)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null)
+            }
+        }
+        Some(Kind::StringValue(s)) => serde_json::Value::String(s.clone()),
+        Some(Kind::StructValue(s)) => prost_struct_to_json(s),
+        Some(Kind::ListValue(l)) => {
+            serde_json::Value::Array(l.values.iter().map(prost_value_to_json).collect())
+        }
+    }
+}
+
 fn json_value_to_prost_value(value: serde_json::Value) -> prost_types::Value {
     use prost_types::value::Kind;
     let kind = match value {
@@ -71,4 +104,18 @@ fn json_value_to_prost_value(value: serde_json::Value) -> prost_types::Value {
         }
     };
     prost_types::Value { kind: Some(kind) }
+}
+
+#[cfg(test)]
+mod struct_json_tests {
+    #[test]
+    fn a_structured_result_round_trips_through_json() {
+        let report = serde_json::json!({
+            "check": true, "changed": 2, "failed": 0,
+            "resources": [{"id": "conf", "kind": "file", "status": "changed", "diff": "created (6 bytes)"}],
+            "ratio": 0.5, "none": null
+        });
+        let s = super::json_value_to_prost_struct(report.clone()).unwrap();
+        assert_eq!(super::prost_struct_to_json(&s), report);
+    }
 }

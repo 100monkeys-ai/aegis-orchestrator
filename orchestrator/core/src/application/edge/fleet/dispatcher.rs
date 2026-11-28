@@ -38,6 +38,10 @@ pub enum FleetEvent {
         exit_code: i32,
         error_kind: Option<String>,
         error_message: Option<String>,
+        /// The tool's structured result, when it returns one (`host.apply`'s
+        /// per-resource report, `host.facts`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result: Option<serde_json::Value>,
     },
     Cancelled {
         reason: String,
@@ -255,6 +259,10 @@ impl FleetDispatcher {
                         } else {
                             Some(res.error_message)
                         },
+                        result: res
+                            .structured_result
+                            .as_ref()
+                            .map(crate::application::edge::prost_struct_to_json),
                     })
                     .await;
                 NodeOutcome {
@@ -270,6 +278,7 @@ impl FleetDispatcher {
                         exit_code: -1,
                         error_kind: Some("timeout".into()),
                         error_message: None,
+                        result: None,
                     })
                     .await;
                 NodeOutcome {
@@ -285,6 +294,7 @@ impl FleetDispatcher {
                         exit_code: -1,
                         error_kind: Some("error".into()),
                         error_message: Some(e.to_string()),
+                        result: None,
                     })
                     .await;
                 NodeOutcome {
