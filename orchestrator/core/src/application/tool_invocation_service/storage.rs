@@ -1494,7 +1494,7 @@ impl ToolInvocationService {
         tenant_id: &crate::domain::tenant::TenantId,
         execution_id: crate::domain::execution::ExecutionId,
         person: &str,
-        tool: &'static str,
+        tool: &str,
         arguments: Value,
         land: F,
     ) -> Result<GatedLanding, RepositoryActionError>

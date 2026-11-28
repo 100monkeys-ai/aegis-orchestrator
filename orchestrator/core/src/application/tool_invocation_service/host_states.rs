@@ -173,6 +173,26 @@ impl HostActionAnswer {
 
 /// A rendered argument: a template renders to a string, so a JSON-shaped
 /// value (a target, a tool's args) is read back as JSON.
+/// What a workflow's `tool_call` may not name: AEGIS's own tools, which a
+/// workflow reaches through their own actions (host states, fleets,
+/// repositories) under their own rules.
+fn tool_call_target(tool: &str) -> Result<(&str, &str), String> {
+    let Some((server, name)) = tool.split_once('.') else {
+        return Err(format!(
+            "`tool` {tool:?} must be <server>.<tool>, e.g. cloudflare.execute"
+        ));
+    };
+    if server.is_empty() || name.is_empty() {
+        return Err(format!("`tool` {tool:?} must be <server>.<tool>"));
+    }
+    if server == "aegis" || server == "host" || server == "cmd" || server == "fs" {
+        return Err(format!(
+            "`tool_call` reaches remote servers; {tool} is AEGIS's own: use its action (host_state_apply, edge_fleet_invoke, …)"
+        ));
+    }
+    Ok((server, name))
+}
+
 fn arg_json(args: &serde_json::Map<String, Value>, key: &str) -> Option<Value> {
     match args.get(key)? {
         Value::String(s) => serde_json::from_str(s)
@@ -206,6 +226,9 @@ impl ToolInvocationService {
         };
         if action == "http_check" {
             return http_check(&args).await;
+        }
+        if action == "tool_call" {
+            return self.tool_call(tenant, run, &args).await;
         }
         if self.host_state_service.is_none() {
             return HostActionAnswer::refused(NO_HOST_STATES);
@@ -414,10 +437,134 @@ async fn http_check(args: &serde_json::Map<String, Value>) -> HostActionAnswer {
     }
 }
 
+impl ToolInvocationService {
+    /// A workflow's `tool_call` (AEGIS ADR-157 D11): `tool` on its remote
+    /// server, with `args`, as the run's person and with the binding the
+    /// run's own `contexts` chose for that server, so a server the run chose
+    /// nothing for is reached with none of the person's credentials. Carbon
+    /// Forge, the run's tree server, is called with the run's execution
+    /// token as every run's Carbon Forge call is. A tool the configuration
+    /// gates waits at the approval gate as the run's person, or runs at once
+    /// on their standing "always allow".
+    async fn tool_call(
+        &self,
+        tenant: &TenantId,
+        run: uuid::Uuid,
+        args: &serde_json::Map<String, Value>,
+    ) -> HostActionAnswer {
+        let Some(tool) = args.get("tool").and_then(Value::as_str) else {
+            return HostActionAnswer::refused("`tool` is required");
+        };
+        let (server, name) = match tool_call_target(tool) {
+            Ok(target) => target,
+            Err(sentence) => return HostActionAnswer::refused(sentence),
+        };
+        let call_args = match arg_json(args, "args") {
+            None => json!({}),
+            Some(Value::Object(o)) => Value::Object(o),
+            Some(_) => return HostActionAnswer::refused("`args` must be a JSON object"),
+        };
+        let Some(executions) = self.workflow_execution_repo.as_ref() else {
+            return HostActionAnswer::refused("the workflow execution store is not configured");
+        };
+        let execution = match executions
+            .find_by_id_for_tenant(tenant, crate::domain::execution::ExecutionId(run))
+            .await
+        {
+            Ok(Some(execution)) => execution,
+            Ok(None) => return HostActionAnswer::refused(format!("no workflow run {run}")),
+            Err(e) => return HostActionAnswer::refused(e.to_string()),
+        };
+        let person = execution.initiating_user_sub.clone().unwrap_or_default();
+        let contexts = self.remote_tool_former_names.execution_contexts(
+            crate::domain::execution::ExecutionContexts::from_value(
+                execution
+                    .input
+                    .get(crate::domain::execution::CONTEXTS_INPUT_KEY),
+            ),
+        );
+        let acting = Self::run_acting(
+            Some(person.as_str()),
+            Some(execution.workflow_id.as_uuid()),
+            contexts,
+        );
+        let tree_server = server == self.run_tree_server();
+        let call = || async {
+            if tree_server {
+                self.invoke_remote_tool_for_run(
+                    run,
+                    tenant,
+                    &acting,
+                    server,
+                    name,
+                    call_args.clone(),
+                )
+                .await
+            } else {
+                self.invoke_remote_tool_with_binding_for_run(
+                    run,
+                    tenant,
+                    &acting,
+                    server,
+                    name,
+                    call_args.clone(),
+                )
+                .await
+            }
+        };
+        let gated = self
+            .land_at_gate(
+                tenant,
+                crate::domain::execution::ExecutionId(run),
+                &person,
+                tool,
+                json!({ "tool": tool, "args": call_args }),
+                call,
+            )
+            .await;
+        match gated {
+            Ok(super::storage::GatedLanding::Landed(result)) => HostActionAnswer {
+                ok: true,
+                result,
+                sentence: None,
+            },
+            Ok(super::storage::GatedLanding::NotApproved(sentence)) => {
+                HostActionAnswer::refused(sentence)
+            }
+            Err(e) => HostActionAnswer::refused(e.to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod host_action_tests {
     use super::*;
     use crate::domain::workflow::ActionName;
+
+    /// ADR-157 D11: tool_call reaches remote servers only; AEGIS's own tools
+    /// keep their own actions and rules.
+    #[test]
+    fn a_tool_call_names_a_remote_servers_tool() {
+        assert_eq!(
+            super::tool_call_target("cloudflare.execute"),
+            Ok(("cloudflare", "execute"))
+        );
+        assert_eq!(
+            super::tool_call_target("github.create_issue"),
+            Ok(("github", "create_issue"))
+        );
+        for refused in [
+            "aegis.host_state.apply",
+            "host.apply",
+            "cmd.run",
+            "fs.write",
+            "execute",
+            ".x",
+            "x.",
+        ] {
+            assert!(super::tool_call_target(refused).is_err(), "{refused}");
+        }
+    }
 
     #[test]
     fn the_host_actions_parse_and_only_the_changing_ones_are_gated() {
@@ -426,6 +573,7 @@ mod host_action_tests {
             ("host_state_apply", true),
             ("edge_fleet_invoke", true),
             ("http_check", false),
+            ("tool_call", true),
         ] {
             let action = ActionName::from_literal(name).expect(name);
             assert_eq!(action.as_str(), name);
